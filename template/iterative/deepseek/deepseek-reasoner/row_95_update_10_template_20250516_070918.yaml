@@ -1,0 +1,252 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated Nginx deployment with built-in VPC infrastructure'
+Parameters:
+  LatestAmi:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t2.micro, t3.micro, t3.small]
+
+Resources:
+  AppVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: SSM-Nginx-VPC
+
+  AppSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref AppVPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: SSM-Nginx-Subnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Tags:
+      - Key: Name
+        Value: SSM-Nginx-IGW
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref AppVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref AppVPC
+      Tags:
+        - Key: Name
+          Value: SSM-Nginx-RouteTable
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref AppSubnet
+      RouteTableId: !Ref RouteTable
+
+  SSMInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref SSMInstanceRole]
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Enable SSM and web access'
+      VpcId: !Ref AppVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  NginxInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmi
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref AppSubnet
+      SecurityGroupIds: [!GetAtt InstanceSecurityGroup.GroupId]
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags:
+        - Key: Name
+          Value: 'SSM-Managed-Nginx'
+        - Key: nginx
+          Value: 'Yes'
+
+  NginxAutomationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: 'NginxAutomation'
+      DocumentType: Automation
+      Content:
+        schemaVersion: '0.3'
+        description: 'Automated system updates and Nginx installation'
+        parameters:
+          TagKey:
+            type: String
+            default: 'nginx'
+          TagValue:
+            type: String
+            default: 'Yes'
+        mainSteps:
+          - name: SelectInstances
+            action: aws:targetByTag
+            inputs:
+              TagKey: '{{TagKey}}'
+              TagValue: '{{TagValue}}'
+            outputs:
+              - name: InstanceIds
+                selector: '$.InstanceIds'
+
+          - name: SystemUpdate
+            action: aws:runCommand
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds: '{{SelectInstances.InstanceIds}}'
+              Parameters:
+                commands:
+                  - sudo yum update -y --security
+
+          - name: CheckReboot
+            action: aws:runCommand
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds: '{{SelectInstances.InstanceIds}}'
+              Parameters:
+                commands:
+                  - 'if [ -f /var/run/reboot-required ]; then echo "REBOOT_NEEDED"; fi'
+            outputs:
+              - name: RebootStatus
+                selector: '$.Payloads.aws:runCommand.0.output'
+
+          - name: EvaluateReboot
+            action: aws:branch
+            inputs:
+              Choices:
+                - NextStep: RebootInstances
+                  StringEquals: 'REBOOT_NEEDED'
+                  Variable: '{{CheckReboot.RebootStatus}}'
+              Default: InstallNginx
+
+          - name: RebootInstances
+            action: aws:rebootInstance
+            inputs:
+              InstanceIds: '{{SelectInstances.InstanceIds}}'
+            nextStep: WaitForReboot
+
+          - name: WaitForReboot
+            action: aws:waitForInstanceStatus
+            inputs:
+              InstanceIds: '{{SelectInstances.InstanceIds}}'
+              DesiredStatus: OK
+              DurationSeconds: 300
+            nextStep: InstallNginx
+
+          - name: InstallNginx
+            action: aws:runCommand
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds: '{{SelectInstances.InstanceIds}}'
+              Parameters:
+                commands:
+                  - sudo amazon-linux-extras install -y nginx1
+                  - sudo systemctl enable --now nginx
+
+          - name: VerifyService
+            action: aws:runCommand
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds: '{{SelectInstances.InstanceIds}}'
+              Parameters:
+                commands:
+                  - 'curl --retry 3 --retry-delay 5 -Is http://localhost || exit 1'
+
+  AutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SSMAutomationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:StartAutomationExecution
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${NginxAutomationDocument}:$DEFAULT'
+
+  AutomationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source: 
+          - aws.ec2
+        detail-type: 
+          - AWS API Call via CloudTrail
+        detail:
+          eventName: 
+            - CreateTags
+          requestParameters:
+            resources:
+              - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+            tags:
+              - key: nginx
+                value: Yes
+      Targets:
+        - Arn: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${NginxAutomationDocument}:$DEFAULT'
+          RoleArn: !GetAtt AutomationRole.Arn
+          Id: TriggerNginxAutomation
+
+Outputs:
+  InstanceId:
+    Value: !Ref NginxInstance
+  AutomationDocumentName:
+    Value: !Ref NginxAutomationDocument
+  VPCId:
+    Value: !Ref AppVPC
+  SubnetId:
+    Value: !Ref AppSubnet

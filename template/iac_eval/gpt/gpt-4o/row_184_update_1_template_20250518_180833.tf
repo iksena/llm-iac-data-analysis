@@ -1,0 +1,73 @@
+provider "aws" {
+  region = "us-west-2"
+}
+
+resource "aws_iam_role" "sagemaker_execution_role" {
+  name = "SageMakerExecutionRole"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "sagemaker.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "sagemaker_policy" {
+  name = "SageMakerPolicy"
+  role = aws_iam_role.sagemaker_execution_role.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:PutObject",
+          "s3:ListBucket"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "cloudwatch:PutMetricData",
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_sagemaker_model" "example" {
+  name = "example-model"
+  execution_role_arn = aws_iam_role.sagemaker_execution_role.arn
+
+  primary_container {
+    image = "123456789012.dkr.ecr.us-west-2.amazonaws.com/my-custom-image:latest"
+    model_data_url = "s3://my-bucket/model.tar.gz"
+  }
+}
+
+resource "aws_sagemaker_endpoint_configuration" "example" {
+  name = "example-endpoint-config"
+
+  production_variants {
+    variant_name = "AllTraffic"
+    model_name = aws_sagemaker_model.example.name
+    initial_instance_count = 1
+    instance_type = "ml.m5.large"
+  }
+}
+
+resource "aws_sagemaker_endpoint" "example" {
+  name = "example-endpoint"
+  endpoint_config_name = aws_sagemaker_endpoint_configuration.example.name
+}

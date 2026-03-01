@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: EC2 instance type for worker nodes
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: ''
+    Description: (Optional) EC2 Key Pair for SSH access
+  LoadTestInstanceType:
+    Type: String
+    Default: t3.micro
+    Description: Instance type for load test instance
+  SampleURLCount:
+    Type: Number
+    Default: 10
+    Description: Number of sample URLs to generate for testing
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+  NewVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: ScreenshotServiceVPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref NewVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet01:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref NewVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet01
+
+  PublicSubnet02:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref NewVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet02
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref NewVPC
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet01
+      RouteTableId: !Ref RouteTable
+
+  SubnetRouteTableAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet02
+      RouteTableId: !Ref RouteTable
+
+  ScreenshotBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ScreenshotQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 345600
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSQSReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+
+  LoadTestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSQSFullAccess
+
+  WorkerSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Worker security group
+      VpcId: !Ref NewVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  LoadTestSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Load test instance security group
+      VpcId: !Ref NewVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  WorkerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref WorkerRole]
+
+  LoadTestInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref LoadTestRole]
+
+  WorkerLT:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
+        SecurityGroupIds: [!GetAtt WorkerSG.GroupId]
+        IamInstanceProfile:
+          Arn: !GetAtt WorkerInstanceProfile.Arn
+        UserData: 
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            sudo amazon-linux-extras install epel -y
+            sudo yum install -y chromium xorg-x11-server-Xvfb jq
+            cat <<'EOF' > /home/ec2-user/process_queue.sh
+            #!/bin/bash
+            while true; do
+              RESPONSE=\$(aws sqs receive-message --queue-url ${ScreenshotQueue} --visibility-timeout 300 --wait-time-seconds 20)
+              [ -z "\$RESPONSE" ] && continue
+              URL=\$(echo \$RESPONSE | jq -r '.Messages[0].Body')
+              RECEIPT=\$(echo \$RESPONSE | jq -r '.Messages[0].ReceiptHandle')
+              xvfb-run --server-args="-screen 0 1280x1024x24" chromium --headless --disable-gpu --screenshot --no-sandbox "\$URL"
+              aws s3 cp screenshot.png "s3://${ScreenshotBucket}/\$(date +%s).png"
+              aws sqs delete-message --queue-url ${ScreenshotQueue} --receipt-handle "\$RECEIPT"
+            done
+            EOF
+            chmod +x /home/ec2-user/process_queue.sh
+            sudo -u ec2-user /home/ec2-user/process_queue.sh &
+
+  WorkerASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLT
+        Version: !GetAtt WorkerLT.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 2
+      DesiredCapacity: 1
+      VPCZoneIdentifier: [!Ref PublicSubnet01, !Ref PublicSubnet02]
+      HealthCheckType: EC2
+
+  LoadTestInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref LoadTestInstanceType
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
+      SecurityGroupIds: [!GetAtt LoadTestSG.GroupId]
+      SubnetId: !Ref PublicSubnet01
+      IamInstanceProfile: !Ref LoadTestInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo yum install -y jq
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          sudo ./aws/install
+          for i in {1..${SampleURLCount}}; do
+            aws sqs send-message --queue-url ${ScreenshotQueue} --message-body "https://example.com/page$i"
+          done
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
+
+Outputs:
+  ScreenshotBucketName:
+    Value: !Ref ScreenshotBucket
+  ScreenshotQueueURL:
+    Value: !Ref ScreenshotQueue
+  VPCId:
+    Value: !Ref NewVPC
+  PublicSubnets:
+    Value: !Join [",", [!Ref PublicSubnet01, !Ref PublicSubnet02]]
+  LoadTestInstanceIP:
+    Value: !GetAtt LoadTestInstance.PublicIp

@@ -1,0 +1,338 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Event-driven AWS Batch job processing pipeline with SQS and EventBridge Pipes'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where the Batch compute environment will be created
+
+  PrivateSubnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets for the Batch compute environment (minimum of 2 recommended)
+
+  ContainerImage:
+    Type: String
+    Description: URI of the container image to use for the Batch job
+    Default: amazon/amazon-ecs-sample
+
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Description: Instance types to use for the Batch compute environment
+    Default: optimal
+
+  MinvCpus:
+    Type: Number
+    Description: Minimum number of vCPUs for the Batch compute environment
+    Default: 0
+    MinValue: 0
+
+  MaxvCpus:
+    Type: Number
+    Description: Maximum number of vCPUs for the Batch compute environment
+    Default: 16
+    MinValue: 1
+
+  JobMemory:
+    Type: Number
+    Description: Memory (in MiB) required for the Batch job
+    Default: 2048
+    MinValue: 4
+
+  JobvCpus:
+    Type: Number
+    Description: vCPUs required for the Batch job
+    Default: 1
+    MinValue: 1
+
+  MessageRetentionPeriod:
+    Type: Number
+    Description: SQS message retention period in seconds
+    Default: 345600  # 4 days
+    MinValue: 60
+    MaxValue: 1209600  # 14 days
+
+Resources:
+  # IAM Roles
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonBatchServiceRole
+
+  BatchInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+
+  BatchInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref BatchInstanceRole
+
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  PipesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pipes.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipesSQSBatchPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt EventQueue.Arn
+              - Effect: Allow
+                Action:
+                  - batch:SubmitJob
+                Resource:
+                  - !Ref BatchJobQueue
+                  - !Ref BatchJobDefinition
+
+  # Security Group
+  BatchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for AWS Batch compute environment
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic
+
+  # SQS Queue
+  EventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: !Ref MessageRetentionPeriod
+      VisibilityTimeout: 300  # 5 minutes
+      Tags:
+        - Key: Name
+          Value: EventDrivenBatchQueue
+
+  # AWS Batch Resources
+  BatchComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      State: ENABLED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeResources:
+        Type: EC2
+        MinvCpus: !Ref MinvCpus
+        MaxvCpus: !Ref MaxvCpus
+        InstanceTypes: !Ref InstanceTypes
+        Subnets: !Ref PrivateSubnets
+        SecurityGroupIds:
+          - !GetAtt BatchSecurityGroup.GroupId
+        InstanceRole: !GetAtt BatchInstanceProfile.Arn
+        AllocationStrategy: BEST_FIT_PROGRESSIVE
+        Tags:
+          Name: BatchComputeEnvironment
+
+  BatchJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      Priority: 1
+      State: ENABLED
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref BatchComputeEnvironment
+
+  BatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/batch/job/${AWS::StackName}
+      RetentionInDays: 14
+
+  BatchJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      ContainerProperties:
+        Image: !Ref ContainerImage
+        Memory: !Ref JobMemory
+        Vcpus: !Ref JobvCpus
+        ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref BatchLogGroup
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: batch
+      RetryStrategy:
+        Attempts: 3
+      Timeout:
+        AttemptDurationSeconds: 900  # 15 minutes
+
+  # EventBridge Rule to trigger Batch job from SQS
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${AWS::StackName}-sqs-to-batch-rule
+      Description: Rule to trigger Batch job when messages arrive in SQS
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.sqs
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - sqs.amazonaws.com
+          eventName:
+            - SendMessage
+            - SendMessageBatch
+          requestParameters:
+            queueUrl:
+              - !Ref EventQueue
+      Targets:
+        - Id: BatchJobTarget
+          Arn: !Ref BatchJobQueue
+          RoleArn: !GetAtt PipesRole.Arn
+          BatchParameters:
+            JobDefinition: !Ref BatchJobDefinition
+            JobName: !Sub "${AWS::StackName}-job"
+
+  # Lambda function to poll SQS and submit Batch jobs
+  SQSPollerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs14.x
+      Timeout: 60
+      Environment:
+        Variables:
+          BATCH_JOB_QUEUE: !Ref BatchJobQueue
+          BATCH_JOB_DEFINITION: !Ref BatchJobDefinition
+          JOB_NAME_PREFIX: !Sub "${AWS::StackName}-job"
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const batch = new AWS.Batch();
+          
+          exports.handler = async (event) => {
+            console.log('Received event:', JSON.stringify(event, null, 2));
+            
+            for (const record of event.Records) {
+              const messageBody = JSON.parse(record.body);
+              console.log('Processing message:', JSON.stringify(messageBody, null, 2));
+              
+              const params = {
+                jobName: process.env.JOB_NAME_PREFIX + '-' + Date.now(),
+                jobQueue: process.env.BATCH_JOB_QUEUE,
+                jobDefinition: process.env.BATCH_JOB_DEFINITION,
+                parameters: {
+                  messageId: record.messageId,
+                  messageBody: JSON.stringify(messageBody)
+                }
+              };
+              
+              try {
+                const result = await batch.submitJob(params).promise();
+                console.log('Job submitted successfully:', result);
+              } catch (error) {
+                console.error('Error submitting job:', error);
+                throw error;
+              }
+            }
+            
+            return { statusCode: 200, body: 'Jobs submitted successfully' };
+          };
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BatchJobSubmission
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - batch:SubmitJob
+                Resource:
+                  - !Ref BatchJobQueue
+                  - !Ref BatchJobDefinition
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt EventQueue.Arn
+
+  SQSEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt EventQueue.Arn
+      FunctionName: !Ref SQSPollerFunction
+
+Outputs:
+  QueueURL:
+    Description: URL of the SQS queue
+    Value: !Ref EventQueue
+
+  QueueARN:
+    Description: ARN of the SQS queue
+    Value: !GetAtt EventQueue.Arn
+
+  BatchJobQueue:
+    Description: Name of the Batch job queue
+    Value: !Ref BatchJobQueue
+
+  BatchJobDefinition:
+    Description: Name of the Batch job definition
+    Value: !Ref BatchJobDefinition
+
+  LambdaFunction:
+    Description: Name of the Lambda function that processes SQS messages
+    Value: !Ref SQSPollerFunction

@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Etherpad deployment pipeline with ALB, ASG, RDS, and CodeDeploy
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: REQUIRED - Existing VPC ID for deployment
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: REQUIRED - Minimum 2 subnets in different AZs
+  SSHKeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: REQUIRED - EC2 Key Pair for instance access
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues: [t3.medium, t3.large, m5.large]
+    Description: EC2 instance type
+  DBUsername:
+    Type: String
+    Default: etherpadadmin
+    Description: RDS master username
+  DBName:
+    Type: String
+    Default: etherpad
+    Description: RDS database name
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-0cff7528ff583bf9a
+    us-west-2:
+      AMI: ami-03f65b8614a860c29
+
+Resources:
+  # --- Security Groups ---
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Etherpad instance security group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !GetAtt ALBSecurityGroup.GroupId
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS security group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !GetAtt EC2SecurityGroup.GroupId
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB security group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  # --- Networking ---
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !GetAtt ALBSecurityGroup.GroupId
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # --- Database ---
+  RDSSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Etherpad DB subnet group
+      SubnetIds: !Ref SubnetIds
+
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: mysql
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: 20
+      MasterUsername: !Ref DBUsername
+      MasterUserPassword: '{{resolve:ssm-secure:/Etherpad/DBPassword:1}}'
+      DBName: !Ref DBName
+      DBSubnetGroupName: !Ref RDSSubnetGroup
+      VPCSecurityGroups:
+        - !GetAtt RDSSecurityGroup.GroupId
+      PubliclyAccessible: false
+
+  # --- IAM Roles ---
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [codedeploy.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRole
+
+  # --- Compute ---
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref SSHKeyName
+        SecurityGroupIds:
+          - !GetAtt EC2SecurityGroup.GroupId
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            yum install -y https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-latest.amzn2.noarch.rpm
+            yum update -y
+            yum install -y ruby wget unzip
+            wget "https://aws-codedeploy-${AWS::Region}.s3.${AWS::Region}.amazonaws.com/latest/install"
+            chmod +x ./install
+            ./install auto
+            curl -sL https://rpm.nodesource.com/setup_14.x | bash -
+            yum install -y nodejs
+            mkdir -p /opt/etherpad
+            
+            # Retrieve database configuration
+            aws ssm get-parameter --name /Etherpad/DBEndpoint --with-decryption --region ${AWS::Region} --query Parameter.Value --output text > /opt/etherpad/dbhost
+            aws ssm get-parameter --name /Etherpad/DBName --with-decryption --region ${AWS::Region} --query Parameter.Value --output text > /opt/etherpad/dbname
+            aws ssm get-parameter --name /Etherpad/DBUsername --with-decryption --region ${AWS::Region} --query Parameter.Value --output text > /opt/etherpad/dbuser
+
+            # Install Etherpad
+            curl -sL https://github.com/ether/etherpad-lite/archive/develop.tar.gz | tar xz -C /opt/
+            mv /opt/etherpad-lite-develop /opt/etherpad
+            npm install --prefix /opt/etherpad --production
+            
+            # Configure service
+            cat > /etc/systemd/system/etherpad.service <<EOF
+            [Unit]
+            Description=Etherpad Service
+            After=network.target
+            
+            [Service]
+            Type=simple
+            User=root
+            WorkingDirectory=/opt/etherpad
+            Environment=NODE_ENV=production
+            ExecStart=/usr/bin/node /opt/etherpad/src/node/server.js
+            Restart=always
+            
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+            
+            systemctl daemon-reload
+            systemctl enable --now etherpad.service
+            /opt/aws/bin/cfn-signal --exit-code $? --stack ${AWS::StackName} --resource AutoScalingGroup --region ${AWS::Region}
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref EC2Role]
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT20M
+        Count: 2
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT20M
+        WaitOnResourceSignals: true
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: 2
+      MaxSize: 4
+      DesiredCapacity: 2
+      VPCZoneIdentifier: !Ref SubnetIds
+      TargetGroupARNs: [!Ref ALBTargetGroup]
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+
+  # --- Deployment Pipeline ---
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: EtherpadApp
+      ComputePlatform: Server
+
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApplication
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      AutoScalingGroups: [!Ref AutoScalingGroup]
+      DeploymentStyle:
+        DeploymentType: IN_PLACE
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      LoadBalancerInfo:
+        TargetGroupInfoList:
+          - Name: !Ref ALBTargetGroup
+
+Outputs:
+  WebsiteURL:
+    Value: !Sub "http://${ALB.DNSName}"
+  DatabaseEndpoint:
+    Value: !GetAtt RDSInstance.Endpoint.Address
+  DeploymentBucket:
+    Value: !Ref EtherpadBucket

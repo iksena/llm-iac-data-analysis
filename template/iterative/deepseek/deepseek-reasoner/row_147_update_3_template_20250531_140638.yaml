@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  AssetZipUrl:
+    Type: String
+    Description: URL of the frontend assets ZIP file
+
+Resources:
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      AccessControl: PublicRead
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal: '*'
+          Action: s3:GetObject
+          Resource: !Sub "arn:aws:s3:::${WebsiteBucket}/*"
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  SlotFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          exports.handler = async () => {
+            const symbols = ['cherry', 'lemon', 'orange', 'plum', 'bell'];
+            const results = Array(3).fill().map(() => 
+              symbols[Math.floor(Math.random() * symbols.length)]
+            );
+            const win = results.every(symbol => symbol === results[0]);
+            return {
+              statusCode: 200,
+              headers: {"Content-Type": "application/json"},
+              body: JSON.stringify({results, win})
+            };
+          }
+
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      AllowUnauthenticatedIdentities: true
+
+  UnauthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Federated: cognito-identity.amazonaws.com
+          Action: sts:AssumeRoleWithWebIdentity
+          Condition:
+            StringEquals:
+              cognito-identity.amazonaws.com:aud: !Ref IdentityPool
+            ForAnyValue:StringLike:
+              cognito-identity.amazonaws.com:amr: unauthenticated
+      Policies:
+      - PolicyName: InvokeSlotFunctionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !GetAtt SlotFunction.Arn
+
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        unauthenticated: !GetAtt UnauthenticatedRole.Arn
+
+  DeploymentLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: S3DeploymentAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:PutObjectAcl
+              - s3:ListBucket
+            Resource:
+              - !GetAtt WebsiteBucket.Arn
+              - !Sub "${WebsiteBucket.Arn}/*"
+      - PolicyName: LambdaLogs
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+
+  DeploymentFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.9
+      Role: !GetAtt DeploymentLambdaRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import urllib.request
+          import zipfile
+          import os
+          import json
+          import tempfile
+          import cfnresponse
+          
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  
+                  bucket = event['ResourceProperties']['BucketName']
+                  identity_pool = event['ResourceProperties']['IdentityPoolId']
+                  region = event['ResourceProperties']['Region']
+                  lambda_name = event['ResourceProperties']['LambdaName']
+                  asset_url = event['ResourceProperties']['AssetUrl']
+                  
+                  s3 = boto3.client('s3')
+                  
+                  with tempfile.TemporaryDirectory() as tmpdir:
+                      zip_path = os.path.join(tmpdir, 'assets.zip')
+                      urllib.request.urlretrieve(asset_url, zip_path)
+                      
+                      extract_path = os.path.join(tmpdir, 'extracted')
+                      os.makedirs(extract_path, exist_ok=True)
+                      with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                          zip_ref.extractall(extract_path)
+                      
+                      config = {
+                          "region": region,
+                          "identityPoolId": identity_pool,
+                          "lambdaFunctionName": lambda_name
+                      }
+                      
+                      config_path = os.path.join(extract_path, 'config.json')
+                      with open(config_path, 'w') as f:
+                          json.dump(config, f)
+                      
+                      for root, _, files in os.walk(extract_path):
+                          for file in files:
+                              local_path = os.path.join(root, file)
+                              s3_path = os.path.relpath(local_path, extract_path)
+                              s3.upload_file(
+                                  local_path, 
+                                  bucket, 
+                                  s3_path, 
+                                  ExtraArgs={'ACL': 'public-read'}
+                              )
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  WebsiteDeployment:
+    Type: Custom::WebsiteDeployment
+    Properties:
+      ServiceToken: !GetAtt DeploymentFunction.Arn
+      BucketName: !Ref WebsiteBucket
+      IdentityPoolId: !Ref IdentityPool
+      Region: !Ref AWS::Region
+      LambdaName: !Ref SlotFunction
+      AssetUrl: !Ref AssetZipUrl
+    DependsOn:
+      - WebsiteBucket
+      - IdentityPool
+      - SlotFunction
+
+Outputs:
+  WebsiteURL:
+    Value: !GetAtt WebsiteBucket.WebsiteURL
+    Description: URL for the slot machine website
+  IdentityPoolId:
+    Value: !Ref IdentityPool
+    Description: Cognito Identity Pool ID for frontend

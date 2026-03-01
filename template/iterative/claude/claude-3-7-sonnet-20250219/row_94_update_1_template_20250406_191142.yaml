@@ -1,0 +1,423 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for EC2 instance with SSM Automation for OS updates, Nginx installation, and validation'
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t3.micro
+      - t3.small
+    ConstraintDescription: Must be a valid EC2 instance type.
+
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access (optional)
+    Type: String
+    Default: ''
+    
+  VpcId:
+    Description: VPC where the EC2 instance will be deployed
+    Type: AWS::EC2::VPC::Id
+    
+  SubnetId:
+    Description: Subnet where the EC2 instance will be deployed
+    Type: AWS::EC2::Subnet::Id
+    
+  S3LogsBucketName:
+    Description: Name for the S3 bucket to store logs (must be globally unique)
+    Type: String
+    Default: ssm-automation-logs-bucket
+    
+Resources:
+  # S3 Bucket for logs
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref S3LogsBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToStandardIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # IAM Role for EC2 instance
+  EC2SSMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Path: /
+
+  # Custom IAM Policy for S3 access and additional permissions
+  EC2SSMCustomPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: EC2SSMCustomPolicy
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !GetAtt LogsBucket.Arn
+              - !Sub "${LogsBucket.Arn}/*"
+          - Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+              - ssm:GetParametersByPath
+            Resource: 
+              - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2"
+      Roles:
+        - !Ref EC2SSMRole
+
+  # EC2 Instance Profile
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref EC2SSMRole
+
+  # Security Group for EC2 instance
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EC2 instance with Nginx
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP access
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS access
+        - !If
+          - HasKeyName
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: 0.0.0.0/0
+            Description: Allow SSH access
+          - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
+
+  # EC2 Instance
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Sub "{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}"
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !GetAtt EC2SecurityGroup.GroupId
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref AWS::NoValue]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-instance"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          # Install AWS CLI and SSM Agent (should already be installed on Amazon Linux 2)
+          yum update -y aws-cli
+          yum update -y amazon-ssm-agent
+          systemctl enable amazon-ssm-agent
+          systemctl start amazon-ssm-agent
+          
+          # Set up CloudWatch agent for logging
+          yum install -y amazon-cloudwatch-agent
+          
+          # Create a basic CloudWatch agent configuration
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json << 'EOF'
+          {
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/messages",
+                      "log_group_name": "${AWS::StackName}-system-logs",
+                      "log_stream_name": "{instance_id}-messages"
+                    },
+                    {
+                      "file_path": "/var/log/nginx/access.log",
+                      "log_group_name": "${AWS::StackName}-nginx-logs",
+                      "log_stream_name": "{instance_id}-nginx-access"
+                    },
+                    {
+                      "file_path": "/var/log/nginx/error.log",
+                      "log_group_name": "${AWS::StackName}-nginx-logs",
+                      "log_stream_name": "{instance_id}-nginx-error"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          
+          # Start CloudWatch agent
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+          
+          # Signal completion
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
+
+  # SSM Automation Document
+  NginxInstallationAutomation:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Content:
+        schemaVersion: '0.3'
+        description: 'Automation document to update OS, install Nginx, and validate installation'
+        assumeRole: !GetAtt EC2SSMRole.Arn
+        parameters:
+          InstanceId:
+            type: String
+            description: The ID of the EC2 instance
+          S3BucketName:
+            type: String
+            description: S3 bucket for storing logs
+            default: !Ref LogsBucket
+        mainSteps:
+          - name: updateOS
+            action: aws:runCommand
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds:
+                - "{{ InstanceId }}"
+              Parameters:
+                commands:
+                  - |
+                    #!/bin/bash
+                    echo "Starting OS update at $(date)" > /tmp/update_log.txt
+                    yum update -y >> /tmp/update_log.txt 2>&1
+                    echo "OS update completed at $(date)" >> /tmp/update_log.txt
+                    aws s3 cp /tmp/update_log.txt s3://{{ S3BucketName }}/logs/{{ InstanceId }}/os_update_$(date +%Y%m%d%H%M%S).log
+              CloudWatchOutputConfig:
+                CloudWatchLogGroupName: !Sub "${AWS::StackName}-SSMAutomation"
+                CloudWatchOutputEnabled: true
+          
+          - name: checkRebootRequired
+            action: aws:runCommand
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds:
+                - "{{ InstanceId }}"
+              Parameters:
+                commands:
+                  - |
+                    #!/bin/bash
+                    if [ -f /var/run/reboot-required ]; then
+                      echo "Reboot is required"
+                      exit 1
+                    else
+                      echo "No reboot required"
+                      exit 0
+                    fi
+              CloudWatchOutputConfig:
+                CloudWatchLogGroupName: !Sub "${AWS::StackName}-SSMAutomation"
+                CloudWatchOutputEnabled: true
+            onFailure: step:rebootInstance
+            onSuccess: step:installNginx
+          
+          - name: rebootInstance
+            action: aws:executeAwsApi
+            inputs:
+              Service: ec2
+              Api: RebootInstances
+              InstanceIds:
+                - "{{ InstanceId }}"
+          
+          - name: waitForInstanceOnline
+            action: aws:waitForAwsResourceProperty
+            timeoutSeconds: 300
+            inputs:
+              Service: ssm
+              Api: DescribeInstanceInformation
+              InstanceInformationFilterList:
+                - key: InstanceIds
+                  valueSet:
+                    - "{{ InstanceId }}"
+              PropertySelector: "$.InstanceInformationList[0].PingStatus"
+              DesiredValues:
+                - "Online"
+            onSuccess: step:installNginx
+          
+          - name: installNginx
+            action: aws:runCommand
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds:
+                - "{{ InstanceId }}"
+              Parameters:
+                commands:
+                  - |
+                    #!/bin/bash
+                    echo "Starting Nginx installation at $(date)" > /tmp/nginx_install_log.txt
+                    amazon-linux-extras enable nginx1
+                    yum install -y nginx >> /tmp/nginx_install_log.txt 2>&1
+                    systemctl enable nginx
+                    systemctl start nginx
+                    echo "Nginx installation completed at $(date)" >> /tmp/nginx_install_log.txt
+                    aws s3 cp /tmp/nginx_install_log.txt s3://{{ S3BucketName }}/logs/{{ InstanceId }}/nginx_install_$(date +%Y%m%d%H%M%S).log
+              CloudWatchOutputConfig:
+                CloudWatchLogGroupName: !Sub "${AWS::StackName}-SSMAutomation"
+                CloudWatchOutputEnabled: true
+          
+          - name: validateNginx
+            action: aws:runCommand
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds:
+                - "{{ InstanceId }}"
+              Parameters:
+                commands:
+                  - |
+                    #!/bin/bash
+                    echo "Starting Nginx validation at $(date)" > /tmp/nginx_validation_log.txt
+                    
+                    # Check if Nginx service is running
+                    if systemctl is-active nginx; then
+                      echo "Nginx service is running" >> /tmp/nginx_validation_log.txt
+                    else
+                      echo "ERROR: Nginx service is not running" >> /tmp/nginx_validation_log.txt
+                      exit 1
+                    fi
+                    
+                    # Check if Nginx is responding locally
+                    HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost)
+                    if [ "$HTTP_CODE" = "200" ]; then
+                      echo "Nginx is responding with HTTP 200 OK" >> /tmp/nginx_validation_log.txt
+                    else
+                      echo "ERROR: Nginx is not responding correctly. HTTP code: $HTTP_CODE" >> /tmp/nginx_validation_log.txt
+                      exit 1
+                    fi
+                    
+                    # Create a custom index.html for validation
+                    echo "<html><body><h1>Nginx Installation Successful</h1><p>Deployed via SSM Automation</p></body></html>" > /usr/share/nginx/html/index.html
+                    
+                    # Validate the custom page
+                    CONTENT=$(curl -s http://localhost | grep "Nginx Installation Successful")
+                    if [ -n "$CONTENT" ]; then
+                      echo "Custom index page validation successful" >> /tmp/nginx_validation_log.txt
+                    else
+                      echo "ERROR: Custom index page validation failed" >> /tmp/nginx_validation_log.txt
+                      exit 1
+                    fi
+                    
+                    echo "Nginx validation completed successfully at $(date)" >> /tmp/nginx_validation_log.txt
+                    aws s3 cp /tmp/nginx_validation_log.txt s3://{{ S3BucketName }}/logs/{{ InstanceId }}/nginx_validation_$(date +%Y%m%d%H%M%S).log
+              CloudWatchOutputConfig:
+                CloudWatchLogGroupName: !Sub "${AWS::StackName}-SSMAutomation"
+                CloudWatchOutputEnabled: true
+          
+          - name: finalReport
+            action: aws:runCommand
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds:
+                - "{{ InstanceId }}"
+              Parameters:
+                commands:
+                  - |
+                    #!/bin/bash
+                    echo "=== Automation Summary Report ===" > /tmp/automation_summary.txt
+                    echo "Date: $(date)" >> /tmp/automation_summary.txt
+                    echo "Instance ID: {{ InstanceId }}" >> /tmp/automation_summary.txt
+                    echo "Nginx Status: $(systemctl status nginx | grep Active)" >> /tmp/automation_summary.txt
+                    echo "OS Version: $(cat /etc/system-release)" >> /tmp/automation_summary.txt
+                    echo "Kernel Version: $(uname -r)" >> /tmp/automation_summary.txt
+                    echo "Nginx Version: $(nginx -v 2>&1)" >> /tmp/automation_summary.txt
+                    echo "=== End of Report ===" >> /tmp/automation_summary.txt
+                    
+                    aws s3 cp /tmp/automation_summary.txt s3://{{ S3BucketName }}/logs/{{ InstanceId }}/automation_summary_$(date +%Y%m%d%H%M%S).txt
+              CloudWatchOutputConfig:
+                CloudWatchLogGroupName: !Sub "${AWS::StackName}-SSMAutomation"
+                CloudWatchOutputEnabled: true
+
+  # SSM Association to run the automation document
+  SSMAssociation:
+    Type: AWS::SSM::Association
+    Properties:
+      Name: !Ref NginxInstallationAutomation
+      Parameters:
+        InstanceId:
+          - !Ref EC2Instance
+        S3BucketName:
+          - !Ref LogsBucket
+      AssociationName: !Sub "${AWS::StackName}-NginxInstallation"
+      ScheduleExpression: rate(1 day)
+      ComplianceSeverity: MEDIUM
+      MaxErrors: 0
+      MaxConcurrency: 1
+      AutomationTargetParameterName: InstanceId
+      Targets:
+        - Key: InstanceIds
+          Values:
+            - !Ref EC2Instance
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
+
+Outputs:
+  InstanceId:
+    Description: ID of the EC2 instance
+    Value: !Ref EC2Instance
+    
+  InstancePublicIP:
+    Description: Public IP address of the EC2 instance
+    Value: !GetAtt EC2Instance.PublicIp
+    
+  InstancePublicDNS:
+    Description: Public DNS name of the EC2 instance
+    Value: !GetAtt EC2Instance.PublicDnsName
+    
+  LogsBucketName:
+    Description: Name of the S3 bucket for logs
+    Value: !Ref LogsBucket
+    
+  SSMAutomationDocument:
+    Description: SSM Automation Document for Nginx installation
+    Value: !Ref NginxInstallationAutomation
+    
+  NginxURL:
+    Description: URL to access Nginx web server
+    Value: !Sub "http://${EC2Instance.PublicDnsName}"

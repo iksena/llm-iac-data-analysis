@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Automated image recognition pipeline with SMS alerts using Step Functions, S3, Rekognition, and SNS
+Parameters:
+  PhoneNumber:
+    Type: String
+    Default: "+14071113333"
+    AllowedPattern: ^\+[1-9]\d{1,14}$
+    Description: E.164 format phone number for SMS alerts
+
+Resources:
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+    DeletionPolicy: Delete
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !GetAtt ImageProcessingStateMachine.Arn
+
+  EventRule:
+    Type: AWS::Events::Rule
+    DependsOn: ImageProcessingStateMachine
+    Properties:
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name: !Ref ImageBucket
+      Targets:
+        - Arn: !GetAtt ImageProcessingStateMachine.Arn
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          Id: ImageProcessingTarget
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StateMachinePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub ${ImageBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - rekognition:DetectLabels
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertTopic
+
+  ImageProcessingStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Image recognition workflow",
+          "StartAt": "Check File Extension",
+          "States": {
+            "Check File Extension": {
+              "Type": "Pass",
+              "Parameters": {
+                "bucket.$": "$.detail.bucket.name",
+                "key.$": "$.detail.object.key",
+                "extension.$": "States.ArrayGetItem(States.StringSplit($.detail.object.key, '.'), -1)"
+              },
+              "ResultPath": "$.fileInfo",
+              "Next": "Check Extension Validity"
+            },
+            "Check Extension Validity": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Or": [
+                    {"Variable": "$.fileInfo.extension", "StringEquals": "jpg"},
+                    {"Variable": "$.fileInfo.extension", "StringEquals": "jpeg"},
+                    {"Variable": "$.fileInfo.extension", "StringEquals": "png"}
+                  ],
+                  "Next": "Detect Labels"
+                }
+              ],
+              "Default": "Invalid File Type"
+            },
+            "Detect Labels": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:rekognition.detectLabels",
+              "Parameters": {
+                "Image": {
+                  "S3Object": {
+                    "Bucket.$": "$.fileInfo.bucket",
+                    "Name.$": "$.fileInfo.key"
+                  }
+                },
+                "MinConfidence": 90
+              },
+              "ResultPath": "$.rekognitionResult",
+              "Next": "Check for Human"
+            },
+            "Check for Human": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Or": [
+                    {"Variable": "$.rekognitionResult.Labels[*].Name", "StringEquals": "Human"},
+                    {"Variable": "$.rekognitionResult.Labels[*].Name", "StringEquals": "Person"}
+                  ],
+                  "Next": "Send SMS Alert"
+                }
+              ],
+              "Default": "No Human Detected"
+            },
+            "Send SMS Alert": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+              "Parameters": {
+                "TopicArn": "${AlertTopic}",
+                "Message": "Human detected in image: s3://${ImageBucket}/${$.fileInfo.key}"
+              },
+              "End": true
+            },
+            "Invalid File Type": {"Type": "Pass", "End": true},
+            "No Human Detected": {"Type": "Pass", "End": true}
+          }
+        }
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref PhoneNumber
+          Protocol: sms
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3BucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt ImageBucket.Arn
+                  - !Sub ${ImageBucket.Arn}/*
+
+  EmptyBucketLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  s3 = boto3.resource('s3')
+                  bucket = s3.Bucket(event['ResourceProperties']['BucketName'])
+                  bucket.objects.all().delete()
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  BucketEmptyCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: [ImageBucket, EmptyBucketLambda]
+    Properties:
+      ServiceToken: !GetAtt EmptyBucketLambda.Arn
+      BucketName: !Ref ImageBucket
+
+Outputs:
+  BucketName:
+    Value: !Ref ImageBucket
+  StateMachineARN:
+    Value: !Ref ImageProcessingStateMachine
+  SNSTopicARN:
+    Value: !Ref AlertTopic

@@ -1,0 +1,464 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated image analysis pipeline using S3, Lambda, Step Functions, and Rekognition'
+
+Parameters:
+  PhoneNumber:
+    Type: String
+    Description: Phone number to receive SMS alerts when human faces are detected (include country code, e.g., +1234567890)
+    AllowedPattern: '^\+[1-9][0-9]{1,14}$'
+    ConstraintDescription: Phone number must be in E.164 format (e.g., +1234567890)
+  
+  S3BucketName:
+    Type: String
+    Description: Name for the S3 bucket (must be globally unique)
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: Bucket name can include numbers, lowercase letters, periods, and hyphens. It must start and end with a letter or number.
+
+Resources:
+  # S3 Bucket for image uploads
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref S3BucketName
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # SNS Topic for sending SMS alerts
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: ImageAnalysisAlerts
+
+  # SNS Subscription for the phone number
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sms
+      Endpoint: !Ref PhoneNumber
+      TopicArn: !Ref NotificationTopic
+
+  # IAM Role for the Analysis Lambda function
+  AnalysisLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RekognitionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rekognition:DetectLabels
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${ImageBucket}/*'
+
+  # IAM Role for the Notification Lambda function
+  NotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+
+  # Lambda function for image analysis using Rekognition
+  AnalysisLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt AnalysisLambdaRole.Arn
+      Runtime: nodejs16.x
+      Timeout: 30
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const rekognition = new AWS.Rekognition();
+          
+          exports.handler = async (event) => {
+            console.log('Received event:', JSON.stringify(event, null, 2));
+            
+            const bucket = event.bucket;
+            const key = event.key;
+            
+            const params = {
+              Image: {
+                S3Object: {
+                  Bucket: bucket,
+                  Name: key
+                }
+              },
+              MaxLabels: 20,
+              MinConfidence: 70
+            };
+            
+            try {
+              const data = await rekognition.detectLabels(params).promise();
+              console.log('Rekognition result:', JSON.stringify(data, null, 2));
+              
+              // Check if any human-related labels are detected
+              const humanLabels = ['Human', 'Person', 'People', 'Face', 'Portrait'];
+              const detectedHumanLabels = data.Labels.filter(label => 
+                humanLabels.includes(label.Name)
+              );
+              
+              const result = {
+                bucket: bucket,
+                key: key,
+                humanDetected: detectedHumanLabels.length > 0,
+                labels: data.Labels,
+                humanLabels: detectedHumanLabels
+              };
+              
+              return result;
+            } catch (error) {
+              console.error('Error analyzing image:', error);
+              throw error;
+            }
+          };
+
+  # Lambda function for sending notifications
+  NotificationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt NotificationLambdaRole.Arn
+      Runtime: nodejs16.x
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const sns = new AWS.SNS();
+          
+          exports.handler = async (event) => {
+            console.log('Received event:', JSON.stringify(event, null, 2));
+            
+            const bucket = event.bucket;
+            const key = event.key;
+            const humanLabels = event.humanLabels;
+            
+            // Construct message
+            const message = `Human detected in image: s3://${bucket}/${key}\n\n` +
+                            `Detected labels: ${humanLabels.map(label => 
+                              `${label.Name} (${label.Confidence.toFixed(2)}%)`
+                            ).join(', ')}`;
+            
+            const params = {
+              Message: message,
+              TopicArn: process.env.SNS_TOPIC_ARN
+            };
+            
+            try {
+              const result = await sns.publish(params).promise();
+              console.log('SNS publish result:', result);
+              return {
+                statusCode: 200,
+                body: JSON.stringify('Notification sent successfully')
+              };
+            } catch (error) {
+              console.error('Error sending notification:', error);
+              throw error;
+            }
+          };
+
+  # IAM Role for Step Functions State Machine
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt AnalysisLambdaFunction.Arn
+                  - !GetAtt NotificationLambdaFunction.Arn
+
+  # Step Functions State Machine
+  ImageAnalysisStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: ImageAnalysisStateMachine
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |-
+        {
+          "Comment": "Image Analysis Workflow",
+          "StartAt": "AnalyzeImage",
+          "States": {
+            "AnalyzeImage": {
+              "Type": "Task",
+              "Resource": "${AnalysisLambdaFunction.Arn}",
+              "Next": "CheckHumanDetected"
+            },
+            "CheckHumanDetected": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.humanDetected",
+                  "BooleanEquals": true,
+                  "Next": "SendNotification"
+                }
+              ],
+              "Default": "AnalysisComplete"
+            },
+            "SendNotification": {
+              "Type": "Task",
+              "Resource": "${NotificationLambdaFunction.Arn}",
+              "Next": "AnalysisComplete"
+            },
+            "AnalysisComplete": {
+              "Type": "Succeed"
+            }
+          }
+        }
+
+  # IAM Role for the Trigger Lambda function
+  TriggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${ImageBucket}/*'
+        - PolicyName: StepFunctionsStartExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !GetAtt ImageAnalysisStateMachine.Arn
+
+  # Lambda function triggered by S3 uploads
+  TriggerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt TriggerLambdaRole.Arn
+      Runtime: nodejs16.x
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref ImageAnalysisStateMachine
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const stepfunctions = new AWS.StepFunctions();
+
+          exports.handler = async (event) => {
+            console.log('Received event:', JSON.stringify(event, null, 2));
+            
+            // Get the object from the event
+            const bucket = event.Records[0].s3.bucket.name;
+            const key = decodeURIComponent(event.Records[0].s3.object.key.replace(/\+/g, ' '));
+            
+            // Start Step Functions execution
+            const params = {
+              stateMachineArn: process.env.STATE_MACHINE_ARN,
+              input: JSON.stringify({
+                bucket: bucket,
+                key: key
+              })
+            };
+            
+            try {
+              const result = await stepfunctions.startExecution(params).promise();
+              console.log('Step Functions execution started:', result);
+              return {
+                statusCode: 200,
+                body: JSON.stringify('Step Functions execution started successfully')
+              };
+            } catch (error) {
+              console.error('Error starting Step Functions execution:', error);
+              throw error;
+            }
+          };
+
+  # Lambda permission for S3 to invoke the trigger function
+  TriggerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TriggerLambdaFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt ImageBucket.Arn
+
+  # IAM Role for S3 Notification Custom Resource Lambda
+  S3NotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3NotificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotificationConfiguration
+                  - s3:GetBucketNotificationConfiguration
+                Resource: !Sub 'arn:aws:s3:::${ImageBucket}'
+
+  # Lambda function to configure S3 bucket notification
+  S3NotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt S3NotificationLambdaRole.Arn
+      Runtime: nodejs16.x
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const s3 = new AWS.S3();
+          const response = require('cfn-response');
+          
+          exports.handler = async (event, context) => {
+            console.log('Received event:', JSON.stringify(event, null, 2));
+            
+            if (event.RequestType === 'Delete') {
+              // If this is a delete event, remove the notification configuration
+              await response.send(event, context, response.SUCCESS, {});
+              return;
+            }
+            
+            const props = event.ResourceProperties;
+            const bucketName = props.BucketName;
+            const notificationConfiguration = props.NotificationConfiguration;
+            
+            try {
+              const params = {
+                Bucket: bucketName,
+                NotificationConfiguration: notificationConfiguration
+              };
+              
+              await s3.putBucketNotificationConfiguration(params).promise();
+              await response.send(event, context, response.SUCCESS, {});
+            } catch (error) {
+              console.error('Error configuring bucket notification:', error);
+              await response.send(event, context, response.FAILED, { Error: error.message });
+            }
+          };
+
+  # Custom resource to configure S3 bucket notification
+  S3BucketNotificationCustomResource:
+    Type: Custom::S3BucketNotification
+    DependsOn:
+      - TriggerLambdaFunction
+      - TriggerLambdaPermission
+    Properties:
+      ServiceToken: !GetAtt S3NotificationFunction.Arn
+      BucketName: !Ref ImageBucket
+      NotificationConfiguration:
+        LambdaFunctionConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: suffix
+                    Value: .jpg
+                  - Name: suffix
+                    Value: .jpeg
+                  - Name: suffix
+                    Value: .png
+            Function: !GetAtt TriggerLambdaFunction.Arn
+
+Outputs:
+  S3BucketName:
+    Description: Name of the S3 bucket for image uploads
+    Value: !Ref ImageBucket
+  
+  StateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !Ref ImageAnalysisStateMachine
+  
+  SNSTopicArn:
+    Description: ARN of the SNS topic for notifications
+    Value: !Ref NotificationTopic
+  
+  UploadInstructions:
+    Description: Instructions for using the image analysis pipeline
+    Value: !Sub |
+      Upload images to the S3 bucket '${ImageBucket}' with .jpg, .jpeg, or .png extensions.
+      If human faces are detected, an SMS will be sent to ${PhoneNumber}.

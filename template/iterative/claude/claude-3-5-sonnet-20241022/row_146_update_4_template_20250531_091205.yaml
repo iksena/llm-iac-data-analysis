@@ -1,0 +1,263 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated image analysis pipeline using S3, Lambda, Step Functions, and Rekognition'
+
+Parameters:
+  PhoneNumber:
+    Type: String
+    Description: Phone number to receive SMS notifications
+    AllowedPattern: '^\+?[1-9]\d{1,14}$'
+  
+  BucketNamePrefix:
+    Type: String
+    Default: 'image-analysis'
+    Description: Prefix for the S3 bucket name
+
+Resources:
+  # IAM Roles
+  TriggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AndStepFunctionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - states:StartExecution
+                Resource: '*'
+
+  RekognitionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RekognitionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: rekognition:DetectLabels
+                Resource: '*'
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: '*'
+
+  NotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: '*'
+
+  StatesExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: '*'
+
+  # SNS Topic
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: 'Face Detection Alerts'
+
+  SNSTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sms
+      Endpoint: !Ref PhoneNumber
+      TopicArn: !Ref NotificationTopic
+
+  # Lambda Functions
+  TriggerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: TriggerLambdaRole
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt TriggerLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          def handler(event, context):
+              sfn = boto3.client('stepfunctions')
+              sfn.start_execution(
+                  stateMachineArn=os.environ['STATE_MACHINE_ARN'],
+                  input=json.dumps(event)
+              )
+              return {'statusCode': 200}
+      Runtime: python3.9
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref StateMachine
+      Timeout: 30
+      MemorySize: 128
+
+  RekognitionFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: RekognitionLambdaRole
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt RekognitionLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          def handler(event, context):
+              rekognition = boto3.client('rekognition')
+              response = rekognition.detect_labels(
+                  Image={
+                      'S3Object': {
+                          'Bucket': event['Records'][0]['s3']['bucket']['name'],
+                          'Name': event['Records'][0]['s3']['object']['key']
+                      }
+                  },
+                  MaxLabels=10
+              )
+              has_human = any(label['Name'] == 'Human' for label in response['Labels'])
+              return {'hasHuman': has_human}
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 128
+
+  NotificationFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: NotificationLambdaRole
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt NotificationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          def handler(event, context):
+              if event['hasHuman']:
+                  sns = boto3.client('sns')
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message='Human detected in uploaded image!'
+                  )
+              return {'status': 'completed'}
+      Runtime: python3.9
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+      Timeout: 30
+      MemorySize: 128
+
+  # Step Functions State Machine
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: 
+      - RekognitionFunction
+      - NotificationFunction
+      - StatesExecutionRole
+    Properties:
+      RoleArn: !GetAtt StatesExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Image analysis workflow",
+          "StartAt": "AnalyzeImage",
+          "States": {
+            "AnalyzeImage": {
+              "Type": "Task",
+              "Resource": "${RekognitionFunction.Arn}",
+              "Next": "NotifyIfHuman"
+            },
+            "NotifyIfHuman": {
+              "Type": "Task",
+              "Resource": "${NotificationFunction.Arn}",
+              "End": true
+            }
+          }
+        }
+
+  # S3 Configuration
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: 
+      - TriggerFunction
+      - LambdaPermissionForS3
+    Properties:
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt TriggerFunction.Arn
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  LambdaPermissionForS3:
+    Type: AWS::Lambda::Permission
+    DependsOn: TriggerFunction
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TriggerFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:s3:::${BucketNamePrefix}-${AWS::AccountId}
+
+Outputs:
+  BucketName:
+    Description: Name of the S3 bucket for image uploads
+    Value: !Ref ImageBucket
+
+  StateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !Ref StateMachine
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for notifications
+    Value: !Ref NotificationTopic

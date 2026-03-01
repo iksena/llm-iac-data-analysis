@@ -1,0 +1,286 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Serverless pipeline for AWS Organizations data collection and analysis
+
+Parameters:
+  ManagementAccountID:
+    Type: String
+    Default: ''
+    Description: AWS Account ID of the Organizations management account (leave empty to use current account)
+    AllowedPattern: ^$|^[0-9]{12}$
+    ConstraintDescription: Must be empty or a valid 12-digit AWS account ID
+  AthenaDatabaseName:
+    Type: String
+    Default: managementcur
+    Description: Name for the Athena database
+    AllowedPattern: ^[a-zA-Z0-9_]+$
+    ConstraintDescription: Must contain only alphanumeric characters and underscores
+  S3BucketName:
+    Type: String
+    Default: ''
+    Description: Name for the S3 bucket to store Organizations data (leave empty for auto-generated name)
+    AllowedPattern: ^$|^[a-z0-9.-]{3,63}$
+    ConstraintDescription: Must be empty or a valid S3 bucket name (3-63 chars, lowercase)
+  OrganizationTagsToInclude:
+    Type: CommaDelimitedList
+    Default: CostCenter,Environment,Project
+    Description: List of Organization tags to include in reports
+  ScheduleExpression:
+    Type: String
+    Default: "rate(7 days)"
+    Description: CloudWatch Events schedule expression for data collection
+
+Conditions:
+  HasCustomBucketName: !Not [!Equals [!Ref S3BucketName, ""]]
+  IsCrossAccount: !Not [!Equals [!Ref ManagementAccountID, ""]]
+  UseCurrentAccount: !Equals [!Ref ManagementAccountID, ""]
+
+Resources:
+  OrganizationsDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !If [HasCustomBucketName, !Ref S3BucketName, !Sub "org-data-${AWS::AccountId}-${AWS::Region}"]
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAfter5Years
+            Status: Enabled
+            ExpirationInDays: 1825
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3WriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${OrganizationsDataBucket}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::${OrganizationsDataBucket}"
+        - PolicyName: AssumeCrossAccountRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !If 
+                  - IsCrossAccount
+                  - !Sub "arn:aws:iam::${ManagementAccountID}:role/OrganizationDataCollectorRole-${AWS::StackName}"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/OrganizationDataCollectorRole-${AWS::StackName}"
+
+  OrganizationsDataCollectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "OrganizationsDataCollector-${AWS::StackName}"
+      Handler: index.handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import datetime
+          import os
+          
+          def handler(event, context):
+              try:
+                  sts_client = boto3.client('sts')
+                  s3_client = boto3.client('s3')
+                  
+                  if os.environ['MANAGEMENT_ACCOUNT_ID']:
+                      assumed_role = sts_client.assume_role(
+                          RoleArn=f"arn:aws:iam::{os.environ['MANAGEMENT_ACCOUNT_ID']}:role/OrganizationDataCollectorRole-{os.environ['STACK_NAME']}",
+                          RoleSessionName="OrganizationDataCollection"
+                      )
+                      credentials = assumed_role['Credentials']
+                      org_client = boto3.client(
+                          'organizations',
+                          aws_access_key_id=credentials['AccessKeyId'],
+                          aws_secret_access_key=credentials['SecretAccessKey'],
+                          aws_session_token=credentials['SessionToken']
+                      )
+                  else:
+                      org_client = boto3.client('organizations')
+                  
+                  org_data = {
+                      'timestamp': datetime.datetime.utcnow().isoformat(),
+                      'accounts': [],
+                      'ous': [],
+                      'tags': []
+                  }
+                  
+                  paginator = org_client.get_paginator('list_accounts')
+                  for page in paginator.paginate():
+                      org_data['accounts'].extend(page['Accounts'])
+                  
+                  root_id = org_client.list_roots()['Roots'][0]['Id']
+                  org_data['ous'] = get_ous_recursive(org_client, root_id)
+                  
+                  tags_to_include = os.environ['TAGS_TO_INCLUDE'].split(',')
+                  for tag in tags_to_include:
+                      if tag.strip():
+                          try:
+                              tag_data = org_client.list_tags_for_resource(
+                                  ResourceId=root_id,
+                                  ResourceType='ROOT'
+                              )
+                              org_data['tags'].extend(tag_data['Tags'])
+                          except Exception as e:
+                              print(f"Error getting tag {tag}: {str(e)}")
+                  
+                  date_str = datetime.datetime.utcnow().strftime('%Y/%m/%d')
+                  s3_key = f"organization-data/{date_str}/data.json"
+                  s3_client.put_object(
+                      Bucket=os.environ['S3_BUCKET'],
+                      Key=s3_key,
+                      Body=json.dumps(org_data, indent=2),
+                      ContentType='application/json'
+                  )
+                  
+                  return {'statusCode': 200, 'body': 'Data collection successful'}
+              except Exception as e:
+                  print(f"Error in handler: {str(e)}")
+                  return {'statusCode': 500, 'body': 'Data collection failed'}
+          
+          def get_ous_recursive(org_client, parent_id):
+              ous = []
+              paginator = org_client.get_paginator('list_organizational_units_for_parent')
+              for page in paginator.paginate(ParentId=parent_id):
+                  for ou in page['OrganizationalUnits']:
+                      ou_details = org_client.describe_organizational_unit(
+                          OrganizationalUnitId=ou['Id']
+                      )['OrganizationalUnit']
+                      ou_details['child_ous'] = get_ous_recursive(org_client, ou['Id'])
+                      ous.append(ou_details)
+              return ous
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref OrganizationsDataBucket
+          MANAGEMENT_ACCOUNT_ID: !Ref ManagementAccountID
+          TAGS_TO_INCLUDE: !Join [",", !Ref OrganizationTagsToInclude]
+          STACK_NAME: !Ref AWS::StackName
+      Timeout: 300
+
+  WeeklyScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Weekly schedule for Organizations data collection
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OrganizationsDataCollectorFunction.Arn
+          Id: OrganizationsDataCollectorLambdaTarget
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt OrganizationsDataCollectorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklyScheduleRule.Arn
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref AthenaDatabaseName
+        Description: Database for AWS Organizations metadata
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+
+  OrganizationsDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub "OrganizationsDataCrawler-${AWS::StackName}"
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref AthenaDatabaseName
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${OrganizationsDataBucket}/organization-data/"
+      Configuration: '{"Version":1.0,"CrawlerOutput":{"Partitions":{"AddOrUpdateBehavior":"InheritFromTable"}},"Grouping":{"TableGroupingPolicy":"CombineCompatibleSchemas"}}'
+      Schedule:
+        ScheduleExpression: "cron(0 12 ? * SUN *)"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+
+  CrossAccountRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "OrganizationDataCollectorRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrganizationsReadOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeOrganization
+                  - organizations:ListAccounts
+                  - organizations:ListOrganizationalUnitsForParent
+                  - organizations:DescribeOrganizationalUnit
+                  - organizations:ListRoots
+                  - organizations:ListTagsForResource
+                Resource: "*"
+
+Outputs:
+  S3BucketARN:
+    Description: ARN of the S3 bucket storing Organizations data
+    Value: !GetAtt OrganizationsDataBucket.Arn
+  S3BucketName:
+    Description: Name of the S3 bucket storing Organizations data
+    Value: !Ref OrganizationsDataBucket
+  LambdaFunctionARN:
+    Description: ARN of the Organizations data collector Lambda function
+    Value: !GetAtt OrganizationsDataCollectorFunction.Arn
+  GlueDatabaseName:
+    Description: Name of the Glue database for querying Organizations data
+    Value: !Ref AthenaDatabaseName
+  GlueCrawlerName:
+    Description: Name of the Glue crawler for Organizations data
+    Value: !Ref OrganizationsDataCrawler
+  CrossAccountRoleARN:
+    Description: ARN of the cross-account role for data collection
+    Value: !GetAtt CrossAccountRole.Arn

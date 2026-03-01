@@ -1,0 +1,370 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for a scalable and monitored Amazon EFS file system with automated backups'
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC where EFS will be deployed
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnets for EFS mount targets (for high availability)
+
+  BackupEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable or disable automated backups via AWS Backup
+
+  BackupSchedule:
+    Type: String
+    Default: 'cron(0 1 * * ? *)'
+    Description: CRON expression for backup schedule (default is daily at 1:00 AM UTC)
+
+  BackupRetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: Number of days to retain backups
+
+  PerformanceMode:
+    Type: String
+    Default: generalPurpose
+    AllowedValues:
+      - generalPurpose
+      - maxIO
+    Description: EFS performance mode
+
+  ThroughputMode:
+    Type: String
+    Default: bursting
+    AllowedValues:
+      - bursting
+      - provisioned
+    Description: EFS throughput mode
+
+  ProvisionedThroughput:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 1024
+    Description: Provisioned throughput in MiB/s (only applicable if ThroughputMode is provisioned)
+
+  BurstCreditLowThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    Description: Threshold percentage for burst credit low alarm
+
+  IOUtilizationThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    Description: Threshold percentage for IO utilization alarm
+
+  ThroughputUtilizationThreshold:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    Description: Threshold percentage for throughput utilization alarm
+
+  EncryptEFS:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable or disable EFS encryption
+
+Conditions:
+  IsBackupEnabled: !Equals [!Ref BackupEnabled, 'true']
+  IsProvisionedThroughput: !Equals [!Ref ThroughputMode, 'provisioned']
+  IsEncrypted: !Equals [!Ref EncryptEFS, 'true']
+
+Resources:
+  EFSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EFS mount targets
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          CidrIp: !GetAtt VPC.CidrBlock
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EFS-SG'
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-VPC'
+
+  EFSFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      PerformanceMode: !Ref PerformanceMode
+      ThroughputMode: !Ref ThroughputMode
+      ProvisionedThroughputInMibps: !If [IsProvisionedThroughput, !Ref ProvisionedThroughput, !Ref 'AWS::NoValue']
+      Encrypted: !If [IsEncrypted, true, false]
+      FileSystemTags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-EFS'
+
+  EFSMountTargets:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt EFSMountTargetFunction.Arn
+      FileSystemId: !Ref EFSFileSystem
+      SubnetIds: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref EFSSecurityGroup
+
+  EFSMountTargetFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt EFSMountTargetRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import logging
+          
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          def handler(event, context):
+              logger.info('Received event: %s', event)
+              
+              response_data = {}
+              physical_resource_id = event.get('PhysicalResourceId', None)
+              
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      file_system_id = event['ResourceProperties']['FileSystemId']
+                      subnet_ids = event['ResourceProperties']['SubnetIds']
+                      security_groups = event['ResourceProperties']['SecurityGroups']
+                      
+                      efs_client = boto3.client('efs')
+                      mount_target_ids = []
+                      
+                      # Create mount targets in each subnet
+                      for subnet_id in subnet_ids:
+                          logger.info(f'Creating mount target in subnet {subnet_id}')
+                          response = efs_client.create_mount_target(
+                              FileSystemId=file_system_id,
+                              SubnetId=subnet_id,
+                              SecurityGroups=security_groups
+                          )
+                          mount_target_ids.append(response['MountTargetId'])
+                      
+                      response_data['MountTargetIds'] = mount_target_ids
+                      physical_resource_id = f"{file_system_id}-mount-targets"
+                  
+                  elif event['RequestType'] == 'Delete':
+                      if physical_resource_id and physical_resource_id.endswith('-mount-targets'):
+                          file_system_id = physical_resource_id.split('-mount-targets')[0]
+                          efs_client = boto3.client('efs')
+                          
+                          # List and delete all mount targets for the file system
+                          response = efs_client.describe_mount_targets(FileSystemId=file_system_id)
+                          for mount_target in response['MountTargets']:
+                              logger.info(f'Deleting mount target {mount_target["MountTargetId"]}')
+                              efs_client.delete_mount_target(MountTargetId=mount_target['MountTargetId'])
+                  
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, physical_resource_id)
+              
+              except Exception as e:
+                  logger.error('Error: %s', str(e))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)}, physical_resource_id)
+
+  EFSMountTargetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EFSMountTargetPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:CreateMountTarget
+                  - elasticfilesystem:DeleteMountTarget
+                  - elasticfilesystem:DescribeMountTargets
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeSecurityGroups
+                Resource: '*'
+
+  BurstCreditBalanceAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: !Sub 'Alarm when burst credit balance for ${EFSFileSystem} falls below ${BurstCreditLowThreshold}%'
+      MetricName: BurstCreditBalance
+      Namespace: AWS/EFS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref BurstCreditLowThreshold
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FileSystemId
+          Value: !Ref EFSFileSystem
+      AlarmActions:
+        - !Ref EFSAlarmTopic
+      OKActions:
+        - !Ref EFSAlarmTopic
+
+  IOUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: !Sub 'Alarm when IO utilization for ${EFSFileSystem} exceeds ${IOUtilizationThreshold}%'
+      MetricName: PercentIOLimit
+      Namespace: AWS/EFS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref IOUtilizationThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FileSystemId
+          Value: !Ref EFSFileSystem
+      AlarmActions:
+        - !Ref EFSAlarmTopic
+      OKActions:
+        - !Ref EFSAlarmTopic
+
+  ThroughputUtilizationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProvisionedThroughput
+    Properties:
+      AlarmDescription: !Sub 'Alarm when throughput utilization for ${EFSFileSystem} exceeds ${ThroughputUtilizationThreshold}%'
+      MetricName: PercentThroughputUtilization
+      Namespace: AWS/EFS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref ThroughputUtilizationThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FileSystemId
+          Value: !Ref EFSFileSystem
+      AlarmActions:
+        - !Ref EFSAlarmTopic
+      OKActions:
+        - !Ref EFSAlarmTopic
+
+  EFSAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub '${AWS::StackName}-EFS-Alarms'
+      TopicName: !Sub '${AWS::StackName}-EFS-Alarms'
+
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Condition: IsBackupEnabled
+    Properties:
+      BackupVaultName: !Sub '${AWS::StackName}-EFS-Backup-Vault'
+
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Condition: IsBackupEnabled
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub '${AWS::StackName}-EFS-Backup-Plan'
+        BackupPlanRule:
+          - RuleName: !Sub '${AWS::StackName}-EFS-Backup-Rule'
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: !Ref BackupSchedule
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 180
+            Lifecycle:
+              DeleteAfterDays: !Ref BackupRetentionDays
+
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Condition: IsBackupEnabled
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: !Sub '${AWS::StackName}-EFS-Backup-Selection'
+        IamRoleArn: !GetAtt BackupRole.Arn
+        Resources:
+          - !Sub 'arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/${EFSFileSystem}'
+
+  BackupRole:
+    Type: AWS::IAM::Role
+    Condition: IsBackupEnabled
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: backup.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+
+Outputs:
+  EfsId:
+    Description: The ID of the EFS file system
+    Value: !Ref EFSFileSystem
+
+  EfsDnsName:
+    Description: The DNS name for mounting the EFS file system
+    Value: !Sub '${EFSFileSystem}.efs.${AWS::Region}.amazonaws.com'
+
+  BackupPlanId:
+    Description: The ID of the backup plan
+    Condition: IsBackupEnabled
+    Value: !Ref BackupPlan
+
+  BurstCreditAlarmArn:
+    Description: ARN of the burst credit balance alarm
+    Value: !GetAtt BurstCreditBalanceAlarm.Arn
+
+  IOUtilizationAlarmArn:
+    Description: ARN of the IO utilization alarm
+    Value: !GetAtt IOUtilizationAlarm.Arn
+
+  ThroughputUtilizationAlarmArn:
+    Description: ARN of the throughput utilization alarm
+    Condition: IsProvisionedThroughput
+    Value: !GetAtt ThroughputUtilizationAlarm.Arn
+
+  EFSAlarmTopicArn:
+    Description: ARN of the SNS topic for EFS alarms
+    Value: !Ref EFSAlarmTopic

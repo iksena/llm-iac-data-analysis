@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Aurora MySQL cluster with RDS Proxy in a secure VPC'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: 'production'
+    AllowedValues: 
+      - 'development'
+      - 'staging'
+      - 'production'
+    Description: Environment name for resource tagging
+  
+  DBName:
+    Type: String
+    MinLength: 1
+    MaxLength: 64
+    Default: 'mydb'
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    Description: The name of the initial database
+  
+  DBInstanceClass:
+    Type: String
+    Default: 'db.r5.large'
+    AllowedValues: 
+      - 'db.r5.large'
+      - 'db.r5.xlarge'
+      - 'db.r5.2xlarge'
+    Description: Database instance class
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-2
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Aurora subnet group
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress: []
+
+  ProxySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS Proxy security group
+      VpcId: !Ref VPC
+      SecurityGroupIngress: []
+
+  SGIngressRule:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: 3306
+      ToPort: 3306
+      SourceSecurityGroupId: !Ref ProxySecurityGroup
+
+  DatabaseKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+
+  DatabaseSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${EnvironmentName}/aurora/credentials
+      KmsKeyId: !Ref DatabaseKMSKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: password
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+
+  MonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+  ProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - kms:Decrypt
+                Resource:
+                  - !Ref DatabaseSecret
+                  - !GetAtt DatabaseKMSKey.Arn
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DependsOn: DatabaseSecret
+    Properties:
+      Engine: aurora-mysql
+      EngineVersion: 5.7.mysql_aurora.2.10.2
+      DatabaseName: !Ref DBName
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DatabaseSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DatabaseSecurityGroup
+      BackupRetentionPeriod: 7
+      StorageEncrypted: true
+      KmsKeyId: !Ref DatabaseKMSKey
+      EnableIAMDatabaseAuthentication: true
+
+  PrimaryInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-mysql
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: !Ref DBInstanceClass
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt MonitoringRole.Arn
+      EnablePerformanceInsights: true
+      PerformanceInsightsKMSKeyId: !Ref DatabaseKMSKey
+      PerformanceInsightsRetentionPeriod: 7
+
+  DatabaseProxy:
+    Type: AWS::RDS::DBProxy
+    DependsOn: AuroraCluster
+    Properties:
+      DBProxyName: !Sub ${EnvironmentName}-proxy
+      EngineFamily: MYSQL
+      RoleArn: !GetAtt ProxyRole.Arn
+      Auth:
+        - AuthScheme: SECRETS
+          IAMAuth: REQUIRED
+          SecretArn: !Ref DatabaseSecret
+      VpcSecurityGroupIds:
+        - !Ref ProxySecurityGroup
+      VpcSubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      RequireTLS: true
+      IdleClientTimeout: 1800
+
+  ProxyTargetGroup:
+    Type: AWS::RDS::DBProxyTargetGroup
+    Properties:
+      DBProxyName: !Ref DatabaseProxy
+      TargetGroupName: default
+      DBClusterIdentifiers:
+        - !Ref AuroraCluster
+      ConnectionPoolConfigurationInfo:
+        MaxConnectionsPercent: 100
+        MaxIdleConnectionsPercent: 50
+        ConnectionBorrowTimeout: 120
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  ClusterEndpoint:
+    Description: Aurora Cluster Endpoint
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+
+  ProxyEndpoint:
+    Description: RDS Proxy Endpoint
+    Value: !GetAtt DatabaseProxy.Endpoint
+
+  SecretARN:
+    Description: Secret ARN
+    Value: !Ref DatabaseSecret

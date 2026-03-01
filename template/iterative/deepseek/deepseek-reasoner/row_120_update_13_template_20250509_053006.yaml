@@ -1,0 +1,201 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Event-driven AWS Batch pipeline with self-contained networking
+
+Parameters:
+  Image:
+    Type: String
+    Description: ECR image URI for batch job container
+    Default: public.ecr.aws/amazonlinux/amazonlinux:latest
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  NATGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NATGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  EventQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: OrderEventsQueue
+
+  BatchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for AWS Batch compute
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [batch.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ecs-tasks.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  BatchComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      Type: MANAGED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeResources:
+        Type: FARGATE
+        MaxvCpus: 256
+        AllocationStrategy: BEST_FIT_PROGRESSIVE
+        Subnets: [!Ref PrivateSubnet1]
+        SecurityGroupIds: [!GetAtt BatchSecurityGroup.GroupId]
+      State: ENABLED
+
+  BatchJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref BatchComputeEnvironment
+      State: ENABLED
+
+  BatchJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      PlatformCapabilities: [FARGATE]
+      ContainerProperties:
+        Image: !Ref Image
+        ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+        ResourceRequirements:
+          - Type: VCPU
+            Value: '1'
+          - Type: MEMORY
+            Value: '2048'
+        NetworkConfiguration:
+          AssignPublicIp: DISABLED
+
+  PipeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [pipes.amazonaws.com]
+            Action: ['sts:AssumeRole']
+      Policies:
+        - PolicyName: PipePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt EventQueue.Arn
+              - Effect: Allow
+                Action: [batch:SubmitJob]
+                Resource: 
+                  - !Ref BatchJobQueue
+                  - !Sub arn:aws:batch:${AWS::Region}:${AWS::AccountId}:job-definition/${BatchJobDefinition}
+
+  EventProcessingPipe:
+    Type: AWS::Pipes::Pipe
+    Properties:
+      Name: OrderEventProcessor
+      RoleArn: !GetAtt PipeRole.Arn
+      Source: !GetAtt EventQueue.Arn
+      Target: !Sub arn:aws:batch:${AWS::Region}:${AWS::AccountId}:job-queue/${BatchJobQueue}
+      SourceParameters:
+        SqsQueueParameters:
+          BatchSize: 1
+          MaximumBatchingWindowInSeconds: 30
+        FilterCriteria:
+          Filters:
+            - Pattern: '{"body": {"eventType": ["OrderCreated"]}}'
+      TargetParameters:
+        BatchJobParameters:
+          JobName: !Sub OrderProcessingJob-${AWS::StackName}
+          JobDefinition: !Ref BatchJobDefinition
+          Parameters:
+            EventBody: "$.body"
+
+Outputs:
+  SQSQueueURL:
+    Value: !Ref EventQueue
+  BatchJobQueueARN:
+    Value: !Ref BatchJobQueue
+  EventBridgePipeName:
+    Value: !Ref EventProcessingPipe

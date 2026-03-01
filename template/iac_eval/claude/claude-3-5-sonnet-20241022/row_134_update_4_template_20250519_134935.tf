@@ -1,0 +1,22 @@
+provider "aws" {
+  region = "us-west-2"
+}
+
+# Create ElastiCache User
+resource "aws_elasticache_user" "redis_user" {
+  user_id       = "redis-user-1"
+  user_name     = "default-user"
+  access_string = "on ~* +@all"
+  engine        = "REDIS"
+  passwords     = ["MySecurePassword123!@#$567890"] # Minimum 16 characters password
+
+  tags = {
+    Environment = "production"
+    Service     = "redis"
+  }
+}
+
+# Output the user ARN
+output "elasticache_user_arn" {
+  value = aws_elasticache_user.redis_user.arn
+}

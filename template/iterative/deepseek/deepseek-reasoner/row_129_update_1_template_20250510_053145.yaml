@@ -1,0 +1,199 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  UseExistingBucket:
+    Type: String
+    AllowedValues: [true, false]
+    Default: "false"
+    Description: "Set to true to use existing S3 bucket"
+  ExistingBucketName:
+    Type: String
+    Default: ""
+    Description: "Existing S3 bucket name (required if UseExistingBucket=true)"
+  NewBucketName:
+    Type: String
+    Default: "aws-config-bucket-${AWS::AccountId}-${AWS::Region}"
+    Description: "Name for new S3 bucket"
+  RetentionInDays:
+    Type: Number
+    Default: 2557
+    MinValue: 30
+    MaxValue: 2557
+    Description: "Number of days to retain configuration snapshots"
+  DeliveryFrequency:
+    Type: String
+    AllowedValues: [One_Hour, Three_Hours, Six_Hours, Twelve_Hours, TwentyFour_Hours]
+    Default: "TwentyFour_Hours"
+    Description: "Frequency for config snapshot deliveries"
+  EnablePermissionBoundary:
+    Type: String
+    AllowedValues: [true, false]
+    Default: "false"
+    Description: "Enable IAM permission boundary for roles"
+  PermissionBoundaryArn:
+    Type: String
+    Default: ""
+    Description: "ARN of permission boundary policy (required if EnablePermissionBoundary=true)"
+
+Conditions:
+  CreateBucket: !Equals [!Ref UseExistingBucket, "false"]
+  ApplyPermissionBoundary: !Equals [!Ref EnablePermissionBoundary, "true"]
+
+Resources:
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateBucket
+    Properties:
+      BucketName: !Ref NewBucketName
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateBucket
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource: !Sub "arn:aws:s3:::${ConfigBucket}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  ConfigTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "aws-config-notifications"
+      KmsMasterKeyId: "alias/aws/sns"
+
+  ConfigTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref ConfigTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "config.amazonaws.com"
+            Action: "sns:Publish"
+            Resource: !Ref ConfigTopic
+
+  ConfigRecorderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "config.amazonaws.com"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWS_ConfigRole"
+      PermissionsBoundary: !If [ApplyPermissionBoundary, !Ref PermissionBoundaryArn, !Ref "AWS::NoValue"]
+      Policies:
+        - PolicyName: S3AndSNSPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                Resource: !Sub 
+                  - "arn:aws:s3:::${BucketName}/*"
+                  - BucketName: !If [CreateBucket, !Ref ConfigBucket, !Ref ExistingBucketName]
+              - Effect: Allow
+                Action: "sns:Publish"
+                Resource: !Ref ConfigTopic
+
+  DeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      S3BucketName: !If [CreateBucket, !Ref ConfigBucket, !Ref ExistingBucketName]
+      SnsTopicARN: !Ref ConfigTopic
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: !Ref DeliveryFrequency
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: "default"
+      RoleARN: !GetAtt ConfigRecorderRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      PermissionsBoundary: !If [ApplyPermissionBoundary, !Ref PermissionBoundaryArn, !Ref "AWS::NoValue"]
+      Policies:
+        - PolicyName: ConfigRetentionPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "config:PutRetentionConfiguration"
+                Resource: "*"
+
+  RetentionManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.9
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+              client = boto3.client('config')
+              retention = int(event['ResourceProperties']['RetentionPeriod'])
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      client.put_retention_configuration(
+                          RetentionPeriodInDays=retention
+                      )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  RetentionManager:
+    Type: Custom::RetentionManager
+    Properties:
+      ServiceToken: !GetAtt RetentionManagerFunction.Arn
+      RetentionPeriod: !Ref RetentionInDays
+
+Outputs:
+  ConfigBucket:
+    Value: !If [CreateBucket, !Ref ConfigBucket, !Ref ExistingBucketName]
+  SnsTopicArn:
+    Value: !Ref ConfigTopic
+  DeliveryChannelName:
+    Value: !Ref DeliveryChannel
+  RetentionPeriod:
+    Value: !Ref RetentionInDays

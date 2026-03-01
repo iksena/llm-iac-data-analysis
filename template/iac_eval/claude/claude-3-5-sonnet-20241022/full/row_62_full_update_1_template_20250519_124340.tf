@@ -1,0 +1,197 @@
+I'll help you create a Terraform configuration for an AWS Kinesis Firehose Delivery Stream that delivers data to an Amazon OpenSearch destination. This configuration will include:
+
+1. An OpenSearch domain with basic settings
+2. A Kinesis Firehose delivery stream
+3. Necessary IAM roles and policies for Firehose to interact with OpenSearch
+4. VPC configuration for OpenSearch domain
+5. Required security groups
+
+Here's the complete Terraform configuration:
+
+<iac_template>
+# Provider configuration
+provider "aws" {
+  region = "us-east-1"
+}
+
+# VPC Configuration
+resource "aws_vpc" "main" {
+  cidr_block           = "10.0.0.0/16"
+  enable_dns_hostnames = true
+  enable_dns_support   = true
+
+  tags = {
+    Name = "opensearch-vpc"
+  }
+}
+
+resource "aws_subnet" "main" {
+  vpc_id            = aws_vpc.main.id
+  cidr_block        = "10.0.1.0/24"
+  availability_zone = "us-east-1a"
+
+  tags = {
+    Name = "opensearch-subnet"
+  }
+}
+
+# Security Group for OpenSearch
+resource "aws_security_group" "opensearch" {
+  name        = "opensearch-sg"
+  description = "Security group for OpenSearch domain"
+  vpc_id      = aws_vpc.main.id
+
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["10.0.0.0/16"]
+  }
+}
+
+# OpenSearch Domain
+resource "aws_opensearch_domain" "example" {
+  domain_name    = "example-domain"
+  engine_version = "OpenSearch_2.5"
+
+  cluster_config {
+    instance_type = "t3.small.search"
+  }
+
+  vpc_options {
+    subnet_ids         = [aws_subnet.main.id]
+    security_group_ids = [aws_security_group.opensearch.id]
+  }
+
+  ebs_options {
+    ebs_enabled = true
+    volume_size = 10
+  }
+
+  encrypt_at_rest {
+    enabled = true
+  }
+
+  node_to_node_encryption {
+    enabled = true
+  }
+
+  domain_endpoint_options {
+    enforce_https       = true
+    tls_security_policy = "Policy-Min-TLS-1-2-2019-07"
+  }
+
+  tags = {
+    Domain = "example-domain"
+  }
+}
+
+# IAM Role for Firehose
+resource "aws_iam_role" "firehose_role" {
+  name = "firehose-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "firehose.amazonaws.com"
+        }
+      }
+    ]
+  })
+}
+
+# IAM Policy for Firehose
+resource "aws_iam_role_policy" "firehose_policy" {
+  name = "firehose-policy"
+  role = aws_iam_role.firehose_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "es:DescribeElasticsearchDomain",
+          "es:DescribeElasticsearchDomains",
+          "es:DescribeElasticsearchDomainConfig",
+          "es:ESHttpPost",
+          "es:ESHttpPut",
+          "es:ESHttpGet"
+        ]
+        Resource = [
+          aws_opensearch_domain.example.arn,
+          "${aws_opensearch_domain.example.arn}/*"
+        ]
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "logs:PutLogEvents",
+          "logs:CreateLogStream",
+          "logs:CreateLogGroup"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+# Kinesis Firehose Delivery Stream
+resource "aws_kinesis_firehose_delivery_stream" "example" {
+  name        = "example-stream"
+  destination = "opensearch"
+
+  opensearch_configuration {
+    domain_arn = aws_opensearch_domain.example.arn
+    role_arn   = aws_iam_role.firehose_role.arn
+    index_name = "example-index"
+    type_name  = "_doc"
+
+    buffering_interval = 60
+    buffering_size    = 5
+
+    s3_backup_mode = "FailedDocumentsOnly"
+
+    retry_duration = 300
+  }
+
+  s3_configuration {
+    role_arn   = aws_iam_role.firehose_role.arn
+    bucket_arn = aws_s3_bucket.backup.arn
+  }
+}
+
+# S3 Bucket for backup
+resource "aws_s3_bucket" "backup" {
+  bucket = "example-firehose-backup-bucket"
+}
+
+resource "aws_s3_bucket_ownership_controls" "backup" {
+  bucket = aws_s3_bucket.backup.id
+  rule {
+    object_ownership = "BucketOwnerPreferred"
+  }
+}
+
+resource "aws_s3_bucket_acl" "backup" {
+  depends_on = [aws_s3_bucket_ownership_controls.backup]
+  bucket     = aws_s3_bucket.backup.id
+  acl        = "private"
+}
+</iac_template>
+
+This Terraform configuration creates:
+1. A VPC and subnet for the OpenSearch domain
+2. A security group for OpenSearch
+3. An OpenSearch domain with basic security settings
+4. An IAM role and policy for Kinesis Firehose
+5. A Kinesis Firehose delivery stream configured to send data to OpenSearch
+6. An S3 bucket for backup of failed documents
+
+The configuration includes all necessary security settings and permissions. The OpenSearch domain is deployed in a VPC for enhanced security, and all communications are encrypted. The Firehose delivery stream is configured to buffer data for 60 seconds or until 5MB is accumulated before sending to OpenSearch.
+
+Note: You may need to adjust the CIDR blocks, instance types, and other parameters according to your specific requirements. Also, make sure to replace the bucket name with a globally unique name.

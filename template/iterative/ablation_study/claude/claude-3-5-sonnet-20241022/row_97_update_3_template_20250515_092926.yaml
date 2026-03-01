@@ -1,0 +1,232 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Organizations Data Collection and Analysis Pipeline'
+
+Parameters:
+  ManagementAccountId:
+    Type: String
+    Description: 'AWS Organizations management account ID'
+    AllowedPattern: '^\d{12}$'
+    ConstraintDescription: 'Must be a valid 12-digit AWS account ID'
+
+  S3BucketName:
+    Type: String
+    Description: 'Name for the S3 bucket to store organization data'
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]*[a-z0-9]$'
+    ConstraintDescription: 'Must be a valid S3 bucket name'
+
+  AthenaDBName:
+    Type: String
+    Description: 'Name for the Athena/Glue database'
+    Default: 'managementcur'
+    AllowedPattern: '^[a-z0-9_]*$'
+    ConstraintDescription: 'Must contain only lowercase letters, numbers, and underscores'
+
+  ScheduleExpression:
+    Type: String
+    Description: 'Schedule expression for data collection'
+    Default: 'rate(7 days)'
+
+Resources:
+  DataEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for organization data encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+
+  DataEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-key'
+      TargetKeyId: !Ref DataEncryptionKey
+
+  OrganizationDataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Ref S3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DataEncryptionKey.Arn
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrganizationDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${OrganizationDataBucket.Arn}/*'
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub 'arn:aws:iam::${ManagementAccountId}:role/OrganizationDataCollectorRole'
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt DataEncryptionKey.Arn
+
+  OrganizationDataCollector:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import datetime
+          import os
+          
+          def handler(event, context):
+              try:
+                  sts = boto3.client('sts')
+                  assumed_role = sts.assume_role(
+                      RoleArn=f"arn:aws:iam::{os.environ['MANAGEMENT_ACCOUNT_ID']}:role/OrganizationDataCollectorRole",
+                      RoleSessionName='OrgDataCollection'
+                  )
+                  
+                  org_client = boto3.client(
+                      'organizations',
+                      aws_access_key_id=assumed_role['Credentials']['AccessKeyId'],
+                      aws_secret_access_key=assumed_role['Credentials']['SecretAccessKey'],
+                      aws_session_token=assumed_role['Credentials']['SessionToken']
+                  )
+                  
+                  accounts = org_client.list_accounts()
+                  
+                  s3 = boto3.client('s3')
+                  date_prefix = datetime.datetime.now().strftime('%Y/%m/%d')
+                  
+                  s3.put_object(
+                      Bucket=os.environ['BUCKET_NAME'],
+                      Key=f'{date_prefix}/accounts.json',
+                      Body=json.dumps(accounts)
+                  )
+                  
+                  return {
+                      'statusCode': 200,
+                      'body': 'Successfully collected organization data'
+                  }
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  raise e
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          MANAGEMENT_ACCOUNT_ID: !Ref ManagementAccountId
+          BUCKET_NAME: !Ref S3BucketName
+
+  DataCollectionSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Schedule for organization data collection'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OrganizationDataCollector.Arn
+          Id: CollectOrganizationData
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt OrganizationDataCollector.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataCollectionSchedule.Arn
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref AthenaDBName
+        Description: 'Database for AWS Organization data analysis'
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub '${OrganizationDataBucket.Arn}/*'
+              - Effect: Allow
+                Action: kms:Decrypt
+                Resource: !GetAtt DataEncryptionKey.Arn
+
+  OrganizationDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub ${AWS::StackName}-crawler
+      Role: !GetAtt GlueCrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Schedule:
+        ScheduleExpression: cron(0 0 ? * SUN *)
+      Targets:
+        S3Targets:
+          - Path: !Sub s3://${S3BucketName}
+
+Outputs:
+  S3BucketArn:
+    Description: 'ARN of the S3 bucket storing organization data'
+    Value: !GetAtt OrganizationDataBucket.Arn
+
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda function collecting organization data'
+    Value: !GetAtt OrganizationDataCollector.Arn
+
+  GlueDatabaseName:
+    Description: 'Name of the Glue/Athena database'
+    Value: !Ref GlueDatabase
+
+  KMSKeyArn:
+    Description: 'ARN of the KMS key used for encryption'
+    Value: !GetAtt DataEncryptionKey.Arn

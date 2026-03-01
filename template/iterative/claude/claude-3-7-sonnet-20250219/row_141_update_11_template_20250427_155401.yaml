@@ -1,0 +1,344 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated image recognition pipeline using Step Functions, S3, and Amazon Rekognition'
+
+Parameters:
+  PhoneNumber:
+    Type: String
+    Default: '+14071113333'
+    Description: Phone number to receive SMS alerts when human faces are detected
+    AllowedPattern: '^\+[1-9][0-9]{1,14}$'
+    ConstraintDescription: Phone number must be in E.164 format (e.g., +14071113333)
+
+  BucketNamePrefix:
+    Type: String
+    Default: 'image-recognition'
+    Description: Prefix for the S3 bucket name
+    AllowedPattern: '^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$'
+    ConstraintDescription: Bucket name prefix can include numbers, lowercase letters, and hyphens
+
+Resources:
+  # S3 Bucket for Image Storage
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${BucketNamePrefix}-${AWS::AccountId}-${AWS::Region}'
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders:
+              - '*'
+            AllowedMethods:
+              - GET
+              - PUT
+              - POST
+              - DELETE
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            MaxAge: 3000
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+  # SNS Topic for Alerts
+  AlertSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: 'Human Detection Alert'
+
+  # SNS Subscription for SMS Alerts
+  AlertSNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertSNSTopic
+      Protocol: sms
+      Endpoint: !Ref PhoneNumber
+
+  # IAM Roles and Policies
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: StepFunctionsS3RekognitionSNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${ImageBucket}/*'
+              - Effect: Allow
+                Action:
+                  - rekognition:DetectLabels
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AlertSNSTopic
+
+  EventBridgeRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:StartExecution
+            Resource: '*'
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref EventBridgeRolePolicy
+
+  S3CleanupLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3BucketCleanupAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ImageBucket}'
+                  - !Sub 'arn:aws:s3:::${ImageBucket}/*'
+
+  # Lambda Function for S3 Bucket Cleanup
+  S3CleanupLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: S3CleanupLambdaRole
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt S3CleanupLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import urllib.request
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              logger.info('Received event: %s', event)
+              
+              # Get the bucket name from the event
+              bucket_name = event['ResourceProperties']['BucketName']
+              
+              try:
+                  if event['RequestType'] == 'Delete':
+                      # Create S3 client
+                      s3 = boto3.resource('s3')
+                      bucket = s3.Bucket(bucket_name)
+                      
+                      # Delete all objects in the bucket
+                      logger.info(f'Emptying bucket {bucket_name}')
+                      bucket.objects.all().delete()
+                      
+                      logger.info(f'Successfully emptied bucket {bucket_name}')
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  else:
+                      # For Create and Update events, just return success
+                      logger.info(f'No action needed for {event["RequestType"]} event')
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  logger.error(f'Error: {str(e)}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  # Step Functions State Machine
+  ImageRecognitionStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: 
+      - StepFunctionsExecutionRole
+      - AlertSNSTopic
+      - ImageBucket
+    Properties:
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString:
+        Fn::Sub:
+          - |
+            {
+              "Comment": "Image Recognition Pipeline",
+              "StartAt": "ValidateFileExtension",
+              "States": {
+                "ValidateFileExtension": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.detail.object.key",
+                      "StringMatches": "*.jpg",
+                      "Next": "DetectLabels"
+                    },
+                    {
+                      "Variable": "$.detail.object.key",
+                      "StringMatches": "*.jpeg",
+                      "Next": "DetectLabels"
+                    },
+                    {
+                      "Variable": "$.detail.object.key",
+                      "StringMatches": "*.png",
+                      "Next": "DetectLabels"
+                    }
+                  ],
+                  "Default": "InvalidFileType"
+                },
+                "InvalidFileType": {
+                  "Type": "Fail",
+                  "Error": "InvalidFileType",
+                  "Cause": "File type is not supported for image recognition"
+                },
+                "DetectLabels": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::aws-sdk:rekognition:detectLabels",
+                  "Parameters": {
+                    "Image": {
+                      "S3Object": {
+                        "Bucket": "${BucketName}",
+                        "Name.$": "$.detail.object.key"
+                      }
+                    },
+                    "MinConfidence": 80
+                  },
+                  "Next": "CheckForHumans"
+                },
+                "CheckForHumans": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.Labels[*].Name",
+                      "StringEquals": "Human",
+                      "Next": "SendAlert"
+                    },
+                    {
+                      "Variable": "$.Labels[*].Name",
+                      "StringEquals": "Person",
+                      "Next": "SendAlert"
+                    }
+                  ],
+                  "Default": "NoHumansDetected"
+                },
+                "SendAlert": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::sns:publish",
+                  "Parameters": {
+                    "TopicArn": "${TopicArn}",
+                    "Message.$": "States.Format('Human detected in image: {}', $.detail.object.key)",
+                    "Subject": "Human Detection Alert"
+                  },
+                  "End": true
+                },
+                "NoHumansDetected": {
+                  "Type": "Succeed"
+                }
+              }
+            }
+          - BucketName: !Ref ImageBucket
+            TopicArn: !Ref AlertSNSTopic
+
+  # Update EventBridgeRolePolicy with specific StateMachine ARN
+  EventBridgeRolePolicyUpdate:
+    Type: AWS::IAM::Policy
+    DependsOn: ImageRecognitionStateMachine
+    Properties:
+      PolicyName: EventBridgeStepFunctionsSpecificAccess
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:StartExecution
+            Resource: !GetAtt ImageRecognitionStateMachine.Arn
+      Roles:
+        - !Ref EventBridgeRole
+
+  # EventBridge Rule to Trigger Step Functions
+  S3UploadEventRule:
+    Type: AWS::Events::Rule
+    DependsOn:
+      - ImageBucket
+      - ImageRecognitionStateMachine
+      - EventBridgeRolePolicyUpdate
+    Properties:
+      Description: 'Rule to trigger Step Functions when an image is uploaded to S3'
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref ImageBucket
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ImageRecognitionStateMachine.Arn
+          Id: 'ImageRecognitionTarget'
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  # Custom Resource to Empty S3 Bucket on Stack Deletion
+  S3BucketCleanup:
+    Type: Custom::S3BucketCleanup
+    DependsOn:
+      - ImageBucket
+      - S3CleanupLambda
+    Properties:
+      ServiceToken: !GetAtt S3CleanupLambda.Arn
+      BucketName: !Ref ImageBucket
+
+Outputs:
+  S3BucketName:
+    Description: 'Name of the S3 bucket for image uploads'
+    Value: !Ref ImageBucket
+
+  StateMachineArn:
+    Description: 'ARN of the Step Functions state machine'
+    Value: !GetAtt ImageRecognitionStateMachine.Arn
+
+  SNSTopicArn:
+    Description: 'ARN of the SNS topic for alerts'
+    Value: !Ref AlertSNSTopic
+
+  UploadURL:
+    Description: 'URL for uploading images to the S3 bucket'
+    Value: !Sub 'https://${ImageBucket}.s3.${AWS::Region}.amazonaws.com/'

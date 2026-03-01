@@ -1,0 +1,259 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated image recognition pipeline using Step Functions, S3, and Rekognition'
+
+Resources:
+  ImageBucket:
+    Type: 'AWS::S3::Bucket'
+    DeletionPolicy: Delete
+    Properties:
+      NotificationConfiguration:
+        EventBridgeConfiguration:
+          EventBridgeEnabled: true
+
+  ImageTopic:
+    Type: 'AWS::SNS::Topic'
+    Properties:
+      DisplayName: 'Face Detection Alerts'
+
+  TopicSubscription:
+    Type: 'AWS::SNS::Subscription'
+    Properties:
+      Protocol: sms
+      Endpoint: '+14071113333'
+      TopicArn: !Ref ImageTopic
+
+  StatesExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource: !Sub '${ImageBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 'rekognition:DetectLabels'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref ImageTopic
+
+  EventBridgeRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: EventBridgeStatesPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'states:StartExecution'
+                Resource: !GetAtt ImageProcessingStateMachine.Arn
+
+  ImageProcessingStateMachine:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      RoleArn: !GetAtt StatesExecutionRole.Arn
+      DefinitionString: !Sub |-
+        {
+          "Comment": "Image Processing State Machine",
+          "StartAt": "ValidateImage",
+          "States": {
+            "ValidateImage": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.detail.object.key",
+                  "StringMatches": "*.jpg",
+                  "Next": "DetectLabels"
+                },
+                {
+                  "Variable": "$.detail.object.key",
+                  "StringMatches": "*.jpeg",
+                  "Next": "DetectLabels"
+                },
+                {
+                  "Variable": "$.detail.object.key",
+                  "StringMatches": "*.png",
+                  "Next": "DetectLabels"
+                }
+              ],
+              "Default": "Failed"
+            },
+            "DetectLabels": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:rekognition:detectLabels",
+              "Parameters": {
+                "Image": {
+                  "S3Object": {
+                    "Bucket": "${ImageBucket}",
+                    "Name.$": "$.detail.object.key"
+                  }
+                },
+                "MaxLabels": 20,
+                "MinConfidence": 90
+              },
+              "Next": "CheckLabels",
+              "Retry": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ]
+            },
+            "CheckLabels": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.Labels[*].Name",
+                      "IsPresent": true
+                    },
+                    {
+                      "Or": [
+                        {
+                          "Variable": "$.Labels[*].Name",
+                          "StringEquals": "Human"
+                        },
+                        {
+                          "Variable": "$.Labels[*].Name",
+                          "StringEquals": "Person"
+                        }
+                      ]
+                    }
+                  ],
+                  "Next": "SendAlert"
+                }
+              ],
+              "Default": "Success"
+            },
+            "SendAlert": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${ImageTopic}",
+                "Message": "Human face detected in uploaded image"
+              },
+              "Next": "Success"
+            },
+            "Success": {
+              "Type": "Succeed"
+            },
+            "Failed": {
+              "Type": "Fail",
+              "Error": "ImageProcessingError",
+              "Cause": "Image processing workflow failed"
+            }
+          }
+        }
+
+  ImageUploadRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: 'Rule for capturing S3 image uploads'
+      EventPattern: 
+        source: 
+          - aws.s3
+        detail-type: 
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref ImageBucket
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ImageProcessingStateMachine.Arn
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          Id: ProcessImage
+
+  CleanupFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: 'index.handler'
+      Role: !GetAtt CleanupFunctionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+              response_data = {}
+              try:
+                  if event['RequestType'] == 'Delete':
+                      s3 = boto3.resource('s3')
+                      bucket = s3.Bucket(event['ResourceProperties']['BucketName'])
+                      bucket.objects.all().delete()
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  print(str(e))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      "Error": str(e)
+                  })
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 128
+
+  CleanupFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: S3BucketCleanup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:DeleteObject'
+                Resource:
+                  - !GetAtt ImageBucket.Arn
+                  - !Sub '${ImageBucket.Arn}/*'
+
+  BucketCleanupResource:
+    Type: 'Custom::BucketCleanup'
+    Properties:
+      ServiceToken: !GetAtt CleanupFunction.Arn
+      BucketName: !Ref ImageBucket
+
+Outputs:
+  BucketName:
+    Description: 'Name of the S3 bucket for image uploads'
+    Value: !Ref ImageBucket
+
+  StateMachineArn:
+    Description: 'ARN of the Step Functions state machine'
+    Value: !Ref ImageProcessingStateMachine
+
+  TopicArn:
+    Description: 'ARN of the SNS topic for alerts'
+    Value: !Ref ImageTopic

@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Automated image analysis pipeline using S3, Lambda, Step Functions, and Rekognition'
+
+Parameters:
+  PhoneNumber:
+    Type: String
+    Description: Phone number to receive SMS notifications (include country code, e.g., +1234567890)
+    AllowedPattern: '^\+?[1-9]\d{1,14}$'
+    Default: '+1234567890'
+    ConstraintDescription: Must be a valid phone number starting with + and country code
+
+Resources:
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: FaceDetectionAlerts
+
+  SNSTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sms
+      Endpoint: !Ref PhoneNumber
+      TopicArn: !Ref NotificationTopic
+
+  TriggerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AndStepFunctionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - s3:GetObject
+                  - s3:PutBucketNotification
+                  - states:StartExecution
+                Resource: '*'
+
+  RekognitionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RekognitionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: rekognition:DetectLabels
+                Resource: '*'
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: '*'
+
+  NotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NotificationTopic
+
+  StatesExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: '*'
+
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  TriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt TriggerLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          def handler(event, context):
+              if 'ResourceType' in event and event['ResourceType'] == 'Custom::S3BucketNotifications':
+                  s3 = boto3.client('s3')
+                  bucket = event['ResourceProperties']['BucketName']
+                  notification = {
+                      'LambdaFunctionConfigurations': [{
+                          'LambdaFunctionArn': os.environ['FUNCTION_ARN'],
+                          'Events': ['s3:ObjectCreated:*']
+                      }]
+                  }
+                  s3.put_bucket_notification_configuration(
+                      Bucket=bucket,
+                      NotificationConfiguration=notification
+                  )
+                  return
+              sfn = boto3.client('stepfunctions')
+              sfn.start_execution(
+                  stateMachineArn=os.environ['STATE_MACHINE_ARN'],
+                  input=json.dumps(event)
+              )
+              return {'statusCode': 200}
+      Runtime: python3.9
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref StateMachine
+          FUNCTION_ARN: !GetAtt TriggerFunction.Arn
+      Timeout: 30
+      MemorySize: 128
+
+  RekognitionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt RekognitionLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          def handler(event, context):
+              rekognition = boto3.client('rekognition')
+              response = rekognition.detect_labels(
+                  Image={
+                      'S3Object': {
+                          'Bucket': event['Records'][0]['s3']['bucket']['name'],
+                          'Name': event['Records'][0]['s3']['object']['key']
+                      }
+                  },
+                  MaxLabels=10
+              )
+              has_human = any(label['Name'] == 'Human' for label in response['Labels'])
+              return {'hasHuman': has_human}
+      Runtime: python3.9
+      Timeout: 30
+      MemorySize: 128
+
+  NotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt NotificationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          def handler(event, context):
+              if event['hasHuman']:
+                  sns = boto3.client('sns')
+                  sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Message='Human detected in uploaded image!'
+                  )
+              return {'status': 'completed'}
+      Runtime: python3.9
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+      Timeout: 30
+      MemorySize: 128
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StatesExecutionRole.Arn
+      DefinitionString: !Sub 
+        - |
+          {
+            "Comment": "Image analysis workflow",
+            "StartAt": "AnalyzeImage",
+            "States": {
+              "AnalyzeImage": {
+                "Type": "Task",
+                "Resource": "${RekognitionFunction}",
+                "Next": "NotifyIfHuman"
+              },
+              "NotifyIfHuman": {
+                "Type": "Task",
+                "Resource": "${NotificationFunction}",
+                "End": true
+              }
+            }
+          }
+        - RekognitionFunction: !GetAtt RekognitionFunction.Arn
+          NotificationFunction: !GetAtt NotificationFunction.Arn
+
+  S3NotificationsHandler:
+    Type: Custom::S3BucketNotifications
+    Properties:
+      ServiceToken: !GetAtt TriggerFunction.Arn
+      BucketName: !Ref ImageBucket
+
+Outputs:
+  BucketName:
+    Description: Name of the S3 bucket for image uploads
+    Value: !Ref ImageBucket
+
+  StateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !Ref StateMachine
+
+  SNSTopicArn:
+    Description: ARN of the SNS topic for notifications
+    Value: !Ref NotificationTopic

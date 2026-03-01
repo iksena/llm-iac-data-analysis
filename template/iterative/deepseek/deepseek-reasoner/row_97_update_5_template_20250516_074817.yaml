@@ -1,0 +1,215 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  TargetS3BucketName:
+    Type: String
+    Description: Name for the organizational data bucket
+    AllowedPattern: ^[a-z0-9-.]{3,63}$
+  AllowedTags:
+    Type: CommaDelimitedList
+    Description: Comma-separated list of tag keys to collect
+    Default: CostCenter,Environment,Project
+  ManagementAccountId:
+    Type: String
+    Description: AWS Organizations management account ID
+    AllowedPattern: ^\d{12}$
+  AthenaDatabaseName:
+    Type: String
+    Default: managementcur
+    Description: Name for the Athena database
+  DataRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 7
+    MaxValue: 3653
+
+Resources:
+  OrgDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref TargetS3BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DataExpiration
+            Status: Enabled
+            ExpirationInDays: !Ref DataRetentionDays
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CrossAccountAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:aws:iam::${ManagementAccountId}:role/OrganizationDataAccess"
+              - Effect: Allow
+                Action:
+                  - organizations:List*
+                  - organizations:Describe*
+                Resource: "*"
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${OrgDataBucket.Arn}/*"
+
+  OrgDataCollector:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 300
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TARGET_BUCKET: !Ref TargetS3BucketName
+          MANAGEMENT_ROLE: !Sub "arn:aws:iam::${ManagementAccountId}:role/OrganizationDataAccess"
+          ALLOWED_TAGS: !Join [",", !Ref AllowedTags]
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import boto3
+          from datetime import datetime
+          
+          def lambda_handler(event, context):
+              sts = boto3.client('sts')
+              assumed_role = sts.assume_role(
+                  RoleArn=os.environ['MANAGEMENT_ROLE'],
+                  RoleSessionName='OrgDataCollection'
+              )
+              credentials = assumed_role['Credentials']
+              
+              org = boto3.client('organizations',
+                  aws_access_key_id=credentials['AccessKeyId'],
+                  aws_secret_access_key=credentials['SecretAccessKey'],
+                  aws_session_token=credentials['SessionToken']
+              )
+              
+              s3 = boto3.client('s3')
+              date_prefix = datetime.now().strftime('%Y/%m/%d')
+              
+              accounts = org.list_accounts()['Accounts']
+              s3.put_object(
+                  Bucket=os.environ['TARGET_BUCKET'],
+                  Key=f'{date_prefix}/accounts.json',
+                  Body=json.dumps(accounts)
+              )
+              
+              roots = org.list_roots()['Roots']
+              ou_data = []
+              for root in roots:
+                  ous = org.list_organizational_units_for_parent(ParentId=root['Id'])
+                  ou_data.extend(ous['OrganizationalUnits'])
+              s3.put_object(
+                  Bucket=os.environ['TARGET_BUCKET'],
+                  Key=f'{date_prefix}/ous.json',
+                  Body=json.dumps(ou_data)
+              )
+
+  WeeklyTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: "rate(7 days)"
+      Targets:
+        - Arn: !GetAtt OrgDataCollector.Arn
+          Id: WeeklyOrgDataCollection
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrgDataCollector
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt WeeklyTrigger.Arn
+
+  GlueCrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "${OrgDataBucket.Arn}"
+                  - !Sub "${OrgDataBucket.Arn}/*"
+
+  AthenaDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref AthenaDatabaseName
+        Description: Database for AWS Organizations metadata
+
+  OrgDataCrawler:
+    Type: AWS::Glue::Crawler
+    DependsOn: AthenaDatabase
+    Properties:
+      DatabaseName: !Ref AthenaDatabaseName
+      Role: !GetAtt GlueCrawlerRole.Arn
+      Schedule:
+        ScheduleExpression: "cron(0 12 ? * SUN *)"
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${TargetS3BucketName}"
+            Exclusions:
+              - "**/*_$folder$"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+Outputs:
+  S3BucketArn:
+    Value: !GetAtt OrgDataBucket.Arn
+    Export:
+      Name: OrgDataBucketArn
+  LambdaFunctionArn:
+    Value: !GetAtt OrgDataCollector.Arn
+    Export:
+      Name: OrgDataLambdaArn
+  GlueCrawlerName:
+    Value: !Ref OrgDataCrawler
+    Export:
+      Name: OrgDataCrawlerName
+  AthenaDatabase:
+    Value: !Ref AthenaDatabaseName
+    Export:
+      Name: OrgAthenaDatabase

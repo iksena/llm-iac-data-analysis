@@ -1,0 +1,481 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Centralized alerting system using Amazon SNS for aggregating notifications from multiple AWS services'
+
+Parameters:
+  EmailEndpoints:
+    Type: String
+    Description: 'Comma-separated list of email addresses to receive notifications (leave empty if not needed)'
+    Default: ''
+    AllowedPattern: '^$|^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(,[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})*$'
+    ConstraintDescription: 'Must be a comma-separated list of valid email addresses or empty'
+
+  HttpsEndpoints:
+    Type: String
+    Description: 'Comma-separated list of HTTPS endpoints to receive notifications (leave empty if not needed)'
+    Default: ''
+    AllowedPattern: '^$|^https://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/[a-zA-Z0-9./_-]*)?(\,https://[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(/[a-zA-Z0-9./_-]*)?)*$'
+    ConstraintDescription: 'Must be a comma-separated list of valid HTTPS URLs or empty'
+
+  FallbackEmail:
+    Type: String
+    Description: 'Email address to receive notifications about delivery failures'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  HttpRetryCount:
+    Type: Number
+    Description: 'Number of retries for HTTP/HTTPS endpoints'
+    Default: 3
+    MinValue: 0
+    MaxValue: 100
+
+  HttpRetryDelay:
+    Type: Number
+    Description: 'Initial retry delay in seconds for HTTP/HTTPS endpoints'
+    Default: 20
+    MinValue: 1
+    MaxValue: 3600
+
+  HttpMaxDelay:
+    Type: Number
+    Description: 'Maximum retry delay in seconds for HTTP/HTTPS endpoints'
+    Default: 600
+    MinValue: 1
+    MaxValue: 3600
+
+  HttpBackoffMode:
+    Type: String
+    Description: 'Backoff mode for HTTP/HTTPS endpoint retries'
+    Default: 'exponential'
+    AllowedValues:
+      - 'linear'
+      - 'arithmetic'
+      - 'geometric'
+      - 'exponential'
+
+Conditions:
+  HasEmailEndpoints: !Not [!Equals [!Ref EmailEndpoints, '']]
+  HasHttpsEndpoints: !Not [!Equals [!Ref HttpsEndpoints, '']]
+
+Resources:
+  PrimarySnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: 'Centralized Alerts'
+      TopicName: !Sub 'centralized-alerts-${AWS::StackName}'
+      Tags:
+        - Key: Purpose
+          Value: Centralized Alerting
+
+  PrimarySnsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref PrimarySnsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAWSServicesToPublish
+            Effect: Allow
+            Principal:
+              Service:
+                - cloudwatch.amazonaws.com
+                - events.amazonaws.com
+                - rds.amazonaws.com
+                - s3.amazonaws.com
+                - budgets.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: !Ref PrimarySnsTopic
+          - Sid: AllowOwnerAccountToManage
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - 'sns:Subscribe'
+              - 'sns:SetTopicAttributes'
+              - 'sns:RemovePermission'
+              - 'sns:Publish'
+              - 'sns:ListSubscriptionsByTopic'
+              - 'sns:GetTopicAttributes'
+              - 'sns:DeleteTopic'
+              - 'sns:AddPermission'
+            Resource: !Ref PrimarySnsTopic
+
+  FallbackSnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: 'Fallback Alerts'
+      TopicName: !Sub 'fallback-alerts-${AWS::StackName}'
+      Tags:
+        - Key: Purpose
+          Value: Fallback Alerting
+
+  FallbackSnsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref FallbackSnsTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchToPublish
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: !Ref FallbackSnsTopic
+          - Sid: AllowOwnerAccountToManage
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - 'sns:Subscribe'
+              - 'sns:SetTopicAttributes'
+              - 'sns:RemovePermission'
+              - 'sns:Publish'
+              - 'sns:ListSubscriptionsByTopic'
+              - 'sns:GetTopicAttributes'
+              - 'sns:DeleteTopic'
+              - 'sns:AddPermission'
+            Resource: !Ref FallbackSnsTopic
+
+  FallbackEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref FallbackSnsTopic
+      Protocol: email
+      Endpoint: !Ref FallbackEmail
+
+  FailedNotificationsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'SNSFailedNotificationsAlarm-${AWS::StackName}'
+      AlarmDescription: 'Alarm when SNS notifications fail to deliver'
+      MetricName: NumberOfNotificationsFailed
+      Namespace: AWS/SNS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: TopicName
+          Value: !GetAtt PrimarySnsTopic.TopicName
+      AlarmActions:
+        - !Ref FallbackSnsTopic
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Purpose
+          Value: Monitor SNS Delivery Failures
+
+  # Email Subscriptions - Using Lambda to handle multiple email subscriptions
+  EmailSubscriptionsLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: HasEmailEndpoints
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSSubscriptionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Subscribe
+                  - sns:ListSubscriptionsByTopic
+                Resource: !Ref PrimarySnsTopic
+
+  EmailSubscriptionsFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasEmailEndpoints
+    DependsOn: EmailSubscriptionsLambdaRole
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt EmailSubscriptionsLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import urllib.request
+          import urllib.error
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def send_response(event, context, response_status, response_data=None, physical_resource_id=None):
+              response_data = response_data or {}
+              physical_resource_id = physical_resource_id or context.log_stream_name
+
+              response_body = {
+                  'Status': response_status,
+                  'Reason': f'See details in CloudWatch Log Stream: {context.log_stream_name}',
+                  'PhysicalResourceId': physical_resource_id,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': response_data
+              }
+
+              logger.info('Response body: %s', json.dumps(response_body))
+
+              response_body_bytes = json.dumps(response_body).encode('utf-8')
+              
+              headers = {
+                  'content-type': '',
+                  'content-length': str(len(response_body_bytes))
+              }
+              
+              try:
+                  req = urllib.request.Request(
+                      url=event['ResponseURL'],
+                      data=response_body_bytes,
+                      headers=headers,
+                      method='PUT'
+                  )
+                  with urllib.request.urlopen(req) as response:
+                      logger.info('Response status code: %s', response.status)
+                  return True
+              except Exception as e:
+                  logger.error('Failed to send response: %s', str(e))
+                  return False
+
+          def handler(event, context):
+              logger.info('Received event: %s', json.dumps(event))
+              
+              # Set initial response
+              response_data = {}
+              
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      topic_arn = event['ResourceProperties']['TopicArn']
+                      email_list = event['ResourceProperties']['EmailList']
+                      
+                      # Split the comma-separated list
+                      emails = [email.strip() for email in email_list.split(',')]
+                      
+                      sns = boto3.client('sns')
+                      subscription_arns = []
+                      
+                      for email in emails:
+                          if email:  # Skip empty strings
+                              logger.info(f'Subscribing {email} to {topic_arn}')
+                              response = sns.subscribe(
+                                  TopicArn=topic_arn,
+                                  Protocol='email',
+                                  Endpoint=email
+                              )
+                              subscription_arns.append(response['SubscriptionArn'])
+                      
+                      response_data['SubscriptionArns'] = subscription_arns
+                      logger.info(f'Successfully created/updated {len(subscription_arns)} email subscriptions')
+                  
+                  # For Delete, we don't need to do anything as subscriptions will be deleted with the topic
+                  elif event['RequestType'] == 'Delete':
+                      logger.info('Delete request - subscriptions will be automatically removed when the topic is deleted')
+                  
+                  send_response(event, context, 'SUCCESS', response_data)
+              except Exception as e:
+                  logger.error('Error: %s', str(e))
+                  send_response(event, context, 'FAILED', {'Error': str(e)})
+
+      Tags:
+        - Key: Purpose
+          Value: SNS Email Subscriptions
+
+  EmailSubscriptionsCustomResource:
+    Type: Custom::EmailSubscriptions
+    Condition: HasEmailEndpoints
+    DependsOn: EmailSubscriptionsFunction
+    Properties:
+      ServiceToken: !GetAtt EmailSubscriptionsFunction.Arn
+      TopicArn: !Ref PrimarySnsTopic
+      EmailList: !Ref EmailEndpoints
+
+  # HTTPS Subscriptions - Using Lambda to handle multiple HTTPS subscriptions with retry policies
+  HttpsSubscriptionsLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: HasHttpsEndpoints
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSSubscriptionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Subscribe
+                  - sns:SetSubscriptionAttributes
+                  - sns:ListSubscriptionsByTopic
+                Resource: !Ref PrimarySnsTopic
+
+  HttpsSubscriptionsFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasHttpsEndpoints
+    DependsOn: HttpsSubscriptionsLambdaRole
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt HttpsSubscriptionsLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import urllib.request
+          import urllib.error
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def send_response(event, context, response_status, response_data=None, physical_resource_id=None):
+              response_data = response_data or {}
+              physical_resource_id = physical_resource_id or context.log_stream_name
+
+              response_body = {
+                  'Status': response_status,
+                  'Reason': f'See details in CloudWatch Log Stream: {context.log_stream_name}',
+                  'PhysicalResourceId': physical_resource_id,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': response_data
+              }
+
+              logger.info('Response body: %s', json.dumps(response_body))
+
+              response_body_bytes = json.dumps(response_body).encode('utf-8')
+              
+              headers = {
+                  'content-type': '',
+                  'content-length': str(len(response_body_bytes))
+              }
+              
+              try:
+                  req = urllib.request.Request(
+                      url=event['ResponseURL'],
+                      data=response_body_bytes,
+                      headers=headers,
+                      method='PUT'
+                  )
+                  with urllib.request.urlopen(req) as response:
+                      logger.info('Response status code: %s', response.status)
+                  return True
+              except Exception as e:
+                  logger.error('Failed to send response: %s', str(e))
+                  return False
+
+          def handler(event, context):
+              logger.info('Received event: %s', json.dumps(event))
+              
+              # Set initial response
+              response_data = {}
+              
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      topic_arn = event['ResourceProperties']['TopicArn']
+                      https_list = event['ResourceProperties']['HttpsList']
+                      retry_policy = event['ResourceProperties']['RetryPolicy']
+                      
+                      # Create the delivery policy JSON
+                      delivery_policy = {
+                          "healthyRetryPolicy": {
+                              "numRetries": int(retry_policy['numRetries']),
+                              "numNoDelayRetries": int(retry_policy.get('numNoDelayRetries', 0)),
+                              "minDelayTarget": int(retry_policy['minDelayTarget']),
+                              "maxDelayTarget": int(retry_policy['maxDelayTarget']),
+                              "backoffFunction": retry_policy['backoffFunction']
+                          }
+                      }
+                      
+                      delivery_policy_json = json.dumps(delivery_policy)
+                      logger.info(f'Delivery policy: {delivery_policy_json}')
+                      
+                      # Split the comma-separated list
+                      https_endpoints = [endpoint.strip() for endpoint in https_list.split(',')]
+                      
+                      sns = boto3.client('sns')
+                      subscription_arns = []
+                      
+                      for endpoint in https_endpoints:
+                          if endpoint:  # Skip empty strings
+                              logger.info(f'Subscribing {endpoint} to {topic_arn}')
+                              response = sns.subscribe(
+                                  TopicArn=topic_arn,
+                                  Protocol='https',
+                                  Endpoint=endpoint,
+                                  Attributes={
+                                      'DeliveryPolicy': delivery_policy_json
+                                  }
+                              )
+                              subscription_arns.append(response['SubscriptionArn'])
+                      
+                      response_data['SubscriptionArns'] = subscription_arns
+                      logger.info(f'Successfully created/updated {len(subscription_arns)} HTTPS subscriptions')
+                  
+                  # For Delete, we don't need to do anything as subscriptions will be deleted with the topic
+                  elif event['RequestType'] == 'Delete':
+                      logger.info('Delete request - subscriptions will be automatically removed when the topic is deleted')
+                  
+                  send_response(event, context, 'SUCCESS', response_data)
+              except Exception as e:
+                  logger.error('Error: %s', str(e))
+                  send_response(event, context, 'FAILED', {'Error': str(e)})
+
+      Tags:
+        - Key: Purpose
+          Value: SNS HTTPS Subscriptions
+
+  HttpsSubscriptionsCustomResource:
+    Type: Custom::HttpsSubscriptions
+    Condition: HasHttpsEndpoints
+    DependsOn: HttpsSubscriptionsFunction
+    Properties:
+      ServiceToken: !GetAtt HttpsSubscriptionsFunction.Arn
+      TopicArn: !Ref PrimarySnsTopic
+      HttpsList: !Ref HttpsEndpoints
+      RetryPolicy:
+        numRetries: !Ref HttpRetryCount
+        numNoDelayRetries: 0
+        minDelayTarget: !Ref HttpRetryDelay
+        maxDelayTarget: !Ref HttpMaxDelay
+        backoffFunction: !Ref HttpBackoffMode
+
+Outputs:
+  PrimarySnsTopicArn:
+    Description: 'ARN of the primary SNS topic for centralized alerts'
+    Value: !Ref PrimarySnsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-PrimarySnsTopicArn'
+
+  FallbackSnsTopicArn:
+    Description: 'ARN of the fallback SNS topic for delivery failure alerts'
+    Value: !Ref FallbackSnsTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-FallbackSnsTopicArn'
+
+  FailedNotificationsAlarmArn:
+    Description: 'ARN of the CloudWatch Alarm monitoring SNS delivery failures'
+    Value: !GetAtt FailedNotificationsAlarm.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FailedNotificationsAlarmArn'

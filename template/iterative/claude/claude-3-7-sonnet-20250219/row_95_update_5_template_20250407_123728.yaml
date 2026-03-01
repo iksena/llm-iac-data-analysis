@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for EC2 instance with SSM-based Nginx installation and validation'
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t3.micro
+      - t3.small
+      - t3.medium
+    ConstraintDescription: Must be a valid EC2 instance type.
+
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access (optional)
+    Type: String
+    Default: ''
+    
+  VpcId:
+    Description: VPC where the EC2 instance will be deployed
+    Type: AWS::EC2::VPC::Id
+    
+  SubnetId:
+    Description: Subnet where the EC2 instance will be deployed
+    Type: AWS::EC2::Subnet::Id
+    
+  LatestAmiId:
+    Description: Latest Amazon Linux 2 AMI ID
+    Type: AWS::EC2::Image::Id
+    Default: ami-0cff7528ff583bf9a
+
+Conditions:
+  HasKeyName: !Not [!Equals [!Ref KeyName, '']]
+
+Resources:
+  SSMInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Path: /
+
+  SSMInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref SSMInstanceRole
+
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for web server with HTTP access
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP access from anywhere
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: Allow SSH access from anywhere (for troubleshooting)
+      Tags:
+        - Key: Name
+          Value: WebServerSecurityGroup
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref LatestAmiId
+      SecurityGroupIds:
+        - !GetAtt WebServerSecurityGroup.GroupId
+      SubnetId: !Ref SubnetId
+      IamInstanceProfile: !Ref SSMInstanceProfile
+      KeyName: !If [HasKeyName, !Ref KeyName, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: NginxWebServer
+        - Key: nginx
+          Value: Yes
+
+  NginxInstallationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Content:
+        schemaVersion: '0.3'
+        description: 'Automates the installation and validation of Nginx on Amazon Linux 2'
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            description: '(Optional) The ARN of the role that allows Automation to perform the actions on your behalf.'
+            default: ''
+        mainSteps:
+          - name: GetInstancesByTag
+            action: aws:executeAwsApi
+            onFailure: Abort
+            inputs:
+              Service: ec2
+              Api: DescribeInstances
+              Filters:
+                - Name: 'tag:nginx'
+                  Values:
+                    - 'Yes'
+                - Name: 'instance-state-name'
+                  Values:
+                    - 'running'
+            outputs:
+              - Name: InstanceIds
+                Selector: '$.Reservations[*].Instances[*].InstanceId'
+                Type: StringList
+          
+          - name: UpdateOS
+            action: aws:runCommand
+            onFailure: Abort
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds: '{{ GetInstancesByTag.InstanceIds }}'
+              Parameters:
+                commands:
+                  - 'sudo yum update -y'
+            
+          - name: CheckIfRebootNeeded
+            action: aws:runCommand
+            onFailure: Abort
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds: '{{ GetInstancesByTag.InstanceIds }}'
+              Parameters:
+                commands:
+                  - 'if [ -f /var/run/reboot-required ]; then echo "Reboot required"; else echo "No reboot needed"; fi'
+            outputs:
+              - Name: RebootOutput
+                Selector: '$.CommandInvocations[*].CommandPlugins[*].Output'
+                Type: StringList
+          
+          - name: RebootIfNeeded
+            action: aws:branch
+            inputs:
+              Choices:
+                - NextStep: RebootInstances
+                  Variable: '{{ CheckIfRebootNeeded.RebootOutput }}'
+                  Contains: 'Reboot required'
+              Default: InstallNginx
+          
+          - name: RebootInstances
+            action: aws:executeAwsApi
+            inputs:
+              Service: ec2
+              Api: RebootInstances
+              InstanceIds: '{{ GetInstancesByTag.InstanceIds }}'
+            nextStep: WaitForInstancesOnline
+          
+          - name: WaitForInstancesOnline
+            action: aws:waitForAwsResourceProperty
+            inputs:
+              Service: ssm
+              Api: DescribeInstanceInformation
+              InstanceInformationFilterList:
+                - key: InstanceIds
+                  valueSet: '{{ GetInstancesByTag.InstanceIds }}'
+              PropertySelector: '$.InstanceInformationList[0].PingStatus'
+              DesiredValues:
+                - 'Online'
+            timeoutSeconds: 300
+            nextStep: InstallNginx
+          
+          - name: InstallNginx
+            action: aws:runCommand
+            onFailure: Abort
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds: '{{ GetInstancesByTag.InstanceIds }}'
+              Parameters:
+                commands:
+                  - 'sudo amazon-linux-extras install nginx1 -y'
+                  - 'sudo systemctl start nginx'
+                  - 'sudo systemctl enable nginx'
+          
+          - name: ValidateNginxInstallation
+            action: aws:runCommand
+            onFailure: Abort
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds: '{{ GetInstancesByTag.InstanceIds }}'
+              Parameters:
+                commands:
+                  - 'curl -s http://localhost:80 > /tmp/nginx_test.html'
+                  - 'if grep -q "nginx" /tmp/nginx_test.html; then echo "Nginx validation successful"; else echo "Nginx validation failed"; exit 1; fi'
+                  - 'sudo systemctl status nginx'
+
+Outputs:
+  InstanceId:
+    Description: ID of the EC2 instance
+    Value: !Ref EC2Instance
+  
+  PublicDNS:
+    Description: Public DNS of the EC2 instance
+    Value: !GetAtt EC2Instance.PublicDnsName
+  
+  SSMDocumentName:
+    Description: Name of the SSM Automation Document
+    Value: !Ref NginxInstallationDocument
+  
+  SSMExecutionCommand:
+    Description: Command to execute the SSM Automation Document
+    Value: !Sub "aws ssm start-automation-execution --document-name ${NginxInstallationDocument} --region ${AWS::Region}"

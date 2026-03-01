@@ -1,0 +1,227 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for managing AWS Security Hub controls'
+
+Parameters:
+  DisableCIS140Controls:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to disable CIS 1.4.0 controls
+
+  DisableAWSFSBPControls:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Whether to disable AWS Foundational Security Best Practices controls
+
+  SpecificControlsToDisable:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Comma-separated list of specific control IDs to disable (e.g., 'CIS.1.1,CIS.1.2')
+
+  PermissionsBoundaryARN:
+    Type: String
+    Default: ''
+    Description: Optional ARN for IAM permissions boundary
+
+  LogRetentionInDays:
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+    Description: Number of days to retain CloudWatch Logs
+
+Conditions:
+  UsePermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryARN, '']]
+
+Resources:
+  SecurityHubControlsManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      PermissionsBoundary: !If [UsePermissionsBoundary, !Ref PermissionsBoundaryARN, !Ref 'AWS::NoValue']
+      Policies:
+        - PolicyName: SecurityHubControlsManagerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - securityhub:ListSecurityControlDefinitions
+                  - securityhub:BatchUpdateStandardsControlAssociations
+                  - securityhub:ListStandardsControlAssociations
+                  - securityhub:GetEnabledStandards
+                Resource: '*'
+
+  SecurityHubControlsManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SecurityHubControlsManager}'
+      RetentionInDays: !Ref LogRetentionInDays
+
+  SecurityHubControlsManager:
+    Type: AWS::Lambda::Function
+    DependsOn: SecurityHubControlsManagerLogGroup
+    Properties:
+      FunctionName: SecurityHubControlsManager
+      Description: Lambda function to manage AWS Security Hub controls
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityHubControlsManagerRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          DISABLE_CIS_140_CONTROLS: !Ref DisableCIS140Controls
+          DISABLE_AWS_FSBP_CONTROLS: !Ref DisableAWSFSBPControls
+          SPECIFIC_CONTROLS_TO_DISABLE: !Join [',', !Ref SpecificControlsToDisable]
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import logging
+          import json
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info("Starting Security Hub Controls Manager")
+              
+              # Get environment variables
+              disable_cis_140 = os.environ.get('DISABLE_CIS_140_CONTROLS', 'false').lower() == 'true'
+              disable_aws_fsbp = os.environ.get('DISABLE_AWS_FSBP_CONTROLS', 'false').lower() == 'true'
+              specific_controls = os.environ.get('SPECIFIC_CONTROLS_TO_DISABLE', '').split(',')
+              specific_controls = [c.strip() for c in specific_controls if c.strip()]
+              
+              # Initialize Security Hub client
+              securityhub = boto3.client('securityhub')
+              
+              # Get enabled standards
+              enabled_standards = []
+              try:
+                  response = securityhub.get_enabled_standards()
+                  enabled_standards = response.get('StandardsSubscriptions', [])
+                  logger.info(f"Found {len(enabled_standards)} enabled standards")
+              except Exception as e:
+                  logger.error(f"Error getting enabled standards: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps(f"Error getting enabled standards: {str(e)}")
+                  }
+              
+              # Process controls based on configuration
+              controls_to_update = []
+              
+              # Get all control associations
+              for standard in enabled_standards:
+                  standard_arn = standard.get('StandardsArn', '')
+                  standard_name = standard_arn.split('/')[-1] if '/' in standard_arn else standard_arn
+                  
+                  try:
+                      paginator = securityhub.get_paginator('list_standards_control_associations')
+                      for page in paginator.paginate(StandardsArn=standard_arn):
+                          for control in page.get('StandardsControlAssociationSummaries', []):
+                              control_id = control.get('SecurityControlId', '')
+                              current_status = control.get('AssociationStatus', '')
+                              
+                              # Determine if this control should be disabled
+                              disable_control = False
+                              
+                              # Check if it's in the specific controls list
+                              if control_id in specific_controls:
+                                  disable_control = True
+                                  logger.info(f"Control {control_id} will be disabled (in specific controls list)")
+                              
+                              # Check if it's a CIS control and CIS disabling is enabled
+                              elif disable_cis_140 and 'CIS' in standard_name:
+                                  disable_control = True
+                                  logger.info(f"Control {control_id} will be disabled (CIS control)")
+                              
+                              # Check if it's an AWS FSBP control and FSBP disabling is enabled
+                              elif disable_aws_fsbp and 'Foundational_Security' in standard_name:
+                                  disable_control = True
+                                  logger.info(f"Control {control_id} will be disabled (AWS FSBP control)")
+                              
+                              # If we need to disable and it's currently enabled
+                              if disable_control and current_status == 'ENABLED':
+                                  controls_to_update.append({
+                                      'StandardsArn': standard_arn,
+                                      'SecurityControlId': control_id,
+                                      'AssociationStatus': 'DISABLED',
+                                      'UpdatedReason': 'Disabled by Security Hub Controls Manager'
+                                  })
+                  except Exception as e:
+                      logger.error(f"Error processing standard {standard_name}: {str(e)}")
+              
+              # Update controls in batches (max 25 per batch)
+              batch_size = 25
+              success_count = 0
+              failure_count = 0
+              
+              for i in range(0, len(controls_to_update), batch_size):
+                  batch = controls_to_update[i:i+batch_size]
+                  try:
+                      response = securityhub.batch_update_standards_control_associations(
+                          StandardsControlAssociationUpdates=batch
+                      )
+                      
+                      for result in response.get('StandardsControlAssociationUpdates', []):
+                          if result.get('StandardsControlAssociationUpdateStatus') == 'SUCCEEDED':
+                              success_count += 1
+                          else:
+                              failure_count += 1
+                              logger.error(f"Failed to update control: {result}")
+                  except Exception as e:
+                      logger.error(f"Error updating batch of controls: {str(e)}")
+                      failure_count += len(batch)
+              
+              logger.info(f"Completed processing. Successfully updated {success_count} controls. Failed to update {failure_count} controls.")
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Security Hub controls update completed',
+                      'success_count': success_count,
+                      'failure_count': failure_count
+                  })
+              }
+
+  SecurityHubControlsManagerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SecurityHubControlsManager
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecurityHubControlsManagerScheduleRule.Arn
+
+  SecurityHubControlsManagerScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Schedule to run Security Hub Controls Manager
+      ScheduleExpression: rate(1 day)
+      State: ENABLED
+      Targets:
+        - Id: SecurityHubControlsManagerTarget
+          Arn: !GetAtt SecurityHubControlsManager.Arn
+
+Outputs:
+  SecurityHubControlsManagerArn:
+    Description: ARN of the Lambda function that manages Security Hub controls
+    Value: !GetAtt SecurityHubControlsManager.Arn
+
+  SecurityHubControlsManagerRoleArn:
+    Description: ARN of the IAM role used by the Lambda function
+    Value: !GetAtt SecurityHubControlsManagerRole.Arn
+
+  SecurityHubControlsManagerLogGroupName:
+    Description: Name of the CloudWatch Logs group for the Lambda function
+    Value: !Ref SecurityHubControlsManagerLogGroup

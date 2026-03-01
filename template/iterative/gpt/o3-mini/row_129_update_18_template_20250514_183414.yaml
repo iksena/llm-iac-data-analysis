@@ -1,0 +1,302 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Production ready CloudFormation template that creates a secure and compliant AWS Config setup
+  with customizable retention policies and delivery configurations. This template ensures that
+  the delivery channel is created before the configuration recorder is initialized.
+
+Parameters:
+  ExistingS3BucketName:
+    Description: "Optional existing S3 bucket name to use for AWS Config snapshots. Leave empty to create a new bucket."
+    Type: String
+    Default: ""
+  RetentionDays:
+    Description: "Number of days to retain configuration snapshot objects (compliance retention period)."
+    Type: Number
+    Default: 2557
+  SnapshotDeliveryFrequency:
+    Description: "Frequency for AWS Config snapshot delivery. Allowed values: One_Hour, Three_Hours, Six_Hours, Twelve_Hours, TwentyFour_Hours."
+    Type: String
+    Default: TwentyFour_Hours
+    AllowedValues:
+      - One_Hour
+      - Three_Hours
+      - Six_Hours
+      - Twelve_Hours
+      - TwentyFour_Hours
+  PermissionBoundaryArn:
+    Description: "Optional IAM Permission Boundary ARN to apply to created IAM roles."
+    Type: String
+    Default: ""
+
+Conditions:
+  CreateNewBucket: !Equals [!Ref ExistingS3BucketName, ""]
+  HasPermissionBoundary: !Not [!Equals [!Ref PermissionBoundaryArn, ""]]
+
+Resources:
+  ConfigS3Bucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateNewBucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  S3BucketSSLPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateNewBucket
+    Properties:
+      Bucket: !Ref ConfigS3Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnforceSSL
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${ConfigS3Bucket}"
+              - !Sub "arn:aws:s3:::${ConfigS3Bucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  ConfigSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: "ConfigNotificationsTopic"
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    DependsOn:
+      - ConfigS3Bucket
+    Properties:
+      Name: "default"
+      S3BucketName: !If [CreateNewBucket, !Ref ConfigS3Bucket, !Ref ExistingS3BucketName]
+      SnsTopicARN: !Ref ConfigSNSTopic
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: !Ref SnapshotDeliveryFrequency
+
+  ConfigServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ConfigServiceRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ConfigServicePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketAcl
+                Resource: !If [CreateNewBucket, !Sub "arn:aws:s3:::${ConfigS3Bucket}", !Sub "arn:aws:s3:::${ExistingS3BucketName}"]
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ConfigSNSTopic
+      PermissionsBoundary: !If [HasPermissionBoundary, !Ref PermissionBoundaryArn, !Ref "AWS::NoValue"]
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    DependsOn:
+      - ConfigDeliveryChannel
+    Properties:
+      Name: "default"
+      RoleARN: !GetAtt ConfigServiceRole.Arn
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ConfigRetentionLambdaRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaLogging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+        - PolicyName: S3LifecycleUpdate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutLifecycleConfiguration
+                Resource: !If [CreateNewBucket, !Sub "arn:aws:s3:::${ConfigS3Bucket}", !Sub "arn:aws:s3:::${ExistingS3BucketName}"]
+      PermissionsBoundary: !If [HasPermissionBoundary, !Ref PermissionBoundaryArn, !Ref "AWS::NoValue"]
+
+  ConfigRetentionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "ConfigRetentionManager-${AWS::StackName}"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import boto3
+          import traceback
+          
+          def send_response(event, context, responseStatus, responseData, physicalResourceId):
+              response_url = event['ResponseURL']
+              response_body = {
+                  'Status': responseStatus,
+                  'Reason': 'See the details in CloudWatch Log Stream: ' + context.log_stream_name,
+                  'PhysicalResourceId': physicalResourceId if physicalResourceId else context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': responseData
+              }
+              json_response_body = json.dumps(response_body)
+              headers = {
+                  'content-type': '',
+                  'content-length': str(len(json_response_body))
+              }
+              req = urllib.request.Request(url=response_url, data=json_response_body.encode('utf-8'), headers=headers, method='PUT')
+              try:
+                  with urllib.request.urlopen(req) as f:
+                      pass
+              except Exception as e:
+                  print("send_response failed: " + str(e))
+          
+          def update_bucket_lifecycle(s3_bucket, retention_days):
+              s3 = boto3.client('s3')
+              lifecycle_configuration = {
+                  'Rules': [
+                      {
+                          'ID': 'ConfigSnapshotExpiration',
+                          'Status': 'Enabled',
+                          'Filter': {'Prefix': ''},
+                          'Expiration': {'Days': int(retention_days)}
+                      }
+                  ]
+              }
+              s3.put_bucket_lifecycle_configuration(
+                  Bucket=s3_bucket,
+                  LifecycleConfiguration=lifecycle_configuration
+              )
+          
+          def handler(event, context):
+              print("Received event: " + json.dumps(event))
+              try:
+                  props = event.get('ResourceProperties', {})
+                  s3_bucket = props.get('S3BucketName')
+                  retention_days = props.get('RetentionDays', 2557)
+                  if event['RequestType'] in ['Create', 'Update']:
+                      if s3_bucket:
+                          update_bucket_lifecycle(s3_bucket, retention_days)
+                      responseData = {'Message': 'Lifecycle configuration updated'}
+                      send_response(event, context, "SUCCESS", responseData, s3_bucket)
+                  elif event['RequestType'] == 'Delete':
+                      responseData = {'Message': 'Delete request received. No action taken.'}
+                      send_response(event, context, "SUCCESS", responseData, s3_bucket)
+              except Exception as e:
+                  print("Exception: " + str(e))
+                  traceback.print_exc()
+                  send_response(event, context, "FAILED", {'Message': str(e)}, "none")
+  
+  StartConfigRecorderLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "StartConfigRecorder-${AWS::StackName}"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 180
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import boto3
+          import urllib.request
+          
+          def handler(event, context):
+              client = boto3.client('config')
+              max_attempts = 10
+              for attempt in range(max_attempts):
+                  channels = client.describe_delivery_channels().get('DeliveryChannels', [])
+                  if channels:
+                      try:
+                          client.start_configuration_recorder(ConfigurationRecorderName='default')
+                          break
+                      except Exception as e:
+                          print("Attempt {}: Error starting recorder: {}".format(attempt+1, str(e)))
+                  else:
+                      print("Attempt {}: Delivery channel not ready.".format(attempt+1))
+                  time.sleep(10)
+              response_body = {
+                  "Status": "SUCCESS",
+                  "PhysicalResourceId": "StartConfigRecorderCustomResource",
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {}
+              }
+              json_response_body = json.dumps(response_body)
+              headers = {"content-type": "", "content-length": str(len(json_response_body))}
+              req = urllib.request.Request(url=event["ResponseURL"], data=json_response_body.encode('utf-8'), headers=headers, method="PUT")
+              with urllib.request.urlopen(req) as f:
+                  pass
+
+  StartConfigRecorderCustomResource:
+    Type: "Custom::StartConfigRecorder"
+    DependsOn:
+      - ConfigDeliveryChannel
+      - ConfigRecorder
+    Properties:
+      ServiceToken: !GetAtt StartConfigRecorderLambda.Arn
+
+  ConfigRetentionCustomResource:
+    Type: "Custom::RetentionManager"
+    Properties:
+      ServiceToken: !GetAtt ConfigRetentionLambda.Arn
+      S3BucketName: !If [CreateNewBucket, !Ref ConfigS3Bucket, !Ref ExistingS3BucketName]
+      RetentionDays: !Ref RetentionDays
+
+Outputs:
+  S3BucketNameOutput:
+    Description: "The S3 bucket used for AWS Config snapshots"
+    Value: !If [CreateNewBucket, !Ref ConfigS3Bucket, !Ref ExistingS3BucketName]
+  SNSTopicArnOutput:
+    Description: "SNS Topic ARN for AWS Config notifications"
+    Value: !Ref ConfigSNSTopic
+  ConfigRecorderOutput:
+    Description: "AWS Config Recorder configuration name"
+    Value: "default"
+  RetentionLambdaFunctionOutput:
+    Description: "Lambda function handling the retention lifecycle"
+    Value: !Ref ConfigRetentionLambda
+  StartRecorderLambdaFunctionOutput:
+    Description: "Lambda function to start the configuration recorder"
+    Value: !Ref StartConfigRecorderLambda
