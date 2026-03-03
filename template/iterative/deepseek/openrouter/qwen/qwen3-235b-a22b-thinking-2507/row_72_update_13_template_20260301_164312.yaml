@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Secure web-based VS Code environment using code-server on EC2 with CloudFront'
+Parameters:
+  UbuntuAMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: '/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id'
+    Description: 'SSM parameter for Ubuntu 22.04 AMI ID'
+  CodeServerVersion:
+    Type: String
+    Default: '4.87.1'
+    Description: 'Version of code-server to install'
+    AllowedPattern: '^[0-9]+\.[0-9]+\.[0-9]+$'
+    ConstraintDescription: 'Must be in format X.X.X'
+  InstanceType:
+    Type: String
+    Default: 't3.medium'
+    Description: 'EC2 instance type for the development environment'
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+  CloudFrontPrefixListId:
+    Type: String
+    Default: 'pl-7ca54014'
+    Description: 'Prefix list ID for CloudFront IPs (same across all regions)'
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: CodeServer-VPC
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: CodeServer-IGW
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: CodeServer-PublicSubnet
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: CodeServer-PublicRouteTable
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for code-server instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: CodeServer-SG
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Name
+          Value: CodeServer-InstanceRole
+  WaitConditionHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+  WaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    DependsOn: EC2Instance
+    Properties:
+      Handle: !Ref WaitConditionHandle
+      Timeout: '900'
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: PublicSubnetRouteTableAssociation
+    Properties:
+      ImageId: !Ref UbuntuAMI
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      SubnetId: !Ref PublicSubnet
+      IamInstanceProfile: !Ref EC2InstanceRole
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+          sleep 30
+          apt-get update
+          apt-get install -y curl
+          MAX_RETRIES=3
+          RETRY_INTERVAL=10
+          for i in $(seq 1 $MAX_RETRIES); do
+            if curl -fL https://github.com/coder/code-server/releases/download/v${CodeServerVersion}/code-server-${CodeServerVersion}-linux-amd64.tar.gz -o /tmp/code-server.tar.gz; then
+              break
+            fi
+            if [ $i -lt $MAX_RETRIES ]; then
+              sleep $RETRY_INTERVAL
+            else
+              echo "Failed to download code-server" >&2
+              exit 1
+            fi
+          done
+          tar -xzvf /tmp/code-server.tar.gz -C /tmp
+          mv /tmp/code-server-${CodeServerVersion}-linux-amd64 /usr/local/bin/code-server
+          cat > /etc/systemd/system/code-server.service <<'EOF'
+          [Unit]
+          Description=code-server
+          After=network.target
+          [Service]
+          User=root
+          WorkingDirectory=/root
+          ExecStart=/usr/local/bin/code-server --bind-addr 0.0.0.0:8080 --auth none
+          Restart=always
+          RestartSec=5
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable code-server
+          systemctl start code-server
+          
+          # Wait for code-server to be ready
+          for i in {1..30}; do
+            if curl -s http://localhost:8080 > /dev/null; then
+              /usr/bin/cfn-signal -e 0 -r "code-server started" '${WaitConditionHandle}'
+              exit 0
+            fi
+            sleep 10
+          done
+          
+          echo "code-server failed to start within timeout" >&2
+          /usr/bin/cfn-signal -e 1 -r "code-server failed to start" '${WaitConditionHandle}'
+          exit 1
+      Tags:
+        - Key: Name
+          Value: CodeServer-Instance
+  CodeServerCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: CodeServer-OneYearTTL
+        Comment: Cache policy with 1-year TTL for static assets
+        MinTTL: 31536000
+        MaxTTL: 31536000
+        DefaultTTL: 31536000
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingBrotli: false
+          EnableAcceptEncodingGzip: true
+          HeadersConfig:
+            HeaderBehavior: none
+          CookiesConfig:
+            CookieBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+  WebDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: WaitCondition
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Origins:
+          - Id: EC2Origin
+            DomainName: !GetAtt EC2Instance.PublicDnsName
+            CustomOriginConfig:
+              HTTPPort: 8080
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+              OriginSSLProtocols:
+                - TLSv1.2
+        DefaultCacheBehavior:
+          TargetOriginId: EC2Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: !Ref CodeServerCachePolicy
+        DefaultRootObject: /
+        Comment: CloudFront for code-server
+Outputs:
+  CloudFrontURL:
+    Description: URL of the CloudFront distribution
+    Value: !Sub 'https://${WebDistribution.DomainName}'
+  InstanceId:
+    Description: EC2 instance ID
+    Value: !Ref EC2Instance
+  PublicDNS:
+    Description: Public DNS of the EC2 instance
+    Value: !GetAtt EC2Instance.PublicDnsName
+  SSMCommand:
+    Description: Command to start SSM session
+    Value: !Sub 'aws ssm start-session --target ${EC2Instance}'

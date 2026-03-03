@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for AWS Secrets Manager lifecycle event monitoring with SNS notifications'
+
+Parameters:
+  SnsEmail:
+    Type: String
+    Description: 'Email address for SNS subscription (optional). Leave blank for no subscription.'
+    Default: ''
+    AllowedPattern: '^(|[\w\.-]+@[\w\.-]+\.\w+)$'
+    ConstraintDescription: 'Must be a valid email address or empty'
+  LambdaMemorySize:
+    Type: Number
+    Default: 128
+    MinValue: 128
+    MaxValue: 1024
+    Description: 'Amount of memory available to the Lambda function'
+  LambdaTimeout:
+    Type: Number
+    Default: 15
+    MinValue: 1
+    MaxValue: 30
+    Description: 'Lambda function execution timeout in seconds'
+  SecretNamePrefix:
+    Type: String
+    Description: 'Optional prefix to filter secrets (e.g., "prod/"). Leave empty for all secrets.'
+    Default: ''
+
+Conditions:
+  HasValidEmail: !Not [!Equals [!Ref SnsEmail, '']]
+
+Resources:
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: SecretsManagerEventNotifications
+      DisplayName: Secrets Manager Lifecycle Event Alerts
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasValidEmail
+    Properties:
+      Endpoint: !Ref SnsEmail
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SnsPublishPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NotificationTopic
+
+  SecretsManagerEventProcessor:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: SecretsManagerEventProcessor
+      Description: 'Processes Secrets Manager lifecycle events and sends notifications'
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs24.x
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const sns = new AWS.SNS();
+          const TOPIC_ARN = process.env.NOTIFICATION_TOPIC;
+
+          exports.handler = async (event) => {
+            try {
+              const message = formatMessage(event);
+              await sns.publish({
+                TopicArn: TOPIC_ARN,
+                Subject: `Secrets Manager Event: ${message.eventType}`,
+                Message: JSON.stringify(message, null, 2)
+              }).promise();
+            } catch (error) {
+              console.error('Failed to publish to SNS:', error);
+              throw error;
+            }
+          };
+
+          function formatMessage(event) {
+            const detail = event.detail || {};
+            const source = event.source || '';
+            let eventType = 'UNKNOWN';
+            let secretName = detail.secretName || 'unknown';
+
+            if (source === 'aws.secretsmanager') {
+              if (event['detail-type'] === 'AWS Secrets Manager Secret Created') {
+                eventType = 'CREATED';
+              } else if (event['detail-type'] === 'AWS Secrets Manager Secret Deleted') {
+                eventType = 'DELETED';
+              } else if (event['detail-type'] === 'AWS Secrets Manager Secret Rotation Started') {
+                eventType = 'ROTATED';
+              } else if (event['detail-type'] === 'AWS Secrets Manager Secret Updated') {
+                eventType = 'UPDATED';
+              }
+            } 
+
+            if (source === 'aws.cloudtrail' && detail.eventName === 'GetSecretValue') {
+              eventType = 'ACCESSED';
+              secretName = detail.requestParameters?.secretId || 'unknown';
+            }
+
+            return {
+              eventType: eventType,
+              secretName: secretName,
+              timestamp: event.time,
+              region: event.region,
+              accountId: event.account,
+              requestId: detail.requestID || detail.requestId || 'unknown'
+            };
+          }
+      Environment:
+        Variables:
+          NOTIFICATION_TOPIC: !Ref NotificationTopic
+
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${SecretsManagerEventProcessor}'
+      RetentionInDays: 30
+
+  SecretsManagerNativeEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Captures Secrets Manager native lifecycle events'
+      EventPattern:
+        source:
+          - aws.secretsmanager
+        detail-type:
+          - AWS Secrets Manager Secret Created
+          - AWS Secrets Manager Secret Deleted
+          - AWS Secrets Manager Secret Rotation Started
+          - AWS Secrets Manager Secret Updated
+        detail:
+          secretName:
+            wildcard: !Sub '${SecretNamePrefix}*'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SecretsManagerEventProcessor.Arn
+          Id: LambdaTarget
+
+  CloudTrailAccessEventsRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 'Captures Secrets Manager access events via CloudTrail'
+      EventPattern:
+        source:
+          - aws.secretsmanager
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - secretsmanager.amazonaws.com
+          eventName:
+            - GetSecretValue
+          requestParameters:
+            secretId:
+              wildcard: !Sub '${SecretNamePrefix}*'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt SecretsManagerEventProcessor.Arn
+          Id: LambdaTarget
+
+  LambdaInvokePermissionNative:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecretsManagerEventProcessor
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SecretsManagerNativeEventsRule.Arn
+
+  LambdaInvokePermissionAccess:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SecretsManagerEventProcessor
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CloudTrailAccessEventsRule.Arn
+
+Outputs:
+  SnsTopicArn:
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !Ref NotificationTopic
+  EventBridgeNativeRule:
+    Description: 'EventBridge rule for Secrets Manager native events'
+    Value: !Ref SecretsManagerNativeEventsRule
+  EventBridgeAccessRule:
+    Description: 'EventBridge rule for secret access events'
+    Value: !Ref CloudTrailAccessEventsRule
+  LambdaFunctionArn:
+    Description: 'ARN of the Lambda processing function'
+    Value: !GetAtt SecretsManagerEventProcessor.Arn
