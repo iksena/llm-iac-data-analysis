@@ -1,0 +1,267 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Automated image recognition pipeline with Step Functions, S3, Rekognition, and SMS alerts
+
+Resources:
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ImageRecognitionAlerts
+
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 'sns:Publish'
+            Resource: !Ref SNSTopic
+
+  IAMRoleStateMachine:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: StepFunctionsExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'states.${AWS::Partition}.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::image-recognition-${AWS::AccountId}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::image-recognition-${AWS::AccountId}/*'
+        - PolicyName: RekognitionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'rekognition:DetectLabels'
+                Resource: '*'
+        - PolicyName: SNSpublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'sns:Publish'
+                Resource: !Ref SNSTopic
+
+  LambdaValidateImage:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ValidateImageFunction
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt IAMRoleStateMachine.Arn
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          def lambda_handler(event, context):
+              s3_bucket = event.get('s3Bucket')
+              s3_key = event.get('s3Key')
+
+              if not s3_key.lower().endswith(('jpg', 'jpeg', 'png', 'bmp', 'gif')):
+                  raise ValueError('Invalid file type')
+
+              return {
+                  'statusCode': 200,
+                  's3Bucket': s3_bucket,
+                  's3Key': s3_key
+              }
+
+  LambdaDetectFaces:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: DetectFacesFunction
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt IAMRoleStateMachine.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              s3_bucket = event.get('s3Bucket')
+              s3_key = event.get('s3Key')
+
+              rekognition = boto3.client('rekognition')
+              response = rekognition.detect_labels(
+                  Image={
+                      'S3Object': {
+                          'Bucket': s3_bucket,
+                          'Name': s3_key
+                      }
+                  },
+                  MaxLabels=10
+              )
+
+              labels = [label['Name'] for label in response['Labels']]
+              return {
+                  'statusCode': 200,
+                  'labels': labels
+              }
+
+  StepFunctionsStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: ImageRecognitionWorkflow
+      DefinitionString: !Sub |
+        {
+          "StartAt": "ValidateImage",
+          "States": {
+            "ValidateImage": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${LambdaValidateImage.Arn}",
+                "Payload": {
+                  "s3Bucket": "image-recognition-${AWS::AccountId}",
+                  "s3Key": "$.detail.object.key"
+                }
+              },
+              "ResultSelector": {
+                "s3Bucket.$": "$.Payload.s3Bucket",
+                "s3Key.$": "$.Payload.s3Key"
+              },
+              "Next": "DetectFaces"
+            },
+            "DetectFaces": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${LambdaDetectFaces.Arn}",
+                "Payload": {
+                  "s3Bucket": "$.s3Bucket",
+                  "s3Key": "$.s3Key"
+                }
+              },
+              "ResultSelector": {
+                "labels.$": "$.Payload.labels"
+              },
+              "Next": "CheckForHuman"
+            },
+            "CheckForHuman": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.labels",
+                  "StringEquals": "Human",
+                  "Next": "SendAlert"
+                },
+                {
+                  "Variable": "$.labels",
+                  "StringEquals": "Person",
+                  "Next": "SendAlert"
+                }
+              ],
+              "Default": "Success"
+            },
+            "SendAlert": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${SNSTopic}",
+                "Message": {
+                  "s3Bucket": "$.s3Bucket",
+                  "s3Key": "$.s3Key",
+                  "message": "Human face detected in uploaded image"
+                }
+              },
+              "End": true
+            },
+            "Success": {
+              "Type": "Succeed"
+            }
+          }
+        }
+      RoleArn: !GetAtt IAMRoleStateMachine.Arn
+
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'image-recognition-${AWS::AccountId}'
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt LambdaValidateImage.Arn
+
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${S3Bucket}/*'
+
+  IAMRoleEventBridge:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EventBridgeToStepFunctionsRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+      Policies:
+        - PolicyName: StepFunctionsInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'states:StartExecution'
+                Resource: !GetAtt StepFunctionsStateMachine.Arn
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: S3UploadToStepFunctions
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - 'AWS API Call via CloudTrail'
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - PutObject
+          requestParameters:
+            bucketName:
+              - !Ref S3Bucket
+      Targets:
+        - Arn: !GetAtt StepFunctionsStateMachine.Arn
+          Id: StepFunctionsTarget
+          RoleArn: !GetAtt IAMRoleEventBridge.Arn
+
+Outputs:
+  S3BucketName:
+    Description: Name of the S3 bucket
+    Value: !Ref S3Bucket
+  StepFunctionsStateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !GetAtt StepFunctionsStateMachine.Arn
