@@ -1,0 +1,112 @@
+# ── awscc_apigateway_restapi_p1.tf ────────────────────────────────────
+# Create a REST API with API Gateway via the 'awscc' provider
+
+# Create REST API Api Gateway with HTTP_PROXY path
+resource "awscc_apigateway_rest_api" "DemoRestAPI" {
+  name = "DemoRestAPI"
+  endpoint_configuration = {
+    types = ["REGIONAL"]
+  }
+  body = jsonencode({
+    openapi = "3.0.1"
+    info = {
+      title   = "DemoRestAPI"
+      version = "1.0"
+    }
+    paths = {
+      "/path1" = {
+        get = {
+          x-amazon-apigateway-integration = {
+            payloadFormatVersion = "1.0"
+            httpMethod           = "GET"
+            type                 = "HTTP_PROXY"
+            uri                  = "https://ip-ranges.amazonaws.com/ip-ranges.json"
+          }
+        }
+      }
+    }
+  })
+}
+
+# Create Api Gateway resource
+resource "awscc_apigateway_resource" "DemoAPIGatewayResource" {
+  rest_api_id = awscc_apigateway_rest_api.DemoRestAPI.id
+  parent_id   = awscc_apigateway_rest_api.DemoRestAPI.root_resource_id
+  path_part   = "DemoAPIGatewayResource"
+}
+
+
+# ── awscc_apigateway_restapi_p2.tf ────────────────────────────────────
+# Terraform code to create a REST API with API Gateway via the 'awscc' provider
+
+# Create REST API Api Gateway with HTTP_PROXY path
+resource "awscc_apigateway_rest_api" "DemoRestAPI" {
+  name = "DemoRestAPI"
+  endpoint_configuration = {
+    types = ["REGIONAL"]
+  }
+  body = jsonencode({
+    openapi = "3.0.1"
+    info = {
+      title   = "DemoRestAPI"
+      version = "1.0"
+    }
+    paths = {
+      "/path1" = {
+        get = {
+          x-amazon-apigateway-integration = {
+            payloadFormatVersion = "1.0"
+            httpMethod           = "GET"
+            type                 = "HTTP_PROXY"
+            uri                  = "https://ip-ranges.amazonaws.com/ip-ranges.json"
+          }
+        }
+      }
+    }
+  })
+}
+
+# Create Api Gateway resource
+resource "awscc_apigateway_resource" "DemoAPIGatewayResource" {
+  rest_api_id = awscc_apigateway_rest_api.DemoRestAPI.id
+  parent_id   = awscc_apigateway_rest_api.DemoRestAPI.root_resource_id
+  path_part   = "DemoAPIGatewayResource"
+}
+
+
+# ── awscc_apigateway_restapi_p3.tf ────────────────────────────────────
+# Write Terraform configuration that creates REST API with API Gateway, use awscc provider
+
+# Create REST API Api Gateway with HTTP_PROXY path
+resource "awscc_apigateway_rest_api" "DemoRestAPI" {
+  name = "DemoRestAPI"
+  endpoint_configuration = {
+    types = ["REGIONAL"]
+  }
+  body = jsonencode({
+    openapi = "3.0.1"
+    info = {
+      title   = "DemoRestAPI"
+      version = "1.0"
+    }
+    paths = {
+      "/path1" = {
+        get = {
+          x-amazon-apigateway-integration = {
+            payloadFormatVersion = "1.0"
+            httpMethod           = "GET"
+            type                 = "HTTP_PROXY"
+            uri                  = "https://ip-ranges.amazonaws.com/ip-ranges.json"
+          }
+        }
+      }
+    }
+  })
+}
+
+# Create Api Gateway resource
+resource "awscc_apigateway_resource" "DemoAPIGatewayResource" {
+  rest_api_id = awscc_apigateway_rest_api.DemoRestAPI.id
+  parent_id   = awscc_apigateway_rest_api.DemoRestAPI.root_resource_id
+  path_part   = "DemoAPIGatewayResource"
+}

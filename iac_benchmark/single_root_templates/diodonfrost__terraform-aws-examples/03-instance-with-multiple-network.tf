@@ -1,0 +1,315 @@
+# ── versions.tf ────────────────────────────────────
+
+terraform {
+  required_version = ">= 0.12"
+}
+
+
+# ── 00-params.tf ────────────────────────────────────
+# parms file for aws ec2 cloud
+
+#### VPC Network
+variable "vpc_cidr" {
+  type    = string
+  default = "192.168.0.0/16"
+}
+
+#### HTTP PARAMS
+variable "network_http" {
+  type = map(string)
+  default = {
+    subnet_name = "subnet_http"
+    cidr        = "192.168.1.0/24"
+  }
+}
+
+# Set number of instance
+variable "http_instance_names" {
+  type    = set(string)
+  default = ["instance-http-1", "instance-http-2"]
+}
+
+#### DB PARAMS
+variable "network_db" {
+  type = map(string)
+  default = {
+    subnet_name = "subnet_db"
+    cidr        = "192.168.2.0/24"
+  }
+}
+
+# Set number of instance
+variable "db_instance_names" {
+  type    = set(string)
+  default = ["instance-db-1", "instance-db-2", "instance-db-3"]
+}
+
+
+
+# ── 010-ssh-key.tf ────────────────────────────────────
+# Define ssh to config in instance
+
+# Create default ssh publique key
+resource "aws_key_pair" "user_key" {
+  key_name   = "user-key"
+  public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD3F6tyPEFEzV0LX3X8BsXdMsQz1x2cEikKDEY0aIj41qgxMCP/iteneqXSIFZBp5vizPvaoIR3Um9xK7PGoW8giupGn+EPuxIA4cDM4vzOqOkiMPhz5XK0whEjkVzTo4+S0puvDZuwIsdiW9mxhJc7tgBNL0cYlWSYVkz4G/fslNfRPW5mYAM49f4fhtxPb5ok4Q2Lg9dPKVHO/Bgeu5woMc7RY0p1ej6D4CKFE6lymSDJpW0YHX/wqE9+cfEauh7xZcG0q9t2ta6F6fmX0agvpFyZo8aFbXeUBr7osSCJNgvavWbM/06niWrOvYX2xwWdhXmXSrbX8ZbabVohBK41 email@example.com"
+}
+
+
+
+# ── 015-ami.tf ────────────────────────────────────
+data "aws_ami" "ubuntu" {
+  most_recent = true
+
+  filter {
+    name   = "name"
+    values = ["ubuntu/images/hvm-ssd/ubuntu-trusty-14.04-amd64-server-*"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  owners = ["099720109477"] # Canonical
+}
+
+
+# ── 020-network.tf ────────────────────────────────────
+# Network configuration
+
+# VPC creation
+resource "aws_vpc" "terraform" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_hostnames = true
+  tags = {
+    Name = "vpc-http"
+  }
+}
+
+# http subnet configuration
+resource "aws_subnet" "http" {
+  vpc_id     = aws_vpc.terraform.id
+  cidr_block = var.network_http["cidr"]
+  tags = {
+    Name = "subnet-http"
+  }
+  depends_on = [aws_internet_gateway.gw]
+}
+
+# db subnet configuration
+resource "aws_subnet" "db" {
+  vpc_id     = aws_vpc.terraform.id
+  cidr_block = var.network_db["cidr"]
+  tags = {
+    Name = "subnet-db"
+  }
+  depends_on = [aws_internet_gateway.gw]
+}
+
+# External gateway configuration
+resource "aws_internet_gateway" "gw" {
+  vpc_id = aws_vpc.terraform.id
+  tags = {
+    Name = "internet-gateway"
+  }
+}
+
+
+
+# ── 030-security-group.tf ────────────────────────────────────
+# Security group configuration
+
+# Default administration port
+resource "aws_security_group" "administration" {
+  name        = "administration"
+  description = "Allow default administration service"
+  vpc_id      = aws_vpc.terraform.id
+  tags = {
+    Name = "administration"
+  }
+
+  # Open ssh port
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # Allow icmp
+  ingress {
+    from_port   = 8
+    to_port     = 0
+    protocol    = "icmp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # Open access to public network
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# Open web port
+resource "aws_security_group" "web" {
+  name        = "web"
+  description = "Allow web incgress trafic"
+  vpc_id      = aws_vpc.terraform.id
+  tags = {
+    Name = "web"
+  }
+
+  # http port
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # https port
+  ingress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # Open access to public network
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+# Open database port
+resource "aws_security_group" "db" {
+  name        = "db"
+  description = "Allow db incgress trafic"
+  vpc_id      = aws_vpc.terraform.id
+  tags = {
+    Name = "db"
+  }
+
+  # db port
+  ingress {
+    from_port   = 3306
+    to_port     = 3306
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # Open access to public network
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+}
+
+
+
+# ── 060-instance-http.tf ────────────────────────────────────
+#### INSTANCE HTTP ####
+
+# Create instance
+resource "aws_instance" "http" {
+  for_each      = var.http_instance_names
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = "t2.micro"
+  key_name      = aws_key_pair.user_key.key_name
+  vpc_security_group_ids = [
+    aws_security_group.administration.id,
+    aws_security_group.web.id,
+  ]
+  subnet_id = aws_subnet.http.id
+  user_data = file("scripts/first-boot-http.sh")
+  tags = {
+    Name = each.key
+  }
+}
+
+# Attach floating ip on instance http
+resource "aws_eip" "public_http" {
+  for_each   = var.http_instance_names
+  vpc        = true
+  instance   = aws_instance.http[each.key].id
+  depends_on = [aws_internet_gateway.gw]
+  tags = {
+    Name = "public-http-${each.key}"
+  }
+}
+
+
+
+# ── 061-instance-db.tf ────────────────────────────────────
+#### INSTANCE DB ####
+
+# Create instance
+resource "aws_instance" "db" {
+  for_each      = var.db_instance_names
+  ami           = data.aws_ami.ubuntu.id
+  instance_type = "t2.micro"
+  key_name      = aws_key_pair.user_key.key_name
+  vpc_security_group_ids = [
+    aws_security_group.administration.id,
+    aws_security_group.db.id,
+  ]
+  subnet_id = aws_subnet.db.id
+  user_data = file("scripts/first-boot-db.sh")
+  tags = {
+    Name = each.key
+  }
+}
+
+
+
+# ── 070-routing-table.tf ────────────────────────────────────
+# Create ande associate route
+
+# Routing table configuration
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.terraform.id
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.gw.id
+  }
+}
+
+# Associate http route
+resource "aws_route_table_association" "http" {
+  subnet_id      = aws_subnet.http.id
+  route_table_id = aws_route_table.public.id
+}
+
+# Associate db route
+resource "aws_route_table_association" "db" {
+  subnet_id      = aws_subnet.db.id
+  route_table_id = aws_route_table.public.id
+}
+
+
+
+# ── 100-outputs.tf ────────────────────────────────────
+# Display dns information
+
+output "http_ip" {
+  value = {
+    for instance in aws_instance.http :
+    instance.id => instance.private_ip
+  }
+}
+
+output "db_ip" {
+  value = {
+    for instance in aws_instance.db :
+    instance.id => instance.private_ip
+  }
+}
