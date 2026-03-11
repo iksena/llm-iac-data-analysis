@@ -1,0 +1,282 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Automated Image Recognition Pipeline with Step Functions, S3, Rekognition, and SMS Alerts
+
+Parameters:
+  PhoneNumber:
+    Type: String
+    Default: "+14071113333"
+    Description: Phone number to receive SMS alerts
+
+Resources:
+  ImageBucket:
+    Type: AWS::S3::Bucket
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger Step Functions on image upload
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - PutObject
+          requestParameters:
+            bucketName:
+              - !Ref ImageBucket
+            key:
+              - prefix: ""
+                suffix: ".jpg"
+              - prefix: ""
+                suffix: ".jpeg"
+              - prefix: ""
+                suffix: ".png"
+      Targets:
+        - Arn: !Ref ImageRecognitionStateMachine
+          Id: StepFunctionsTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref ImageRecognitionStateMachine
+
+  ImageRecognitionStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: !Sub |
+        {
+          "StartAt": "ValidateImage",
+          "States": {
+            "ValidateImage": {
+              "Type": "Task",
+              "Resource": "${ValidateLambdaArn}",
+              "Parameters": {
+                "s3Bucket.$": "$.s3Bucket",
+                "s3Key.$": "$.s3Key"
+              },
+              "ResultSelector": {
+                "s3Bucket.$": "$.Payload.s3Bucket",
+                "s3Key.$": "$.Payload.s3Key"
+              },
+              "Next": "DetectFaces"
+            },
+            "DetectFaces": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::rekognition:detectLabels",
+              "Parameters": {
+                "Image": {
+                  "S3Object": {
+                    "Bucket.$": "$.s3Bucket",
+                    "Name.$": "$.s3Key"
+                  }
+                },
+                "MaxLabels": 10,
+                "MinConfidence": 80
+              },
+              "ResultSelector": {
+                "labels.$": "$.Payload.Labels"
+              },
+              "Next": "CheckForHuman"
+            },
+            "CheckForHuman": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.labels[?(@.Name == 'Human' || @.Name == 'Person')]",
+                  "Next": "SendAlert"
+                }
+              ],
+              "Default": "End"
+            },
+            "SendAlert": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${SNSTopicArn}",
+                "Message": "Human face detected in image: ${s3Key}"
+              },
+              "End": true
+            },
+            "End": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionSubstitutions:
+        ValidateLambdaArn: !GetAtt ValidateImageLambda.Arn
+        SNSTopicArn: !Ref ImageAlertTopic
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - states.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub arn:aws:s3:::${ImageBucket}/*
+        - PolicyName: RekognitionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rekognition:DetectLabels
+                Resource: "*"
+        - PolicyName: SNSTopicAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ImageAlertTopic
+
+  ValidateImageLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import os
+
+          def lambda_handler(event, context):
+              s3_bucket = event['s3Bucket']
+              s3_key = event['s3Key']
+
+              allowed_extensions = ['.jpg', '.jpeg', '.png']
+              if not any(s3_key.lower().endswith(ext) for ext in allowed_extensions):
+                  raise ValueError(f"Invalid file extension: {s3_key}")
+
+              return {
+                  'statusCode': 200,
+                  's3Bucket': s3_bucket,
+                  's3Key': s3_key
+              }
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  ImageAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref PhoneNumber
+          Protocol: sms
+
+  EmptyBucketLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              bucket_name = event['ResourceProperties']['BucketName']
+
+              try:
+                  response = s3.list_objects_v2(Bucket=bucket_name)
+                  if 'Contents' in response:
+                      for item in response['Contents']:
+                          s3.delete_object(Bucket=bucket_name, Key=item['Key'])
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, None)
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {}, None)
+
+      Role: !GetAtt EmptyBucketRole.Arn
+
+  EmptyBucketRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub arn:aws:s3:::${ImageBucket}
+                  - !Sub arn:aws:s3:::${ImageBucket}/*
+
+  EmptyBucketCustomResource:
+    Type: Custom::EmptyBucket
+    Properties:
+      ServiceToken: !GetAtt EmptyBucketLambda.Arn
+      BucketName: !Ref ImageBucket
+
+Outputs:
+  ImageBucketName:
+    Description: Name of the S3 bucket for image uploads
+    Value: !Ref ImageBucket
+  StateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !Ref ImageRecognitionStateMachine
+  SNSTopicArn:
+    Description: ARN of the SNS topic for alerts
+    Value: !Ref ImageAlertTopic

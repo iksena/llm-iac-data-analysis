@@ -1,0 +1,259 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: URL-to-PNG Screenshot Service with Auto Scaling and Load Testing
+
+Parameters:
+  LoadTestInstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+  WorkerInstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: default-key
+  Subnet1:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-00000000000000000
+  Subnet2:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-00000000000000000
+
+Resources:
+  ScreenshotQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      VisibilityTimeout: 300
+
+  ScreenshotBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  WorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSQSFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+
+  LoadTestRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSQSFullAccess
+
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Name: !Ref WorkerRole
+        InstanceType: !Ref WorkerInstanceType
+        ImageId: ami-0c55b159cbfafe1f0
+        KeyName: !Ref KeyName
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            yum update -y
+            yum install -y chromium-headless python3
+            pip3 install boto3
+            cat > /home/ec2-user/screenshot_worker.py << 'EOF'
+            import boto3
+            import subprocess
+            import os
+            import time
+            from botocore.exceptions import NoCredentialsError
+
+            def take_screenshot(url, output_path):
+                try:
+                    subprocess.run(['chromium-browser', '--headless', '--disable-gpu', '--screenshot=' + output_path, url], check=True)
+                    return True
+                except subprocess.CalledProcessError:
+                    return False
+
+            def main():
+                sqs = boto3.client('sqs')
+                s3 = boto3.client('s3')
+                queue_url = os.getenv('SCREENSHOT_QUEUE_URL')
+                bucket_name = os.getenv('SCREENSHOT_BUCKET_NAME')
+
+                while True:
+                    try:
+                        response = sqs.receive_message(
+                            QueueUrl=queue_url,
+                            MaxNumberOfMessages=1,
+                            VisibilityTimeout=300,
+                            WaitTimeSeconds=10
+                        )
+                        if 'Messages' in response:
+                            message = response['Messages'][0]
+                            receipt_handle = message['ReceiptHandle']
+                            body = message['Body']
+
+                            screenshot_path = f"/tmp/{int(time.time())}.png"
+                            if take_screenshot(body, screenshot_path):
+                                s3.upload_file(screenshot_path, bucket_name, os.path.basename(screenshot_path))
+                                sqs.delete_message(QueueUrl=queue_url, ReceiptHandle=receipt_handle)
+                    except Exception as e:
+                        print(f"Error: {e}")
+                        time.sleep(5)
+
+            if __name__ == "__main__":
+                main()
+            EOF
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: ScreenshotWorker
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref Subnet1
+        - !Ref Subnet2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WorkerLaunchTemplate
+        Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 2
+      DesiredCapacity: 1
+      TargetGroupARNs: []
+
+  HighQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: High queue depth - scale up
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ScreenshotQueue.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref ScaleUpPolicy
+
+  LowQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Low queue depth - scale down
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ScreenshotQueue.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: LessThanThreshold
+      AlarmActions:
+        - !Ref ScaleDownPolicy
+
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: 1
+      Cooldown: 300
+
+  ScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      AdjustmentType: ChangeInCapacity
+      ScalingAdjustment: -1
+      Cooldown: 300
+
+  LoadTestInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      IamInstanceProfile: !Ref LoadTestRole
+      InstanceType: !Ref LoadTestInstanceType
+      ImageId: ami-0c55b159cbfafe1f0
+      KeyName: !Ref KeyName
+      SubnetId: !Ref Subnet1
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          yum update -y
+          yum install -y python3
+          pip3 install boto3
+          cat > /home/ec2-user/load_test.py << 'EOF'
+          import boto3
+          import time
+
+          def main():
+              sqs = boto3.client('sqs')
+              queue_url = os.getenv('SCREENSHOT_QUEUE_URL')
+              sample_urls = [
+                  'https://www.amazon.com',
+                  'https://www.google.com',
+                  'https://www.github.com',
+                  'https://www.aws.amazon.com'
+              ]
+
+              while True:
+                  for url in sample_urls:
+                      sqs.send_message(QueueUrl=queue_url, MessageBody=url)
+                  time.sleep(60)
+
+          if __name__ == "__main__":
+              main()
+          EOF
+      Tags:
+        - Key: Name
+          Value: LoadTestInstance
+
+Outputs:
+  QueueURL:
+    Description: SQS Queue URL
+    Value: !Ref ScreenshotQueue
+  BucketName:
+    Description: S3 Bucket Name
+    Value: !Ref ScreenshotBucket
+  AutoScalingGroupName:
+    Description: Auto Scaling Group Name
+    Value: !Ref AutoScalingGroup

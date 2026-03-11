@@ -1,0 +1,193 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Config Setup with Secure S3 Storage, SNS Notifications, and Dynamic Retention Management'
+
+Parameters:
+  RetentionDays:
+    Type: Number
+    Default: 2557
+    Description: 'AWS Config data retention period in days (default: 2557 days = 7 years)'
+  DeliveryFrequency:
+    Type: String
+    Default: 'TwentyFour_Hours'
+    AllowedValues:
+      - 'One_Hour'
+      - 'Three_Hours'
+      - 'Six_Hours'
+      - 'Twelve_Hours'
+      - 'TwentyFour_Hours'
+    Description: 'Frequency for AWS Config to deliver configuration snapshots'
+  PermissionBoundary:
+    Type: String
+    Default: ''
+    Description: 'Optional IAM permission boundary ARN for resource creation'
+
+Resources:
+  ConfigS3Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'config-${AWS::AccountId}-${AWS::Region}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${ConfigS3Bucket}/*'
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource: !Sub 'arn:${AWS::Partition}:s3:::${ConfigS3Bucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  ConfigSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: 'AWS Config Notifications'
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      s3BucketName: !Ref ConfigS3Bucket
+      snsTopicARN: !Ref ConfigSNSTopic
+      configSnapshotDeliveryProperties:
+        deliveryFrequency: !Ref DeliveryFrequency
+
+  ConfigRecorderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'ConfigRecorderRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'config.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      PermissionsBoundary: !Ref PermissionBoundary
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSConfigRole'
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    DependsOn: ConfigRecorderRole
+    Properties:
+      Name: 'AllResourcesRecorder'
+      RecordingGroup:
+        allSupported: true
+        includeGlobalResourceTypes: true
+      RoleARN: !GetAtt ConfigRecorderRole.Arn
+
+  RetentionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 'ConfigRetentionLambdaRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: 'lambda.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      PermissionsBoundary: !Ref PermissionBoundary
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: 'ConfigRetentionPolicy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'config:GetConfigurationRecorder'
+                  - 'config:PutConfigurationRecorder'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:PutBucketLifecycleConfiguration'
+                  - 's3:GetBucketLifecycleConfiguration'
+                Resource: !Sub 'arn:${AWS::Partition}:s3:::${ConfigS3Bucket}'
+
+  RetentionLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: 'ConfigRetentionManager'
+      Handler: 'index.lambda_handler'
+      Runtime: 'python3.12'
+      Role: !GetAtt RetentionLambdaRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              config = boto3.client('config')
+              s3 = boto3.client('s3')
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      retention_days = int(event['ResourceProperties']['RetentionDays'])
+                      bucket_name = event['ResourceProperties']['S3BucketName']
+
+                      # Configure S3 lifecycle policy
+                      lifecycle_config = {
+                          'Rules': [{
+                              'ID': 'ConfigDataRetention',
+                              'Status': 'Enabled',
+                              'Expiration': {
+                                  'Days': retention_days
+                              },
+                              'Filter': {
+                                  'Prefix': 'AWSLogs/'
+                              }
+                          }]
+                      }
+                      s3.put_bucket_lifecycle_configuration(
+                          Bucket=bucket_name,
+                          LifecycleConfiguration=lifecycle_config
+                      )
+
+                      # Update Config recorder retention
+                      recorder = config.describe_configuration_recorders()
+                      if recorder['ConfigurationRecorders']:
+                          config.put_configuration_recorder(
+                              ConfigurationRecorder={
+                                  'name': recorder['ConfigurationRecorders'][0]['name'],
+                                  'roleARN': recorder['ConfigurationRecorders'][0]['roleARN'],
+                                  'recordingGroup': {
+                                      'allSupported': True,
+                                      'includeGlobalResourceTypes': True
+                                  }
+                              }
+                          )
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  RetentionLambdaCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt RetentionLambdaFunction.Arn
+      RetentionDays: !Ref RetentionDays
+      S3BucketName: !Ref ConfigS3Bucket
+
+Outputs:
+  ConfigS3BucketName:
+    Description: 'S3 bucket name for AWS Config data storage'
+    Value: !Ref ConfigS3Bucket
+  ConfigSNSTopicARN:
+    Description: 'SNS topic ARN for AWS Config notifications'
+    Value: !Ref ConfigSNSTopic
+  ConfigRecorderName:
+    Description: 'AWS Config recorder name'
+    Value: !Ref ConfigRecorder
