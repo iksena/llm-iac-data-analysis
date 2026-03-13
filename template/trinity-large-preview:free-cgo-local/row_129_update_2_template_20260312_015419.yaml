@@ -1,0 +1,230 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Secure AWS Config setup with customizable retention policies and delivery configurations
+
+Parameters:
+  RetentionDays:
+    Type: Number
+    Default: 2557
+    Description: Retention period in days for configuration snapshots (default: 2557)
+  DeliveryFrequency:
+    Type: String
+    Default: One_Hour
+    AllowedValues:
+      - One_Hour
+      - Three_Hours
+      - Six_Hours
+      - Twelve_Hours
+      - TwentyFour_Hours
+    Description: Frequency for delivering configuration snapshots
+  ExistingBucketName:
+    Type: String
+    Default: ''
+    Description: Optional existing S3 bucket name for configuration snapshots
+  PermissionBoundary:
+    Type: String
+    Default: ''
+    Description: Optional IAM permission boundary ARN for Lambda function
+
+Resources:
+  ConfigS3Bucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateNewBucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ConfigRetention
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+            NoncurrentVersionExpiration:
+              NoncurrentDays: !Ref RetentionDays
+            Expiration:
+              Days: !Ref RetentionDays
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+
+  ConfigS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateNewBucket
+    Properties:
+      Bucket: !Ref ConfigS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt ConfigS3Bucket.Arn
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${ConfigS3Bucket.Arn}/AWSLogs/${AWS::AccountId}/*'
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: AWSConfigNotifications
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    DependsOn: ConfigRecorderRole
+    Properties:
+      Name: ConfigRecorder
+      RecordingGroup:
+        allSupported: true
+        includeGlobalResourceTypes: true
+      RoleARN: !GetAtt ConfigRecorderRole.Arn
+
+  ConfigRecorderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRole
+      Policies:
+        - PolicyName: ConfigS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                  - s3:PutObject
+                Resource:
+                  - !If [CreateNewBucket, !GetAtt ConfigS3Bucket.Arn, !Sub 'arn:aws:s3:::${ExistingBucketName}']
+                  - !If [CreateNewBucket, !Sub '${ConfigS3Bucket.Arn}/*', !Sub 'arn:aws:s3:::${ExistingBucketName}/*']
+                Condition:
+                  StringEquals:
+                    s3:x-amz-acl: bucket-owner-full-control
+        - PolicyName: ConfigSNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SNSTopic
+
+  DeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    DependsOn: ConfigRecorder
+    Properties:
+      name: ConfigDeliveryChannel
+      s3BucketName: !If [CreateNewBucket, !Ref ConfigS3Bucket, !Ref ExistingBucketName]
+      snsTopicARN: !Ref SNSTopic
+      configSnapshotDeliveryProperties:
+        deliveryFrequency: !Ref DeliveryFrequency
+
+  RetentionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt RetentionLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      bucket = event['ResourceProperties']['BucketName']
+                      days = int(event['ResourceProperties']['RetentionDays'])
+                      s3.put_bucket_lifecycle_configuration(
+                          Bucket=bucket,
+                          LifecycleConfiguration:
+                          {
+                              'Rules': [{
+                                  'ID': 'ConfigRetention',
+                                  'Status': 'Enabled',
+                                  'Expiration': {
+                                      'Days': days
+                                  }
+                              }]
+                          }
+                      )
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  elif event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  RetentionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3LifecycleAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:PutBucketLifecycleConfiguration
+                Resource: !Sub 'arn:aws:s3:::${ConfigS3Bucket}'
+      PermissionsBoundary: !Ref PermissionBoundary
+
+  RetentionCustomResource:
+    Type: Custom::RetentionManager
+    DependsOn: RetentionLambda
+    Properties:
+      ServiceToken: !GetAtt RetentionLambda.Arn
+      BucketName: !If [CreateNewBucket, !Ref ConfigS3Bucket, !Ref ExistingBucketName]
+      RetentionDays: !Ref RetentionDays
+
+  ConfigRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: PeriodicConfigEvaluation
+      Scope:
+        ComplianceResourceTypes: []
+      Source:
+        Owner: AWS
+        SourceIdentifier: AWS_CONFIG_RULE
+      MaximumExecutionFrequency: !Ref DeliveryFrequency
+
+Conditions:
+  CreateNewBucket: !Equals [!Ref ExistingBucketName, '']
+
+Outputs:
+  S3BucketName:
+    Description: S3 bucket for configuration snapshots
+    Value: !If [CreateNewBucket, !Ref ConfigS3Bucket, !Ref ExistingBucketName]
+  SNSTopicARN:
+    Description: SNS topic for Config notifications
+    Value: !Ref SNSTopic
+  LambdaFunctionARN:
+    Description: Lambda function ARN for retention management
+    Value: !GetAtt RetentionLambda.Arn

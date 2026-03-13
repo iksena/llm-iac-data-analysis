@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Automated Image Analysis Pipeline with S3, Lambda, Step Functions, Rekognition, and SNS
+
+Parameters:
+  PhoneNumber:
+    Type: String
+    Description: Phone number to receive SMS alerts (format: +1234567890)
+    Default: '+1234567890'
+    AllowedPattern: '^\+[1-9]\d{1,14}$'
+  BucketName:
+    Type: String
+    Description: Name for the S3 bucket
+    Default: 'image-analysis-pipeline-bucket'
+  Environment:
+    Type: String
+    Description: Environment tag
+    Default: 'dev'
+    AllowedValues: ['dev', 'test', 'prod']
+
+Resources:
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SNSTopic
+
+  SNSSMSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref PhoneNumber
+      Protocol: sms
+      TopicArn: !Ref SNSTopic
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RekognitionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rekognition:DetectLabels
+                Resource: '*'
+        - PolicyName: SNSPublishAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SNSTopic
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaFunctionRekognition:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import NoCredentialsError
+
+          def lambda_handler(event, context):
+              s3_bucket = event['bucket']
+              s3_key = event['key']
+
+              rekognition = boto3.client('rekognition')
+              try:
+                  response = rekognition.detect_labels(
+                      Image={'S3Object': {'Bucket': s3_bucket, 'Name': s3_key}},
+                      MaxLabels=10,
+                      MinConfidence=75
+                  )
+
+                  labels = response['Labels']
+                  has_human = any(label['Name'].lower() == 'human' for label in labels)
+
+                  return {
+                      'has_human': has_human,
+                      'labels': [label['Name'] for label in labels]
+                  }
+              except NoCredentialsError:
+                  return {'error': 'Credentials not available'}
+              except Exception as e:
+                  return {'error': str(e)}
+      Runtime: python3.12
+      Timeout: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaFunctionNotifier:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              if event['has_human']:
+                  sns = boto3.client('sns')
+                  message = f"Human detected in image! Labels: {', '.join(event.get('labels', []))}"
+                  try:
+                      sns.publish(
+                          TopicArn='{{resolve:ssm-secure:/sns/topic/arn}}',
+                          Message=message
+                      )
+                      return {'status': 'success', 'message': 'SMS sent'}
+                  except Exception as e:
+                      return {'status': 'error', 'message': str(e)}
+              return {'status': 'no_human', 'message': 'No human detected'}
+      Runtime: python3.12
+      Timeout: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+      Policies:
+        - PolicyName: LambdaInvokeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt LambdaFunctionRekognition.Arn
+                  - !GetAtt LambdaFunctionNotifier.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  StepFunctionsStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: !Sub |
+        {
+          "StartAt": "AnalyzeImage",
+          "States": {
+            "AnalyzeImage": {
+              "Type": "Task",
+              "Resource": "${LambdaFunctionRekognition}",
+              "Next": "CheckHuman"
+            },
+            "CheckHuman": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.has_human",
+                  "BooleanEquals": true,
+                  "Next": "SendNotification"
+                }
+              ],
+              "Default": "End"
+            },
+            "SendNotification": {
+              "Type": "Task",
+              "Resource": "${LambdaFunctionNotifier}",
+              "End": true
+            },
+            "End": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  LambdaPermissionRekognition:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunctionRekognition.Arn
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+      SourceArn: !Sub 'arn:aws:s3:::${S3Bucket}'
+
+  LambdaPermissionNotifier:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunctionNotifier.Arn
+      Principal: states.amazonaws.com
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  S3BucketNotification:
+    Type: AWS::S3::BucketNotification
+    Properties:
+      Bucket: !Ref S3Bucket
+      LambdaFunctionConfigurations:
+        - Function: !GetAtt LambdaFunctionRekognition.Arn
+          Event: 's3:ObjectCreated:*'
+          Filter:
+            S3Key:
+              Rules:
+                - Name: prefix
+                  Value: uploads/
+
+Outputs:
+  S3BucketName:
+    Description: S3 Bucket Name
+    Value: !Ref S3Bucket
+  StepFunctionsStateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref StepFunctionsStateMachine
+  SNSTopicArn:
+    Description: SNS Topic ARN
+    Value: !Ref SNSTopic
