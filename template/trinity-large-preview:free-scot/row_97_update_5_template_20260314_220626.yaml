@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Serverless pipeline to collect, store, and analyze AWS Organization data for centralized governance and reporting.
+
+Parameters:
+  TargetS3Bucket:
+    Type: String
+    Default: org-data-bucket
+    Description: S3 bucket name for storing organizational data
+  TagsToInclude:
+    Type: CommaDelimitedList
+    Default: Name,Owner,Environment
+    Description: Tags to include in reports
+  ManagementAccountId:
+    Type: String
+    Default: 123456789012
+    Description: AWS Management Account ID
+  AthenaDatabaseName:
+    Type: String
+    Default: managementcur
+    Description: Athena database name
+
+Resources:
+  OrgDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref TargetS3Bucket
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OrgDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub 'arn:aws:s3:::${OrgDataBucket}/*'
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSOrganizationsReadOnlyAccess
+      Policies:
+        - PolicyName: OrganizationsCrossAccount
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub 'arn:aws:iam::${ManagementAccountId}:root'
+
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3WriteAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource: !Sub 'arn:aws:s3:::${OrgDataBucket}/*'
+
+  OrgDataCollector:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          MANAGEMENT_ACCOUNT_ID: !Ref ManagementAccountId
+          TAGS_TO_INCLUDE: !Join ',', !Ref TagsToInclude
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime
+
+          def handler(event, context):
+              org_client = boto3.client('organizations')
+              sts_client = boto3.client('sts')
+              s3_client = boto3.client('s3')
+
+              # Assume role in management account
+              role_arn = f'arn:aws:iam::{os.environ["MANAGEMENT_ACCOUNT_ID"]}:role/OrganizationAccessRole'
+              response = sts_client.assume_role(
+                  RoleArn=role_arn,
+                  RoleSessionName='OrgDataCollection'
+              )
+              credentials = response['Credentials']
+
+              # Create organizations client with assumed role
+              org_client = boto3.client(
+                  'organizations',
+                  aws_access_key_id=credentials['AccessKeyId'],
+                  aws_secret_access_key=credentials['SecretAccessKey'],
+                  aws_session_token=credentials['SessionToken']
+              )
+
+              # Collect organization data
+              accounts = org_client.list_accounts()['Accounts']
+              ous = org_client.list_organizational_units_for_parent(ParentId='r-root')['OrganizationalUnits']
+
+              # Filter tags if specified
+              tags_to_include = os.environ.get('TAGS_TO_INCLUDE', '').split(',')
+              if tags_to_include:
+                  for account in accounts:
+                      account_tags = org_client.list_tags_for_resource(ResourceId=account['Id'])['Tags']
+                      filtered_tags = {tag['Key']: tag['Value'] for tag in account_tags if tag['Key'] in tags_to_include}
+                      account['Tags'] = filtered_tags
+
+              # Prepare data
+              data = {
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'accounts': accounts,
+                  'organizational_units': ous
+              }
+
+              # Write to S3
+              s3_key = f'org-data/{datetime.utcnow().strftime("%Y/%m/%d")}/data.json'
+              s3_client.put_object(
+                  Bucket=os.environ['TARGET_S3_BUCKET'],
+                  Key=s3_key,
+                  Body=json.dumps(data),
+                  ContentType='application/json'
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({'message': 'Organization data collected successfully'})
+              }
+
+  WeeklySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(7 days)
+      Targets:
+        - Arn: !GetAtt OrgDataCollector.Arn
+          Id: OrgDataCollectorTarget
+
+  OrgDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: org-data-crawler
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref AthenaDatabaseName
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${OrgDataBucket}/org-data/'
+      SchemaChangePolicy:
+        UpdateBehavior: UpdateAddColumns
+        DeleteBehavior: DeleteFromDatabase
+
+Outputs:
+  OrgDataBucketArn:
+    Description: ARN of the S3 bucket for organizational data
+    Value: !GetAtt OrgDataBucket.Arn
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt OrgDataCollector.Arn
+  GlueCrawlerName:
+    Description: Name of the Glue crawler
+    Value: !Ref OrgDataCrawler

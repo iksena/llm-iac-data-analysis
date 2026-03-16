@@ -1,0 +1,300 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Serverless pipeline to collect, store, and analyze AWS Organization data
+
+Parameters:
+  ManagementAccountId:
+    Type: String
+    Description: AWS Management Account ID for cross-account access
+  TargetS3Bucket:
+    Type: String
+    Default: organizations-data
+    Description: Target S3 bucket name for storing Organizations data
+  AthenaDatabaseName:
+    Type: String
+    Default: managementcur
+    Description: Athena database name for Glue catalog
+  TagsToInclude:
+    Type: String
+    Default: Environment,Owner,Project
+    Description: Comma-separated list of tags to include in reports
+  EncryptionType:
+    Type: String
+    Default: aws:kms
+    AllowedValues:
+      - aws:kms
+      - AES256
+    Description: S3 encryption type
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(7 days)'
+    Description: CloudWatch Events schedule expression
+
+Resources:
+  # S3 Bucket for Organizations Data Storage
+  OrganizationsDataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${TargetS3Bucket}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !Ref EncryptionType
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Sub 'Organizations-Data-${AWS::Region}'
+
+  # S3 Bucket Policy for Strict Access Controls
+  OrganizationsDataBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OrganizationsDataBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub 'arn:aws:s3:::${TargetS3Bucket}-${AWS::AccountId}-${AWS::Region}'
+              - !Sub 'arn:aws:s3:::${TargetS3Bucket}-${AWS::AccountId}-${AWS::Region}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrganizationsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:Describe*
+                  - organizations:List*
+                Resource: '*'
+
+  # Cross-Account Role for Organizations Access
+  CrossAccountOrganizationsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: OrganizationsDataCollectorRole
+      Path: /
+      PermissionsBoundary: !Sub 'arn:aws:iam::${ManagementAccountId}:policy/Boundaries/OrganizationsDataCollector'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${LambdaExecutionRole}'
+            Action:
+              - sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:PrincipalTag/Role: Lambda
+      Policies:
+        - PolicyName: OrganizationsReadOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - organizations:Describe*
+                  - organizations:List*
+                Resource: '*'
+
+  # Lambda Function for Organizations Data Collection
+  OrganizationsDataCollectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.12
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          MANAGEMENT_ACCOUNT_ID: !Ref ManagementAccountId
+          TARGET_S3_BUCKET: !Sub '${TargetS3Bucket}-${AWS::AccountId}-${AWS::Region}'
+          TAGS_TO_INCLUDE: !Ref TagsToInclude
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              try:
+                  # Initialize clients
+                  sts_client = boto3.client('sts')
+                  s3_client = boto3.client('s3')
+
+                  # Assume cross-account role
+                  role_arn = f"arn:aws:iam::{os.environ['MANAGEMENT_ACCOUNT_ID']}:role/OrganizationsDataCollectorRole"
+                  assumed_role = sts_client.assume_role(
+                      RoleArn=role_arn,
+                      RoleSessionName='OrganizationsDataCollection'
+                  )
+                  organizations_client = boto3.client(
+                      'organizations',
+                      aws_access_key_id=assumed_role['Credentials']['AccessKeyId'],
+                      aws_secret_access_key=assumed_role['Credentials']['SecretAccessKey'],
+                      aws_session_token=assumed_role['Credentials']['SessionToken']
+                  )
+
+                  # Collect Organizations data
+                  accounts = organizations_client.list_accounts()
+                  ou_hierarchy = organizations_client.list_roots()
+
+                  # Prepare data
+                  data = {
+                      'timestamp': datetime.utcnow().isoformat(),
+                      'accounts': accounts['Accounts'],
+                      'organizational_units': ou_hierarchy
+                  }
+
+                  # Write to S3
+                  s3_key = f"organizations-data/{datetime.utcnow().strftime('%Y/%m/%d')}/data.json"
+                  s3_client.put_object(
+                      Bucket=os.environ['TARGET_S3_BUCKET'],
+                      Key=s3_key,
+                      Body=json.dumps(data),
+                      ContentType='application/json'
+                  )
+
+                  logger.info(f"Successfully wrote Organizations data to s3://{os.environ['TARGET_S3_BUCKET']}/{s3_key}")
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Data collection successful')
+                  }
+              except Exception as e:
+                  logger.error(f"Error collecting Organizations data: {str(e)}")
+                  raise e
+
+  # CloudWatch Events Rule for Scheduled Execution
+  OrganizationsDataCollectionRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: OrganizationsDataCollectionWeekly
+      Description: Weekly Organizations data collection
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt OrganizationsDataCollectorFunction.Arn
+          Id: OrganizationsDataCollectorTarget
+
+  # Permission for CloudWatch Events to Invoke Lambda
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OrganizationsDataCollectorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OrganizationsDataCollectionRule.Arn
+
+  # Glue Service Role
+  GlueServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - glue.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: S3AccessForGlue
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${TargetS3Bucket}-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:aws:s3:::${TargetS3Bucket}-${AWS::AccountId}-${AWS::Region}/*'
+
+  # Glue Database
+  OrganizationsDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref AthenaDatabaseName
+        Description: Database for Organizations data
+
+  # Glue Crawler
+  OrganizationsDataCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: OrganizationsDataCrawler
+      Role: !GetAtt GlueServiceRole.Arn
+      DatabaseName: !Ref AthenaDatabaseName
+      Targets:
+        S3Targets:
+          - Path: !Sub 's3://${TargetS3Bucket}-${AWS::AccountId}-${AWS::Region}/organizations-data/'
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DEPRECATE_IN_DATABASE
+      Configuration: |
+        {
+          "Version": 1.0,
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            }
+          }
+        }
+
+Outputs:
+  OrganizationsDataBucketArn:
+    Description: S3 Bucket ARN for Organizations data
+    Value: !GetAtt OrganizationsDataBucket.Arn
+    Export:
+      Name: OrganizationsDataBucketArn
+  LambdaFunctionArn:
+    Description: Lambda Function ARN
+    Value: !GetAtt OrganizationsDataCollectorFunction.Arn
+    Export:
+      Name: OrganizationsDataCollectorFunctionArn
+  GlueDatabase:
+    Description: Glue Database Name
+    Value: !Ref OrganizationsDatabase
+    Export:
+      Name: OrganizationsDataDatabase
+  CrossAccountRoleArn:
+    Description: Cross-account Organizations Role ARN
+    Value: !GetAtt CrossAccountOrganizationsRole.Arn
+    Export:
+      Name: OrganizationsDataCollectorRoleArn

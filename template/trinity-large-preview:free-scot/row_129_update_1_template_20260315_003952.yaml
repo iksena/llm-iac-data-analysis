@@ -1,0 +1,274 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Config Setup with Customizable Retention Policies and Delivery Configurations'
+
+Parameters:
+  RetentionDays:
+    Type: Number
+    Default: 2557
+    AllowedValues: [30, 90, 180, 365, 730, 1095, 1825, 2557]
+    Description: Retention period in days for configuration history
+  DeliveryFrequency:
+    Type: String
+    Default: One_Hour
+    AllowedValues: [One_Hour, Three_Hours, Six_Hours, Twelve_Hours, TwentyFour_Hours]
+    Description: Frequency of configuration snapshot delivery
+  ExistingS3BucketName:
+    Type: String
+    Default: ""
+    Description: Optional existing S3 bucket name to use instead of creating new
+  SnsTopicArn:
+    Type: String
+    Default: ""
+    Description: Optional existing SNS topic ARN to use instead of creating new
+  EnableIAMPermissionBoundaries:
+    Type: Boolean
+    Default: false
+    Description: Whether to enable IAM permission boundaries for Config role
+  ConfigRecorderName:
+    Type: String
+    Default: "ConfigRecorder"
+    Description: Name for the AWS Config recorder
+  ConfigDeliveryChannelName:
+    Type: String
+    Default: "ConfigDeliveryChannel"
+    Description: Name for the delivery channel
+
+Resources:
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateNewBucket
+    Properties:
+      BucketName: !Sub 'config-bucket-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Versioning:
+        Status: Enabled
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      DeletionPolicy: Retain
+      UpdateReplacePolicy: Retain
+
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateNewBucket
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucket}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucket}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  ConfigTopic:
+    Type: AWS::SNS::Topic
+    Condition: CreateNewTopic
+    Properties:
+      DisplayName: "AWS Config Notifications"
+
+  ConfigTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Condition: CreateNewTopic
+    Properties:
+      Topics:
+        - !Ref ConfigTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref ConfigTopic
+
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'ConfigRole-${AWS::AccountId}'
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/service-role/AWSConfigRole'
+      PermissionsBoundary: !If [EnableIAMPermissionBoundaries, !Ref ConfigPermissionBoundary, !Ref "AWS::NoValue"]
+
+  ConfigPermissionBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Condition: EnableIAMPermissionBoundaries
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: 'config:*'
+            Resource: '*'
+
+  ConfigPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: ConfigPolicy
+      Roles:
+        - !Ref ConfigRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:GetBucketAcl
+            Resource:
+              - !If [CreateNewBucket, !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucket}', !Sub 'arn:${AWS::Partition}:s3:::${ExistingS3BucketName}']
+              - !If [CreateNewBucket, !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucket}/*', !Sub 'arn:${AWS::Partition}:s3:::${ExistingS3BucketName}/*']
+          - Effect: Allow
+            Action: sns:Publish
+            Resource: !If [CreateNewTopic, !Ref ConfigTopic, !Ref SnsTopicArn]
+
+  RetentionManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              bucket = event['ResourceProperties']['BucketName']
+              retention_days = int(event['ResourceProperties']['RetentionDays'])
+
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      s3.put_bucket_lifecycle_configuration(
+                          Bucket=bucket,
+                          LifecycleConfiguration={
+                              'Rules': [{
+                                  'ID': 'ConfigRetention',
+                                  'Status': 'Enabled',
+                                  'Filter': {},
+                                  'NoncurrentVersionExpiration': {
+                                      'NoncurrentDays': retention_days
+                                  },
+                                  'Expiration': {
+                                      'Days': retention_days
+                                  }
+                              }]
+                          }
+                      )
+                  elif event['RequestType'] == 'Delete':
+                      s3.delete_bucket_lifecycle_configuration(Bucket=bucket)
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+      Timeout: 300
+      Role: !GetAtt LambdaExecutionRole.Arn
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'LambdaExecutionRole-${AWS::AccountId}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+  LambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LambdaPolicy
+      Roles:
+        - !Ref LambdaExecutionRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutBucketLifecycleConfiguration
+              - s3:DeleteBucketLifecycleConfiguration
+              - s3:GetBucketLocation
+            Resource: !If [CreateNewBucket, !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucket}', !Sub 'arn:${AWS::Partition}:s3:::${ExistingS3BucketName}']
+          - Effect: Allow
+            Action: logs:CreateLogGroup
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*'
+          - Effect: Allow
+            Action: logs:CreateLogStream
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*'
+          - Effect: Allow
+            Action: logs:PutLogEvents
+            Resource: !Sub 'arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*:log-stream:*'
+
+  RetentionManagerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt RetentionManagerFunction.Arn
+      Principal: custom-resource.amazonaws.com
+
+  RetentionManager:
+    Type: Custom::RetentionManager
+    Properties:
+      ServiceToken: !GetAtt RetentionManagerFunction.Arn
+      BucketName: !If [CreateNewBucket, !Ref ConfigBucket, !Ref ExistingS3BucketName]
+      RetentionDays: !Ref RetentionDays
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: !Ref ConfigRecorderName
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+      RoleARN: !GetAtt ConfigRole.Arn
+
+  ConfigDeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      Name: !Ref ConfigDeliveryChannelName
+      S3BucketName: !If [CreateNewBucket, !Ref ConfigBucket, !Ref ExistingS3BucketName]
+      SnsTopicARN: !If [CreateNewTopic, !Ref ConfigTopic, !Ref SnsTopicArn]
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: !Ref DeliveryFrequency
+
+Conditions:
+  CreateNewBucket: !Equals [!Ref ExistingS3BucketName, ""]
+  CreateNewTopic: !Equals [!Ref SnsTopicArn, ""]
+
+Outputs:
+  ConfigBucketName:
+    Description: Name of the S3 bucket used for Config data
+    Value: !If [CreateNewBucket, !Ref ConfigBucket, !Ref ExistingS3BucketName]
+  ConfigTopicARN:
+    Description: ARN of the SNS topic used for Config notifications
+    Value: !If [CreateNewTopic, !Ref ConfigTopic, !Ref SnsTopicArn]
+  ConfigRecorderARN:
+    Description: ARN of the Config recorder
+    Value: !GetAtt ConfigRecorder.Arn
+  ConfigDeliveryChannelARN:
+    Description: ARN of the Config delivery channel
+    Value: !GetAtt ConfigDeliveryChannel.Arn

@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  PhoneNumber:
+    Type: String
+    Default: +14071113333
+    AllowedPattern: ^\+[1-9]\d{1,14}$
+
+Resources:
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub image-recognition-${AWS::AccountId}
+
+  ImageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ImageBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub arn:aws:s3:::${ImageBucket}/*
+              - !Sub arn:aws:s3:::${ImageBucket}
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: ImageRecognitionAlerts
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+
+  StateMachinePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: StateMachineAccessPolicy
+      Roles:
+        - !Ref StateMachineRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:PutObject
+            Resource:
+              - !Sub arn:aws:s3:::${ImageBucket}/*
+              - !Sub arn:aws:s3:::${ImageBucket}
+          - Effect: Allow
+            Action: rekognition:DetectLabels
+            Resource: '*'
+          - Effect: Allow
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+
+  ImageRecognitionStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: !Sub |
+        {
+          "StartAt": "ValidateFile",
+          "States": {
+            "ValidateFile": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Records[0].s3.object.key",
+                  "StringMatches": "*.jpg",
+                  "Next": "DetectLabels"
+                },
+                {
+                  "Variable": "$.Records[0].s3.object.key",
+                  "StringMatches": "*.jpeg",
+                  "Next": "DetectLabels"
+                },
+                {
+                  "Variable": "$.Records[0].s3.object.key",
+                  "StringMatches": "*.png",
+                  "Next": "DetectLabels"
+                }
+              ],
+              "Default": "End"
+            },
+            "DetectLabels": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::rekognition:detectLabels",
+              "Parameters": {
+                "Image": {
+                  "S3Object": {
+                    "Bucket": "$$$.Records[0].s3.bucket.name",
+                    "Name": "$$$.Records[0].s3.object.key"
+                  }
+                },
+                "MaxLabels": 10,
+                "MinConfidence": 80
+              },
+              "ResultSelector": {
+                "Labels.$": "$.Payload.Labels"
+              },
+              "Next": "CheckForHuman"
+            },
+            "CheckForHuman": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Labels",
+                  "StringEquals": "Human",
+                  "Next": "SendAlert"
+                },
+                {
+                  "Variable": "$.Labels",
+                  "StringEquals": "Person",
+                  "Next": "SendAlert"
+                }
+              ],
+              "Default": "End"
+            },
+            "SendAlert": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${AlertTopic}",
+                "Message": {
+                  "Input.$": "$$$.Payload",
+                  "Labels.$": "$.Labels"
+                }
+              },
+              "End": true
+            },
+            "End": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StateMachineRole.Arn
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+
+  LambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LambdaAccessPolicy
+      Roles:
+        - !Ref LambdaRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:ListBucket
+              - s3:DeleteObject
+            Resource:
+              - !Sub arn:aws:s3:::${ImageBucket}
+              - !Sub arn:aws:s3:::${ImageBucket}/*
+
+  EmptyBucketFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              bucket_name = event['ResourceProperties']['BucketName']
+
+              try:
+                  objects = s3.list_objects_v2(Bucket=bucket_name)
+                  if 'Contents' in objects:
+                      for obj in objects['Contents']:
+                          s3.delete_object(Bucket=bucket_name, Key=obj['Key'])
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+      Runtime: python3.12
+      Timeout: 30
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt EmptyBucketFunction.Arn
+      Principal: cloudformation.amazonaws.com
+
+  ImageUploadTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.s3
+        "detail-type":
+          - 'AWS API Call via CloudTrail'
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - 'PutObject'
+          requestParameters:
+            bucketName:
+              - !Ref ImageBucket
+      Targets:
+        - Arn: !GetAtt ImageRecognitionStateMachine.Arn
+          Id: ImageRecognitionStateMachine
+          InputTransformer:
+            InputPathsMap:
+              bucket: $.detail.requestParameters.bucketName
+              key: $.detail.requestParameters.key
+            InputTemplate: |
+              {
+                "Records": [
+                  {
+                    "s3": {
+                      "bucket": {
+                        "name": <bucket>
+                      },
+                      "object": {
+                        "key": <key>
+                      }
+                    }
+                  }
+                ]
+              }
+
+Outputs:
+  ImageBucketName:
+    Description: Name of the S3 bucket for image uploads
+    Value: !Ref ImageBucket
+  StateMachineARN:
+    Description: ARN of the Step Functions state machine
+    Value: !GetAtt ImageRecognitionStateMachine.Arn
