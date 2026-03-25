@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -15,7 +15,7 @@ terraform {
   }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   description = "AWS region"
   type        = string
@@ -39,7 +39,7 @@ locals {
   private_key_path = "~/ssh_key_pairs/aws/ServersKey.pem"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "region" {
   value = var.region
 }
@@ -60,7 +60,7 @@ output "instance_public_ip" {
   value = aws_instance.webserver.public_ip
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_caller_identity" "current" {}
 
 data "aws_ami" "latest_ubuntu" {
@@ -72,9 +72,7 @@ data "aws_ami" "latest_ubuntu" {
   }
 }
 
-
-
-# ── instance.tf ────────────────────────────────────
+# ── instance.tf ──────────────────────────────────────────
 provider "aws" {
   region = var.region
 }

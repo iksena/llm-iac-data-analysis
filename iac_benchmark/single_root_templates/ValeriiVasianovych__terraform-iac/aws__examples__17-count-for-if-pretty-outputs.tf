@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -18,7 +18,7 @@ provider "aws" {
   region = var.region
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   description = "Region variable"
   type        = string
@@ -31,7 +31,7 @@ variable "users" {
   default     = ["bob", "fred", "anna", "andrew", "victor", "samara"]
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "created_users_all" {
   description = "List of all created IAM users as resources"
   value       = aws_iam_user.users
@@ -58,7 +58,7 @@ output "created_users_map" {
   }
 }
 
-# print all users with length 4 
+# print all users with length 4
 output "selected_users" {
   description = "Custom if for users"
   value = [
@@ -79,7 +79,7 @@ output "ec2_id_ip" {
   }
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_ami" "latest_ubuntu" {
   owners      = ["099720109477"]
   most_recent = true
@@ -89,7 +89,7 @@ data "aws_ami" "latest_ubuntu" {
   }
 }
 
-# ── instances.tf ────────────────────────────────────
+# ── instances.tf ──────────────────────────────────────────
 resource "aws_instance" "ubuntu_instance" {
     count         = 2
     ami           = data.aws_ami.latest_ubuntu.id
@@ -99,7 +99,7 @@ resource "aws_instance" "ubuntu_instance" {
     }
 }
 
-# ── users.tf ────────────────────────────────────
+# ── users.tf ──────────────────────────────────────────
 resource "aws_iam_user" "users" {
   count = length(var.users)
   name  = element(var.users, count.index)

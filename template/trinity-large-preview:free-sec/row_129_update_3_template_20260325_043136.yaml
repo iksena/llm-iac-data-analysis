@@ -1,0 +1,227 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Secure AWS Config setup with customizable retention policies and delivery configurations
+
+Parameters:
+  ConfigBucketName:
+    Type: String
+    Default: aws-config-snapshots
+    Description: Name of the S3 bucket for configuration snapshots
+  RetentionDays:
+    Type: Number
+    Default: 2557
+    Description: Retention period in days for configuration snapshots
+  DeliveryFrequency:
+    Type: String
+    Default: One_Hour
+    AllowedValues:
+      - One_Hour
+      - Three_Hours
+      - Six_Hours
+      - Twelve_Hours
+      - TwentyFour_Hours
+    Description: Frequency for configuration snapshot delivery
+  EnableConformancePack:
+    Type: String
+    Default: false
+    AllowedValues:
+      - true
+      - false
+    Description: Enable AWS Config Conformance Pack for compliance baseline
+  PermissionBoundary:
+    Type: String
+    Default: ""
+    Description: Optional IAM permission boundary ARN for Config role
+
+Resources:
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref ConfigBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action:
+              - s3:Get*
+              - s3:Put*
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucketName}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucketName}/*'
+          - Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucketName}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucketName}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: AWSConfigNotifications
+
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWSConfigRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      PermissionsBoundary: !If [HasPermissionBoundary, !Ref PermissionBoundary, !Ref "AWS::NoValue"]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSConfigRole
+      Policies:
+        - PolicyName: ConfigS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:Put*
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucketName}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucketName}/*'
+
+  ConfigRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: ConfigRecorder
+      RecordingGroup:
+        AllSupported: true
+        IncludeGlobalResourceTypes: true
+      RoleARN: !GetAtt ConfigRole.Arn
+
+  DeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      S3BucketName: !Ref ConfigBucket
+      SnsTopicARN: !Ref SNSTopic
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: !Ref DeliveryFrequency
+
+  RetentionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: RetentionLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3RetentionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObjectRetention
+                  - s3:PutObjectRetention
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucketName}'
+                  - !Sub 'arn:${AWS::Partition}:s3:::${ConfigBucketName}/*'
+
+  RetentionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: ConfigRetentionManager
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt RetentionLambdaRole.Arn
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              try:
+                  if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                      s3.put_bucket_object_lock_configuration(
+                          Bucket=event['ResourceProperties']['BucketName'],
+                          ObjectLockConfiguration={
+                              'Rule': {
+                                  'DefaultRetention': {
+                                      'Mode': 'COMPLIANCE',
+                                      'Days': int(event['ResourceProperties']['RetentionDays'])
+                                  }
+                              }
+                          }
+                      )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  RetentionLambdaInvoke:
+    Type: Custom::RetentionLambdaInvoke
+    Properties:
+      ServiceToken: !GetAtt RetentionLambda.Arn
+      BucketName: !Ref ConfigBucket
+      RetentionDays: !Ref RetentionDays
+
+  ConfigDeliveryCheck:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: ConfigDeliveryChannelCheck
+      Source:
+        Owner: AWS
+        SourceIdentifier: CONFIG_SNAPSHOT_DELIVERY_CHECK
+
+  ConformancePack:
+    Type: AWS::Config::ConformancePack
+    Condition: HasConformancePack
+    Properties:
+      ConformancePackName: AWSConfigConformancePack
+      DeliveryS3Bucket: !Ref ConfigBucket
+      TemplateS3Uri: s3://aws-config-conformance-packs/aws-config-security-baseline/v1.4/aws-config-security-baseline-conformance-pack.json
+
+Conditions:
+  HasPermissionBoundary: !Not [!Equals [!Ref PermissionBoundary, ""]]
+  HasConformancePack: !Equals [!Ref EnableConformancePack, "true"]
+
+Outputs:
+  ConfigBucketName:
+    Description: S3 bucket for configuration snapshots
+    Value: !Ref ConfigBucket
+  SNSTopicARN:
+    Description: SNS topic for Config notifications
+    Value: !Ref SNSTopic
+  ConfigRoleARN:
+    Description: IAM role for Config service
+    Value: !GetAtt ConfigRole.Arn
+  LambdaFunctionARN:
+    Description: Lambda function for retention management
+    Value: !GetAtt RetentionLambda.Arn

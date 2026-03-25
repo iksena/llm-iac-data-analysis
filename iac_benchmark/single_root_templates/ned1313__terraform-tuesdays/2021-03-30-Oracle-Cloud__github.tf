@@ -43,7 +43,7 @@ resource "oci_identity_compartment" "testing" {
 module "vcn" {
   source  = "oracle-terraform-modules/vcn/oci"
   version = "~>2.0"
-  
+
   compartment_id = oci_identity_compartment.testing.id
   drg_display_name = "${var.prefix}-testing-drg"
   region = var.region
@@ -61,5 +61,3 @@ resource "oci_core_subnet" "subnet1" {
   compartment_id = oci_identity_compartment.testing.id
   vcn_id = module.vcn.vcn_id
 }
-
-

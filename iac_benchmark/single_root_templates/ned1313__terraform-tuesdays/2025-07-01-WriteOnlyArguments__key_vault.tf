@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
 
@@ -62,7 +62,7 @@ resource "azurerm_key_vault_secret" "write_only" {
   key_vault_id     = azurerm_key_vault.example.id
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "prefix" {
   description = "The prefix for the Key Vault name."
   type        = string
@@ -91,7 +91,7 @@ variable "db_password_version" {
   }
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "db_password_info" {
   value = {
     key_vault_id          = azurerm_key_vault.example.id
@@ -100,7 +100,7 @@ output "db_password_info" {
   }
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.11.0"
   required_providers {

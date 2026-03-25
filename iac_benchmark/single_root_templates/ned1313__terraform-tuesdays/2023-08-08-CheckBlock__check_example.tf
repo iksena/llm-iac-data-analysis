@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Deploy and Azure Virtual Machine running Ubuntu 22.04
 # Include a Public IP address and DNS name
 
@@ -106,12 +106,12 @@ data "azurerm_public_ip" "pip" {
   depends_on = [module.ubuntu_server]
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "linux_public_ip" {
   value = data.azurerm_public_ip.pip.ip_address
 }
 
-# ── checks.tf ────────────────────────────────────
+# ── checks.tf ──────────────────────────────────────────
 locals {
   status_code = 200
 }
@@ -156,14 +156,12 @@ check "server_on" {
   }
 }
 
-
 data "azurerm_virtual_machine" "web2" {
   name                = module.ubuntu_server.vm_name
   resource_group_name = azurerm_resource_group.example.name
 }
 
-
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">=1.5"
 

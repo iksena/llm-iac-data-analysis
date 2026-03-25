@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
 }
@@ -28,7 +28,6 @@ resource "azurerm_key_vault" "example" {
   resource_group_name = azurerm_resource_group.example.name
   tenant_id           = data.azurerm_client_config.example.tenant_id
   sku_name            = "standard"
-
 
 }
 
@@ -92,7 +91,7 @@ resource "azurerm_key_vault_certificate" "example" {
   }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "location" {
   description = "The location/region where the Azure Key Vault should be created."
   default     = "East US"
@@ -104,7 +103,7 @@ variable "prefix" {
   default     = "tacos"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "secret_name" {
   value       = azurerm_key_vault_secret.example.name
   description = "The name of the secret in the Azure Key Vault."
@@ -121,7 +120,7 @@ output "key_vault_id" {
   description = "The ID of the Azure Key Vault."
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.10"
 

@@ -1,7 +1,7 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 # File Version: 0.7.1
 
@@ -103,8 +103,7 @@ locals {
   node_pool_ads = (var.node_pool_shape_specific_ad > 0) ? data.oci_identity_availability_domain.specfic : data.oci_identity_availability_domains.ADs.availability_domains
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # Copyright (c) 2022, 2023, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
 #
@@ -251,10 +250,10 @@ variable "worker_nodes_tags" {
   description = "Tags to be added to the worker nodes resources"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Copyright (c) 2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 output "node_pool_name" {
   value = var.create_new_node_pool ? oci_containerengine_node_pool.oke_node_pool.0.name : var.existent_oke_nodepool_id_for_autoscaler
@@ -275,10 +274,10 @@ output "node_pool_autoscaler_enabled" {
   value = var.node_pool_autoscaler_enabled
 }
 
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 # Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 terraform {
   required_version = ">= 1.5" #">= 1.1"
@@ -296,10 +295,10 @@ terraform {
   }
 }
 
-# ── datasources.tf ────────────────────────────────────
+# ── datasources.tf ──────────────────────────────────────────
 # Copyright (c) 2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 # Gets supported Kubernetes versions for node pools
 data "oci_containerengine_node_pool_option" "node_pool" {

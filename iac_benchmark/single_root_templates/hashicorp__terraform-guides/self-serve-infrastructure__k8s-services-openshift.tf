@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.11.7"
 }
@@ -226,8 +226,7 @@ resource "null_resource" "expose_route" {
 
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "tfe_organization" {
   description = "TFE organization"
 }
@@ -240,8 +239,7 @@ variable "private_key_data" {
   description = "contents of the private key"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "cats_and_dogs_dns" {
   value = "http://cats-and-dogs-frontend.${data.terraform_remote_state.k8s_cluster.master_public_ip}.xip.io"
 }

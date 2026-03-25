@@ -1,4 +1,4 @@
-# ── aws_vpc_for_microsoft_ad_p1.tf ────────────────────────────────────
+# ── aws_vpc_for_microsoft_ad_p1.tf ──────────────────────────────────────────
 # Create a VPC for Microsoft AD via the 'aws' provider
 
 # Get availability zones to for subnet deployments
@@ -49,8 +49,7 @@ resource "aws_directory_service_directory" "main" {
   }
 }
 
-
-# ── aws_vpc_for_microsoft_ad_p2.tf ────────────────────────────────────
+# ── aws_vpc_for_microsoft_ad_p2.tf ──────────────────────────────────────────
 # Terraform code to create a VPC for Microsoft AD via the 'aws' provider
 
 # Get availability zones to for subnet deployments
@@ -101,8 +100,7 @@ resource "aws_directory_service_directory" "main" {
   }
 }
 
-
-# ── aws_vpc_for_rds_sql_server_p1.tf ────────────────────────────────────
+# ── aws_vpc_for_rds_sql_server_p1.tf ──────────────────────────────────────────
 # Create a VPC for RDS SQL Server via the 'aws' provider
 
 data "aws_partition" "main" {}
@@ -248,8 +246,7 @@ resource "aws_db_instance" "rds" {
   }
 }
 
-
-# ── aws_vpc_for_rds_sql_server_p2.tf ────────────────────────────────────
+# ── aws_vpc_for_rds_sql_server_p2.tf ──────────────────────────────────────────
 # Terraform code to create a VPC for RDS SQL Server via the 'aws' provider
 
 data "aws_partition" "main" {}
@@ -395,8 +392,7 @@ resource "aws_db_instance" "rds" {
   }
 }
 
-
-# ── aws_vpc_with_route53_resolver_p1.tf ────────────────────────────────────
+# ── aws_vpc_with_route53_resolver_p1.tf ──────────────────────────────────────────
 # Create a VPC with a Route53 Resolver via the 'aws' provider
 
 # Get availability zones to for subnet deployments
@@ -544,8 +540,7 @@ resource "aws_route53_resolver_rule_association" "r53_outbound_resolver_rule_ass
   vpc_id           = aws_vpc.main.id
 }
 
-
-# ── aws_vpc_with_route53_resolver_p2.tf ────────────────────────────────────
+# ── aws_vpc_with_route53_resolver_p2.tf ──────────────────────────────────────────
 # Terraform code to create a VPC with a Route53 Resolver via the 'aws' provider
 
 # Get availability zones to for subnet deployments

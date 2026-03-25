@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
 }
@@ -39,7 +39,7 @@ resource "azurerm_storage_blob" "homepage" {
   content_type           = "text/html"
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "location" {
   description = "The Azure region in which to create all resources."
   default     = "eastus"
@@ -60,7 +60,7 @@ variable "html_path" {
   default     = "index.html"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "homepage_url" {
   value = azurerm_storage_blob.homepage.url
 }
@@ -73,7 +73,7 @@ output "resource_group_name" {
   value = azurerm_storage_account.main.resource_group_name
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">=1.6.0"
   required_providers {

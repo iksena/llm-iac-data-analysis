@@ -1,4 +1,4 @@
-# ── azuread.tf ────────────────────────────────────
+# ── azuread.tf ──────────────────────────────────────────
 # Set the reply URL
 variable "reply_url" {
   type = string
@@ -21,7 +21,7 @@ resource "random_integer" "suffix" {
 }
 
 locals {
-  oauth2_permissions_scopes = { for scope in data.azuread_service_principal.microsoft_graph.oauth2_permission_scopes : scope.value => scope } 
+  oauth2_permissions_scopes = { for scope in data.azuread_service_principal.microsoft_graph.oauth2_permission_scopes : scope.value => scope }
   read_all_scope = local.oauth2_permissions_scopes["GroupMember.Read.All"] # Refer to the local.read_all_scope.id attribute
   app_name = "boundary-${random_integer.suffix.result}"
 }
@@ -74,7 +74,7 @@ output "grant_command" {
   value = "az ad app permission grant --id ${azuread_service_principal.boundary_oidc.application_id}  --api ${data.azuread_service_principal.microsoft_graph.id}"
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
       azuread = {

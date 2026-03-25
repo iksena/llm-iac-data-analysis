@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # Infrastructure Configuration
 variable "region" {
   description = "The AWS region"
@@ -49,7 +49,7 @@ variable "db_private_subnet_cidrs" {
   default     = []
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "region" {
   value = var.region
 }
@@ -91,7 +91,7 @@ output "db_private_subnet_ids" {
   value = length(aws_subnet.db_private_subnets) > 0 ? aws_subnet.db_private_subnets[*].id : []
 }
 
-# ── db_subnets.tf ────────────────────────────────────
+# ── db_subnets.tf ──────────────────────────────────────────
 resource "aws_subnet" "db_private_subnets" {
   count             = length(var.db_private_subnet_cidrs)
   vpc_id            = aws_vpc.main.id
@@ -118,12 +118,7 @@ resource "aws_route_table_association" "db_private_routes" {
   subnet_id      = element(aws_subnet.db_private_subnets[*].id, count.index)
 }
 
-
-
-
-
-
-# ── private-subnets.tf ────────────────────────────────────
+# ── private-subnets.tf ──────────────────────────────────────────
 resource "aws_eip" "nat" {
   count = length(var.private_subnet_cidrs)
   tags = {
@@ -169,7 +164,7 @@ resource "aws_route_table_association" "private_routes" {
   subnet_id      = aws_subnet.private_subnets[count.index].id
 }
 
-# ── public-subnets.tf ────────────────────────────────────
+# ── public-subnets.tf ──────────────────────────────────────────
 resource "aws_subnet" "public_subnets" {
   count                   = length(var.public_subnet_cidrs)
   vpc_id                  = aws_vpc.main.id
@@ -199,7 +194,7 @@ resource "aws_route_table_association" "public_routes" {
   subnet_id      = element(aws_subnet.public_subnets[*].id, count.index)
 }
 
-# ── vpc.tf ────────────────────────────────────
+# ── vpc.tf ──────────────────────────────────────────
 data "aws_availability_zones" "available" {}
 
 resource "aws_vpc" "main" {

@@ -51,7 +51,6 @@ resource "aws_subnet" "subnet" {
   availability_zone       = data.aws_availability_zones.available.names[0]
 }
 
-
 /*
 resource "aws_subnet" "subnet" {
   for_each = toset(local.subnets)

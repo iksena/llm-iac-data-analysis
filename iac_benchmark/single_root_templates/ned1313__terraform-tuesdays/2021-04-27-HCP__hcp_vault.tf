@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "prefix" {
   description = "Naming prefix for Vault Cluster"
   type = string
@@ -16,7 +16,7 @@ variable "hvn_id" {
   type = string
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vault_private_endpoint_url" {
   value = hcp_vault_cluster.vault.vault_private_endpoint_url
 }
@@ -30,7 +30,7 @@ output "vault_admin_token" {
   sensitive = true
 }
 
-# ── resources.tf ────────────────────────────────────
+# ── resources.tf ──────────────────────────────────────────
 locals {
   name = "${lower(var.prefix)}-${random_id.seed.hex}"
 }
@@ -49,7 +49,7 @@ resource "hcp_vault_cluster_admin_token" "vault" {
   cluster_id = hcp_vault_cluster.vault.cluster_id
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
       hcp = {

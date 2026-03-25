@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Create the main EC2 instance
 # https://www.terraform.io/docs/providers/aws/r/instance.html
 resource "aws_instance" "this" {
@@ -78,8 +78,7 @@ resource "null_resource" "provisioners" {
   }
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # Whenever the contents of this block changes, the host should be re-provisioned
 locals {
   reprovision_trigger = <<EOF
@@ -183,8 +182,7 @@ variable "tags" {
   default     = {}
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "hostname" {
   description = "Hostname by which this service is identified in metrics, logs etc"
   value       = "${var.hostname}"
@@ -225,8 +223,7 @@ output "security_group_id" {
   value       = "${aws_security_group.this.id}"
 }
 
-
-# ── data.tf ────────────────────────────────────
+# ── data.tf ──────────────────────────────────────────
 # Access data about available availability zones in the current region
 data "aws_availability_zones" "this" {}
 
@@ -242,8 +239,7 @@ data "aws_subnet" "this" {
   availability_zone = "${local.availability_zone}"
 }
 
-
-# ── security.tf ────────────────────────────────────
+# ── security.tf ──────────────────────────────────────────
 # Create an SSH key pair for accessing the EC2 instance
 resource "aws_key_pair" "this" {
   public_key = "${file("${var.ssh_public_key_path}")}"

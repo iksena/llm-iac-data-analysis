@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {
 
@@ -20,7 +20,7 @@ module "main" {
   subnets             = var.subnets
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "azure_region" {
   type        = string
   description = "(Optional) Region of Azure to use for resources. Defaults to East US."
@@ -47,10 +47,9 @@ variable "subnets" {
   description = "(Required) Map of subnet names and address prefixes."
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 
-
-# ── imports.tf ────────────────────────────────────
+# ── imports.tf ──────────────────────────────────────────
 /*
 import {
   to = module.main.azurerm_subnet.main["web3"]
@@ -58,7 +57,7 @@ import {
 }
 */
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">=1.5.0"
 

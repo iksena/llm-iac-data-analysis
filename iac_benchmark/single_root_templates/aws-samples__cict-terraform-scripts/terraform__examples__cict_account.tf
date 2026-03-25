@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 locals {
   region     = var.region != "" ? var.region : data.aws_region.current.name
   account_id = var.account_id != "" ? var.account_id : data.aws_caller_identity.current.account_id
@@ -14,7 +14,7 @@ module "setup_testing_pipeline" {
   git_repository_name             = var.git_repository_name
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "custom_tags" {
   description = "AWS Resource tags"
   type = object({
@@ -57,7 +57,7 @@ variable "region" {
   type        = string
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "AWS_Region" {
   description = "Region  where the AWS resources will be deployed"
   value       = module.setup_testing_pipeline.region
@@ -88,7 +88,7 @@ output "AWS_Resource_Tags" {
   value       = module.setup_testing_pipeline.custom_tags
 }
 
-# ── providers.tf ────────────────────────────────────
+# ── providers.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     aws = {
@@ -106,7 +106,6 @@ provider "aws" {
   region = var.region
 }
 
-
-# ── data.tf ────────────────────────────────────
+# ── data.tf ──────────────────────────────────────────
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}

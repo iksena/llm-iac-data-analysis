@@ -1,7 +1,7 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Copyright (c) 2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 resource "oci_core_subnet" "subnet" {
   cidr_block                 = var.cidr_block
@@ -21,10 +21,10 @@ resource "oci_core_subnet" "subnet" {
   count = var.create_subnet ? 1 : 0
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 variable "compartment_ocid" {}
 variable "vcn_id" {}
@@ -75,10 +75,10 @@ variable "subnet_tags" {
   description = "Tags to be added to the subnet resources"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Copyright (c) 2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 output "subnet_id" {
   value       = var.create_subnet ? oci_core_subnet.subnet[0].id : null
@@ -89,10 +89,10 @@ output "subnet_name" {
   description = "The reference name of the subnet. (Not the display name)"
 }
 
-# ── providers.tf ────────────────────────────────────
+# ── providers.tf ──────────────────────────────────────────
 # Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 terraform {
   required_version = ">= 1.1"

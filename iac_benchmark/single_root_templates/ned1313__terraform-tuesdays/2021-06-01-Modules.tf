@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "meat" {
   type = string
   default = "chicken"
@@ -14,16 +14,12 @@ variable "shell" {
   default = "corn"
 }
 
-# ── outputs.tf ────────────────────────────────────
-
-
+# ── outputs.tf ──────────────────────────────────────────
 output "taco_info" {
   value = local.taco
 }
 
-
-
-# ── locals.tf ────────────────────────────────────
+# ── locals.tf ──────────────────────────────────────────
 locals {
   taco = {
       meat = var.meat
@@ -32,17 +28,13 @@ locals {
   }
 }
 
-
-
-# ── resources.tf ────────────────────────────────────
-
-
+# ── resources.tf ──────────────────────────────────────────
 resource "local_file" "taco_order" {
   content = jsonencode(local.taco)
   filename = "${path.module}/order.json"
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
       # List of providers

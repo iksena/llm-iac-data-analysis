@@ -9,7 +9,6 @@ Process is run in a sandboxed VM, so any server exploits cannot do any serious d
 We are experimenting with providing support through a [google doc](https://docs.google.com/document/d/1TXyzHKqoKMS-jY9FSMrYNLEGathqSG8YuHdj0Z9GP34).
 Help us make this simple for others to use by asking for help.
 
-
 Features
 - Runs [itzg/minecraft-server](https://hub.docker.com/r/itzg/minecraft-server/) Docker image
 - Preemtible VM (cheapest), shuts down automatically within 24h if you forget to stop the VM
@@ -50,7 +49,6 @@ locals {
   enable_switch_access_group = 1
   minecraft_switch_access_group = "minecraft-switchers-lark@googlegroups.com"
 }
-
 
 provider "google" {
   project = local.project
@@ -96,7 +94,7 @@ resource "google_compute_instance" "minecraft" {
   metadata = {
     enable-oslogin = "TRUE"
   }
-      
+
   boot_disk {
     auto_delete = false # Keep disk after shutdown (game data)
     source      = google_compute_disk.minecraft.self_link

@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "location" {
   default = "eastus"
   type = string
@@ -58,7 +58,7 @@ locals {
   worker_vm     = "worker-${random_id.id.hex}"
 }
 
-# ── network.tf ────────────────────────────────────
+# ── network.tf ──────────────────────────────────────────
 terraform {
     required_providers {
         azurerm = {
@@ -104,7 +104,7 @@ resource "azurerm_network_security_group" "worker_nics" {
   resource_group_name = azurerm_resource_group.cka.name
 }
 
-# ── nsgs.tf ────────────────────────────────────
+# ── nsgs.tf ──────────────────────────────────────────
 resource "azurerm_network_security_rule" "controller_nic_ssh" {
   name                        = "allow_ssh"
   priority                    = 100
@@ -161,9 +161,7 @@ resource "azurerm_network_security_rule" "worker_nic_allow_controller" {
   network_security_group_name = azurerm_network_security_group.worker_nics.name
 }
 
-
-
-# ── vms.tf ────────────────────────────────────
+# ── vms.tf ──────────────────────────────────────────
 # Generate key pair for all VMs
 resource "tls_private_key" "cka" {
   algorithm = "RSA"
@@ -194,7 +192,6 @@ resource "azurerm_public_ip" "controller" {
     allocation_method = "Static"
     sku = "Standard"
 }
-
 
 resource "azurerm_network_interface" "controller" {
   count               = var.controller_vm_count

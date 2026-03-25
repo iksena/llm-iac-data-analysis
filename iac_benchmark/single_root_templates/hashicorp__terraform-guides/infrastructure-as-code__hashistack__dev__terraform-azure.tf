@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.10.1"
 }
@@ -46,8 +46,7 @@ module "consul_azure" {
   auto_join_client_secret   = "${var.auto_join_client_secret}"
 }
 
-
-# ── _interface.tf ────────────────────────────────────
+# ── _interface.tf ──────────────────────────────────────────
 # Required variables
 
 variable "custom_image_id" {

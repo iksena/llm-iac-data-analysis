@@ -10,7 +10,6 @@ output "admin_users" {
 
 }
 
-
 locals {
 
 }

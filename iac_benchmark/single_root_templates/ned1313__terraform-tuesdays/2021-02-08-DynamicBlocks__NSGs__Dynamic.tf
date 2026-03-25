@@ -116,7 +116,7 @@ resource "azurerm_network_security_group" "public" {
     resource_group_name = azurerm_resource_group.vnet.name
 
     dynamic "security_rule" {
-        for_each = local.rules 
+        for_each = local.rules
         content {
             name = security_rule.value["name"]
             priority = security_rule.value["priority"]

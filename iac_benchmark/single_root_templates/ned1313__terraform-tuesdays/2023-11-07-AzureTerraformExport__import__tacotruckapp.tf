@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "azurerm_linux_virtual_machine" "res-0" {
   admin_password                  = "ignored-as-imported1234!"
   admin_username                  = "tacoadmin"
@@ -98,8 +98,7 @@ resource "azurerm_storage_account" "res-8" {
   resource_group_name      = "tacotruck-vms"
 }
 
-
-# ── import.tf ────────────────────────────────────
+# ── import.tf ──────────────────────────────────────────
 import {
   id = "/subscriptions/4d8e572a-3214-40e9-a26f-8f71ecd24e0d/resourceGroups/TACOTRUCK-VMS/providers/Microsoft.Compute/virtualMachines/TACOTRUCK-WEB-VMLINUX-0"
   to = azurerm_linux_virtual_machine.res-0
@@ -137,15 +136,13 @@ import {
   to = azurerm_storage_account.res-8
 }
 
-
-# ── provider.tf ────────────────────────────────────
+# ── provider.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {
   }
 }
 
-
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   backend "local" {}
 

@@ -6,7 +6,6 @@ variable "account_code" {
    description = "code of cloud account: can be 1 or 2"
 }
 
-
 # Add fake resource to make sure that TFE runs this each time
 resource "null_resource" "fake" {
    triggers {
@@ -21,5 +20,3 @@ data "external" "check_balance" {
 output "balance" {
   value = "${data.external.check_balance.result["balance"]}"
 }
-
-

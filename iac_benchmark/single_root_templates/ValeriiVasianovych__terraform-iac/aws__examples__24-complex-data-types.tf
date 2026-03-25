@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket       = "terrafrom-tfstate-file-s3-bucket"
@@ -13,14 +13,14 @@ provider "aws" {
   region = "us-east-1"
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   description = "The AWS region to launch the resources."
   type        = string
   default     = "us-east-1"
 }
 
-# ── complex-data-types.tf ────────────────────────────────────
+# ── complex-data-types.tf ──────────────────────────────────────────
 # All of complex data types in terraform are immutable.
 # It means that you cannot change them. You can only create new values based on the existing ones.
 
@@ -122,9 +122,7 @@ output "tuple_example" {
   value = var.tuple_example
 }
 
-
-
-# ── func-list.tf ────────────────────────────────────
+# ── func-list.tf ──────────────────────────────────────────
 output "list_example_reversed" {
   value = reverse(var.list_example) # reverse the list
 }

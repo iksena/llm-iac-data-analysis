@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
   # Set storage access to use Azure AD instead of storage key SAS
@@ -39,7 +39,6 @@ resource "azurerm_storage_account" "main" {
   default_to_oauth_authentication   = true
   infrastructure_encryption_enabled = false
 
-
   blob_properties {
     versioning_enabled            = true
     change_feed_enabled           = true
@@ -63,7 +62,6 @@ resource "azurerm_storage_account" "main" {
 
 }
 
-
 # Create a container in storage account
 resource "azurerm_storage_container" "main" {
   name                  = "tfstate"
@@ -76,7 +74,6 @@ resource "azurerm_storage_container" "nope" {
   storage_account_name  = azurerm_storage_account.main.name
   container_access_type = "private"
 }
-
 
 # Create a custom role with ABAC
 resource "azurerm_role_definition" "main" {
@@ -161,7 +158,7 @@ output "service_principal_password" {
   value = nonsensitive(azuread_service_principal_password.main.value)
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "azurerm_virtual_network" "main" {
   resource_group_name = var.resource_group_name
   location            = var.azure_region
@@ -16,7 +16,7 @@ resource "azurerm_subnet" "main" {
   address_prefixes = [each.value]
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "azure_region" {
   type        = string
   description = "Region of Azure to use for resources."
@@ -42,7 +42,7 @@ variable "subnets" {
   description = "Name of subnet and address prefix"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "virtual_network_name" {
   value = azurerm_virtual_network.main.name
 }

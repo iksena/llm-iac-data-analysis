@@ -38,7 +38,7 @@ resource "aws_kms_key" "tofu_key" {
 module "terraform_state_backend" {
   source = "cloudposse/tfstate-backend/aws"
   version     = "1.4.1"
-  
+
   force_destroy = true
   bucket_enabled = true
   dynamodb_enabled = true

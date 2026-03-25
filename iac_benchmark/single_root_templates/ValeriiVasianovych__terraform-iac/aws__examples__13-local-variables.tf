@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket  = "terrafrom-tfstate-file-s3-bucket"
@@ -27,47 +27,45 @@ locals {
   region_az         = "In ${local.region} region are az: ${local.az_list}"
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   description = "Default region"
   type        = string
-  default     = "eu-central-1"  
+  default     = "eu-central-1"
 }
 
 variable "project" {
   description = "Project name"
   type        = string
-  default     = "local-variables example"  
+  default     = "local-variables example"
 }
 
 variable "env" {
   description = "Environment"
   type        = string
-  default     = "Development"  
+  default     = "Development"
 }
 
 variable "city" {
   description = "City Location"
   type        = string
-  default     = "New York"  
+  default     = "New York"
 }
 
 variable "country" {
   description = "Country location"
   type        = string
-  default     = "United States"  
+  default     = "United States"
 }
 
+# ── outputs.tf ──────────────────────────────────────────
 
-# ── outputs.tf ────────────────────────────────────
-
-
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 data "aws_availability_zones" "available" {}
 data "aws_caller_identity" "current" {}
 
-# ── eip.tf ────────────────────────────────────
+# ── eip.tf ──────────────────────────────────────────
 resource "aws_eip" "elastic_ip" {
     tags = {
         Name        = "Example Elasic IP"
@@ -77,4 +75,4 @@ resource "aws_eip" "elastic_ip" {
         AvailableAZ = "All available AZ: ${local.az_list}"
         AZinRegion  = "${local.region_az}"
     }
-} 
+}

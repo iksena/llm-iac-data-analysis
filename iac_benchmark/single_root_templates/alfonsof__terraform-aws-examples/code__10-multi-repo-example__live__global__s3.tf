@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Configure the AWS provider
 provider "aws" {
   region = "eu-west-1"
@@ -6,27 +6,24 @@ provider "aws" {
 
 # Create a S3 bucket
 resource "aws_s3_bucket" "terraform_state" {
-  bucket		  = "${var.bucket_name}"
-  
+  bucket      = "${var.bucket_name}"
+
   versioning {
     enabled = true
-  }  
-  
+  }
+
   lifecycle {
     prevent_destroy = true
   }
 }
 
-
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Output variable: S3 bucket
 output "s3_bucket_arn" {
   value = "${aws_s3_bucket.terraform_state.arn}"
 }
 
-
-# ── vars.tf ────────────────────────────────────
+# ── vars.tf ──────────────────────────────────────────
 # Input variable: S3 bucket name
 variable "bucket_name" {
   description = "The name of the S3 bucket. Must be globally unique."

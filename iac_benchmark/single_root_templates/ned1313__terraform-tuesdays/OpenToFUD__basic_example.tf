@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "aws" {
   region = var.aws_region
 }
@@ -41,8 +41,7 @@ module "ecs" {
   tags = var.tags
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "aws_region" {
   description = "AWS region to deploy resources"
   type        = string
@@ -64,8 +63,7 @@ variable "tags" {
   }
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vpc_id" {
   description = "The ID of the VPC"
   value       = module.vpc.vpc_id
@@ -91,8 +89,7 @@ output "ecs_cluster_arn" {
   value       = module.ecs.cluster_arn
 }
 
-
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.0.0"
 

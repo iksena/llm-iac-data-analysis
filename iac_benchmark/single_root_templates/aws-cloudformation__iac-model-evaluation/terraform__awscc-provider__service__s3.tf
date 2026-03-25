@@ -1,4 +1,4 @@
-# ── awscc_s3_bucket_name_conditional.tf ────────────────────────────────────
+# ── awscc_s3_bucket_name_conditional.tf ──────────────────────────────────────────
 # create s3 bucket with Terraform AWSCC, if the var name_length is bigger than 0, then use random pet for bucket name, otherwise set bucket name as var bucket_name
 resource "awscc_s3_bucket" "example" {
   bucket_name = var.name_length > 0 ? random_pet.example.id : var.bucket_name
@@ -21,8 +21,8 @@ resource "random_pet" "example" {
   length = var.name_length
 }
 
-# ── awscc_s3_bucket_name_dynamic.tf ────────────────────────────────────
-# aws_iam_policy_document for bucket policy, use dynamic block to iterate over list of iam role names. For each statement, set the action to Getobject, set resource to bucket prefix + role name, set AWS principal role ARN with combination of account id and role name 
+# ── awscc_s3_bucket_name_dynamic.tf ──────────────────────────────────────────
+# aws_iam_policy_document for bucket policy, use dynamic block to iterate over list of iam role names. For each statement, set the action to Getobject, set resource to bucket prefix + role name, set AWS principal role ARN with combination of account id and role name
 
 resource "awscc_s3_bucket" "example" {
 }
@@ -59,7 +59,7 @@ variable "account_id" {
   type = string
 }
 
-# ── awscc_s3_bucket_p1.tf ────────────────────────────────────
+# ── awscc_s3_bucket_p1.tf ──────────────────────────────────────────
 # Create an S3 Bucket named 'example' via 'awscc' provider
 
 resource "awscc_s3_bucket" "example" {
@@ -77,8 +77,7 @@ resource "awscc_s3_bucket" "example" {
 
 }
 
-
-# ── awscc_s3_bucket_p2.tf ────────────────────────────────────
+# ── awscc_s3_bucket_p2.tf ──────────────────────────────────────────
 # Terraform code to create an S3 Bucket named 'example' via 'awscc' provider
 
 resource "awscc_s3_bucket" "example" {
@@ -96,8 +95,7 @@ resource "awscc_s3_bucket" "example" {
 
 }
 
-
-# ── awscc_s3_bucket_p3.tf ────────────────────────────────────
+# ── awscc_s3_bucket_p3.tf ──────────────────────────────────────────
 # Write Terraform configuration that creates S3 bucket named 'example', use awscc provider
 
 resource "awscc_s3_bucket" "example" {

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket         = "terrafrom-tfstate-file-s3-bucket"
@@ -20,14 +20,14 @@ provider "aws" {
   profile = "default"
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "aws_region" {
   description = "The AWS region to deploy resources in"
   type        = string
   default     = "us-east-1"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "aws_region" {
   value = data.aws_region.current.name
 }
@@ -44,15 +44,14 @@ output "data_aws_caller_identity" {
   value = data.aws_caller_identity.current.account_id
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 data "aws_availability_zones" "available" {}
 data "aws_caller_identity" "current" {}
 
-# ── vpc.tf ────────────────────────────────────
+# ── vpc.tf ──────────────────────────────────────────
 module "vpc" {
   source = "terraform-aws-modules/vpc/aws"
-
 
   name            = "terraform.vpc"
   cidr            = "10.0.0.0/16"

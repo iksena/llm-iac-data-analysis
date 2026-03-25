@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "location" {
   type    = string
   default = "East US"
@@ -100,8 +100,7 @@ locals {
 
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vault_name" {
     value = local.vault_name
 }
@@ -118,8 +117,7 @@ output "target_ips" {
     value = ""
 }
 
-# ── keyvault.tf ────────────────────────────────────
-
+# ── keyvault.tf ──────────────────────────────────────────
 # Get your current IP address
 data "http" "my_ip" {
   url = "http://ifconfig.me"
@@ -274,7 +272,7 @@ resource "azurerm_key_vault_certificate" "boundary" {
   }
 }
 
-# ── lb.tf ────────────────────────────────────
+# ── lb.tf ──────────────────────────────────────────
 resource "azurerm_public_ip" "boundary" {
   name                = local.pip_name
   resource_group_name = azurerm_resource_group.boundary.name
@@ -355,9 +353,7 @@ resource "azurerm_lb_rule" "worker" {
   backend_address_pool_id = azurerm_lb_backend_address_pool.pools["worker"].id
 }
 
-
-
-# ── nsg.tf ────────────────────────────────────
+# ── nsg.tf ──────────────────────────────────────────
 # Inbound rules for controller subnet nsg
 
 resource "azurerm_network_security_rule" "controller_9200" {
@@ -454,7 +450,7 @@ resource "azurerm_network_security_rule" "worker_nic_9202" {
 
 # None for right now
 
-# ── postgres.tf ────────────────────────────────────
+# ── postgres.tf ──────────────────────────────────────────
 # Create postgresql server
 # Make sure to allow Azure services
 resource "azurerm_postgresql_server" "boundary" {
@@ -486,8 +482,7 @@ resource "azurerm_postgresql_firewall_rule" "boundary" {
   end_ip_address      = "0.0.0.0"
 }
 
-
-# ── vm.tf ────────────────────────────────────
+# ── vm.tf ──────────────────────────────────────────
 # Generate key pair for all VMs
 resource "tls_private_key" "boundary" {
   algorithm = "RSA"
@@ -524,7 +519,6 @@ resource "azurerm_availability_set" "controller" {
   platform_update_domain_count = 2
   managed                      = true
 }
-
 
 resource "azurerm_network_interface" "controller" {
   count               = var.controller_vm_count
@@ -714,7 +708,7 @@ resource "azurerm_linux_virtual_machine" "worker" {
   depends_on = [azurerm_linux_virtual_machine.controller]
 }
 
-# ── vnet.tf ────────────────────────────────────
+# ── vnet.tf ──────────────────────────────────────────
 # Define provider for config
 provider "azurerm" {
   version = "~> 2.0"

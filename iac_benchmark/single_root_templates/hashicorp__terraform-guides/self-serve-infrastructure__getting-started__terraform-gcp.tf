@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "google" {
   project = "terraform-gcp-module-test"
   region  = "us-central1"
@@ -17,8 +17,7 @@ resource "google_compute_subnetwork" "demo_subnetwork" {
   ip_cidr_range = "${var.sn_cidr_range}"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "compute_network_consumable" {
   value       = "${google_compute_network.demo_network.name}"
   description = "The Network Name"
@@ -34,8 +33,7 @@ output "subnetwork_consumable_ip_cidr_range" {
   description = "The default Cidr Range"
 }
 
-
-# ── _interface.tf ────────────────────────────────────
+# ── _interface.tf ──────────────────────────────────────────
 variable "gn_name" {
   default     = ""
   description = "The default name for the Compute Network"

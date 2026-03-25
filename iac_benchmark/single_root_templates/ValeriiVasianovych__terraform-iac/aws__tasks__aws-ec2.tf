@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket       = "terrafrom-tfstate-file-s3-bucket"
@@ -52,7 +52,7 @@ resource "aws_security_group" "sg" {
     })
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
     type = string
     description = "The region in which to launch the EC2 instance"
@@ -62,14 +62,14 @@ variable "region" {
 variable "instance_type" {
     type = string
     description = "The type of instance to launch"
-    default = "t2.micro" 
+    default = "t2.micro"
 }
 
 variable "key_name" {
     type = string
     description = "The name of the key pair to use for the instance"
     default = "aws_ssh_key"
-  
+
 }
 
 variable "common_tags" {
@@ -87,7 +87,7 @@ variable "count_instance" {
     default = 2
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "get_public_ip" {
   value = aws_instance.ubuntu_ec2[*].public_ip
 }
@@ -96,7 +96,7 @@ output "lookup_example" {
   value = lookup({a="ay", b="bee"}, "c", "what?")
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_caller_identity" "current" {}
 data "aws_availability_zones" "available" {}
 data "aws_region" "current" {}
@@ -108,5 +108,3 @@ data "aws_ami" "latest_ubuntu" {
     values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
   }
 }
-
-

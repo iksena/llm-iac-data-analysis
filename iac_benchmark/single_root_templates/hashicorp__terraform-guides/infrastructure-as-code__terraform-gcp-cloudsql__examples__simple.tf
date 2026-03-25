@@ -23,4 +23,3 @@ module "example-gcp-cloudsql" {
   gcp_sql_root_user_pw = "${var.gcp_sql_root_user_pw}"
   authorized_network = "${var.authorized_network}"
 }
-

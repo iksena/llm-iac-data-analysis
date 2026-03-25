@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket       = "terrafrom-tfstate-file-s3-bucket"
@@ -20,13 +20,12 @@ provider "aws" {
   }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   default = "us-east-1"
 }
 
-# ── instance-prod.tf ────────────────────────────────────
-
+# ── instance-prod.tf ──────────────────────────────────────────
 resource "aws_instance" "instance-1" {
   ami = "ami-084568db4383264d4"
   instance_type = "t2.micro"
@@ -37,7 +36,7 @@ resource "aws_instance" "instance-1" {
   }
 }
 
-# ── sg-forgotted.tf ────────────────────────────────────
+# ── sg-forgotted.tf ──────────────────────────────────────────
 resource "aws_security_group" "sg-forgotted" {
   name        = "sg_forgotted"
   description = "Allows HTTP HTTPS"
@@ -85,7 +84,7 @@ resource "aws_security_group" "sg-forgotted" {
 #   }
 # }
 
-# ── sg-prod.tf ────────────────────────────────────
+# ── sg-prod.tf ──────────────────────────────────────────
 resource "aws_security_group" "sg-1" {
   name        = "http-ssh-sg"
   description = "Allows HTTP SSH"

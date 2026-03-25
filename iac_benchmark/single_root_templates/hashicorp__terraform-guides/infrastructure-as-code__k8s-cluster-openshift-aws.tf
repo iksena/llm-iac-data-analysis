@@ -1,8 +1,7 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.11.11"
 }
-
 
 # Set VAULT_TOKEN environment variable
 provider "vault" {
@@ -208,8 +207,7 @@ resource "vault_kubernetes_auth_backend_role" "role" {
   token_ttl = 7200
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 //  The region we will deploy our cluster into.
 variable "region" {
   description = "Region to deploy the cluster into"
@@ -275,8 +273,7 @@ variable "vault_addr" {
   description = "Address of Vault server including port"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Output some useful variables for quick SSH access etc.
 output "master_url" {
   value = "https://${module.openshift.master_public_ip}.xip.io:8443"

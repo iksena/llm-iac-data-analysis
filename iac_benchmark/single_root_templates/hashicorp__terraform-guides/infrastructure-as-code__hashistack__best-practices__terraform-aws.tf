@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 module "ssh_keypair_aws_override" {
   source = "github.com/hashicorp-modules/ssh-keypair-aws"
 
@@ -176,8 +176,7 @@ module "hashistack_aws" {
   tags_list        = "${var.hashistack_tags_list}"
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # ---------------------------------------------------------------------------------------------------------------------
 # General Variables
 # ---------------------------------------------------------------------------------------------------------------------
@@ -256,8 +255,7 @@ variable "hashistack_tags_list" {
   default = [ ]
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "zREADME" {
   value = <<README
 
@@ -471,8 +469,7 @@ output "nomad_lb_dns" {
   value = "${module.hashistack_aws.nomad_lb_dns}"
 }
 
-
-# ── gitignore.tf ────────────────────────────────────
+# ── gitignore.tf ──────────────────────────────────────────
 # `.tf` files that contain the word "gitignore" are ignored
 # by git in the `.gitignore` file at the root of this repo.
 

@@ -71,10 +71,7 @@ module "bigip" {
   ssh_key = tls_private_key.boundary.public_key_openssh
 }
 
-
 # Install AS3
-
-
 
 # Create CTS VM
 resource "azurerm_public_ip" "cts_vm" {
@@ -137,7 +134,6 @@ resource "azurerm_linux_virtual_machine" "cts_vm" {
       })
   )
 }
-
 
 # NSGs
 

@@ -1,4 +1,4 @@
-# ── 00-variables.tf ────────────────────────────────────
+# ── 00-variables.tf ──────────────────────────────────────────
 variable "region" {
   description = "The region to deploy the cluster in, e.g: us-east-1."
 }
@@ -40,8 +40,7 @@ variable "ttl" {
   description = "value set on EC2 TTL tag. -1 means forever. Measured in hours."
 }
 
-
-# ── 01-amis.tf ────────────────────────────────────
+# ── 01-amis.tf ──────────────────────────────────────────
 # Define the RHEL 7.2 AMI by:
 # RedHat, Latest, x86_64, EBS, HVM, RHEL 7.5
 data "aws_ami" "rhel7_5" {
@@ -97,8 +96,7 @@ data "aws_ami" "amazonlinux" {
   }
 }
 
-
-# ── 02-vpc.tf ────────────────────────────────────
+# ── 02-vpc.tf ──────────────────────────────────────────
 //  Define the VPC.
 resource "aws_vpc" "openshift" {
   cidr_block           = "${var.vpc_cidr}"
@@ -156,8 +154,7 @@ resource "aws_route_table_association" "public-subnet" {
   route_table_id = "${aws_route_table.public.id}"
 }
 
-
-# ── 03-security-groups.tf ────────────────────────────────────
+# ── 03-security-groups.tf ──────────────────────────────────────────
 //  This security group allows intra-node communication on all ports with all
 //  protocols.
 resource "aws_security_group" "openshift-vpc" {
@@ -288,8 +285,7 @@ resource "aws_security_group" "openshift-ssh" {
   }
 }
 
-
-# ── 04-roles.tf ────────────────────────────────────
+# ── 04-roles.tf ──────────────────────────────────────────
 //  Create a role which OpenShift instances will assume.
 //  This role has a policy saying it can be assumed by ec2
 //  instances.
@@ -341,7 +337,6 @@ resource "aws_iam_policy" "openshift-policy-forward-logs" {
 EOF
 }
 
-
 //  Attach the policies to the role.
 resource "aws_iam_policy_attachment" "openshift-attachment-forward-logs" {
   name       = "${var.name_tag_prefix}-openshift-attachment-forward-logs"
@@ -355,8 +350,7 @@ resource "aws_iam_instance_profile" "openshift-instance-profile" {
   role = "${aws_iam_role.openshift-instance-role.name}"
 }
 
-
-# ── 05-nodes.tf ────────────────────────────────────
+# ── 05-nodes.tf ──────────────────────────────────────────
 //  Create the master userdata script.
 data "template_file" "setup-master" {
   template = "${file("${path.module}/files/setup-master.sh")}"
@@ -444,8 +438,7 @@ resource "aws_instance" "node1" {
   }
 }
 
-
-# ── 06-dns.tf ────────────────────────────────────
+# ── 06-dns.tf ──────────────────────────────────────────
 //  Notes: We could make the internal domain a variable, but not sure it is
 //  really necessary.
 
@@ -482,8 +475,7 @@ resource "aws_route53_record" "node1-a-record" {
     ]
 }
 
-
-# ── 07-bastion.tf ────────────────────────────────────
+# ── 07-bastion.tf ──────────────────────────────────────────
 data "external" "delay" {
   program = ["./modules/openshift/delay-aws"]
 
@@ -539,8 +531,7 @@ resource "aws_instance" "bastion" {
   }
 }
 
-
-# ── 08-outputs.tf ────────────────────────────────────
+# ── 08-outputs.tf ──────────────────────────────────────────
 //  Output some useful variables for quick SSH access etc.
 output "master_public_dns" {
   value = "${aws_instance.master.public_dns}"

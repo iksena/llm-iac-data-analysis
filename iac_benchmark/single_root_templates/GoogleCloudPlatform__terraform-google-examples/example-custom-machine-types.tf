@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "google" {
   region = "${var.region}"
 }
@@ -111,8 +111,7 @@ output "bastion" {
   value = "gcloud compute ssh --ssh-flag=\"-A\" $(terraform output bastion_instance)"
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   default = "us-central1"
 }

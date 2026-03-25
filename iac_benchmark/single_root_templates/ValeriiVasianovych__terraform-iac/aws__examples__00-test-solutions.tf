@@ -1,10 +1,10 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   # cloud {
   #   organization = "terraform-cloud-local"
 
   #   workspaces {
-  #     name = "cli-driven-workspace" 
+  #     name = "cli-driven-workspace"
   #   }
   # }
 
@@ -157,7 +157,7 @@ resource "aws_security_group" "web" {
   }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # Variables
 variable "region" {
   type        = string
@@ -204,7 +204,7 @@ variable "common_tags" {
 #   default     = "Hello World"
 # }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Outputs
 # output "created_instance_type" {
 #   value = aws_instance.example_ec2.instance_type
@@ -230,7 +230,7 @@ output "greater_than" {
 #   value = "${var.1_hello_world}"
 # }
 
-# ── count-for-if.tf ────────────────────────────────────
+# ── count-for-if.tf ──────────────────────────────────────────
 variable "aws_users" {
   description = "This is array with names of new users"
   type        = list(string)
@@ -295,7 +295,7 @@ output "return_numbers" {
   value = length(var.numbers)
 }
 
-# ── local_file.tf ────────────────────────────────────
+# ── local_file.tf ──────────────────────────────────────────
 resource "local_file" "foo_file" {
   content  = "The environment of this terraform is: ${var.environment}"
   filename = "${path.module}/local_files/foo_file.txt"
@@ -316,7 +316,7 @@ resource "local_file" "multiple_files" {
   filename = "${path.module}/local_files/${each.key}"
 }
 
-# ── s3-import.tf ────────────────────────────────────
+# ── s3-import.tf ──────────────────────────────────────────
 # Import existing S3 bucket from AWS
 resource "aws_s3_bucket" "import-example" {
   bucket = "rds-import-s3-bucket" # actual bucket name in AWS
@@ -324,7 +324,7 @@ resource "aws_s3_bucket" "import-example" {
 
 # terraform import aws_s3_bucket.import-example minikube-crossplane-bucket-v2
 
-# ── vpc.tf ────────────────────────────────────
+# ── vpc.tf ──────────────────────────────────────────
 # module "vpc" {
 #   source = "terraform-aws-modules/vpc/aws"
 

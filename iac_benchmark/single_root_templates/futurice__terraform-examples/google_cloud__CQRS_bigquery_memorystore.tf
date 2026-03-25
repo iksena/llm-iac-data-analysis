@@ -27,7 +27,7 @@ locals {
     version = module.version.result
     retention_days = 30
     network = "default"
-    ip_cidr_range = "10.9.0.0/28"    
+    ip_cidr_range = "10.9.0.0/28"
     memorystore_tier = "BASIC"
     code_bucket = google_storage_bucket.code
   }
@@ -71,7 +71,6 @@ module "functions" {
   historical_totals_latest_table = module.bigquery.historical_totals_latest_table
   current_totals_table = module.bigquery.current_totals_table
   historical_totals_table = module.bigquery.historical_totals_table
-  
+
   config = local.config
 }
-

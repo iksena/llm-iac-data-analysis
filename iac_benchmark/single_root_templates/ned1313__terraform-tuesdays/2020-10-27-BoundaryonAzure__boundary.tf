@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     boundary = {
@@ -13,14 +13,14 @@ provider "boundary" {
   recovery_kms_hcl = <<EOT
 kms "azurekeyvault" {
     purpose = "recovery"
-	tenant_id     = "${var.tenant_id}"
+  tenant_id     = "${var.tenant_id}"
     vault_name = "${var.vault_name}"
     key_name = "recovery"
 }
 EOT
 }
 
-# ── auth.tf ────────────────────────────────────
+# ── auth.tf ──────────────────────────────────────────
 resource "boundary_auth_method" "password" {
   name        = "corp_password_auth_method"
   description = "Password auth method for Corp org"
@@ -28,7 +28,7 @@ resource "boundary_auth_method" "password" {
   scope_id    = boundary_scope.org.id
 }
 
-# ── hosts.tf ────────────────────────────────────
+# ── hosts.tf ──────────────────────────────────────────
 resource "boundary_host_catalog" "backend_servers" {
   name        = "backend_servers"
   description = "Web servers for backend team"
@@ -53,8 +53,7 @@ resource "boundary_host_set" "backend_servers" {
   host_ids        = [for host in boundary_host.backend_servers : host.id]
 }
 
-
-# ── principles.tf ────────────────────────────────────
+# ── principles.tf ──────────────────────────────────────────
 resource "boundary_user" "backend" {
   for_each    = var.backend_team
   name        = each.key
@@ -132,8 +131,7 @@ resource "boundary_group" "frontend_core_infra" {
   scope_id    = boundary_scope.core_infra.id
 }
 
-
-# ── roles.tf ────────────────────────────────────
+# ── roles.tf ──────────────────────────────────────────
 # Allows anonymous (un-authenticated) users to list and authenticate against any
 # auth method, list the global scope, and read and change password on their account ID
 # at the global scope
@@ -160,7 +158,7 @@ resource "boundary_role" "org_anon_listing" {
   principal_ids = ["u_anon"]
 }
 
-# Creates a role in the global scope that's granting administrative access to 
+# Creates a role in the global scope that's granting administrative access to
 # resources in the org scope for all backend users
 resource "boundary_role" "org_admin" {
   scope_id       = boundary_scope.global.id
@@ -175,7 +173,7 @@ resource "boundary_role" "org_admin" {
 }
 
 # Adds a read-only role in the global scope granting read-only access
-# to all resources within the org scope and adds principals from the 
+# to all resources within the org scope and adds principals from the
 # leadership team to the role
 resource "boundary_role" "org_readonly" {
   name        = "readonly"
@@ -205,8 +203,7 @@ resource "boundary_role" "project_admin" {
   )
 }
 
-
-# ── scopes.tf ────────────────────────────────────
+# ── scopes.tf ──────────────────────────────────────────
 resource "boundary_scope" "global" {
   global_scope = true
   name         = "global"
@@ -228,8 +225,7 @@ resource "boundary_scope" "core_infra" {
   auto_create_default_role = true
 }
 
-
-# ── targets.tf ────────────────────────────────────
+# ── targets.tf ──────────────────────────────────────────
 resource "boundary_target" "backend_servers_ssh" {
   type                     = "tcp"
   name                     = "backend_servers_ssh"
@@ -254,8 +250,7 @@ resource "boundary_target" "backend_servers_website" {
   ]
 }
 
-
-# ── vars.tf ────────────────────────────────────
+# ── vars.tf ──────────────────────────────────────────
 variable "url" {
   default = "http://127.0.0.1:9200"
 }

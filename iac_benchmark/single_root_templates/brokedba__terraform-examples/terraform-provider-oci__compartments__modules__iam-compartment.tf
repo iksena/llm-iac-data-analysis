@@ -1,6 +1,5 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 // Copyright (c) 2018, 2021, Oracle and/or its affiliates.
- 
 
 ########################
 # Compartment
@@ -29,8 +28,7 @@ locals {
   parent_compartment_ids = concat(flatten(data.oci_identity_compartments.this.*.compartments), tolist([tomap({"compartment_id" = ""})]))
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 // Copyright (c) 2018, 2021, Oracle and/or its affiliates.
 
 variable "tenancy_ocid" {
@@ -70,8 +68,7 @@ variable "enable_delete" {
   default     = false
 }
 
-
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     oci = {
@@ -82,8 +79,7 @@ terraform {
   required_version = ">= 1.0.0"
 }
 
-
-# ── output.tf ────────────────────────────────────
+# ── output.tf ──────────────────────────────────────────
 output "compartment_id" {
   description = "Compartment ocid"
   // This allows the compartment ID to be retrieved from the resource if it exists, and if not to use the data source.

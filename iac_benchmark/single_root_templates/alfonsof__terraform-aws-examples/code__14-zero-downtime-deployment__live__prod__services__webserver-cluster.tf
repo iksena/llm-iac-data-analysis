@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Configure the AWS provider
 provider "aws" {
   region = "eu-west-1"
@@ -7,7 +7,7 @@ provider "aws" {
 # Use Module
 module "webserver_cluster" {
   source = "../../../../modules/services/webserver-cluster"
-  
+
   ami         = "ami-785db401"
   server_text = "Hello, World"
 
@@ -21,15 +21,13 @@ module "webserver_cluster" {
   enable_autoscaling  = true
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Output variable: DNS Name of ELB
 output "elb_dns_name" {
   value = "${module.webserver_cluster.elb_dns_name}"
 }
 
-
-# ── backend.tf ────────────────────────────────────
+# ── backend.tf ──────────────────────────────────────────
 # Define Terraform backend using a S3 bucket for storing the Terraform state
 terraform {
   backend "s3" {
@@ -39,8 +37,7 @@ terraform {
   }
 }
 
-
-# ── vars.tf ────────────────────────────────────
+# ── vars.tf ──────────────────────────────────────────
 # Input variable: DB remote state bucket name
 variable "db_remote_state_bucket" {
   description = "The name of the S3 bucket for the database's remote state"

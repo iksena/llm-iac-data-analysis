@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 ## Azure provider
 provider "azurerm" {
   features {}
@@ -36,7 +36,7 @@ module "aks" {
   depends_on = [azurerm_resource_group.main]
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "prefix" {
   type        = string
   description = "Short prefix to use for naming. Should be six characters or less. Defaults to test."
@@ -72,7 +72,7 @@ variable "castai_grpc_url" {
   default     = "grpc.cast.ai:443"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "client_certificate" {
   value = module.aks.client_certificate
   sensitive = true
@@ -93,7 +93,7 @@ output "host" {
   sensitive = true
 }
 
-# ── castai.tf ────────────────────────────────────
+# ── castai.tf ──────────────────────────────────────────
 # 3. Connect AKS cluster to CAST AI in READ-ONLY mode.
 
 # Configure Data sources and providers required for CAST AI connection.
@@ -143,7 +143,7 @@ module "castai-aks-cluster" {
   }
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = "~>1.5"
 

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {
@@ -8,7 +8,7 @@ terraform {
   }
 
   backend "azurerm" {
-    
+
   }
 }
 
@@ -21,10 +21,7 @@ variable "subscription_id" {
   type = string
 }
 
-
-
-
-# ── import.tf ────────────────────────────────────
+# ── import.tf ──────────────────────────────────────────
 # __generated__ by Terraform
 # Please review these resources and move them into your main configuration files.
 

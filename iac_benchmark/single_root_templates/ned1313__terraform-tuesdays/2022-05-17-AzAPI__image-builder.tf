@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # This will create resources for the Azure Image Builder
 data "azurerm_client_config" "current" {}
 
@@ -71,7 +71,6 @@ resource "azurerm_shared_image" "aib" {
     offer     = "Windows10"
     sku       = "Win10AVDMS"
   }
-
 
 }
 
@@ -176,8 +175,7 @@ resource "azapi_resource_action" "run_build" {
   }
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "location" {
   type        = string
   description = "(Optional) The Azure region where the resources should be created."
@@ -196,7 +194,7 @@ variable "build_image" {
   default     = false
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "resource_group_name" {
   value = azurerm_resource_group.aib.name
 }
@@ -209,7 +207,7 @@ output "build_run" {
   value = azapi_resource_action.run_build
 }
 
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_version = "~>1.0"
 

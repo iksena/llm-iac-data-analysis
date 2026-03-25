@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # This aws_lambda_function is used when invoked with a local zipfile
 resource "aws_lambda_function" "local_zipfile" {
   count = "${var.function_s3_bucket == "" ? 1 : 0}"
@@ -54,8 +54,7 @@ locals {
   function_invoke_arn = "${element(concat(aws_lambda_function.local_zipfile.*.invoke_arn, list("")), 0)}${element(concat(aws_lambda_function.s3_zipfile.*.invoke_arn, list("")), 0)}"
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "cronjob_name" {
   description = "Name which will be used to create your Lambda function (e.g. `\"my-important-cronjob\"`)"
 }
@@ -130,15 +129,13 @@ locals {
   prefix_with_name = "${var.name_prefix}${replace("${var.cronjob_name}", "/[^a-z0-9-]+/", "-")}" # only lowercase alphanumeric characters and hyphens are allowed in e.g. S3 bucket names
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "function_name" {
   description = "This is the unique name of the Lambda function that was created"
   value       = "${local.function_id}"
 }
 
-
-# ── permissions.tf ────────────────────────────────────
+# ── permissions.tf ──────────────────────────────────────────
 # Allow Lambda to invoke our functions:
 
 resource "aws_iam_role" "this" {

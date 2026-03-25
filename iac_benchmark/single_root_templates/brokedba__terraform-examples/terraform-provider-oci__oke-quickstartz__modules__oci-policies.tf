@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
 #
@@ -35,7 +35,7 @@ locals {
   policy_compartment_ocid = var.compartment_ocid != "" ? var.compartment_ocid : var.tenancy_ocid
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
 #
@@ -110,7 +110,7 @@ locals {
   policy_name_normalized        = substr(replace(lower(var.policy_name), " ", "-"), 0, 80)
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Copyright (c) 2023 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
 #
@@ -125,7 +125,7 @@ output "compartment_policy_id" {
   value = try(oci_identity_policy.policies.0.id, null)
 }
 
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 # Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
 #

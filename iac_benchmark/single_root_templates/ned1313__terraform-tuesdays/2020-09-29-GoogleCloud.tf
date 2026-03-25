@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 #########################################################################################
 # This configuration creates a project and App Engine instance in GCP
 # and it creates a MongoDB cluster through Atlas on GCP
@@ -47,7 +47,6 @@ variable "mongodbatlas_org_id" {}
 
 # Set this using the environment variable TF_VAR_mongodbatlas_database_password
 variable "mongodbatlas_database_password" {}
-
 
 ############################
 # PROVIDERS
@@ -164,8 +163,6 @@ resource "google_app_engine_application" "app" {
   location_id = var.location_id
 }
 
-
-
 ############################
 # OUTPUTS
 ############################
@@ -178,7 +175,7 @@ output "plstring" {
     value = mongodbatlas_cluster.run.connection_strings[0]
 }
 
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     google = {

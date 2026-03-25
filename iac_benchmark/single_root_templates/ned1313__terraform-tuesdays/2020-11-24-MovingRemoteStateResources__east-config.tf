@@ -18,7 +18,6 @@ variable "region_2" {
   default = "us-west-1"
 }
 
-
 variable "vpc1_cidr_range" {
   type    = string
   default = "10.0.0.0/16"
@@ -38,7 +37,6 @@ variable "vpc2_public_subnets" {
   type    = list(string)
   default = ["10.1.0.0/24", "10.1.1.0/24"]
 }
-
 
 #############################################################################
 # PROVIDERS
@@ -67,7 +65,7 @@ data "aws_availability_zones" "azs_2" {
 
 #############################################################################
 # RESOURCES
-#############################################################################  
+#############################################################################
 
 module "vpc1" {
   source  = "terraform-aws-modules/vpc/aws"

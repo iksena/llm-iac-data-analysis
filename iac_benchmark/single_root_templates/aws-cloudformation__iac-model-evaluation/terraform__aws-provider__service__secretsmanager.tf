@@ -1,4 +1,4 @@
-# ── aws_secretsmanager_count_if.tf ────────────────────────────────────
+# ── aws_secretsmanager_count_if.tf ──────────────────────────────────────────
 # Write Terraform configuration that creates Secrets Manager and set the secret version if var generate_secret is true
 
 resource "aws_secretsmanager_secret" "example" {
@@ -22,7 +22,7 @@ variable "generate_secret" {
   default = false
 }
 
-# ── aws_secretsmanager_version_if.tf ────────────────────────────────────
+# ── aws_secretsmanager_version_if.tf ──────────────────────────────────────────
 # Create Terraform resoource for secrets manager secret, set the secret value from variable secret_string if available, else auto-generate the secret
 
 resource "aws_secretsmanager_secret" "example" {

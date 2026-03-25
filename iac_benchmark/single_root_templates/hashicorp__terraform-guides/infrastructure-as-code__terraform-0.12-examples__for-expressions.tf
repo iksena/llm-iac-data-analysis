@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.12.0"
 }
@@ -83,8 +83,7 @@ output "ips_with_list_in_brackets" {
   ]
 }
 
-
-# ── lists-and-maps-with-for.tf ────────────────────────────────────
+# ── lists-and-maps-with-for.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.12.0"
 }

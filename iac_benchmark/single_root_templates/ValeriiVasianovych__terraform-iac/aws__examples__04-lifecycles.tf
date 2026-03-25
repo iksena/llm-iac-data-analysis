@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -39,8 +39,7 @@ resource "aws_instance" "lifecycle_instance" {
   })
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "aws_region" {
   description = "Region to deploy the resources"
   type        = string
@@ -69,7 +68,7 @@ variable "allow_security_groups_ports" {
   default     = [22, 80, 443]
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "aws_region" {
   value = data.aws_region.current.name
 }
@@ -86,12 +85,12 @@ output "aws_caller_identity" {
   value = data.aws_caller_identity.current
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 data "aws_availability_zones" "available" {}
 data "aws_caller_identity" "current" {}
 
-# ── security_group.tf ────────────────────────────────────
+# ── security_group.tf ──────────────────────────────────────────
 resource "aws_security_group" "lifecycle_security_group" {
   name        = "terraform_server"
   description = "An example security group for Terraform"

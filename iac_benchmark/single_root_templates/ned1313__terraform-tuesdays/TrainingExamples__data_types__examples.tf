@@ -1,16 +1,7 @@
-
-
-
-
-
-
-
 resource "azurerm_subnet" "main" {
   count = 3
   #...
 }
-
-
 
 variable "subnet_count" {
     type    = number
@@ -26,7 +17,6 @@ locals {
   plain_string = "I'm a string!"
   single_quoted = 'I am single quoted' # ERROR!
 }
-
 
 locals {
   multi_line = <<EOF

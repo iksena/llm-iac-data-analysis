@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -18,7 +18,7 @@ provider "aws" {
   region = var.region
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   description = "The AWS region to launch the resources."
   type        = string
@@ -32,10 +32,10 @@ variable "db_username" {
 
 variable "db_password" {
   type        = string
-  description = "The password for the database using ENV variable." 
+  description = "The password for the database using ENV variable."
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "region" {
   value = data.aws_region.current.name
 }
@@ -54,13 +54,11 @@ output "db_password" {
   sensitive = true
 }
 
-
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
-
-# ── db.tf ────────────────────────────────────
+# ── db.tf ──────────────────────────────────────────
 resource "aws_db_instance" "mysql" {
   identifier           = "mysql-db"         # It is the name of the database instance.
   publicly_accessible  = true               # It means that the database is accessible from the internet.

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Set the Azure Provider source and version being used
 terraform {
   required_version = ">= 0.14"
@@ -150,8 +150,7 @@ resource "azurerm_virtual_machine_extension" "tfexample" {
   }
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Data source to access the properties of an existing Azure Public IP Address
 data "azurerm_public_ip" "tfexample" {
   name                = azurerm_public_ip.tfexample.name
@@ -163,8 +162,7 @@ output "public_ip" {
   value = data.azurerm_public_ip.tfexample.ip_address
 }
 
-
-# ── vars.tf ────────────────────────────────────
+# ── vars.tf ──────────────────────────────────────────
 # Input variable: server port
 variable "server_port" {
   description = "The port the server will use for HTTP requests"

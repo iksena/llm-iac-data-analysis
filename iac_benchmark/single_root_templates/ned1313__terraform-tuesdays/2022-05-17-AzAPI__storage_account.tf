@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Based on a public preview and GitHub issue: https://github.com/hashicorp/terraform-provider-azurerm/issues/15846
 # This may not work in your region or at all.
 
@@ -6,7 +6,6 @@ resource "azurerm_resource_group" "example" {
     name     = "resource-update"
     location = "eastus"
 }
-
 
 resource "azurerm_storage_account" "example" {
   name = "examplednsendpoint42"
@@ -29,8 +28,7 @@ resource "azapi_update_resource" "example" {
   })
 }
 
-
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {

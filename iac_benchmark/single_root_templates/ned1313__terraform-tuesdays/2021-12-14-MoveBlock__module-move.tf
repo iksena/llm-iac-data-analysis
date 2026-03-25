@@ -21,7 +21,6 @@ data "aws_availability_zones" "available" {
 
 }
 
-
 resource "aws_vpc" "vpc" {
   cidr_block           = "192.168.0.0/22"
   enable_dns_hostnames = true
@@ -47,7 +46,6 @@ resource "aws_route" "default_route" {
   destination_cidr_block = "0.0.0.0/0"
   gateway_id             = aws_internet_gateway.igw.id
 }
-
 
 /*
 module "vpc" {
@@ -83,4 +81,3 @@ moved {
   to   = module.vpc.aws_subnet.subnets[0]
 }
 */
-

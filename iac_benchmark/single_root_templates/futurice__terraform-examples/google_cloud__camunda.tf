@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "gcs" {
     prefix = "terraform/state"
@@ -21,8 +21,7 @@ locals {
   }
 }
 
-
-# ── build.tf ────────────────────────────────────
+# ── build.tf ──────────────────────────────────────────
 # Copy Camunda base image from Dockerhub image into Google Container Registry
 module "docker-mirror-camunda-bpm-platform" {
   source      = "github.com/neomantra/terraform-docker-mirror"
@@ -67,7 +66,7 @@ resource "null_resource" "camunda_cloudsql_image" {
     image = "eu.gcr.io/${local.project}/camunda_cloudsql:${local.config.base_image_tag}_${
       sha1(
         "${sha1(local_file.dockerfile.content)}${sha1(local_file.bpm-platform.content)}"
-      )  
+      )
     }"
   }
   provisioner "local-exec" {
@@ -80,9 +79,7 @@ resource "null_resource" "camunda_cloudsql_image" {
   }
 }
 
-
-# ── camunda.tf ────────────────────────────────────
-
+# ── camunda.tf ──────────────────────────────────────────
 # Policy to allow public access to Cloud Run endpoint
 data "google_iam_policy" "noauth" {
   binding {
@@ -123,7 +120,7 @@ resource "google_cloud_run_service" "camunda" {
         image = null_resource.camunda_cloudsql_image.triggers.image
         resources {
           limits = {
-            # Default of 256Mb is not enough to start Camunda 
+            # Default of 256Mb is not enough to start Camunda
             memory = "2Gi"
             cpu    = "1000m"
           }
@@ -182,8 +179,7 @@ resource "google_cloud_run_service" "camunda" {
   }
 }
 
-
-# ── cloudsql.tf ────────────────────────────────────
+# ── cloudsql.tf ──────────────────────────────────────────
 resource "google_sql_database_instance" "camunda-db" {
   name             = "camunda-db-postgres"
   database_version = "POSTGRES_11"

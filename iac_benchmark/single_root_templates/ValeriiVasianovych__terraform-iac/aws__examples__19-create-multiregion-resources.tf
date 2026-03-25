@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -16,12 +16,12 @@ terraform {
   }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region_name" {
   default = ["us-east-1", "eu-north-1", "eu-central-1"]
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "aws_caller_identity" {
     value = data.aws_caller_identity.current.id
 }
@@ -34,21 +34,21 @@ output "show_created_vpc" {
     ]
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_caller_identity" "current" {}
 
-# ── provider.tf ────────────────────────────────────
+# ── provider.tf ──────────────────────────────────────────
 provider "aws" {
   region = var.region_name[0]
   alias  = "region-1"
 
   assume_role {
     # Region-level control:
-    # Example has three providers to operate in different regions. 
-    # If you want to: 
-    # - Manage resources in regions with different access levels or configurations, 
+    # Example has three providers to operate in different regions.
+    # If you want to:
+    # - Manage resources in regions with different access levels or configurations,
     # - Use specific roles for each region,
-    
+
     # Example scenario:
     # The role for region-1 allows managing only EC2 and RDS.
     # For region-2, there is no role, direct access is used.
@@ -70,7 +70,7 @@ provider "aws" {
   alias  = "region-3"
 }
 
-# ── vpc.tf ────────────────────────────────────
+# ── vpc.tf ──────────────────────────────────────────
 resource "aws_vpc" "vpc-1" {
   provider   = aws.region-1
   cidr_block = "10.0.0.0/16"

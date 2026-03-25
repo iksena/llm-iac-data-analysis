@@ -1,5 +1,4 @@
-# ── main.tf ────────────────────────────────────
-
+# ── main.tf ──────────────────────────────────────────
 locals {
   project           = "larkworthy-tester"
   project_number    = "455826092000"
@@ -149,8 +148,7 @@ resource "google_pubsub_subscription" "httpwal" {
   }
 }
 
-
-# ── build.tf ────────────────────────────────────
+# ── build.tf ──────────────────────────────────────────
 # Mirror base image from Dockerhub image into Google Container Registry
 module "docker-mirror" {
   source      = "github.com/neomantra/terraform-docker-mirror"
@@ -178,7 +176,7 @@ resource "null_resource" "openresty_image" {
     image = "eu.gcr.io/${local.project}/openresty:${local.base_image_tag}_${
       sha1(
         "${sha1(local_file.dockerfile.content)}${sha1(local_file.config.content)}${sha1(local_file.login.content)}${data.archive_file.swiss.output_sha}"
-      )  
+      )
     }"
   }
   provisioner "local-exec" {

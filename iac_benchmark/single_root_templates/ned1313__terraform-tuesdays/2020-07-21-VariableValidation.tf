@@ -18,7 +18,6 @@ variable "always_wrong" {
     }
 }
 
-
 variable "ip_address" {
     type = string
 
@@ -28,14 +27,12 @@ variable "ip_address" {
     }
 }
 
-
 module "default_variable" {
     source = "./mock_mod"
 
     my_str = var.no_caps
-    
-}
 
+}
 
 output "ip_address" {
     value = var.ip_address

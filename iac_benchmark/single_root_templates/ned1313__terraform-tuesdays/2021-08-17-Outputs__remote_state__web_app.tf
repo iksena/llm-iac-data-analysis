@@ -1,4 +1,4 @@
-# In this configuration we are going to access the outputs from the 
+# In this configuration we are going to access the outputs from the
 # remote state stored for the networking.
 
 data "terraform_remote_state" "network" {

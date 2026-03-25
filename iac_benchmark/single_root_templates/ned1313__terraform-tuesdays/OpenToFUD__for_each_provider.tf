@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "aws" {
   region = var.aws_regions[0]
 }
@@ -52,8 +52,7 @@ module "vpc_region2" {
   tags = var.tags
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "aws_regions" {
   description = "AWS region to deploy resources"
   type        = list(string)
@@ -85,8 +84,7 @@ variable "vpc_config_by_region" {
 
 }
 
-
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.0.0"
 

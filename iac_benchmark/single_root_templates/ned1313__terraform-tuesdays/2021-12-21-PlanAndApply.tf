@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 ##################################################################################
 # PROVIDERS
 ##################################################################################
@@ -32,13 +32,12 @@ resource "aws_vpc" "vpc" {
 resource "aws_internet_gateway" "igw" {
   vpc_id = aws_vpc.vpc.id
 
-  
 }
 
 resource "aws_subnet" "subnet1" {
   cidr_block              = var.vpc_subnet1_cidr_block
   vpc_id                  = aws_vpc.vpc.id
-  
+
   tags = {
       Name = "Taconet-sub1"
   }
@@ -53,7 +52,6 @@ resource "aws_route_table" "rtb" {
     gateway_id = aws_internet_gateway.igw.id
   }
 
-  
 }
 
 resource "aws_route_table_association" "rta-subnet1" {
@@ -62,7 +60,7 @@ resource "aws_route_table_association" "rta-subnet1" {
 }
 
 # SECURITY GROUPS #
-# Nginx security group 
+# Nginx security group
 resource "aws_security_group" "nginx-sg" {
   name   = "nginx_sg"
   vpc_id = aws_vpc.vpc.id
@@ -83,7 +81,6 @@ resource "aws_security_group" "nginx-sg" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  
 }
 
 # INSTANCES #
@@ -107,7 +104,7 @@ EOF
 
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "aws_region" {
   type        = string
   description = "Region for AWS Resources"

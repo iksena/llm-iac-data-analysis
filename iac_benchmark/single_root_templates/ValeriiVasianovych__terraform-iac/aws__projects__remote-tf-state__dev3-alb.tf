@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket  = "terrafrom-tfstate-file-s3-bucket"
@@ -19,7 +19,7 @@ module "common_vars" {
   source = "../common"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "ec2_remote_state_outputs" {
   value = data.terraform_remote_state.ec2.outputs
 }
@@ -28,7 +28,7 @@ output "nlb_dns_name" {
   value = aws_lb.webservers_nlb.dns_name
 }
 
-# ── alb.tf ────────────────────────────────────
+# ── alb.tf ──────────────────────────────────────────
 resource "aws_lb" "webservers_nlb" {
   name               = "webservers-nlb"
   internal           = false
@@ -91,8 +91,7 @@ resource "aws_lb_listener" "webservers_listener" {
   }
 }
 
-
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "terraform_remote_state" "vpc" {
   backend = "s3"
   config = {

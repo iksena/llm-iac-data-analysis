@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket       = "terraform-states-vv"
@@ -115,8 +115,7 @@ resource "aws_ec2_transit_gateway_vpc_attachment" "vpc_attachment" {
 # | VPC3    | 10.10.0.0/16           | TGW Attachment к VPC1   |
 # | VPC3    | 10.20.0.0/16           | TGW Attachment к VPC2   |
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   description = "The AWS region where the resources will be created."
   type        = string
@@ -154,7 +153,6 @@ locals {
   }
 }
 
-
 locals {
   vpc_cidrs = var.vpc_cidr
 }
@@ -171,5 +169,4 @@ variable "key_name" {
     default = "aws_ssh_key"
 }
 
-
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────

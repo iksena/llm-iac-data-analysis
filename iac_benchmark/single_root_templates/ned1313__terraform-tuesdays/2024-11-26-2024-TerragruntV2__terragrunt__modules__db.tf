@@ -1,11 +1,10 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "azurerm_resource_group" "postgres" {
   name     = "${var.prefix}-postgres-rg"
   location = var.location
 
   tags = var.common_tags
 }
-
 
 resource "azurerm_postgresql_server" "postgres" {
   name                = "${var.prefix}-postgres-server"
@@ -16,7 +15,6 @@ resource "azurerm_postgresql_server" "postgres" {
 
   storage_mb            = 5120
   backup_retention_days = 7
-
 
   administrator_login          = "psqladmin"
   administrator_login_password = "H@Sh1CoR3!"
@@ -32,7 +30,7 @@ resource "azurerm_postgresql_virtual_network_rule" "postgres" {
   ignore_missing_vnet_service_endpoint = true
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "common_tags" {
   description = "Common tags to be applied to resources"
   type        = map(string)
@@ -53,8 +51,8 @@ variable "subnet_id" {
   type        = string
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "postgres_fqdn" {
   value = azurerm_postgresql_server.postgres.fqdn
-  
+
 }

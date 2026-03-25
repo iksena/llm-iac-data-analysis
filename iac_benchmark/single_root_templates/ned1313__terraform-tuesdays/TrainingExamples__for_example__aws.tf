@@ -1,8 +1,7 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "aws" {
   region = "us-west-2"
 }
-
 
 locals {
   layers = flatten([ for l in var.lambdas :
@@ -48,8 +47,7 @@ resource "aws_lambda_function" "name" {
 
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "lambdas" {
   description = "Lambdas"
   type = list(object({
@@ -77,10 +75,10 @@ variable "lambdas" {
 }
 
 variable "lambda_role" {
-  
+
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     aws = {

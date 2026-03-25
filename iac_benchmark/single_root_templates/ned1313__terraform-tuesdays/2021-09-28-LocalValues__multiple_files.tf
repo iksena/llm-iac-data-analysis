@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   type        = string
   description = "Region in Azure"
@@ -10,7 +10,7 @@ variable "naming_prefix" {
   default = "taco"
 }
 
-# ── locals.tf ────────────────────────────────────
+# ── locals.tf ──────────────────────────────────────────
 resource "random_id" "seed" {
   byte_length = 4
 }
@@ -19,7 +19,7 @@ locals {
   prefix = "${var.naming_prefix}-${random_id.seed.hex}"
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {
@@ -34,7 +34,7 @@ provider "azurerm" {
   features {}
 }
 
-# ── vnet.tf ────────────────────────────────────
+# ── vnet.tf ──────────────────────────────────────────
 locals {
   vnet_info = {
     name    = "${local.prefix}-vnet"
@@ -60,7 +60,6 @@ resource "azurerm_resource_group" "vnet" {
   name     = local.prefix
   location = var.region
 }
-
 
 module "network" {
   source              = "Azure/network/azurerm"

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Configure the Azure provider
 provider "azurerm" {
   features {}
@@ -32,8 +32,7 @@ data "terraform_remote_state" "network" {
   }
 }
 
-
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {

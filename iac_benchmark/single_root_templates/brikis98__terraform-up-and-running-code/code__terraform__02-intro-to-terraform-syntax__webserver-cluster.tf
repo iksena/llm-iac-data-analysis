@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.0.0, < 2.0.0"
 
@@ -152,9 +152,7 @@ resource "aws_security_group" "alb" {
   }
 }
 
-
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "server_port" {
   description = "The port the server will use for HTTP requests"
   type        = number
@@ -179,8 +177,7 @@ variable "alb_security_group_name" {
   default     = "terraform-example-alb"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "alb_dns_name" {
   value       = aws_lb.example.dns_name
   description = "The domain name of the load balancer"

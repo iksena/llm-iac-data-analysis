@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "aws" {
   region = local.region
 }
@@ -46,11 +46,9 @@ module "vpc" {
   tags = local.tags
 }
 
+# ── variables.tf ──────────────────────────────────────────
 
-# ── variables.tf ────────────────────────────────────
-
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vpc_id" {
   description = "The ID of the VPC"
   value       = module.vpc.vpc_id
@@ -592,8 +590,7 @@ output "vpc_flow_log_cloudwatch_iam_role_arn" {
   value       = module.vpc.vpc_flow_log_cloudwatch_iam_role_arn
 }
 
-
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.0"
 

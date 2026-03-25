@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
   subscription_id = var.subscription_id
@@ -43,7 +43,7 @@ module "db" {
   subnet_id   = module.network.subnet_id_map["db"]
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "location" {
   description = "The location to use for the network"
   type        = string
@@ -85,7 +85,7 @@ variable "subscription_id" {
 
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "fe_fqdn" {
   value = "https://${module.frontend.frontend_public_dns}"
 
@@ -95,7 +95,7 @@ output "be_ip_address" {
   value = module.backend.backend_ip_address
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {

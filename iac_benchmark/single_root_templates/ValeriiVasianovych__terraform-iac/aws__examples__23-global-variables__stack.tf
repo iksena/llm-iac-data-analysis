@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket       = "terrafrom-tfstate-file-s3-bucket"
@@ -47,12 +47,12 @@ output "instance_types" {
 #================================================================
 #================================================================
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "instance_public_ip" {
   value = aws_instance.example.public_ip
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_caller_identity" "current" {}
 
 data "aws_ami" "latest_ubuntu" {
@@ -73,7 +73,7 @@ data "terraform_remote_state" "global_vars" {
   }
 }
 
-# ── instance.tf ────────────────────────────────────
+# ── instance.tf ──────────────────────────────────────────
 resource "aws_instance" "example" {
   ami             = data.aws_ami.latest_ubuntu.id
   instance_type   = local.instance_types["micro"]

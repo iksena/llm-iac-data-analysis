@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   description = "AWS region"
   type        = string
@@ -32,7 +32,6 @@ variable "env" {
     default     = "dev"
 }
 
-
 variable "developer" {
     description = "Developer name"
     type        = list(string)
@@ -58,7 +57,7 @@ variable "instance_type" {
     }
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "region" {
   description = "AWS region"
   value       = var.region

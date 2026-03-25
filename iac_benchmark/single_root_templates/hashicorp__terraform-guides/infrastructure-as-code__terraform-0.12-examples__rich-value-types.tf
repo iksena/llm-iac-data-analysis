@@ -49,7 +49,7 @@ module "network" {
 resource "aws_network_interface" "rvt" {
   subnet_id = module.network.subnet_id
   private_ips = var.interface_ips
-  
+
   tags = {
     Name = "tf-0.12-rvt-example-interface"
   }

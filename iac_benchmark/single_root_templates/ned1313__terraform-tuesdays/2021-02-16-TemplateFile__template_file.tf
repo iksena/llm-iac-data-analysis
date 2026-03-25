@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Let's try and render the test template using the template_file data source
 data "template_file" "test" {
   template = file("test.tmpl")
@@ -20,7 +20,7 @@ output "template" {
   value = data.template_file.test.rendered
 }
 
-# ── locals.tf ────────────────────────────────────
+# ── locals.tf ──────────────────────────────────────────
 # Let's create some local values of different object types
 locals {
   mystring = "taco"

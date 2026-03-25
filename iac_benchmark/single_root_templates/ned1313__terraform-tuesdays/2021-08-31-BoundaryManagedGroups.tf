@@ -1,12 +1,11 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "boundary_server" {
   type = string
   description = "Address of boundary server for provider"
   default = "http://localhost:9200"
 }
 
-
-# ── oidc_auth_method.tf ────────────────────────────────────
+# ── oidc_auth_method.tf ──────────────────────────────────────────
 provider "boundary" {
   addr = var.boundary_server
   auth_method_id = "ampw_1234567890"
@@ -58,7 +57,7 @@ output "grant_command" {
   value = module.azuread_oidc.grant_command
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
       boundary = {

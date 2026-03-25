@@ -9,7 +9,7 @@ terraform {
 
 provider "azurerm" {
   features {}
-  
+
 }
 
 variable "primary_location" {

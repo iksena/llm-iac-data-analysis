@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 data "terraform_remote_state" "aks" {
   backend = "local"
   config = {
@@ -130,7 +130,7 @@ resource "kubernetes_deployment" "load_gen" {
   }
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = "~>1.5"
 

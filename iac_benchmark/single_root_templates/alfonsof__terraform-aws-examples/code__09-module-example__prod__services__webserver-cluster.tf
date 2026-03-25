@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Configure the AWS provider
 provider "aws" {
   region = "eu-west-1"
@@ -7,7 +7,7 @@ provider "aws" {
 # Use Module
 module "webserver_cluster" {
   source = "../../../modules/services/webserver-cluster"
-  
+
   cluster_name           = "werservers-prod"
   db_remote_state_bucket = "${var.db_remote_state_bucket}"
   db_remote_state_key    = "${var.db_remote_state_key}"
@@ -24,7 +24,7 @@ resource "aws_autoscaling_schedule" "scale_out_during_business_hours" {
   max_size              = 10
   desired_capacity      = 10
   recurrence            = "0 9 * * *"
-  
+
   autoscaling_group_name = "${module.webserver_cluster.asg_name}"
 }
 
@@ -39,15 +39,13 @@ resource "aws_autoscaling_schedule" "scale_in_at_night" {
   autoscaling_group_name = "${module.webserver_cluster.asg_name}"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Output variable: DNS Name of ELB
 output "elb_dns_name" {
   value = "${module.webserver_cluster.elb_dns_name}"
 }
 
-
-# ── backend.tf ────────────────────────────────────
+# ── backend.tf ──────────────────────────────────────────
 # Define Terraform backend using a S3 bucket for storing the Terraform state
 terraform {
   backend "s3" {
@@ -57,8 +55,7 @@ terraform {
   }
 }
 
-
-# ── vars.tf ────────────────────────────────────
+# ── vars.tf ──────────────────────────────────────────
 # Input variable: DB remote state bucket name
 variable "db_remote_state_bucket" {
   description = "The name of the S3 bucket for the database's remote state"

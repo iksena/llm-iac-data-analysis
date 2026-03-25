@@ -10,4 +10,4 @@ resource "azurerm_resource_group" "tacos" {
 # By running `terraform init`, you will get the Azure provider
 # to download into your .terraform/providers directory
 # BTW, the full path is .terraform/providers/provider_registry_location/company_name/provider_name/version/platform/*.exe
-# That is.. a long path. 
+# That is.. a long path.

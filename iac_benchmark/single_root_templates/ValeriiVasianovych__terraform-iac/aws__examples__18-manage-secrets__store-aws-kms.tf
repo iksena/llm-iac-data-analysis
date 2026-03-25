@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -18,14 +18,14 @@ provider "aws" {
   region = var.region
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
     description = "The AWS region to launch the resources."
     type        = string
     default     = "us-east-1"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "region" {
   value = data.aws_region.current.name
 }
@@ -44,7 +44,7 @@ output "db_creds_password" {
   sensitive = true
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 data "aws_kms_secrets" "creds" {
@@ -54,7 +54,7 @@ data "aws_kms_secrets" "creds" {
   }
 }
 
-# ── db.tf ────────────────────────────────────
+# ── db.tf ──────────────────────────────────────────
 locals {
   db_creds = yamldecode(data.aws_kms_secrets.creds.plaintext["db"])
 }

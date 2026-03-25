@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # - Trust Relationships -
 data "aws_iam_policy_document" "ec2_trust_relationship" {
   statement {
@@ -32,8 +32,7 @@ resource "aws_s3_bucket" "example" {
   force_destroy = true
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "aws_region" {
   type        = string
   description = "The AWS region you wish to deploy your resources to."
@@ -41,8 +40,7 @@ variable "aws_region" {
 
 }
 
-
-# ── provider.tf ────────────────────────────────────
+# ── provider.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     aws = {
@@ -55,7 +53,6 @@ terraform {
 # Configure the AWS Provider
 provider "aws" {
   region = var.aws_region
-
 
   default_tags {
     tags = {

@@ -4,7 +4,7 @@ variable "prefix" {
 
 output "local_value" {
   value = "${var.prefix}-local"
-  
+
 }
 
 output "path_module" {

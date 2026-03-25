@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -20,7 +20,7 @@ module "common_vars" {
   source = "../common"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "sg_group_id" {
   value = aws_security_group.webserver.id
 }
@@ -45,7 +45,7 @@ output "eip_ids" {
   value = aws_eip.public_eip[*].id
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "terraform_remote_state" "vpc" {
   backend = "s3"
   config = {
@@ -64,9 +64,8 @@ data "aws_ami" "latest_ubuntu" {
     values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
   }
 }
-  
 
-# ── instance.tf ────────────────────────────────────
+# ── instance.tf ──────────────────────────────────────────
 provider "aws" {
     region = module.common_vars.region
 }
@@ -98,7 +97,7 @@ resource "aws_security_group" "webserver" {
       cidr_blocks = ["0.0.0.0/0"]
     }
   }
-  
+
   egress {
     from_port   = 0
     to_port     = 0

@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "site_domain" {
   description = "Domain on which the reverse proxy will be made available (e.g. `\"www.example.com\"`)"
 }
@@ -122,8 +122,7 @@ locals {
   url_path     = "${replace("${var.origin_url}", "/^(?:\\w+:\\/\\/)?[^/]+(?:\\/(.*)|$)/", "$1")}"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "cloudfront_id" {
   description = "The ID of the CloudFront distribution that's used for hosting the content"
   value       = "${aws_cloudfront_distribution.this.id}"
@@ -134,8 +133,7 @@ output "site_domain" {
   value       = "${var.site_domain}"
 }
 
-
-# ── certificate.tf ────────────────────────────────────
+# ── certificate.tf ──────────────────────────────────────────
 # Generate a certificate for the domain automatically using ACM
 # https://www.terraform.io/docs/providers/aws/r/acm_certificate.html
 resource "aws_acm_certificate" "this" {
@@ -161,8 +159,7 @@ resource "aws_acm_certificate_validation" "this" {
   validation_record_fqdns = ["${aws_route53_record.cert_validation.fqdn}"]
 }
 
-
-# ── cloudfront.tf ────────────────────────────────────
+# ── cloudfront.tf ──────────────────────────────────────────
 # Create the CloudFront distribution through which the site contents will be served
 # https://www.terraform.io/docs/providers/aws/r/cloudfront_distribution.html
 resource "aws_cloudfront_distribution" "this" {
@@ -303,14 +300,12 @@ resource "aws_cloudfront_distribution" "this" {
   }
 }
 
-
-# ── data.tf ────────────────────────────────────
+# ── data.tf ──────────────────────────────────────────
 data "aws_route53_zone" "this" {
   name = "${replace("${var.site_domain}", "/.*\\b(\\w+\\.\\w+)\\.?$/", "$1")}" # e.g. "foo.example.com" => "example.com"
 }
 
-
-# ── lambda.tf ────────────────────────────────────
+# ── lambda.tf ──────────────────────────────────────────
 locals {
   config = {
     basic_auth_username                  = "${var.basic_auth_username}"
@@ -434,8 +429,7 @@ resource "aws_iam_role_policy_attachment" "this" {
   policy_arn = "${aws_iam_policy.this.arn}"
 }
 
-
-# ── route53.tf ────────────────────────────────────
+# ── route53.tf ──────────────────────────────────────────
 # Add an IPv4 DNS record pointing to the CloudFront distribution
 resource "aws_route53_record" "ipv4" {
   zone_id = "${data.aws_route53_zone.this.zone_id}"

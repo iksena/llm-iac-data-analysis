@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "aws" {
   region = "${var.region}"
 }
@@ -21,8 +21,7 @@ resource "aws_subnet" "demo_subnet" {
   }
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vpc_id_consumable" {
   value       = "${aws_vpc.demo_vpc.id}"
   description = "This is the VPC ID for later use"
@@ -33,8 +32,7 @@ output "demo_subnet_id" {
   description = "This is the Subnet ID for later use"
 }
 
-
-# ── _interface.tf ────────────────────────────────────
+# ── _interface.tf ──────────────────────────────────────────
 variable "region" {
   default     = ""
   description = "The default AZ to provision to for the provider"

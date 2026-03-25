@@ -1,10 +1,9 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "config" {
   type = any
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "prober_ingress_table" {
   value = google_bigquery_table.prober_ingress
 }
@@ -35,9 +34,7 @@ output "ingress_dataset" {
   value = google_bigquery_dataset.ingress
 }
 
-
-# ── controls.tf ────────────────────────────────────
-
+# ── controls.tf ──────────────────────────────────────────
 locals {
   control_fields = ["multiplier"]
   control_types  = ["FLOAT"]
@@ -77,7 +74,7 @@ resource "google_bigquery_table" "control_range_view" {
   }
 }
 
-# ── ingress.tf ────────────────────────────────────
+# ── ingress.tf ──────────────────────────────────────────
 resource "google_bigquery_dataset" "ingress" {
   dataset_id                  = "ingress"
   description                 = "Raw event data"
@@ -112,10 +109,7 @@ resource "google_bigquery_table" "prober_ingress" {
   }
 }
 
-
-
-# ── reports.tf ────────────────────────────────────
-
+# ── reports.tf ──────────────────────────────────────────
 resource "google_bigquery_dataset" "reports" {
   dataset_id                  = "reports"
   description                 = "Materialized reports"
@@ -139,8 +133,7 @@ resource "google_bigquery_table" "historical_totals" {
   }
 }
 
-
-# ── urdf.tf ────────────────────────────────────
+# ── urdf.tf ──────────────────────────────────────────
 resource "google_bigquery_dataset" "urdfs" {
   dataset_id                  = "urdfs"
   description                 = "Data processing"
@@ -164,8 +157,7 @@ resource "null_resource" "CUSTOM_JSON_EXTRACT_ARRAY_FLOAT" {
   }
 }
 
-
-# ── views.tf ────────────────────────────────────
+# ── views.tf ──────────────────────────────────────────
 resource "google_bigquery_dataset" "views" {
   dataset_id                  = "views"
   description                 = "Data processing"

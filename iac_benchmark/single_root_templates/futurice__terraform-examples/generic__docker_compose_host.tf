@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "null_resource" "provisioners" {
   triggers = {
     docker_host_ip      = "${var.public_ip}"                        # whenever the docker host on which docker-compose runs changes, re-run the provisioners
@@ -51,8 +51,7 @@ EOF
   }
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "public_ip" {
   description = "Public IP address of a host running docker"
 }
@@ -103,8 +102,7 @@ variable "docker_compose_down_command" {
   default     = "docker-compose stop && docker-compose rm -f"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 locals {
   reprovision_trigger = <<EOF
   ${var.docker_compose_version}

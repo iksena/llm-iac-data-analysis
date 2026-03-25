@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket         = "terrafrom-tfstate-file-s3-bucket"
@@ -21,8 +21,7 @@ provider "aws" {
   region = var.aws_region
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "aws_region" {
     description = "Define region"
     type        = string
@@ -51,7 +50,7 @@ variable "allow_security_groups_ports" {
     default     = [22, 80, 443]
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 
@@ -64,7 +63,7 @@ data "aws_ami" "latest_ubuntu" {
   }
 }
 
-# ── dynamic-user-data.tf ────────────────────────────────────
+# ── dynamic-user-data.tf ──────────────────────────────────────────
 resource "aws_instance" "dynamic_template_server" {
   ami                    = data.aws_ami.latest_ubuntu.id
   instance_type          = "t2.micro"
@@ -83,7 +82,7 @@ resource "aws_instance" "dynamic_template_server" {
     Year = 2024})
   }
 
-# ── security_group.tf ────────────────────────────────────
+# ── security_group.tf ──────────────────────────────────────────
 resource "aws_security_group" "sg_rule" {
   name        = "sg_rule"
   description = "Allow HTTP and HTTPS and SSH inbound traffic"

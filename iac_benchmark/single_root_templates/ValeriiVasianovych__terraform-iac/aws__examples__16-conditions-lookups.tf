@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -18,7 +18,7 @@ provider "aws" {
   region = var.region
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   description = "Region variable"
   type        = string
@@ -58,7 +58,7 @@ variable "sg_lookup_ports" {
   }
 }
 
-# ── conditions.tf ────────────────────────────────────
+# ── conditions.tf ──────────────────────────────────────────
 resource "aws_instance" "ec2_instance_conditions" {
   count                  = (var.env == "Development" ? 1 : 3)
   ami                    = "data.aws_ami.latest_ubuntu"
@@ -101,7 +101,7 @@ resource "aws_security_group" "sg_conditions" {
   }
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_ami" "latest_ubuntu" {
   owners      = ["099720109477"]
   most_recent = true
@@ -111,7 +111,7 @@ data "aws_ami" "latest_ubuntu" {
   }
 }
 
-# ── lookups.tf ────────────────────────────────────
+# ── lookups.tf ──────────────────────────────────────────
 resource "aws_instance" "ec2_instance_lookups" {
   ami = "data.aws_ami.latest_ubuntu"
   # instance_type = lookup(var.instance_size, "staging")

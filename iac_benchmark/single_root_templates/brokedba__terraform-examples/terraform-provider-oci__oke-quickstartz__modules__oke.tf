@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Copyright (c) 2021-2023 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
 #
@@ -75,11 +75,10 @@ locals {
   for x in data.oci_containerengine_clusters.oke.clusters : x.kubernetes_version if x.id == var.existent_oke_cluster_id][0]
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # Copyright (c) 2021, 2022, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 # OCI Provider
 variable "tenancy_ocid" {}
@@ -172,7 +171,7 @@ variable "k8s_version" {
 
 # Create Dynamic Group and Policies
 # variable "create_dynamic_group_for_nodes_in_compartment" {
-#   default     = false # TODO: true 
+#   default     = false # TODO: true
 #   description = "Creates dynamic group of Nodes in the compartment. Note: You need to have proper rights on the Tenancy. If you only have rights in a compartment, uncheck and ask you administrator to create the Dynamic Group for you"
 # }
 # variable "existent_dynamic_group_for_nodes_in_compartment" {
@@ -180,11 +179,11 @@ variable "k8s_version" {
 #   description = "Enter previous created Dynamic Group for the policies"
 # }
 # variable "create_compartment_policies" {
-#   default     = false # TODO: true 
+#   default     = false # TODO: true
 #   description = "Creates policies that will reside on the compartment. e.g.: Policies to support Cluster Autoscaler, OCI Logging datasource on Grafana"
 # }
 # variable "create_tenancy_policies" {
-#   default     = false # TODO: true 
+#   default     = false # TODO: true
 #   description = "Creates policies that need to reside on the tenancy. e.g.: Policies to support OCI Metrics datasource on Grafana"
 # }
 
@@ -222,10 +221,10 @@ variable "block_volumes_tags" {
   description = "Tags to be added to the block volumes resources"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Copyright (c) 2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 output "comments" {
   value = "The application URL will be unavailable for a few minutes after provisioning while the application is configured and deployed to Kubernetes"
@@ -265,8 +264,7 @@ output "oke_cluster_compartment_ocid" {
   description = "Compartment OCID used by the OKE Cluster"
 }
 
-
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 # Copyright (c) 2023, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
 #
@@ -287,11 +285,10 @@ terraform {
   }
 }
 
-
-# ── datasources.tf ────────────────────────────────────
+# ── datasources.tf ──────────────────────────────────────────
 # Copyright (c) 2021-2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 data "oci_containerengine_cluster_option" "oke" {
   cluster_option_id = "all"
@@ -310,11 +307,10 @@ data "oci_containerengine_cluster_kube_config" "oke" {
   cluster_id = var.create_new_oke_cluster ? oci_containerengine_cluster.oke_cluster[0].id : var.existent_oke_cluster_id
 }
 
-
-# ── oke-orm-private-endpoint.tf ────────────────────────────────────
+# ── oke-orm-private-endpoint.tf ──────────────────────────────────────────
 # Copyright (c) 2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 ### Important Notice ###
 # OCI Resource Manager Private Endpoint is only available when using Resource Manager.

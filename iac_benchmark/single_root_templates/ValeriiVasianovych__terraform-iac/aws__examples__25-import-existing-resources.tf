@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "aws" {
   region = var.region
 
@@ -10,7 +10,7 @@ provider "aws" {
   }
 }
 
-# terraform import aws_instance.import_node i-2222222222222222e 
+# terraform import aws_instance.import_node i-2222222222222222e
 resource "aws_instance" "import_node" {
   ami           = "ami-084568db4383264d4"
   instance_type = "t2.micro"
@@ -42,8 +42,7 @@ resource "aws_security_group" "import_sg" {
   }
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   default = "us-east-1"
 }

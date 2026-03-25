@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     aws = {
@@ -17,7 +17,7 @@ provider "aws" {
   region = "us-east-1"
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "allocated_storage" {
   description = "The amount of storage to allocate"
   type        = number
@@ -49,7 +49,7 @@ variable "default_tag" {
   default     = "terraform_aws_rds_secrets_manager"
 }
 
-# ── kms_key.tf ────────────────────────────────────
+# ── kms_key.tf ──────────────────────────────────────────
 # KMS key used by Secrets Manager for RDS
 resource "aws_kms_key" "default" {
   description             = "KMS key for RDS"
@@ -62,7 +62,7 @@ resource "aws_kms_key" "default" {
   }
 }
 
-# ── rds.tf ────────────────────────────────────
+# ── rds.tf ──────────────────────────────────────────
 data "aws_secretsmanager_secret" "example" {
   name = "rds_admin6"
   depends_on = [
@@ -95,7 +95,7 @@ resource "aws_db_instance" "default" {
   }
 }
 
-# ── secrets_manager.tf ────────────────────────────────────
+# ── secrets_manager.tf ──────────────────────────────────────────
 resource "random_password" "password" {
   length           = 16
   special          = true

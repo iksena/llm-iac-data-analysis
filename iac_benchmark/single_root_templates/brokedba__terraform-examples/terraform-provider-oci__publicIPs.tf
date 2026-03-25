@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 #########################################################
 # Public IPs.
 # Author Brokedba https://twitter.com/BrokeDba
@@ -31,19 +31,19 @@ variable "region" {}
 variable "dr_region" {}
 
 ######################
-# locals : 
+# locals :
 ######################
-# all cases in one map 
+# all cases in one map
 locals {
   ips = {
     primary_site = {  # key (display_name) => value (description)
-      mgmt-public_ip-vm-a = "Public IP for Firewall Primary VM management Interface" 
-      mgmt-public_ip-vm-b = "Public IP for Firewall Secondary VM management Interface" 
-      untrust-floating-public_ip = "Floating Public IP for Firewall Untrust Interface" 
+      mgmt-public_ip-vm-a = "Public IP for Firewall Primary VM management Interface"
+      mgmt-public_ip-vm-b = "Public IP for Firewall Secondary VM management Interface"
+      untrust-floating-public_ip = "Floating Public IP for Firewall Untrust Interface"
       untrust-floating-public_ip_frontend_1 = "Floating Public IP for Firewall Untrust Interface inbound (frontend cluster ip)"
     },
     dr_site = {
-      dr-mgmt-public_ip-vm-c = "DR Public IP for Firewall Primary VM management Interface" 
+      dr-mgmt-public_ip-vm-c = "DR Public IP for Firewall Primary VM management Interface"
       dr-mgmt-public_ip-vm-d = "DR Public IP for Firewall Secondary VM management Interface"
       dr-untrust-floating-public_ip = "DR Floating Public IP for Firewall Untrust Interface"
       dr-untrust-floating-public_ip_frontend_1 = "DR Floating Public IP for Firewall Untrust Interface inbound (frontend cluster ip)"
@@ -51,7 +51,7 @@ locals {
 }
 }
 
-# ── output.tf ────────────────────────────────────
+# ── output.tf ──────────────────────────────────────────
 # display the Public Ips
 output "Toronto_public_ips" {
       description = "Shows all public IPs and their OCIDs in Primary site [Toronto]"
@@ -63,10 +63,10 @@ output "Montreal_public_ips" {
       value        = { for ip,p in  oci_core_public_ip.dr_firewall_public_ip : ip => format("name: %s IP:%s OCID:%s",p.display_name,p.ip_address, p.id) }
 }
 
-# ── publicip.tf ────────────────────────────────────
+# ── publicip.tf ──────────────────────────────────────────
 # ---- Terraform Version and configuration_aliases [primary Toronto, DR Montreal]
 terraform {
-required_version = ">= 1.0.3"     
+required_version = ">= 1.0.3"
 required_providers {
  oci = {
       source  = "oracle/oci"
@@ -75,7 +75,7 @@ required_providers {
    }
   }
 }
- 
+
  resource "oci_core_public_ip" "primary_firewall_public_ip" {
     provider = oci.primary
     #Required

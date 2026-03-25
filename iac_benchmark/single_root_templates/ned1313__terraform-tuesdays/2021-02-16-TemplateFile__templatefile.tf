@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 output "template" {
   value = templatefile("${path.module}/test.tmpl",
   {
@@ -9,7 +9,7 @@ output "template" {
   })
 }
 
-# ── locals.tf ────────────────────────────────────
+# ── locals.tf ──────────────────────────────────────────
 # Let's create some local values of different object types
 locals {
   mystring = "taco"

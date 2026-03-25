@@ -1,4 +1,4 @@
-# ── awscc_apigateway_restapi_p1.tf ────────────────────────────────────
+# ── awscc_apigateway_restapi_p1.tf ──────────────────────────────────────────
 # Create a REST API with API Gateway via the 'awscc' provider
 
 # Create REST API Api Gateway with HTTP_PROXY path
@@ -35,8 +35,7 @@ resource "awscc_apigateway_resource" "DemoAPIGatewayResource" {
   path_part   = "DemoAPIGatewayResource"
 }
 
-
-# ── awscc_apigateway_restapi_p2.tf ────────────────────────────────────
+# ── awscc_apigateway_restapi_p2.tf ──────────────────────────────────────────
 # Terraform code to create a REST API with API Gateway via the 'awscc' provider
 
 # Create REST API Api Gateway with HTTP_PROXY path
@@ -73,8 +72,7 @@ resource "awscc_apigateway_resource" "DemoAPIGatewayResource" {
   path_part   = "DemoAPIGatewayResource"
 }
 
-
-# ── awscc_apigateway_restapi_p3.tf ────────────────────────────────────
+# ── awscc_apigateway_restapi_p3.tf ──────────────────────────────────────────
 # Write Terraform configuration that creates REST API with API Gateway, use awscc provider
 
 # Create REST API Api Gateway with HTTP_PROXY path

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "azurerm_resource_group" "network" {
   name     = "${var.prefix}-network-rg"
   location = var.location
@@ -35,7 +35,7 @@ resource "azurerm_subnet" "subnets" {
   }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "location" {
   description = "The location to use for the network"
   type        = string
@@ -71,7 +71,7 @@ variable "subnets" {
   description = "Map of subnets to create"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vnet_id" {
   description = "ID of the virtual network"
   value       = azurerm_virtual_network.network.id

@@ -1,10 +1,10 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   type    = string
   default = "us-east-1"
 }
 
-# ── compute.tf ────────────────────────────────────
+# ── compute.tf ──────────────────────────────────────────
 locals {
   csv_data = csvdecode(file("values.csv"))
 
@@ -66,7 +66,7 @@ resource "aws_launch_template" "taco-machines" {
 
 }
 
-# ── networking.tf ────────────────────────────────────
+# ── networking.tf ──────────────────────────────────────────
 data "aws_availability_zones" "azs" {
   state = "available"
 }
@@ -89,7 +89,7 @@ module "vpc" {
   tags = local.vpc_json_data.Tags
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     aws = {

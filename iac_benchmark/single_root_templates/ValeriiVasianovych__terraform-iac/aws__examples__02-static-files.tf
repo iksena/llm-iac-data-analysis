@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket  = "terrafrom-tfstate-file-s3-bucket"
@@ -39,7 +39,6 @@ resource "aws_security_group" "instance" {
   name        = "terraform_example_instance"
   description = "An example security group for Terraform"
 
-
   dynamic "ingress" {
     for_each =  ["80", "443", "22"]
 
@@ -59,7 +58,7 @@ resource "aws_security_group" "instance" {
   }
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "aws_region" {
   value = data.aws_region.current.name
 }
@@ -76,7 +75,7 @@ output "aws_caller_identity" {
   value = data.aws_caller_identity.current
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 data "aws_availability_zones" "available" {}
 data "aws_caller_identity" "current" {}

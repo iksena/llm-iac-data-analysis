@@ -1,4 +1,4 @@
-# ── network.tf ────────────────────────────────────
+# ── network.tf ──────────────────────────────────────────
 locals {
   # Load all of the data from json
   vnet_json_data = jsondecode(file("config_data.json")).VirtualNetworks
@@ -14,7 +14,7 @@ locals {
   if network_key != "hub-vnet" ])
 }
 
-# ── vm.tf ────────────────────────────────────
+# ── vm.tf ──────────────────────────────────────────
 locals {
   # Load all of the data from json
   vm_json_data = jsondecode(file("config_data.json")).VirtualMachines

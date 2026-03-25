@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
   client_id       = data.vault_azure_access_credentials.creds.client_id
@@ -34,7 +34,7 @@ resource "azurerm_resource_group" "test" {
   location = "eastus"
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "tenant_id" {
   type        = string
   description = "The Azure Active Directory tenant ID"
@@ -76,9 +76,8 @@ variable "vault_namespace" {
   description = "The Vault namespace"
   default = null
 }
-  
 
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     vault = {

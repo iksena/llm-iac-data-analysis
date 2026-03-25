@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   subscription_id = ""
   client_id       = ""
@@ -25,8 +25,7 @@ resource "azurerm_subnet" "demo_subnet" {
   address_prefix       = "${var.sb_address_prefix}"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "resource_group_consumable" {
   value       = "${azurerm_resource_group.demo_resource_group.name}"
   description = "The Demo VPC Name for later use"
@@ -47,8 +46,7 @@ output "subnet_consumable" {
   description = "The Demo Subnet for later use"
 }
 
-
-# ── _interface.tf ────────────────────────────────────
+# ── _interface.tf ──────────────────────────────────────────
 variable "rg_name" {
   default     = ""
   description = "The default name for the Resource Group"

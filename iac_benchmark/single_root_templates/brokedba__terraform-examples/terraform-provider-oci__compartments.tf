@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 provider "oci" {
   tenancy_ocid     = var.tenancy_ocid
   user_ocid        = var.user_ocid
@@ -27,9 +27,9 @@ variable "app_compartment_name" {
   default = "comp-app"
 }
 ######################
-# locals : compartment 
+# locals : compartment
 ######################
-# all cases in one map 
+# all cases in one map
 locals {
   compartments = {
     l1_subcomp = {
@@ -47,12 +47,11 @@ locals {
   }
 }
 
-
 ############################
 # Additional Configuration #
 ############################
 
-# ── compartments.tf ────────────────────────────────────
+# ── compartments.tf ──────────────────────────────────────────
 # ---- Terraform Version
 terraform {
   required_version = ">= 1.0.3" # ">= 0.12, < 0.13" this example is intended to run with Terraform v0.12
@@ -73,7 +72,6 @@ terraform {
 #  version = "2.0.2"
 #}
 
-
 resource "oci_identity_compartment" "iam_compartment_main" {
   #Required
   compartment_id = var.tenancy_ocid
@@ -84,7 +82,6 @@ resource "oci_identity_compartment" "iam_compartment_main" {
   #    freeform_tags = {"Department"= "Finance"}
 }
 
-
 module "level_1_sub_compartments" {
   source   = "./modules/iam-compartment"
   for_each = local.compartments.l1_subcomp
@@ -93,7 +90,7 @@ module "level_1_sub_compartments" {
   compartment_name        = each.key
   compartment_description = each.value
   compartment_create      = true # if false, a data source with a matching name is created instead
-  enable_delete           = true # if false, on `terraform destroy`, compartment is deleted from the terraform state but not from oci 
+  enable_delete           = true # if false, on `terraform destroy`, compartment is deleted from the terraform state but not from oci
 }
 
 data "oci_identity_compartments" "app_comp" {
@@ -105,7 +102,6 @@ data "oci_identity_compartments" "app_comp" {
   depends_on = [module.level_1_sub_compartments, ]
 }
 
-
 module "level_2_sub_compartments" {
   source                  = "./modules/iam-compartment"
   for_each                = local.compartments.l2_subcomp
@@ -113,13 +109,12 @@ module "level_2_sub_compartments" {
   compartment_name        = each.key
   compartment_description = each.value
   compartment_create      = true # if false, a data source with a matching name is created instead
-  enable_delete           = true # if false, on `terraform destroy`, compartment is deleted from the terraform state but not from oci 
+  enable_delete           = true # if false, on `terraform destroy`, compartment is deleted from the terraform state but not from oci
 
   depends_on = [module.level_1_sub_compartments, ]
 }
 
-
-# ── output.tf ────────────────────────────────────
+# ── output.tf ──────────────────────────────────────────
 output "main_compartment" {
   value = {
     Comp_name = oci_identity_compartment.iam_compartment_main.name
@@ -175,5 +170,3 @@ output "comp-app-nprod-ocid" {
 output "comp-app-dr-ocid" {
   value = module.level_2_sub_compartments["${var.app_compartment_name}-dr"].compartment_id
 }
-
- 

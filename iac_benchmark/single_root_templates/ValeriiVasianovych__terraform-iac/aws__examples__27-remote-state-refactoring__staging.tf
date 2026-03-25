@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket       = "terrafrom-tfstate-file-s3-bucket"
@@ -20,12 +20,12 @@ provider "aws" {
   }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   default = "us-east-1"
 }
 
-# ── instance-staging.tf ────────────────────────────────────
+# ── instance-staging.tf ──────────────────────────────────────────
 resource "aws_instance" "instance-2" {
   ami = "ami-084568db4383264d4"
   instance_type = "t2.micro"
@@ -36,7 +36,7 @@ resource "aws_instance" "instance-2" {
   }
 }
 
-# ── sg-staging.tf ────────────────────────────────────
+# ── sg-staging.tf ──────────────────────────────────────────
 resource "aws_security_group" "sg-2" {
   name        = "http-https-sg"
   description = "Allows HTTP HTTPS"

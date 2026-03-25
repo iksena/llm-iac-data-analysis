@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # Infrastructure Configuration
 variable "region" {
   description = "The AWS region"
@@ -133,8 +133,7 @@ locals {
   use_alb       = local.create_private_resources && length(var.private_subnet_ids) >= 2
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "bastion_instance_id" {
   value       = local.create_public_resources ? data.aws_instances.bastion_instances[0].ids : []
   description = "List of IDs of the bastion instances managed by the ASG."
@@ -170,19 +169,19 @@ output "application_domain_name" {
   description = "The fully qualified domain name (FQDN) of the application, or null if no private subnets are created."
 }
 
-# ── app-route53.tf ────────────────────────────────────
+# ── app-route53.tf ──────────────────────────────────────────
 # http
 # resource "aws_route53_record" "app_domain_record" {
 #   zone_id = var.hosted_zone_id
 #   name    = var.hosted_zone_name
 #   type    = "A"
-  
+
 #   alias {
 #     name                   = aws_lb.private_instance_alb[0].dns_name
 #     zone_id                = aws_lb.private_instance_alb[0].zone_id
-#     evaluate_target_health = true                                    
+#     evaluate_target_health = true
 #   }
-  
+
 #   depends_on = [aws_lb.private_instance_alb]
 # }
 
@@ -191,9 +190,9 @@ resource "aws_acm_certificate" "app_domain_cert" {
   count             = local.create_private_resources ? 1 : 0
   domain_name       = "app.${var.hosted_zone_name}"
   validation_method = "DNS"
-  
+
   # subject_alternative_names = ["app.${var.hosted_zone_name}"]  # Modified to include wildcard if needed
-  
+
   tags = {
     Name = "${var.env}-app-certificate"
   }
@@ -241,7 +240,7 @@ resource "aws_route53_record" "app_domain_record" {
   depends_on = [aws_lb.private_instance_nlb, aws_lb.private_instance_alb]
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_instances" "bastion_instances" {
   count = length(var.public_subnet_ids) > 0 ? 1 : 0
 
@@ -275,7 +274,7 @@ data "aws_subnet" "db_private_subnets" {
   id    = var.db_private_subnet_ids[count.index]
 }
 
-# ── private-instance.tf ────────────────────────────────────
+# ── private-instance.tf ──────────────────────────────────────────
 # Creation of NLB for private instances
 resource "aws_lb" "private_instance_nlb" {
   count              = local.use_nlb ? 1 : 0
@@ -440,12 +439,9 @@ resource "aws_autoscaling_group" "private_instance_asg" {
   }
 }
 
+# ── rds-instance.tf ──────────────────────────────────────────
 
-
-# ── rds-instance.tf ────────────────────────────────────
-
-
-# ── security-groups.tf ────────────────────────────────────
+# ── security-groups.tf ──────────────────────────────────────────
 # SG for bastion host 80 443 and 22
 
 resource "aws_security_group" "public_sg" {
@@ -534,8 +530,7 @@ resource "aws_security_group" "db_sg" {
   }
 }
 
-
-# ── vpn-endpoint.tf ────────────────────────────────────
+# ── vpn-endpoint.tf ──────────────────────────────────────────
 # Client VPN Resources
 resource "aws_ec2_client_vpn_endpoint" "vpn_endpoint" {
   count                  = local.create_private_resources ? 1 : 0

@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "az_identity_name" {
   type        = string
   description = "(Required) Name of application and service principal."
@@ -43,7 +43,7 @@ variable "tfc_workspace_name" {
   description = "(Required) Name of the Terraform Cloud workspace."
 }
 
-# ── azure.tf ────────────────────────────────────
+# ── azure.tf ──────────────────────────────────────────
 # Providers
 provider "azurerm" {
   features {
@@ -123,7 +123,7 @@ resource "azurerm_role_assignment" "security" {
   principal_id         = azuread_service_principal.security.object_id
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = "~> 1.0"
   required_providers {
@@ -142,7 +142,7 @@ terraform {
   }
 }
 
-# ── tfc.tf ────────────────────────────────────
+# ── tfc.tf ──────────────────────────────────────────
 # Terraform Cloud Provider
 provider "tfe" {
   hostname     = var.tfc_hostname

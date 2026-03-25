@@ -1,0 +1,292 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Automated Image Analysis Pipeline with S3, Lambda, Step Functions, Rekognition, and SNS
+
+Parameters:
+  PhoneNumber:
+    Type: String
+    Default: "+1234567890"
+    Description: Phone number to receive SMS alerts (E.164 format)
+
+Resources:
+  ImageAnalysisBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  S3EventHandlerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: S3RekognitionStepFunctionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt ImageAnalysisBucket.Arn
+                  - !Sub '${ImageAnalysisBucket.Arn}/*'
+              - Effect: Allow
+                Action: 'stepfunctions:StartExecution'
+                Resource: !Ref ImageAnalysisStateMachine
+
+  S3EventHandlerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              s3_client = boto3.client('s3')
+              step_client = boto3.client('stepfunctions')
+
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+
+                  input_data = {
+                      'bucket': bucket,
+                      'key': key
+                  }
+
+                  response = step_client.start_execution(
+                      stateMachineArn=os.environ['STEP_FUNCTION_ARN'],
+                      input=json.dumps(input_data)
+                  )
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Processing initiated')
+              }
+      Environment:
+        Variables:
+          STEP_FUNCTION_ARN: !Ref ImageAnalysisStateMachine
+      Role: !GetAtt S3EventHandlerLambdaRole.Arn
+
+  S3EventHandlerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt S3EventHandlerLambda.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt ImageAnalysisBucket.Arn
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  DetectFacesLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: RekognitionS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'rekognition:DetectLabels'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt ImageAnalysisBucket.Arn
+                  - !Sub '${ImageAnalysisBucket.Arn}/*'
+
+  DetectFacesLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              rekognition = boto3.client('rekognition')
+              s3 = boto3.client('s3')
+
+              bucket = event['bucket']
+              key = event['key']
+
+              response = rekognition.detect_labels(
+                  Image={
+                      'S3Object': {
+                          'Bucket': bucket,
+                          'Name': key
+                      }
+                  },
+                  MaxLabels=10,
+                  MinConfidence=75
+              )
+
+              face_count = 0
+              for label in response['Labels']:
+                  if label['Name'].lower() == 'person' or label['Name'].lower() == 'human':
+                      face_count = label['Instances'] if 'Instances' in label else 0
+                      break
+
+              return {
+                  'FaceCount': face_count,
+                  'Labels': response['Labels']
+              }
+      Role: !GetAtt DetectFacesLambdaRole.Arn
+
+  SendAlertLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: SNSpublishAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'sns:Publish'
+                Resource: !Ref AlertTopic
+
+  SendAlertLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+
+          def lambda_handler(event, context):
+              sns = boto3.client('sns')
+              message = f"Human detected in image: {event['bucket']}/{event['key']}"
+
+              sns.publish(
+                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                  Message=message,
+                  Subject='Human Detection Alert'
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': 'Alert sent successfully'
+              }
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AlertTopic
+      Role: !GetAtt SendAlertLambdaRole.Arn
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !Ref PhoneNumber
+          Protocol: sms
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: StepFunctionsLambdaAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                  - 'lambda:GetFunction'
+                Resource:
+                  - !GetAtt DetectFacesLambda.Arn
+                  - !GetAtt SendAlertLambda.Arn
+
+  ImageAnalysisStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: |
+        {
+          "StartAt": "DetectFaces",
+          "States": {
+            "DetectFaces": {
+              "Type": "Task",
+              "Resource": "${DetectFacesLambdaArn}",
+              "ResultPath": "$.detectionResult",
+              "Next": "CheckDetection"
+            },
+            "CheckDetection": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.detectionResult.FaceCount",
+                  "NumericGreaterThan": 0,
+                  "Next": "SendAlert"
+                }
+              ],
+              "Default": "End"
+            },
+            "SendAlert": {
+              "Type": "Task",
+              "Resource": "${SendAlertLambdaArn}",
+              "End": true
+            },
+            "End": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        }
+      DefinitionSubstitutions:
+        DetectFacesLambdaArn: !GetAtt DetectFacesLambda.Arn
+        SendAlertLambdaArn: !GetAtt SendAlertLambda.Arn
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+
+Outputs:
+  BucketName:
+    Description: S3 Bucket for Image Analysis
+    Value: !Ref ImageAnalysisBucket
+  StateMachineArn:
+    Description: Step Functions State Machine ARN
+    Value: !Ref ImageAnalysisStateMachine
+  TopicArn:
+    Description: SNS Topic ARN for Alerts
+    Value: !Ref AlertTopic

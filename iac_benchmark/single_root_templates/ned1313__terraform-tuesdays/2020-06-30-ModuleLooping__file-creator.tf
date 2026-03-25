@@ -1,21 +1,21 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "local_file" "my_file" {
   content  = var.content
   filename = "${path.root}/${var.filename}"
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "content" {}
 
 variable "filename" {}
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # No outputs defined
 output "stuff" {
   value = local_file.my_file.id
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     local = {
@@ -24,4 +24,3 @@ terraform {
     }
   }
 }
-

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.12.0"
   required_providers {
@@ -52,7 +52,7 @@ resource "azurerm_role_assignment" "example" {
   principal_id         = data.azurerm_client_config.current.object_id
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "prefix" {
   description = "Name of backend storage account."
   default     = "taco-storage"
@@ -63,9 +63,7 @@ variable "location" {
   default     = "eastus"
 }
 
-
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "storage_account_name" {
   value = azurerm_storage_account.state.name
 }

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Create a project to host the runner MIG
 module "project" {
   source          = "./project_creation"
@@ -58,8 +58,7 @@ resource "google_storage_bucket_iam_binding" "gh_runner_allow" {
   ]
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "billing_account" {
   type        = string
   description = "Billing account to associate with the project being created."
@@ -112,12 +111,12 @@ locals {
   gcp_service_account_name = "${var.prefix}-gh-runner-account"
 }
 
-# ── output.tf ────────────────────────────────────
+# ── output.tf ──────────────────────────────────────────
 output "bucket_name" {
   value = google_storage_bucket.tf_state.name
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     google = {

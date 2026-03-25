@@ -20,7 +20,7 @@ variable "shell" {
 
 module "my_salsa" {
     source = "./salsa"
-    
+
     meat = var.meat
 }
 

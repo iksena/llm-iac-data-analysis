@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket       = "terrafrom-tfstate-file-s3-bucket"
@@ -25,12 +25,12 @@ provider "aws" {
 # VPC Module Configuration
 module "aws_vpc" {
   source = "../../modules/aws_vpc"
-  
+
   # Basic Configuration
   region     = var.region
   env        = var.env
   account_id = data.aws_caller_identity.current.id
-  
+
   # Network Configuration
   vpc_cidr                = "10.0.0.0/16"
   public_subnet_cidrs     = ["10.0.10.0/24", "10.0.11.0/24"]
@@ -74,8 +74,7 @@ module "aws_compute" {
   db_private_sg      = []
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # Infrastructure Configuration
 variable "region" {
   description = "The AWS region"
@@ -128,9 +127,7 @@ variable "vpn_client_cert_arn" {
   default     = ""
 }
 
-
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # VPC Information
 output "vpc_region" {
   value       = module.aws_vpc.region
@@ -220,8 +217,7 @@ output "application_domain_name" {
   description = "The fully qualified domain name (FQDN) of the application, or null if no private subnets are created."
 }
 
-
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 # AWS Account Information
 data "aws_caller_identity" "current" {
   # Get current AWS account ID

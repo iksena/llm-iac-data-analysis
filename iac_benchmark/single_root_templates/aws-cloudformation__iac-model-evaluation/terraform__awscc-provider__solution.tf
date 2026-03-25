@@ -1,4 +1,4 @@
-# ── awscc_rds_mysql_p1.tf ────────────────────────────────────
+# ── awscc_rds_mysql_p1.tf ──────────────────────────────────────────
 # Create a RDS MySQL database via the 'awscc' provider
 
 # Create default tennacy VPC with DNS hostname and resolution support using RFC 1918 /24 subnet mask
@@ -64,8 +64,7 @@ resource "awscc_rds_db_instance" "mysql_instance" {
 
 }
 
-
-# ── awscc_rds_mysql_p2.tf ────────────────────────────────────
+# ── awscc_rds_mysql_p2.tf ──────────────────────────────────────────
 # Terraform to create a RDS MySQL database via the 'awscc' provider
 
 # Create default tennacy VPC with DNS hostname and resolution support using RFC 1918 /24 subnet mask
@@ -131,8 +130,7 @@ resource "awscc_rds_db_instance" "mysql_instance" {
 
 }
 
-
-# ── awscc_vpc_public_and_private_subnets_p1.tf ────────────────────────────────────
+# ── awscc_vpc_public_and_private_subnets_p1.tf ──────────────────────────────────────────
 # Create a VPC with cidr_block '10.0.0.0/16' one public and one private subnet via the 'awscc' provider
 
 # Create default tennacy VPC with DNS hostname and resolution support using RFC 1918 /24 subnet mask
@@ -194,8 +192,7 @@ resource "awscc_ec2_subnet_route_table_association" "subnet_route_table_associat
   subnet_id      = awscc_ec2_subnet.public_subnet.id
 }
 
-
-# ── awscc_vpc_public_and_private_subnets_p2.tf ────────────────────────────────────
+# ── awscc_vpc_public_and_private_subnets_p2.tf ──────────────────────────────────────────
 # Terraform code to create a VPC with cidr_block '10.0.0.0/16' one public and one private subnet via the 'awscc' provider
 
 # Create default tennacy VPC with DNS hostname and resolution support using RFC 1918 /24 subnet mask

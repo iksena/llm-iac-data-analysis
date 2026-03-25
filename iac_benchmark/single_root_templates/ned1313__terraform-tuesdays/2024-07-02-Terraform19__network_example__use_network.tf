@@ -12,7 +12,6 @@ provider "azurerm" {
   features {}
 }
 
-
 data "azurerm_virtual_network" "main" {
   name                = var.vnet_name
   resource_group_name = var.resource_group_name

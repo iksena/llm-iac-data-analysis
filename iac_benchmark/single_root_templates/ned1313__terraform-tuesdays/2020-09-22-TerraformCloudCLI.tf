@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 ###########################
 # CONFIGURATION
 ###########################
@@ -71,10 +71,8 @@ module "network" {
   depends_on = [azurerm_resource_group.vnet]
 }
 
-
-
-# ── backend.tf ────────────────────────────────────
- terraform {
+# ── backend.tf ──────────────────────────────────────────
+terraform {
   backend "remote" {
     organization = "ned-in-the-cloud"
 
