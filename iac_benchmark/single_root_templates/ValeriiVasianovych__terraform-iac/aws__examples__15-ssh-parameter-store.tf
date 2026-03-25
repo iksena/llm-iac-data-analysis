@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -18,7 +18,7 @@ provider "aws" {
     region = "us-east-1"
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "owner" {
   description = "Owner of the resources"
   type        = string
@@ -34,18 +34,18 @@ variable "common_tags" {
     }
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 data "aws_ssm_parameter" "rds_password" {
   name = "/prod/mysql"
   depends_on = [aws_ssm_parameter.rds_password]
 }
 
-# ── ssm-rds.tf ────────────────────────────────────
+# ── ssm-rds.tf ──────────────────────────────────────────
 resource "random_string" "rds_password" {
   length           = 8    # It means that the length of the password will be 15 characters
   special          = true  # It means that the password will contain special characters
-  override_special = "!@#" # Use this special characters in the password 
+  override_special = "!@#" # Use this special characters in the password
   keepers = {
     generate-password = "password-v3" # It means that the password will be generated only once
   }
@@ -83,8 +83,6 @@ resource "aws_db_instance" "default" {
     DB     = "MySQL"
   })
 }
-
-
 
 output "rds_password_value" {
   value = nonsensitive(aws_ssm_parameter.rds_password.value)

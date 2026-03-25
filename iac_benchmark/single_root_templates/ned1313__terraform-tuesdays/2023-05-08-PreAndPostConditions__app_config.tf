@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 variable "region" {
   type        = string
   default     = "eastus"
@@ -49,7 +49,7 @@ output "app_config_store_id" {
   value = azurerm_app_configuration.main.id
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.2.0"
   required_providers {

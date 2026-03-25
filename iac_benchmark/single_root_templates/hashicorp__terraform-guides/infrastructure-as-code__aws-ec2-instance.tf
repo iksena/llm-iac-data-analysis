@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.11.0"
 }
@@ -17,8 +17,7 @@ resource "aws_instance" "ubuntu" {
   }
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "aws_region" {
   description = "AWS region"
   default = "us-west-1"
@@ -39,8 +38,7 @@ variable "name" {
   default = "Provisioned by Terraform"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "public_dns" {
   value = "${aws_instance.ubuntu.public_dns}"
 }

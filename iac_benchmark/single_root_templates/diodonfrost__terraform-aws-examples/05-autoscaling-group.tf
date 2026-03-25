@@ -1,11 +1,9 @@
-# ── versions.tf ────────────────────────────────────
-
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.12"
 }
 
-
-# ── 00-params.tf ────────────────────────────────────
+# ── 00-params.tf ──────────────────────────────────────────
 # parms file for aws ec2 cloud
 
 #### VPC Network
@@ -47,9 +45,7 @@ variable "autoscaling_db" {
   }
 }
 
-
-
-# ── 010-ssh-key.tf ────────────────────────────────────
+# ── 010-ssh-key.tf ──────────────────────────────────────────
 # Define ssh to config in instance
 
 # Create default ssh publique key
@@ -58,9 +54,7 @@ resource "aws_key_pair" "user_key" {
   public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQD3F6tyPEFEzV0LX3X8BsXdMsQz1x2cEikKDEY0aIj41qgxMCP/iteneqXSIFZBp5vizPvaoIR3Um9xK7PGoW8giupGn+EPuxIA4cDM4vzOqOkiMPhz5XK0whEjkVzTo4+S0puvDZuwIsdiW9mxhJc7tgBNL0cYlWSYVkz4G/fslNfRPW5mYAM49f4fhtxPb5ok4Q2Lg9dPKVHO/Bgeu5woMc7RY0p1ej6D4CKFE6lymSDJpW0YHX/wqE9+cfEauh7xZcG0q9t2ta6F6fmX0agvpFyZo8aFbXeUBr7osSCJNgvavWbM/06niWrOvYX2xwWdhXmXSrbX8ZbabVohBK41 email@example.com"
 }
 
-
-
-# ── 015-ami.tf ────────────────────────────────────
+# ── 015-ami.tf ──────────────────────────────────────────
 data "aws_ami" "ubuntu" {
   most_recent = true
 
@@ -77,8 +71,7 @@ data "aws_ami" "ubuntu" {
   owners = ["099720109477"] # Canonical
 }
 
-
-# ── 020-network.tf ────────────────────────────────────
+# ── 020-network.tf ──────────────────────────────────────────
 # Network configuration
 
 # VPC creation
@@ -118,9 +111,7 @@ resource "aws_internet_gateway" "gw" {
   }
 }
 
-
-
-# ── 030-security-group.tf ────────────────────────────────────
+# ── 030-security-group.tf ──────────────────────────────────────────
 # Security group configuration
 
 # Default administration port
@@ -217,9 +208,7 @@ resource "aws_security_group" "db" {
   }
 }
 
-
-
-# ── 060-instance-http.tf ────────────────────────────────────
+# ── 060-instance-http.tf ──────────────────────────────────────────
 #### INSTANCE HTTP ####
 
 # Create load balancer
@@ -275,9 +264,7 @@ resource "aws_launch_configuration" "http" {
   user_data = file("scripts/first-boot-http.sh")
 }
 
-
-
-# ── 061-instance-db.tf ────────────────────────────────────
+# ── 061-instance-db.tf ──────────────────────────────────────────
 #### INSTANCE DB ####
 
 # Create load balancer
@@ -334,9 +321,7 @@ resource "aws_launch_configuration" "db" {
   user_data = file("scripts/first-boot-db.sh")
 }
 
-
-
-# ── 071-routing-table.tf ────────────────────────────────────
+# ── 071-routing-table.tf ──────────────────────────────────────────
 # Create ande associate route
 
 # Routing table configuration
@@ -360,9 +345,7 @@ resource "aws_route_table_association" "db" {
   route_table_id = aws_route_table.public.id
 }
 
-
-
-# ── 100-outputs.tf ────────────────────────────────────
+# ── 100-outputs.tf ──────────────────────────────────────────
 # Display output information
 
 # Display http loadbalancer dns name
@@ -374,4 +357,3 @@ output "lb_hostname_http" {
 output "lb_hostname_db" {
   value = aws_elb.db.dns_name
 }
-

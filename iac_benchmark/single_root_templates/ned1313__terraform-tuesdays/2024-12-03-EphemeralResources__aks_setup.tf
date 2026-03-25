@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
 }
@@ -105,7 +105,7 @@ output "aks_cluster_host" {
   description = "The Kubernetes cluster host."
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.10"
 

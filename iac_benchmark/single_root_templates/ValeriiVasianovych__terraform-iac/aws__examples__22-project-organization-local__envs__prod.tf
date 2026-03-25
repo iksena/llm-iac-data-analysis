@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -23,7 +23,7 @@ module "vpc" {
     common_tags = var.common_tags
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   default = "us-east-1"
 }
@@ -55,7 +55,7 @@ variable "common_tags" {
   }
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "region" {
     value = module.vpc.region
 }

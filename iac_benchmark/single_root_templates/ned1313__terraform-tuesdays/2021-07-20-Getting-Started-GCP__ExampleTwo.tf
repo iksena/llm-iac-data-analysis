@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Google Cloud variables
 variable "billing_account" {
   type        = string
@@ -60,7 +60,7 @@ output "project_id" {
   value = google_project.project.project_id
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     google = {

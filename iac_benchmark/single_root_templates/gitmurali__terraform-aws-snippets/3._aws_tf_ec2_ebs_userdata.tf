@@ -1,4 +1,4 @@
-# ── cloudinit.tf ────────────────────────────────────
+# ── cloudinit.tf ──────────────────────────────────────────
 # Define a cloud-init configuration data source named "cloudinit-example"
 data "cloudinit_config" "cloudinit-example" {
   # Specify options for cloud-init
@@ -25,8 +25,7 @@ data "cloudinit_config" "cloudinit-example" {
   }
 }
 
-
-# ── instance.tf ────────────────────────────────────
+# ── instance.tf ──────────────────────────────────────────
 resource "aws_instance" "example" {
   ami           = var.AMIS[var.AWS_REGION]
   instance_type = "t2.micro"
@@ -60,17 +59,13 @@ resource "aws_volume_attachment" "ebs-volume-1-attachment" {
   skip_destroy = true                            # skip destroy to avoid issues with terraform destroy
 }
 
-
-
-# ── key.tf ────────────────────────────────────
+# ── key.tf ──────────────────────────────────────────
 resource "aws_key_pair" "mykeypair" {
   key_name   = "mykeypair"
   public_key = file(var.PATH_TO_PUBLIC_KEY)
 }
 
-
-
-# ── provider.tf ────────────────────────────────────
+# ── provider.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     aws = {
@@ -88,7 +83,7 @@ provider "aws" {
   region = var.AWS_REGION
 }
 
-# ── securitygroup.tf ────────────────────────────────────
+# ── securitygroup.tf ──────────────────────────────────────────
 resource "aws_security_group" "allow-ssh" {
   vpc_id      = aws_vpc.main.id
   name        = "allow-ssh"
@@ -111,9 +106,7 @@ resource "aws_security_group" "allow-ssh" {
   }
 }
 
-
-
-# ── vars.tf ────────────────────────────────────
+# ── vars.tf ──────────────────────────────────────────
 variable "AWS_REGION" {
   default = "us-east-1"
 }
@@ -137,9 +130,7 @@ variable "INSTANCE_DEVICE_NAME" {
   default = "/dev/xvdh"
 }
 
-
-
-# ── vpc.tf ────────────────────────────────────
+# ── vpc.tf ──────────────────────────────────────────
 # Internet VPC
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
@@ -255,4 +246,3 @@ resource "aws_route_table_association" "main-public-3-a" {
   subnet_id      = aws_subnet.main-public-3.id
   route_table_id = aws_route_table.main-public.id
 }
-

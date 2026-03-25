@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Create a Google project for Compute Engine
 resource "google_project" "project" {
   name            = var.prefix
@@ -17,8 +17,7 @@ resource "google_project_service" "service" {
   disable_on_destroy = false
 }
 
-# ── variables.tf ────────────────────────────────────
-
+# ── variables.tf ──────────────────────────────────────────
 variable "billing_account" {
   type        = string
   description = "Billing account to associate with the project being created."
@@ -52,13 +51,13 @@ variable "services" {
   ]
 }
 
-# ── output.tf ────────────────────────────────────
+# ── output.tf ──────────────────────────────────────────
 # Provide the project information for another user
 output "project_id" {
   value = google_project.project.project_id
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     google = {
@@ -67,7 +66,6 @@ terraform {
     }
   }
 }
-
 
 provider "google" {
   region = var.region

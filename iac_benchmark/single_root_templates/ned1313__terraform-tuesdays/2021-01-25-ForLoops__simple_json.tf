@@ -9,9 +9,6 @@ locals {
   map1_data = local.all_json_data.Map1
 }
 
-
- 
-
 #map of maps for creating subnets
 variable "subnet_map" {
    type = map

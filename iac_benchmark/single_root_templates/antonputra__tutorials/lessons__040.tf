@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/instance
 # Resource: aws_instance
 
@@ -23,20 +23,17 @@ resource "aws_eip" "ip" {
   instance = aws_instance.server.id
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "ami" {
   default = "ami-0ac73f33a1888c64a"
 }
 
-
-# ── output.tf ────────────────────────────────────
+# ── output.tf ──────────────────────────────────────────
 output "ip" {
   value = aws_eip.ip.public_ip
 }
 
-
-# ── provider.tf ────────────────────────────────────
+# ── provider.tf ──────────────────────────────────────────
 provider "aws" {
   region  = "us-west-2"
   profile = "terraform"

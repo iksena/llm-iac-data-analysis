@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.11.11"
 }
@@ -72,8 +72,7 @@ resource "vault_kubernetes_auth_backend_role" "role" {
   ttl = 7200
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "tfe_organization" {
   description = "TFE organization"
   default = "RogerBerlind"
@@ -83,8 +82,7 @@ variable "k8s_cluster_workspace" {
   description = "workspace to use for the k8s cluster"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vault_k8s_auth_backend" {
   value = "${vault_auth_backend.k8s.path}"
 }

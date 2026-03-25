@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Set environment name
 resource "random_id" "environment_name" {
   byte_length = 4
@@ -49,8 +49,7 @@ module "ssh-keypair-data" {
   private_key_filename = "${random_id.environment_name.hex}"
 }
 
-
-# ── _interface.tf ────────────────────────────────────
+# ── _interface.tf ──────────────────────────────────────────
 # Required variables
 variable "account_file_json" {
   description = "Path to the JSON file used to authenticate."

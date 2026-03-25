@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 module "aws-iam-identity-center" {
   source = "../.." // local example
   # source = "aws-ia/iam-identity-center/aws" // remote example
@@ -85,8 +85,7 @@ module "aws-iam-identity-center" {
 
 }
 
-
-# ── locals.tf ────────────────────────────────────
+# ── locals.tf ──────────────────────────────────────────
 # Fetch Account Id from SSM Parameter Store
 data "aws_ssm_parameter" "account1_account_id" {
   name = "tf-aws-iam-idc-module-testing-account1-account-id" // replace with your SSM Parameter Key

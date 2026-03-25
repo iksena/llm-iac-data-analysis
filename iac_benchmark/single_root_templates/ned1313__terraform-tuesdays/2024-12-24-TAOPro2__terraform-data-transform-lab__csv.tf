@@ -3,13 +3,13 @@ locals {
 }
 
 output "csv_parsed" {
-  
+
 }
 
 # Create an output that is a map of the server names to the type
 
 output "server_types" {
-  
+
 }
 
 locals {
@@ -27,7 +27,7 @@ resource "aws_vpc" "main" {
 
 # Using for_each, create security groups and security group rules using the contents of the firewall_rules.csv file.
 locals {
-  
+
 }
 
 resource "aws_security_group" "main" {

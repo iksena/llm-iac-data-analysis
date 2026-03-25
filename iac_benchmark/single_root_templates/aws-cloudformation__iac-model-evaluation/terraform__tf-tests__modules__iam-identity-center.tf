@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # - IAM Identity Center Dynamic Group Creation -
 resource "aws_identitystore_group" "sso_groups" {
   for_each          = var.sso_groups == null ? {} : var.sso_groups
@@ -6,7 +6,6 @@ resource "aws_identitystore_group" "sso_groups" {
   display_name      = each.value.group_name
   description       = each.value.group_description
 }
-
 
 # - IAM Identity Center Dynamic User Creation -
 resource "aws_identitystore_user" "sso_users" {
@@ -132,7 +131,6 @@ resource "aws_identitystore_user" "sso_users" {
 
 }
 
-
 # - Identity Store Group Membership -
 resource "aws_identitystore_group_membership" "sso_group_membership" {
   for_each          = local.users_and_their_groups
@@ -141,7 +139,6 @@ resource "aws_identitystore_group_membership" "sso_group_membership" {
   group_id  = data.aws_identitystore_group.existing_sso_groups[each.key].group_id
   member_id = data.aws_identitystore_user.existing_sso_users[each.key].user_id
 }
-
 
 # - SSO Permission Set -
 resource "aws_ssoadmin_permission_set" "pset" {
@@ -158,7 +155,6 @@ resource "aws_ssoadmin_permission_set" "pset" {
   tags             = lookup(each.value, "tags", {})
 }
 
-
 # - AWS Managed Policy Attachment -
 resource "aws_ssoadmin_managed_policy_attachment" "pset_aws_managed_policy" {
   # iterate over the permission_sets map of maps, and set the result to be pset_name and pset_index
@@ -172,7 +168,6 @@ resource "aws_ssoadmin_managed_policy_attachment" "pset_aws_managed_policy" {
   depends_on = [aws_ssoadmin_account_assignment.account_assignment]
 }
 
-
 # - Customer Managed Policy Attachment -
 resource "aws_ssoadmin_customer_managed_policy_attachment" "pset_customer_managed_policy" {
   for_each = { for pset in local.pset_customer_managed_policy_maps : "${pset.pset_name}.${pset.policy_name}" => pset }
@@ -185,7 +180,6 @@ resource "aws_ssoadmin_customer_managed_policy_attachment" "pset_customer_manage
   }
 
 }
-
 
 #  ! NOT CURRENTLY SUPPORTED !
 # - Inline Policy -
@@ -210,8 +204,7 @@ resource "aws_ssoadmin_account_assignment" "account_assignment" {
   target_type = "AWS_ACCOUNT"
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # Groups
 variable "sso_groups" {
   description = "Names of the groups you wish to create in IAM Identity Center"
@@ -259,8 +252,7 @@ variable "account_assignments" {
   default = {}
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "account_assignment_data" {
   value       = local.flatten_account_assignment_data
   description = "Tuple containing account assignment data"
@@ -278,8 +270,7 @@ output "sso_groups_ids" {
   description = "A map of SSO groups ids created by this module"
 }
 
-
-# ── providers.tf ────────────────────────────────────
+# ── providers.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.14.0"
   required_providers {
@@ -294,8 +285,7 @@ terraform {
   }
 }
 
-
-# ── locals.tf ────────────────────────────────────
+# ── locals.tf ──────────────────────────────────────────
 # - Users and Groups -
 locals {
   # Create a new local variable by flattening the complex type given in the variable "sso_users"
@@ -313,7 +303,6 @@ locals {
   }
 
 }
-
 
 # - Permission Sets and Policies -
 locals {
@@ -333,8 +322,6 @@ locals {
 
   #  ! NOT CURRENTLY SUPPORTED !
   # inline_policy_permission_sets = { for pset_name, pset_index in var.permission_sets : pset_name => pset_index if can(pset_index.inline_policy) }
-
-
 
   # When using the 'for' expression in Terraform:
   # [ and ] produces a tuple
@@ -379,7 +366,6 @@ locals {
 
 }
 
-
 # - Account Assignments -
 locals {
   # Create a new local variable by flattening the complex type given in the variable "account_assignments"
@@ -397,13 +383,11 @@ locals {
     ]
   ])
 
-
   #  Convert the flatten_account_assignment_data tuple into a map.
   # Since we will be using this local in a for_each, it must either be a map or a set of strings
   principals_and_their_account_assignments = {
     for s in local.flatten_account_assignment_data : format("Type:%s__Principal:%s__Permission:%s__Account:%s", s.principal_type, s.principal_name, s.permission_set, s.account_id) => s
   }
-
 
   # iterates over account_assignents, sets that to be assignment.principal_name ONLY if the assignment.principal_type
   #is GROUP. Essentially stores all the possible 'assignments' (account assignments) that would be attached to a user group
@@ -417,11 +401,9 @@ locals {
   account_assignments_for_users = [for assignment in var.account_assignments : assignment.principal_name if assignment.principal_type == "USER"]
 }
 
-
-# ── data.tf ────────────────────────────────────
+# ── data.tf ──────────────────────────────────────────
 # Fetch existing SSO Instance
 data "aws_ssoadmin_instances" "sso_instance" {}
-
 
 # The local variable 'users_and_their_groups' is a map of values for relevant user information.
 # It contians a list of all users with the name of their group_assignments appended to the end of the string.
@@ -455,7 +437,6 @@ data "aws_identitystore_group" "existing_sso_groups" {
   depends_on = [aws_identitystore_group.sso_groups]
 }
 
-
 # - Fetch of SSO Users to be used for group membership assignment -
 data "aws_identitystore_user" "existing_sso_users" {
   for_each          = local.users_and_their_groups
@@ -472,7 +453,6 @@ data "aws_identitystore_user" "existing_sso_users" {
   depends_on = [aws_identitystore_user.sso_users]
 }
 
-
 # - Fetch of SSO Groups to be used for account assignments (for GROUPS) -
 data "aws_identitystore_group" "identity_store_group" {
   for_each          = toset(local.account_assignments_for_groups)
@@ -488,7 +468,6 @@ data "aws_identitystore_group" "identity_store_group" {
   depends_on = [aws_identitystore_group.sso_groups]
 }
 
-
 # - Fetch of SSO Groups to be used for account assignments (for USERS) -
 data "aws_identitystore_user" "identity_store_user" {
   for_each          = toset(local.account_assignments_for_users)
@@ -503,7 +482,6 @@ data "aws_identitystore_user" "identity_store_user" {
   // Prevents failure if data fetch is attempted before USERS are created
   depends_on = [aws_identitystore_user.sso_users]
 }
-
 
 # The local variable 'principals_and_their_permission_sets' is a map of values for relevant user information.
 # It contians a list of all users with the name of their group_assignments appended to the end of the string.

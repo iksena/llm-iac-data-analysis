@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Configure the Azure provider
 provider "azurerm" {
   features {}
@@ -53,8 +53,7 @@ resource "azurerm_app_configuration_key" "app_subnet_id" {
   value                  = azurerm_subnet.shared.id
 }
 
-
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {

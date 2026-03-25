@@ -78,4 +78,3 @@ output "s3_bucket" {
 output "kmskey" {
   value = module.remote_state.kms_key.key_id
 }
-

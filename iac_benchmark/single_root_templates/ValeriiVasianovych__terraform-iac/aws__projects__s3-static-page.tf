@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   description = "The AWS region to launch the resources."
   type        = string
@@ -29,7 +29,7 @@ variable "zone_id" {
   default     = "Z3AQBSTGFYJSTF"
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 data "aws_route53_zone" "selected" {
@@ -37,7 +37,7 @@ data "aws_route53_zone" "selected" {
   private_zone = false
 }
 
-# ── output.tf ────────────────────────────────────
+# ── output.tf ──────────────────────────────────────────
 output "region" {
   value = data.aws_region.current.name
 }
@@ -62,9 +62,7 @@ output "bucket_website_domain_www" {
   value = "http://www.${var.bucket_name}"
 }
 
-
-
-# ── provider.tf ────────────────────────────────────
+# ── provider.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -81,7 +79,7 @@ terraform {
   }
 }
 
-# ── route53.tf ────────────────────────────────────
+# ── route53.tf ──────────────────────────────────────────
 resource "aws_route53_record" "root" {
   zone_id = data.aws_route53_zone.selected.zone_id
   name    = var.bucket_name
@@ -106,8 +104,7 @@ resource "aws_route53_record" "www" {
   depends_on = [aws_s3_bucket.redirect_bucket]
 }
 
-
-# ── static-s3.tf ────────────────────────────────────
+# ── static-s3.tf ──────────────────────────────────────────
 provider "aws" {
   region = var.region
 }

@@ -109,7 +109,7 @@ resource "azurerm_subnet" "subnet2" {
   resource_group_name  = azurerm_resource_group.tacos.name
   virtual_network_name = azurerm_virtual_network.vnet.name
   address_prefixes     = [local.subnet2AddressSpace]
-  
+
 }
 
 # Network security groups
@@ -222,4 +222,3 @@ resource "azurerm_windows_virtual_machine" "VM" {
     storage_account_uri = azurerm_storage_account.VMDiag.primary_blob_endpoint
   }
 }
-

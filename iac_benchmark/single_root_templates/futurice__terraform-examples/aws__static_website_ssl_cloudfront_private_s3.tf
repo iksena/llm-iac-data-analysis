@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 ## ACM Certificate
 data "aws_route53_zone" "this" {
   name = replace(var.site_domain, "/.*\\b(\\w+\\.\\w+)\\.?$/", "$1") # gets domain from subdomain e.g. "foo.example.com" => "example.com"
@@ -62,7 +62,6 @@ resource "aws_cloudfront_origin_access_identity" "this" {
   comment = "Origin Access Identity used to access S3 for ${var.site_domain}"
 }
 
-
 resource "aws_cloudfront_distribution" "this" {
   origin {
     domain_name = aws_s3_bucket.this.bucket_regional_domain_name
@@ -108,7 +107,6 @@ resource "aws_cloudfront_distribution" "this" {
     }
   }
 
-
   viewer_certificate {
     acm_certificate_arn      = module.acm.this_acm_certificate_arn
     ssl_support_method       = "sni-only"
@@ -139,8 +137,6 @@ resource "aws_cloudfront_distribution" "this" {
 
 }
 
-
-
 ## Route53
 # Add an IPv4 DNS record pointing to the CloudFront distribution
 resource "aws_route53_record" "ipv4" {
@@ -168,8 +164,7 @@ resource "aws_route53_record" "ipv6" {
   }
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   description = "THe primary AWS region where all the resources will be created. See https://docs.aws.amazon.com/general/latest/gr/rande.html"
 }
@@ -198,7 +193,6 @@ variable "default_root_object" {
   default     = "index.html"
 }
 
-
 variable "default_ttl" {
   description = "The default amount of time (in secs) that an object is cached in cloudfront in the absence of Cache-Control max-age or Expires header."
   default     = "86400"
@@ -219,12 +213,11 @@ variable "error_ttl" {
   default     = "30"
 }
 
-
 locals {
   s3_origin_id = "myS3Origin"
 }
 
-# ── init.tf ────────────────────────────────────
+# ── init.tf ──────────────────────────────────────────
 provider "aws" {
   region  = var.region
   version = "~> 2.0"

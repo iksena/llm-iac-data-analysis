@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   default = "us-east-1"
 }
@@ -10,7 +10,7 @@ variable "common_tags" {
   }
 }
 
-# ── s3-bucket.tf ────────────────────────────────────
+# ── s3-bucket.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket       = "terrafrom-tfstate-file-s3-bucket"

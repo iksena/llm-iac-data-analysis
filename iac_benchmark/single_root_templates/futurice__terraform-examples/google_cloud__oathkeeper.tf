@@ -1,5 +1,4 @@
-# ── main.tf ────────────────────────────────────
-
+# ── main.tf ──────────────────────────────────────────
 locals {
   project         = "larkworthy-tester"
   location        = "EU"
@@ -83,7 +82,7 @@ resource "google_cloud_run_service" "oathkeeper" {
       containers {
         image = null_resource.oathkeeper_image.triggers.image
         args = ["--config", "/config.yaml"]
-        env { 
+        env {
           name  = "nonce"
           value = filesha256("${path.module}/rules.template.yml") # Force refresh on rule change
         }
@@ -106,8 +105,7 @@ resource "google_cloud_run_service" "oathkeeper" {
   }
 }
 
-
-# ── build.tf ────────────────────────────────────
+# ── build.tf ──────────────────────────────────────────
 # Mirror base image from Dockerhub image into Google Container Registry
 module "docker-mirror" {
   source      = "github.com/neomantra/terraform-docker-mirror"
@@ -143,7 +141,7 @@ resource "null_resource" "oathkeeper_image" {
     image = "eu.gcr.io/${local.project}/oathkeeper:${local.base_image_tag}_${
       sha1(
         "${sha1(local_file.dockerfile.content)}${sha1(local_file.config.content)}"
-      )  
+      )
     }"
   }
   provisioner "local-exec" {

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     aws = {
@@ -63,7 +63,7 @@ resource "aws_instance" "server_dev" {
   tags          = { Name = "Server-DEV" }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "instance_type" {
   default = "t2.micro"
 }

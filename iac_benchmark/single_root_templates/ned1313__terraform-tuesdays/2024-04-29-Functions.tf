@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
 
@@ -29,7 +29,6 @@ module "vnet" {
     subnet_names = [for key in keys(local.subnets) : "${local.environment}-${key}"]
     subnet_prefixes = values(local.subnets)
 }
-
 
 resource "azurerm_resource_group" "web" {
   name = "web"
@@ -63,10 +62,9 @@ resource "aws_instance" "example2" {
   instance_type = "t2.micro"
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 
-
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {

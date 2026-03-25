@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.11.0"
 }
@@ -22,8 +22,7 @@ provider "aws" {
 
 data "aws_availability_zones" "main" {}
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # Required variables
 variable "environment_name" {
   description = "Environment Name"
@@ -46,8 +45,7 @@ variable "vpc_cidrs_public" {
   ]
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Outputs
 output "vpc_id" {
   value = "${aws_vpc.main.id}"
@@ -61,8 +59,7 @@ output "security_group_apps" {
   value = "${aws_security_group.egress_public.id}"
 }
 
-
-# ── networks-firewalls-ingress.tf ────────────────────────────────────
+# ── networks-firewalls-ingress.tf ──────────────────────────────────────────
 resource "aws_security_group_rule" "ssh" {
   security_group_id = "${aws_security_group.egress_public.id}"
   type              = "ingress"
@@ -72,8 +69,7 @@ resource "aws_security_group_rule" "ssh" {
   cidr_blocks       = ["0.0.0.0/0"]
 }
 
-
-# ── networks-firewalls.tf ────────────────────────────────────
+# ── networks-firewalls.tf ──────────────────────────────────────────
 resource "aws_security_group" "egress_public" {
   name        = "${var.environment_name}-egress_public"
   description = "${var.environment_name}-egress_public"
@@ -98,8 +94,7 @@ resource "aws_security_group_rule" "ingress_internal" {
   self              = "true"
 }
 
-
-# ── networks-gateways.tf ────────────────────────────────────
+# ── networks-gateways.tf ──────────────────────────────────────────
 resource "aws_internet_gateway" "main" {
   vpc_id = "${aws_vpc.main.id}"
 
@@ -121,8 +116,7 @@ resource "aws_eip" "nat" {
   vpc = true
 }
 
-
-# ── networks-routes.tf ────────────────────────────────────
+# ── networks-routes.tf ──────────────────────────────────────────
 #
 # Public
 #
@@ -146,9 +140,7 @@ resource "aws_route_table_association" "public" {
   route_table_id = "${aws_route_table.public.id}"
 }
 
-
-
-# ── networks-subnets.tf ────────────────────────────────────
+# ── networks-subnets.tf ──────────────────────────────────────────
 resource "aws_subnet" "public" {
   count = "${length(var.vpc_cidrs_public)}"
 
@@ -162,8 +154,7 @@ resource "aws_subnet" "public" {
   }
 }
 
-
-# ── networks.tf ────────────────────────────────────
+# ── networks.tf ──────────────────────────────────────────
 resource "aws_vpc" "main" {
   cidr_block           = "${var.vpc_cidr}"
   enable_dns_hostnames = true

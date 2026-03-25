@@ -33,7 +33,7 @@ output "out_2" {
 
 /*
 
-resource "local_file" "workspace_file" { 
+resource "local_file" "workspace_file" {
   count = terraform.workspace == "default" ? 0 : 1
   content = local.workspace_map[terraform.workspace]
   #content = terraform.workspace != "default" ? local.workspace_map[terraform.workspace] : ""
@@ -44,7 +44,7 @@ resource "local_file" "workspace_file" {
 
 /*
 
-resource "local_file" "workspace_file_2" { 
+resource "local_file" "workspace_file_2" {
   count = contains(keys(local.workspace_map),terraform.workspace) ? 1 : 0
   content = contains(keys(local.workspace_map),terraform.workspace) ? local.workspace_map[terraform.workspace] : ""
   filename = "${path.module}/${terraform.workspace}_2.txt"

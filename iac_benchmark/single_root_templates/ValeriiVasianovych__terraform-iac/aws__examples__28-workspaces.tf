@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket       = "terrafrom-tfstate-file-s3-bucket"
@@ -21,15 +21,14 @@ provider "aws" {
   }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   default = "us-east-1"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 
-
-# ── eip.tf ────────────────────────────────────
+# ── eip.tf ──────────────────────────────────────────
 resource "aws_eip" "eip" {
     instance = aws_instance.instance-ec2.id
   tags = {
@@ -37,17 +36,17 @@ resource "aws_eip" "eip" {
   }
 }
 
-# ── instance.tf ────────────────────────────────────
+# ── instance.tf ──────────────────────────────────────────
 resource "aws_instance" "instance-ec2" {
   ami = "ami-084568db4383264d4"
   instance_type = "t2.micro"
   vpc_security_group_ids = [aws_security_group.sg.id]
   tags = {
-    Name = "Instance-${terraform.workspace}" 
+    Name = "Instance-${terraform.workspace}"
   }
 }
 
-# ── sg.tf ────────────────────────────────────
+# ── sg.tf ──────────────────────────────────────────
 resource "aws_security_group" "sg" {
   description = "Allows HTTP SSH"
 

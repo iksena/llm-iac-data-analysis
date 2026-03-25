@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -19,7 +19,7 @@ provider "aws" {
   region = var.region
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   description = "The AWS region to launch the instance"
   type        = string
@@ -54,7 +54,7 @@ variable "common_tags" {
   }
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "region" {
   value = data.aws_region.current.name
 }
@@ -75,7 +75,7 @@ output "subnet_ids" {
   value = data.aws_subnet_ids.default.ids
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_availability_zones" "available" {}
 data "aws_region" "current" {}
 data "aws_vpc" "default" {}
@@ -91,7 +91,7 @@ data "aws_ami" "latest_ubuntu" {
   }
 }
 
-# ── eip.tf ────────────────────────────────────
+# ── eip.tf ──────────────────────────────────────────
 resource "aws_eip" "static_ip" {
   instance = aws_instance.instance_ubuntu.id
   tags = merge(var.common_tags, {
@@ -99,8 +99,7 @@ resource "aws_eip" "static_ip" {
   })
 }
 
-
-# ── instance.tf ────────────────────────────────────
+# ── instance.tf ──────────────────────────────────────────
 resource "aws_instance" "instance_ubuntu" {
   ami                    = data.aws_ami.latest_ubuntu.id
   instance_type          = var.instance_type # Instance type, default is t2.micro
@@ -114,8 +113,7 @@ resource "aws_instance" "instance_ubuntu" {
   })
 }
 
-# ── security-group.tf ────────────────────────────────────
-
+# ── security-group.tf ──────────────────────────────────────────
 resource "aws_security_group" "web_sg" {
   name        = "Web Security Group"
   description = "Allow HTTP and HTTPS inbound traffic"

@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "ado_org_service_url" {
   type        = string
   description = "Org service url for Azure DevOps"
@@ -75,7 +75,7 @@ locals {
   azad_resource_creation_sp_name = "${var.prefix}-resource-creation-${random_integer.suffix.result}"
 }
 
-# ── azuread.tf ────────────────────────────────────
+# ── azuread.tf ──────────────────────────────────────────
 # The pipeline needs a service principal to use for an AzureRM service connection
 # It will need access to the Azure Key Vault
 
@@ -129,13 +129,12 @@ resource "azurerm_role_assignment" "resource_creation" {
   principal_id = azuread_service_principal.resource_creation.object_id
 }
 
-
-# ── azuredevops.tf ────────────────────────────────────
+# ── azuredevops.tf ──────────────────────────────────────────
 # Create ADO objects for pipeline
 
 provider "azuredevops" {
   org_service_url = var.ado_org_service_url
-  # Authentication through PAT defined with AZDO_PERSONAL_ACCESS_TOKEN 
+  # Authentication through PAT defined with AZDO_PERSONAL_ACCESS_TOKEN
 }
 
 resource "azuredevops_project" "project" {
@@ -154,7 +153,6 @@ resource "azuredevops_project" "project" {
     "pipelines"    = "enabled"
   }
 }
-
 
 resource "azuredevops_serviceendpoint_github" "serviceendpoint_github" {
   project_id            = azuredevops_project.project.id
@@ -236,9 +234,7 @@ resource "azuredevops_resource_authorization" "kv_auth" {
 
 # Key Vault task is here: https://docs.microsoft.com/en-us/azure/devops/pipelines/tasks/deploy/azure-key-vault?view=azure-devops
 
-
-
-# ── azurekeyvault.tf ────────────────────────────────────
+# ── azurekeyvault.tf ──────────────────────────────────────────
 data "azurerm_client_config" "current" {}
 
 data "azurerm_subscription" "current" {}
@@ -298,8 +294,7 @@ resource "azurerm_key_vault_secret" "pipeline" {
   key_vault_id = azurerm_key_vault.setup.id
 }
 
-
-# ── azurestorage.tf ────────────────────────────────────
+# ── azurestorage.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
 }
@@ -356,7 +351,7 @@ data "azurerm_storage_account_sas" "state" {
   }
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azuredevops = {

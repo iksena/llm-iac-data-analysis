@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   type        = string
   description = "Region in Azure"
@@ -38,7 +38,7 @@ locals {
   hypervisor_vm = "hypervisor-${random_id.seed.hex}"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "hypervisor_fqdn" {
   value = azurerm_public_ip.hypervisor.fqdn
 }
@@ -47,7 +47,7 @@ output "hypervisor_public_ip" {
   value = azurerm_public_ip.hypervisor.ip_address
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {
@@ -62,7 +62,7 @@ provider "azurerm" {
   features {}
 }
 
-# ── vm.tf ────────────────────────────────────
+# ── vm.tf ──────────────────────────────────────────
 resource "tls_private_key" "hypervisor" {
   algorithm = "RSA"
   rsa_bits  = "2048"
@@ -150,7 +150,6 @@ resource "azurerm_linux_virtual_machine" "hypervisor" {
     storage_account_type = "StandardSSD_LRS"
   }
 
-
   #Source image is hardcoded b/c I said so
   source_image_reference {
     publisher = "Canonical"
@@ -178,7 +177,7 @@ resource "azurerm_virtual_machine_data_disk_attachment" "hypervisor" {
   caching            = "ReadWrite"
 }
 
-# ── vnet.tf ────────────────────────────────────
+# ── vnet.tf ──────────────────────────────────────────
 resource "azurerm_resource_group" "vnet" {
   name     = local.name
   location = var.region

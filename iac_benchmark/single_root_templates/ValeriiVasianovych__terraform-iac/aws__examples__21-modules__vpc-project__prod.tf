@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -29,7 +29,7 @@ module "vpc_prod" {
     }
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vpc_prod_id" {
   value = module.vpc_prod.vpc_id
 }

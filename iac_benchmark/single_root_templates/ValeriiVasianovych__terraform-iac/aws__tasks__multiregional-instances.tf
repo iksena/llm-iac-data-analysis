@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "aws" {
   region = var.region_name[0]
   alias  = "region-1"
@@ -9,12 +9,12 @@ provider "aws" {
   alias  = "region-2"
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region_name" {
   default = ["eu-central-1", "eu-west-1"]
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "public_ip_addresse_1" {
   value = aws_instance.instance-1.public_ip
 }
@@ -23,7 +23,7 @@ output "public_ip_addresse_2" {
   value = aws_instance.instance-2.public_ip
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_ami" "latest_ubuntu_region_1" {
   provider    = aws.region-1
   owners      = ["099720109477"]
@@ -42,9 +42,9 @@ data "aws_ami" "latest_ubuntu_region_2" {
     name   = "name"
     values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
   }
-}   
+}
 
-# ── instances.tf ────────────────────────────────────
+# ── instances.tf ──────────────────────────────────────────
 resource "aws_instance" "instance-1" {
   provider        = aws.region-1
   ami             = data.aws_ami.latest_ubuntu_region_1.id

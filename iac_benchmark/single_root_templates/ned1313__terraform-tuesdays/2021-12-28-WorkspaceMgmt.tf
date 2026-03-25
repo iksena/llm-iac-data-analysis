@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Create an organization
 resource "tfe_organization" "org" {
   count = var.create_new_organization ? 1 : 0
@@ -16,10 +16,10 @@ locals {
   org_data = jsondecode(file("${var.config_file_path}"))
 
   ## What we want is a list of team access permissions that looks like this
-  # { 
+  # {
   #   workspace = workspace_name
   #   team_name = team_name
-  #   access_level = access_level  
+  #   access_level = access_level
   # }
   # Then we can simply run a count based on the entries
 
@@ -95,7 +95,7 @@ resource "tfe_team_organization_member" "team_members" {
   organization_membership_id = tfe_organization_membership.org_members[each.value["member_name"]].id
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "organization" {
   type        = string
   description = "(Required) Name of organization to use for resource management."
@@ -118,7 +118,7 @@ variable "config_file_path" {
   type        = string
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     tfe = {

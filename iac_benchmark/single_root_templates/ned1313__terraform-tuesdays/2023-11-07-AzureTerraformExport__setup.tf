@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {
 
@@ -73,14 +73,14 @@ output "storage_account_id" {
   value = azurerm_storage_account.main.id
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "location" {
   type        = string
   default     = "eastus"
   description = "Location of Azure resources"
 }
 
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {

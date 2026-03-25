@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 data "aws_ami" "base" {
   most_recent = true
   owners      = ["${var.ami_owner}"]
@@ -148,8 +148,7 @@ ${var.nomad_client_java_install ? data.template_file.java_install.rendered : "ec
 EOF
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # ---------------------------------------------------------------------------------------------------------------------
 # General Variables
 # ---------------------------------------------------------------------------------------------------------------------
@@ -219,8 +218,7 @@ variable "hashistack_tags_list" {
   default = [ ]
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "zREADME" {
   value = <<README
 
@@ -400,8 +398,7 @@ output "nomad_lb_dns" {
   value = "${module.hashistack_aws.nomad_lb_dns}"
 }
 
-
-# ── gitignore.tf ────────────────────────────────────
+# ── gitignore.tf ──────────────────────────────────────────
 # `.tf` files that contain the word "gitignore" are ignored
 # by git in the `.gitignore` file at the root of this repo.
 

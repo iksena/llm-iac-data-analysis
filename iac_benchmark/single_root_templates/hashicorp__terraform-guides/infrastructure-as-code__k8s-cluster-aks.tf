@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.11.11"
 }
@@ -61,8 +61,7 @@ resource "azurerm_kubernetes_cluster" "k8sexample" {
   }
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "resource_group_name" {
   description = "Azure Resource Group Name"
 }
@@ -124,8 +123,7 @@ variable "vault_addr" {
   description = "Address of Vault server including port that is used in the associated k8s-vault-config and k8s-services workspaces"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "private_key_pem" {
   value = "${chomp(tls_private_key.ssh_key.private_key_pem)}"
 }

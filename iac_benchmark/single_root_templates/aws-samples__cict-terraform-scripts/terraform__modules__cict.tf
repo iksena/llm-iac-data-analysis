@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "custom_tags" {
   description = "Resources tags"
   type = object({
@@ -81,13 +81,11 @@ variable "proxy_config" {
   }
 }
 
-
 variable "branches" {
   description = "Branches to be built"
   type        = list(string)
   default     = ["cleanup"]
 }
-
 
 variable "pipeline_deployment_bucket_name" {
   description = "Bucket used by codepipeline and codebuild to store artifacts regarding the deployment"
@@ -101,7 +99,7 @@ variable "codebuild_image" {
   default = "aws/codebuild/standard:5.0"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "codepipeline_name" {
   value = values(aws_codepipeline.awscodepipeline)[*].id
 }
@@ -130,12 +128,12 @@ output "region" {
   value = data.aws_region.current.name
 }
 
-# ── providers.tf ────────────────────────────────────
+# ── providers.tf ──────────────────────────────────────────
 provider "aws" {
   region = var.region
 }
 
-# ── locals.tf ────────────────────────────────────
+# ── locals.tf ──────────────────────────────────────────
 locals {
   buckets_to_lock = {
     codepipeline = aws_s3_bucket.awscodepipeline_s3_bucket.id
@@ -143,7 +141,7 @@ locals {
   }
 }
 
-# ── codebuild.tf ────────────────────────────────────
+# ── codebuild.tf ──────────────────────────────────────────
 #### Create a CODEBUILD Project #####
 
 resource "random_pet" "rname" {
@@ -180,7 +178,6 @@ resource "aws_codebuild_project" "awscodebuild_project" {
     }
   }
 
- 
   dynamic "vpc_config" {
     for_each = var.priv_vpc_config["vpc_id"] != "" ? [var.priv_vpc_config["vpc_id"]] : []
     content {
@@ -211,7 +208,7 @@ resource "aws_codebuild_project" "awscodebuild_project" {
 
 }
 
-# ── codecommit.tf ────────────────────────────────────
+# ── codecommit.tf ──────────────────────────────────────────
 #### Create CODECOMMIT REPOSITORY ####
 
 resource "aws_codecommit_repository" "awscodecommit_repo" {
@@ -221,7 +218,7 @@ resource "aws_codecommit_repository" "awscodecommit_repo" {
   tags = var.custom_tags
 }
 
-# ── codepipeline.tf ────────────────────────────────────
+# ── codepipeline.tf ──────────────────────────────────────────
 #### Create CodePipeline with multiple stages and CodeBuild actions ####
 
 resource "aws_codepipeline" "awscodepipeline" {
@@ -334,11 +331,11 @@ resource "aws_codepipeline" "awscodepipeline" {
   tags = var.custom_tags
 }
 
-# ── data.tf ────────────────────────────────────
+# ── data.tf ──────────────────────────────────────────
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
-# ── iam.tf ────────────────────────────────────
+# ── iam.tf ──────────────────────────────────────────
 #### Create IAM Cross-account Role and Policy for Codebuild projects ####
 
 resource "aws_iam_role" "awscodebuild_role" {
@@ -402,7 +399,7 @@ resource "aws_iam_role_policy" "awscodepipeline_policy" {
   })
 }
 
-# ── s3.tf ────────────────────────────────────
+# ── s3.tf ──────────────────────────────────────────
 #### Create Amazon S3 Codepipeline artefacts bucket ####
 
 resource "aws_s3_bucket" "awscodepipeline_s3_bucket" {
@@ -424,7 +421,6 @@ resource "aws_s3_bucket" "awscodepipeline_s3_bucket" {
 
   tags = var.custom_tags
 }
-
 
 #### Create Amazon S3 bucket for Codebuild project ####
 

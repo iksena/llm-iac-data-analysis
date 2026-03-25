@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "config" {
   type = any
 }
@@ -35,8 +35,7 @@ variable "memorystore_host" {
   type = any
 }
 
-
-# ── function_memorystoreloader.tf ────────────────────────────────────
+# ── function_memorystoreloader.tf ──────────────────────────────────────────
 locals {
   memorystoreloader_function_name = "memorystoreload"
 }
@@ -86,8 +85,7 @@ resource "google_storage_bucket_object" "memorystoreload_code" {
   source = data.archive_file.memorystoreload_zip.output_path
 }
 
-
-# ── function_prober.tf ────────────────────────────────────
+# ── function_prober.tf ──────────────────────────────────────────
 locals {
   probe_function_name = "probe"
 }
@@ -133,8 +131,7 @@ resource "google_storage_bucket_object" "probe_code" {
   source = data.archive_file.probe_zip.output_path
 }
 
-
-# ── function_test.tf ────────────────────────────────────
+# ── function_test.tf ──────────────────────────────────────────
 locals {
     test_function_name = "test"
 }
@@ -143,7 +140,7 @@ resource "google_cloudfunctions_function" "test" {
   name                  = "test"
   runtime               = "nodejs10"
   /* Testing has minimal resource requirements */
-  max_instances         = 1   
+  max_instances         = 1
   available_memory_mb   = 128
   timeout               = 30
   entry_point           = "test"
@@ -192,8 +189,7 @@ resource "google_storage_bucket_object" "test_code" {
   source = data.archive_file.test_zip.output_path
 }
 
-
-# ── function_update_current.tf ────────────────────────────────────
+# ── function_update_current.tf ──────────────────────────────────────────
 locals {
   materializer_function_name = "materialize"
 }
@@ -244,8 +240,7 @@ resource "google_storage_bucket_object" "materialize_code" {
   source = data.archive_file.materialize_zip.output_path
 }
 
-
-# ── function_update_historical.tf ────────────────────────────────────
+# ── function_update_historical.tf ──────────────────────────────────────────
 resource "google_cloudfunctions_function" "update_historical" {
   name    = "update_historical"
   runtime = "nodejs10"
@@ -281,15 +276,13 @@ resource "google_cloudfunctions_function" "update_historical" {
   }
 }
 
-
-# ── gcs.tf ────────────────────────────────────
+# ── gcs.tf ──────────────────────────────────────────
 resource "google_storage_bucket" "memorystore_uploads" {
   name     = "${var.config.project}_memorystore_uploads"
   location = "${var.config.region}"
 }
 
-
-# ── pubsub.tf ────────────────────────────────────
+# ── pubsub.tf ──────────────────────────────────────────
 resource "google_pubsub_topic" "version_every_minute" {
   name = "version_every_minute"
 }
@@ -302,8 +295,7 @@ resource "google_pubsub_topic" "version_every_hour" {
   name = "version_every_hour"
 }
 
-
-# ── scheduler.tf ────────────────────────────────────
+# ── scheduler.tf ──────────────────────────────────────────
 resource "google_cloud_scheduler_job" "version_every_minute" {
   name        = "version_every_minute"
   description = "Pings topic with version once a min"
@@ -349,8 +341,7 @@ resource "google_cloud_scheduler_job" "version_every_hour" {
   }
 }
 
-
-# ── vpc.tf ────────────────────────────────────
+# ── vpc.tf ──────────────────────────────────────────
 resource "google_vpc_access_connector" "serverless_vpc_connector" {
   name          = "${var.config.network}-connector"
   provider      = "google-beta"

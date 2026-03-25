@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "vault" {
   address = "http://localhost:8200"
   token   = "root"
@@ -28,7 +28,7 @@ resource "vault_kv_secret_v2" "burrito_recipe" {
   data_json_wo_version = var.burrito_recipe_version
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "burrito_recipe" {
   description = "Secret information for the burrito recipe"
   type = object({
@@ -58,11 +58,9 @@ variable "secret_mount_path" {
   default     = "secret"
 }
 
+# ── outputs.tf ──────────────────────────────────────────
 
-# ── outputs.tf ────────────────────────────────────
-
-
-# ── main.vault.tf ────────────────────────────────────
+# ── main.vault.tf ──────────────────────────────────────────
 provider "docker" {}
 
 resource "docker_image" "vault" {
@@ -95,7 +93,7 @@ resource "docker_container" "vault" {
   }
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.11.0"
   required_providers {

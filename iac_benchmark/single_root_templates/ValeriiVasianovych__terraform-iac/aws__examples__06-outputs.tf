@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket  = "terrafrom-tfstate-file-s3-bucket"
@@ -8,10 +8,10 @@ terraform {
     region  = "us-east-1"
   }
   required_providers {
-	aws = {
-	  source = "hashicorp/aws"
-	  version = "~> 4.16"
-	}
+  aws = {
+    source = "hashicorp/aws"
+    version = "~> 4.16"
+  }
   }
   required_version = ">= 1.2.0"
 }
@@ -23,8 +23,6 @@ provider "aws" {
 resource "aws_eip" "static_ip" {
   instance = aws_instance.little_downtime.id
   }
-
-
 
 resource "aws_instance" "little_downtime" {
   ami                    = "ami-04b70fa74e45c3917"
@@ -67,7 +65,7 @@ resource "aws_security_group" "lifecycle_security_group" {
   }
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "webserver_public_ip" {
   value = aws_eip.static_ip.public_ip
   description = "The public IP address of the web server"
@@ -98,7 +96,7 @@ output "sg_info" {
   description = "The AMI ID of the web server"
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 data "aws_availability_zones" "available" {}
 data "aws_caller_identity" "current" {}

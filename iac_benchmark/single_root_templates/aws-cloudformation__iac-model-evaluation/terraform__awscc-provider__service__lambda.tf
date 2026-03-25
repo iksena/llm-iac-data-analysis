@@ -1,4 +1,4 @@
-# ── awscc_lambda_function_p1.tf ────────────────────────────────────
+# ── awscc_lambda_function_p1.tf ──────────────────────────────────────────
 # Create AWS Lambda Function via the 'awscc' provider
 
 # Create IAM Role for Lambda Function
@@ -48,8 +48,7 @@ resource "awscc_lambda_function" "main" {
   }
 }
 
-
-# ── awscc_lambda_function_p2.tf ────────────────────────────────────
+# ── awscc_lambda_function_p2.tf ──────────────────────────────────────────
 # Terraform code to create AWS Lambda Function via the 'awscc' provider
 
 # Create IAM Role for Lambda Function
@@ -99,8 +98,7 @@ resource "awscc_lambda_function" "main" {
   }
 }
 
-
-# ── awscc_lambda_function_p3.tf ────────────────────────────────────
+# ── awscc_lambda_function_p3.tf ──────────────────────────────────────────
 # Write Terraform configuration that creates AWS Lambda Function, use awscc provider
 
 # Create IAM Role for Lambda Function
@@ -150,8 +148,7 @@ resource "awscc_lambda_function" "main" {
   }
 }
 
-
-# ── awscc_lambda_function_with_ephemeral_storage_p1.tf ────────────────────────────────────
+# ── awscc_lambda_function_with_ephemeral_storage_p1.tf ──────────────────────────────────────────
 # Create AWS Lambda Function with ephemeral storage via the 'awscc' provider
 
 # Create IAM Role for Lambda Function
@@ -203,8 +200,7 @@ resource "awscc_lambda_function" "main" {
   }
 }
 
-
-# ── awscc_lambda_function_with_ephemeral_storage_p2.tf ────────────────────────────────────
+# ── awscc_lambda_function_with_ephemeral_storage_p2.tf ──────────────────────────────────────────
 # Terraform code to create AWS Lambda Function with ephemeral storage via the 'awscc' provider
 
 # Create IAM Role for Lambda Function
@@ -256,8 +252,7 @@ resource "awscc_lambda_function" "main" {
   }
 }
 
-
-# ── awscc_lambda_function_with_ephemeral_storage_p3.tf ────────────────────────────────────
+# ── awscc_lambda_function_with_ephemeral_storage_p3.tf ──────────────────────────────────────────
 # Write Terraform configuration that creates AWS Lambda Function with ephemeral storage, use awscc provider
 
 # Create IAM Role for Lambda Function
@@ -309,8 +304,7 @@ resource "awscc_lambda_function" "main" {
   }
 }
 
-
-# ── awscc_lambda_function_with_lambda_layer_p1.tf ────────────────────────────────────
+# ── awscc_lambda_function_with_lambda_layer_p1.tf ──────────────────────────────────────────
 # Create AWS Lambda Function with Lambda Layer via the 'awscc' provider
 
 # Create IAM Role for Lambda Function
@@ -368,8 +362,7 @@ resource "awscc_lambda_function" "main" {
   }
 }
 
-
-# ── awscc_lambda_function_with_lambda_layer_p2.tf ────────────────────────────────────
+# ── awscc_lambda_function_with_lambda_layer_p2.tf ──────────────────────────────────────────
 # Terraform code to create AWS Lambda Function with Lambda Layer via the 'awscc' provider
 
 # Create IAM Role for Lambda Function
@@ -427,8 +420,7 @@ resource "awscc_lambda_function" "main" {
   }
 }
 
-
-# ── awscc_lambda_function_with_lambda_layer_p3.tf ────────────────────────────────────
+# ── awscc_lambda_function_with_lambda_layer_p3.tf ──────────────────────────────────────────
 # Write Terraform configuration that creates AWS Lambda Function with Lambda Layer, use awscc provider
 
 # Create IAM Role for Lambda Function

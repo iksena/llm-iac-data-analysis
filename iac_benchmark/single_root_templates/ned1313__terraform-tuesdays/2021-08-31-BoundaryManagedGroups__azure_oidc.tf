@@ -1,4 +1,4 @@
-# ── azuread.tf ────────────────────────────────────
+# ── azuread.tf ──────────────────────────────────────────
 # Set the reply URL
 variable "reply_url" {
   type = string
@@ -31,7 +31,7 @@ resource "azuread_application" "boundary_oidc" {
 
   group_membership_claims = ["All"]
   owners = [data.azuread_client_config.current.object_id]
-  
+
   required_resource_access {
     resource_app_id = "00000003-0000-0000-c000-000000000000" # Microsoft Graph
 
@@ -93,7 +93,7 @@ output "grant_command" {
   value = "az ad app permission grant --id ${azuread_service_principal.boundary_oidc.application_id}  --api ${data.azuread_service_principal.microsoft_graph.id}"
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
       azuread = {

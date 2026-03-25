@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
 }
@@ -92,7 +92,7 @@ output "resource_group_name" {
   value = azurerm_resource_group.training.name
 }
 
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {

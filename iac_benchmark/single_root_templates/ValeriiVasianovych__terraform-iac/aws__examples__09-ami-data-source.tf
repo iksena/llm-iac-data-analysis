@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
     backend "s3" {
     bucket         = "terrafrom-tfstate-file-s3-bucket"
@@ -20,7 +20,7 @@ provider "aws" {
   region = "us-east-1"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "latest_ubuntu_ami_id" {
   value = data.aws_ami.latest_ubuntu.id
 }
@@ -37,8 +37,7 @@ output "latest_windows_2022" {
   value = data.aws_ami.latest_windows.id
 }
 
-
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_ami" "latest_ubuntu" {
   owners      = ["099720109477"]
   most_recent = true

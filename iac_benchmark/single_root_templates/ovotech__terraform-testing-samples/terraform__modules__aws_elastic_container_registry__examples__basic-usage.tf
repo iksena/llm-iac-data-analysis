@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 module "ecr" {
   source  = "app.terraform.io/ovotech/container-registry/aws"
   version = "1.0.0"
@@ -6,8 +6,7 @@ module "ecr" {
   ecr_name = "my-container-registry"
 }
 
-
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_version = "~> 1.0"
 

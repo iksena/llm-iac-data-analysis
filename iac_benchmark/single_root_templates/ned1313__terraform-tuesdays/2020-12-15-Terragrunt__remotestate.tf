@@ -47,7 +47,6 @@ resource "random_integer" "sa_num" {
   max = 99999
 }
 
-
 resource "azurerm_resource_group" "setup" {
   name     = local.resource_group_name
   location = var.location

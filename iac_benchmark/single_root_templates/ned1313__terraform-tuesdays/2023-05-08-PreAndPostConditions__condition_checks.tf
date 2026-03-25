@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
 }
@@ -75,8 +75,7 @@ resource "azurerm_virtual_network" "main" {
   }
 }
 
-
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.2.0"
   required_providers {

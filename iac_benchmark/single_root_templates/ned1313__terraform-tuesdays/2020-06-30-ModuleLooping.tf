@@ -45,5 +45,5 @@ resource "local_file" "test" {
 
 output "names" {
   value = module.files[*].stuff
-  
+
 }

@@ -1,7 +1,7 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Copyright (c) 2021, 2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 resource "oci_core_vcn" "main" {
   cidr_blocks             = var.cidr_blocks
@@ -16,10 +16,10 @@ resource "oci_core_vcn" "main" {
   count = var.create_new_vcn ? 1 : 0
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 variable "compartment_ocid" {}
 variable "create_new_vcn" {
@@ -56,10 +56,10 @@ variable "vcn_tags" {
   description = "Tags to be added to the VCN resources"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Copyright (c) 2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 output "vcn_id" {
   value = data.oci_core_vcn.main_or_existent.id
@@ -98,11 +98,10 @@ output "vcn_domain_name" {
   value = data.oci_core_vcn.main_or_existent.vcn_domain_name
 }
 
-
-# ── providers.tf ────────────────────────────────────
+# ── providers.tf ──────────────────────────────────────────
 # Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 terraform {
   required_version = ">= 1.1"
@@ -120,10 +119,10 @@ terraform {
   }
 }
 
-# ── datasources.tf ────────────────────────────────────
+# ── datasources.tf ──────────────────────────────────────────
 # Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 data "oci_core_vcn" "main_or_existent" {
   vcn_id = var.create_new_vcn ? oci_core_vcn.main[0].id : var.existent_vcn_ocid

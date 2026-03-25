@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -33,7 +33,7 @@ module "network" {
 #   common_tags       = var.common_tags
 # }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   description = "AWS region to deploy instance"
   type        = string
@@ -74,7 +74,7 @@ variable "common_tags" {
   }
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "current_region" {
   value = data.aws_region.current.name
 }
@@ -93,8 +93,7 @@ output "vpc_id" {
   value       = module.network.vpc_id
 }
 
-
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 data "aws_ami" "latest_ubuntu" {
@@ -106,7 +105,7 @@ data "aws_ami" "latest_ubuntu" {
   }
 }
 
-# ── provider.tf ────────────────────────────────────
+# ── provider.tf ──────────────────────────────────────────
 provider "aws" {
   region = var.region
 }

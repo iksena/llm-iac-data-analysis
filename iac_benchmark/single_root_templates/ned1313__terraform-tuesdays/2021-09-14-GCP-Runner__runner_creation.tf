@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 /**
  * Copyright 2020 Google LLC
  *
@@ -91,7 +91,6 @@ resource "google_secret_manager_secret_version" "gh-secret-version" {
   })
 }
 
-
 resource "google_secret_manager_secret_iam_member" "gh-secret-member" {
   provider  = google-beta
   project   = var.project_id
@@ -106,7 +105,6 @@ resource "google_secret_manager_secret_iam_member" "gh-secret-member" {
 locals {
   instance_name = "gh-runner-vm"
 }
-
 
 module "mig_template" {
   source             = "terraform-google-modules/vm/google//modules/instance_template"
@@ -158,8 +156,7 @@ module "mig" {
   cooldown_period     = var.cooldown_period
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 /**
  * Copyright 2020 Google LLC
  *
@@ -311,8 +308,7 @@ variable "cooldown_period" {
   default     = 60
 }
 
-
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 /**
  * Copyright 2021 Google LLC
  *
@@ -353,8 +349,7 @@ terraform {
 
 }
 
-
-# ── output.tf ────────────────────────────────────
+# ── output.tf ──────────────────────────────────────────
 /**
  * Copyright 2020 Google LLC
  *
@@ -400,5 +395,3 @@ output "gh_secret_id" {
   description = "Secret Manager ID and version of the github secrets (token, repo_name,repo_owner)"
   value       = google_secret_manager_secret_version.gh-secret-version.name
 }
-
-

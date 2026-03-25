@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "ado_org_service_url" {
   type        = string
   description = "Org service url for Azure DevOps"
@@ -81,7 +81,7 @@ locals {
 
 }
 
-# ── azuread.tf ────────────────────────────────────
+# ── azuread.tf ──────────────────────────────────────────
 # The pipeline needs a service principal to use for an AzureRM service connection
 # It will need access to the Azure Key Vault
 
@@ -92,12 +92,12 @@ locals {
 
 # Create SP for service connection in pipeline. Will be used to access KV.
 
-# ── azuredevops.tf ────────────────────────────────────
+# ── azuredevops.tf ──────────────────────────────────────────
 # Create ADO objects for pipeline
 
 provider "azuredevops" {
   org_service_url = var.ado_org_service_url
-  # Authentication through PAT defined with AZDO_PERSONAL_ACCESS_TOKEN 
+  # Authentication through PAT defined with AZDO_PERSONAL_ACCESS_TOKEN
 }
 
 resource "azuredevops_project" "project" {
@@ -116,7 +116,6 @@ resource "azuredevops_project" "project" {
     "pipelines"    = "enabled"
   }
 }
-
 
 resource "azuredevops_serviceendpoint_github" "serviceendpoint_github" {
   project_id            = azuredevops_project.project.id
@@ -211,12 +210,9 @@ resource "azuredevops_build_definition" "pipeline_1" {
 
 # Key Vault task is here: https://docs.microsoft.com/en-us/azure/devops/pipelines/tasks/deploy/azure-key-vault?view=azure-devops
 
+# ── azurekeyvault.tf ──────────────────────────────────────────
 
-
-# ── azurekeyvault.tf ────────────────────────────────────
-
-
-# ── azurestorage.tf ────────────────────────────────────
+# ── azurestorage.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
 }
@@ -273,7 +269,7 @@ data "azurerm_storage_account_sas" "state" {
   }
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azuredevops = {

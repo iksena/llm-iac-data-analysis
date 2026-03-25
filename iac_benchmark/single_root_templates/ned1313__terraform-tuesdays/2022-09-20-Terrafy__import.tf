@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "azurerm_resource_group" "res-0" {
   location = "eastus"
   name     = "RG-aztfy"
@@ -97,8 +97,7 @@ resource "azurerm_subnet" "res-7" {
   ]
 }
 
-
-# ── provider.tf ────────────────────────────────────
+# ── provider.tf ──────────────────────────────────────────
 terraform {
   backend "local" {}
   required_providers {

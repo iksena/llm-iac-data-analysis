@@ -12,7 +12,7 @@ terraform {
   }
 
   backend "azurerm" {
-    
+
   }
 }
 

@@ -1,4 +1,4 @@
-# ── awscc_ecs_cluster_lookup_by_region.tf ────────────────────────────────────
+# ── awscc_ecs_cluster_lookup_by_region.tf ──────────────────────────────────────────
 # create variable type map call it cluster_name, set default to map of key us-east-1, us-west-2 and us-east-2, for each key, set the value to key + prod
 variable "cluster_name" {
   type = map(string)
@@ -17,7 +17,7 @@ resource "awscc_ecs_cluster" "this" {
 # data source to get current aws region
 data "aws_region" "current" {}
 
-# ── awscc_ecs_cluster_with_container_insights_enabled_p1.tf ────────────────────────────────────
+# ── awscc_ecs_cluster_with_container_insights_enabled_p1.tf ──────────────────────────────────────────
 # Create AWS ECS Cluster via the 'awscc' provider
 
 resource "awscc_ecs_cluster" "this" {
@@ -33,8 +33,7 @@ resource "awscc_ecs_cluster" "this" {
   }]
 }
 
-
-# ── awscc_ecs_cluster_with_container_insights_enabled_p2.tf ────────────────────────────────────
+# ── awscc_ecs_cluster_with_container_insights_enabled_p2.tf ──────────────────────────────────────────
 # Terraform code to create AWS ECS Cluster via the 'awscc' provider
 
 resource "awscc_ecs_cluster" "this" {
@@ -50,8 +49,7 @@ resource "awscc_ecs_cluster" "this" {
   }]
 }
 
-
-# ── awscc_ecs_cluster_with_container_insights_enabled_p3.tf ────────────────────────────────────
+# ── awscc_ecs_cluster_with_container_insights_enabled_p3.tf ──────────────────────────────────────────
 # Write Terraform configuration that creates AWS ECS Cluster, use awscc provider
 
 resource "awscc_ecs_cluster" "this" {
@@ -67,8 +65,7 @@ resource "awscc_ecs_cluster" "this" {
   }]
 }
 
-
-# ── awscc_ecs_service_on_fargate_p1.tf ────────────────────────────────────
+# ── awscc_ecs_service_on_fargate_p1.tf ──────────────────────────────────────────
 # Create AWS ECS Cluster via the 'awscc' provider
 
 data "awscc_ec2_subnet" "subnet" {
@@ -116,8 +113,7 @@ resource "awscc_ecs_service" "nginx" {
   depends_on = [awscc_iam_role.nginx]
 }
 
-
-# ── awscc_ecs_service_on_fargate_p2.tf ────────────────────────────────────
+# ── awscc_ecs_service_on_fargate_p2.tf ──────────────────────────────────────────
 # Terraform code to create AWS ECS Cluster via the 'awscc' provider
 
 data "awscc_ec2_subnet" "subnet" {
@@ -165,8 +161,7 @@ resource "awscc_ecs_service" "nginx" {
   depends_on = [awscc_iam_role.nginx]
 }
 
-
-# ── awscc_ecs_service_on_fargate_p3.tf ────────────────────────────────────
+# ── awscc_ecs_service_on_fargate_p3.tf ──────────────────────────────────────────
 # Write Terraform configuration that creates AWS ECS Cluster, use awscc provider
 
 data "awscc_ec2_subnet" "subnet" {

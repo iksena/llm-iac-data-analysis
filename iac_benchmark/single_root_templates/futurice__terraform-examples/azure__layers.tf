@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azuread" {
   version = "=0.7.0"
 }
@@ -66,8 +66,7 @@ resource "azurerm_storage_blob" "a_file" {
   source_content         = "Hello, Blob!"
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "resource_name_prefix" {
   type    = string
   default = "trylayers"
@@ -78,8 +77,7 @@ variable "location" {
   default = "westeurope"
 }
 
-
-# ── layers.tf ────────────────────────────────────
+# ── layers.tf ──────────────────────────────────────────
 /*
     You may need service principals for eg. managing access to Key Vault.
     However, that requires privileges to manage AD, which is outside of focus of this example.

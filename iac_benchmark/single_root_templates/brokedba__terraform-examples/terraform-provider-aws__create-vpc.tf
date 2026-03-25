@@ -1,5 +1,5 @@
-# ── variables.tf ────────────────────────────────────
-# Aws account region and autehntication 
+# ── variables.tf ──────────────────────────────────────────
+# Aws account region and autehntication
 #variable "aws_access_key" {}
 #variable "aws_secret_key" {}
 variable "aws_region" {
@@ -9,42 +9,39 @@ variable "aws_region" {
     variable "vpc_name" {
       default = "Terravpc"
     }
-    
+
     variable "vpc_cidr" {
       default = "192.168.0.0/16"
     }
 
 # SUBNET INFO
     variable "subnet_name"{
-      default = "terrasub" 
+      default = "terrasub"
       }
 
     variable "subnet_cidr"{
       default = "192.168.10.0/24"
-      } 
-    variable "map_public_ip_on_launch" { 
+      }
+    variable "map_public_ip_on_launch" {
       description = "Indicate if instances launched into the VPC's Subnet will be assigned a public IP address . "
-      default = true   
-    }  
+      default = true
+    }
 
 # IGW INFO
     variable "igw_name"{
-      default = "terra-igw" 
+      default = "terra-igw"
       }
 
 # ROUTE TABLE INFO
     variable "rt_name"{
-      default = "terra-rt" 
+      default = "terra-rt"
       }
 # ROUTE TABLE INFO
     variable "sg_name"{
-      default = "terra-sg" 
-      }      
+      default = "terra-sg"
+      }
 
-
-
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vpc_Name" {
       description = "Name of created VPC. "
       value       = "${lookup(aws_vpc.terra_vpc.tags, "Name")}"
@@ -56,8 +53,8 @@ output "vpc_id" {
 output "vpc_CIDR" {
       description = "cidr block of created VPC. "
       value       = aws_vpc.terra_vpc.cidr_block
-    }    
-    
+    }
+
 output "Subnet_Name" {
       description = "Name of created VPC's Subnet. "
       value       = "${lookup(aws_subnet.terra_sub.tags, "Name")}"
@@ -75,7 +72,7 @@ output "map_public_ip_on_launch" {
       description = "Indicate if instances launched into the VPC's Subnet will be assigned a public IP address . "
       value       = aws_subnet.terra_sub.map_public_ip_on_launch
     }
-  
+
 output "internet_gateway_id" {
        description = "id of internet gateway. "
        value       = aws_internet_gateway.terra_igw.id
@@ -83,7 +80,7 @@ output "internet_gateway_id" {
 output "internet_gateway_Name" {
        description = "Name of internet gateway. "
        value       = "${lookup(aws_internet_gateway.terra_igw.tags, "Name")}"
-    }    
+    }
 
 output "route_table_id" {
        description = "id of route table. "
@@ -92,12 +89,12 @@ output "route_table_id" {
 output "route_table_Name" {
        description = "Name of route table. "
        value       = "${lookup(aws_route_table.terra_rt.tags, "Name")}"
-    }    
- 
+    }
+
 output "route_table_routes" {
        description = "A list of routes. "
        value       = aws_route_table.terra_rt.route
-    } 
+    }
 
 output "vpc_dedicated_security_group_Name" {
        description = "Security Group Name. "
@@ -110,18 +107,10 @@ output "vpc_dedicated_security_group_id" {
 output "SecurityGroup_ingress_rules" {
        description = "Shows ingress rules of the Security group "
        value       = formatlist("%s:  %s" ,aws_security_group.terra_sg.ingress[*].description,formatlist("%s , CIDR: %s", aws_security_group.terra_sg.ingress[*].to_port,aws_security_group.terra_sg.ingress[*].cidr_blocks[0]))
-   }      
+   }
 
-
-  
-
-
-
-
-
-
-# ── vpc.tf ────────────────────────────────────
- terraform {
+# ── vpc.tf ──────────────────────────────────────────
+terraform {
       required_version = ">= 0.12.0"
     }
 # Provider specific configs
@@ -137,7 +126,7 @@ data "aws_availability_zones" "ad" {
     name   = "region-name"
     values =[var.aws_region]
   }
-}    
+}
 #################
 # VPC
 #################
@@ -159,13 +148,12 @@ resource "aws_subnet" "terra_sub" {
     tags                            = {
         "Name" = var.subnet_name
     }
-    
 
     timeouts {}
 }
 ######################
 # Internet Gateway
-###################### 
+######################
 # aws_internet_gateway.terra_igw:
 resource "aws_internet_gateway" "terra_igw" {
     vpc_id   = aws_vpc.terra_vpc.id
@@ -175,7 +163,7 @@ resource "aws_internet_gateway" "terra_igw" {
 }
 ######################
 # Route Table
-###################### 
+######################
 # aws_route_table.terra_rt:
 resource "aws_route_table" "terra_rt" {
     vpc_id  = aws_vpc.terra_vpc.id
@@ -183,7 +171,7 @@ resource "aws_route_table" "terra_rt" {
             cidr_block   = "0.0.0.0/0"
             gateway_id   = aws_internet_gateway.terra_igw.id
         }
-    
+
     tags             = {
         "Name" = var.rt_name
     }
@@ -198,7 +186,7 @@ resource "aws_route_table_association" "terra_rt_sub" {
 
 ######################
 # Security Group
-######################    
+######################
 # aws_security_group.terra_sg:
 resource "aws_security_group" "terra_sg" {
     name        = var.sg_name
@@ -214,7 +202,7 @@ resource "aws_security_group" "terra_sg" {
             to_port          = 0
             self             = false
         }
-    
+
     ingress     = [
         {
             cidr_blocks      = [
@@ -241,7 +229,7 @@ resource "aws_security_group" "terra_sg" {
             ipv6_cidr_blocks = null  # (Optional) List of IPv6 CIDR blocks.
             security_groups  = null   # (Optional) List of security group Group Names if using EC2-Classic, or Group IDs if using a VPC.
             self             = false # (Optional, default false) If true, the security group itself will be added as a source to this ingress rule.
-            
+
         },
         {
             cidr_blocks      = [
@@ -255,7 +243,7 @@ resource "aws_security_group" "terra_sg" {
              prefix_list_ids  = null  # (Optional) List of prefix list IDs.
             ipv6_cidr_blocks = null  # (Optional) List of IPv6 CIDR blocks.
             security_groups  = null   # (Optional) List of security group Group Names if using EC2-Classic, or Group IDs if using a VPC.
-            self             = false # (Optional, default false) If true, the security group itself will be added as a source to this ingress rule.        
+            self             = false # (Optional, default false) If true, the security group itself will be added as a source to this ingress rule.
         },
         {
             cidr_blocks      = [
@@ -276,4 +264,3 @@ resource "aws_security_group" "terra_sg" {
   }
     timeouts {}
 }
-

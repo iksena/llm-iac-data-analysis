@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "tls_private_key" "main" {
   algorithm = "RSA"
 }
@@ -13,8 +13,7 @@ resource "null_resource" "main" {
   }
 }
 
-
-# ── _interface.tf ────────────────────────────────────
+# ── _interface.tf ──────────────────────────────────────────
 # Optional Variables
 variable "private_key_filename" {
   default     = "private_key.pem"

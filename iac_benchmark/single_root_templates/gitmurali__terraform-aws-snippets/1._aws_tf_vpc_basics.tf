@@ -1,5 +1,4 @@
-# ── main.tf ────────────────────────────────────
-
+# ── main.tf ──────────────────────────────────────────
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
@@ -96,13 +95,12 @@ resource "aws_key_pair" "auth" {
   public_key = file("mykey.pub")
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "dev_id" {
   value = aws_instance.MyEc2Instance.public_ip
 }
 
-# ── providers.tf ────────────────────────────────────
+# ── providers.tf ──────────────────────────────────────────
 # this provides configuration to aws
 terraform {
   required_providers {
@@ -118,8 +116,7 @@ provider "aws" {
   profile                  = "default"
 }
 
-
-# ── datasources.tf ────────────────────────────────────
+# ── datasources.tf ──────────────────────────────────────────
 data "aws_ami" "example" {
   most_recent = true
   owners      = ["099720109477"]
@@ -138,7 +135,7 @@ resource "aws_instance" "MyEc2Instance" {
   subnet_id              = aws_subnet.main.id
   user_data              = file("${path.module}/userdata.tpl")
 
-  root_block_device { 
+  root_block_device {
     volume_size = 10
   }
 

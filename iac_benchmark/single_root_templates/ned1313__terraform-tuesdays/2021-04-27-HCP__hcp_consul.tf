@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "prefix" {
   description = "Naming prefix for Consul Cluster"
   type = string
@@ -22,13 +22,13 @@ variable "tier" {
   default = "development"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "consul_private_endpoint_url" {
-  value = hcp_consul_cluster.consul.consul_private_endpoint_url 
+  value = hcp_consul_cluster.consul.consul_private_endpoint_url
 }
 
 output "consul_public_endpoint_url" {
-  value = hcp_consul_cluster.consul.consul_public_endpoint_url 
+  value = hcp_consul_cluster.consul.consul_public_endpoint_url
 }
 
 output "consul_admin_token" {
@@ -44,7 +44,7 @@ output "consul_config_file" {
   value = hcp_consul_cluster.consul.consul_config_file
 }
 
-# ── resources.tf ────────────────────────────────────
+# ── resources.tf ──────────────────────────────────────────
 locals {
   name = "${lower(var.prefix)}-${random_id.seed.hex}"
 }
@@ -64,7 +64,7 @@ resource "hcp_consul_cluster_root_token" "consul" {
   cluster_id = hcp_consul_cluster.consul.cluster_id
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
       hcp = {

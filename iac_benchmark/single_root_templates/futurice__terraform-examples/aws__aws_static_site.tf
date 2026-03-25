@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 module "aws_reverse_proxy" {
   # Available inputs: https://github.com/futurice/terraform-utils/tree/master/aws_reverse_proxy#inputs
   # Check for updates: https://github.com/futurice/terraform-utils/compare/v11.0...master
@@ -30,8 +30,7 @@ module "aws_reverse_proxy" {
   tags                   = "${var.tags}"
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "site_domain" {
   description = "Domain on which the static site will be made available (e.g. `\"www.example.com\"`)"
 }
@@ -118,8 +117,7 @@ locals {
   error_ttl          = "${var.cache_ttl_override >= 0 ? var.cache_ttl_override : 0}"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "bucket_name" {
   description = "The name of the S3 bucket that's used for hosting the content (either auto-generated or externally provided)"
 
@@ -144,8 +142,7 @@ output "bucket_domain_name" {
   value       = "${local.bucket_domain_name}"
 }
 
-
-# ── data.tf ────────────────────────────────────
+# ── data.tf ──────────────────────────────────────────
 data "aws_route53_zone" "this" {
   name = "${replace("${var.site_domain}", "/.*\\b(\\w+\\.\\w+)\\.?$/", "$1")}" # e.g. "foo.example.com" => "example.com"
 }
@@ -155,8 +152,7 @@ resource "random_string" "s3_read_password" {
   special = false
 }
 
-
-# ── s3.tf ────────────────────────────────────
+# ── s3.tf ──────────────────────────────────────────
 # Query the current AWS region so we know its S3 endpoint
 data "aws_region" "current" {}
 

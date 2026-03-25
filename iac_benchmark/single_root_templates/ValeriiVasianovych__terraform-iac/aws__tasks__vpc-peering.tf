@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # VPC-1
 variable "vpc_region_1" {
   description = "The region of the VPC"
@@ -51,7 +51,7 @@ locals {
   vpc_2_name = "vpc-2"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "account_id" {
   value = data.aws_caller_identity.current.account_id
 }
@@ -86,10 +86,10 @@ output "subnet_2_cidr" {
   value = aws_subnet.subnet-2.cidr_block
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_caller_identity" "current" {}
 
-# ── peering-connection.tf ────────────────────────────────────
+# ── peering-connection.tf ──────────────────────────────────────────
 resource "aws_vpc_peering_connection" "vpc_peering" {
   provider = aws.vpc-1
   vpc_id = aws_vpc.vpc-1.id
@@ -109,7 +109,7 @@ resource "aws_vpc_peering_connection_accepter" "vpc_peering_accepter" {
   depends_on = [ aws_vpc_peering_connection.vpc_peering ]
 }
 
-# ── vpc-1.tf ────────────────────────────────────
+# ── vpc-1.tf ──────────────────────────────────────────
 provider "aws" {
   region = var.vpc_region_1
   alias  = "vpc-1"
@@ -166,7 +166,7 @@ resource "aws_route_table_association" "subnet_1_association" {
   route_table_id = aws_route_table.vpc_1_igw.id
 }
 
-# ── vpc-2.tf ────────────────────────────────────
+# ── vpc-2.tf ──────────────────────────────────────────
 provider "aws" {
   region = var.vpc_region_2
   alias  = "vpc-2"
@@ -224,4 +224,3 @@ resource "aws_route_table_association" "subnet_2_association" {
   subnet_id = aws_subnet.subnet-2.id
   route_table_id = aws_route_table.vpc_2_igw.id
 }
-

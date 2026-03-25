@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "random_string" "main" {
   length  = 8
   special = false
@@ -9,7 +9,7 @@ output "name" {
   value = random_string.main.result
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   /*backend "remote" {
     organization = "nitc-project-demo"
@@ -18,7 +18,7 @@ terraform {
       name = "project_example_remote_backend"
     }
   }*/
-  
+
   cloud {
     organization = "nitc-project-demo"
 

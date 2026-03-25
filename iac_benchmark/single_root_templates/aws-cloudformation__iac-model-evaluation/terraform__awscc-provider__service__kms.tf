@@ -1,4 +1,4 @@
-# ── awscc_kms_alias_p1.tf ────────────────────────────────────
+# ── awscc_kms_alias_p1.tf ──────────────────────────────────────────
 # Create AWS KMS Alias via the 'awscc' provider
 
 # Create KMS Key
@@ -27,8 +27,7 @@ resource "awscc_kms_alias" "this" {
   target_key_id = awscc_kms_key.this.key_id
 }
 
-
-# ── awscc_kms_alias_p2.tf ────────────────────────────────────
+# ── awscc_kms_alias_p2.tf ──────────────────────────────────────────
 # Terraform code to create KMS Alias via the 'awscc' provider
 
 # Create KMS Key
@@ -57,8 +56,7 @@ resource "awscc_kms_alias" "this" {
   target_key_id = awscc_kms_key.this.key_id
 }
 
-
-# ── awscc_kms_alias_p3.tf ────────────────────────────────────
+# ── awscc_kms_alias_p3.tf ──────────────────────────────────────────
 # Write Terraform configuration that creates KMS Alias, use awscc provider
 
 # Create KMS Key
@@ -87,8 +85,7 @@ resource "awscc_kms_alias" "this" {
   target_key_id = awscc_kms_key.this.key_id
 }
 
-
-# ── awscc_kms_key_p1.tf ────────────────────────────────────
+# ── awscc_kms_key_p1.tf ──────────────────────────────────────────
 # Create AWS KMS Key via the 'awscc' provider
 
 resource "awscc_kms_key" "this" {
@@ -111,8 +108,7 @@ resource "awscc_kms_key" "this" {
   )
 }
 
-
-# ── awscc_kms_key_p2.tf ────────────────────────────────────
+# ── awscc_kms_key_p2.tf ──────────────────────────────────────────
 # Terraform code to create KMS Key via the 'awscc' provider
 
 resource "awscc_kms_key" "this" {
@@ -135,8 +131,7 @@ resource "awscc_kms_key" "this" {
   )
 }
 
-
-# ── awscc_kms_key_p3.tf ────────────────────────────────────
+# ── awscc_kms_key_p3.tf ──────────────────────────────────────────
 # Write Terraform configuration that creates KMS Key, use awscc provider
 
 resource "awscc_kms_key" "this" {
@@ -159,8 +154,7 @@ resource "awscc_kms_key" "this" {
   )
 }
 
-
-# ── awscc_kms_key_with_tags_p1.tf ────────────────────────────────────
+# ── awscc_kms_key_with_tags_p1.tf ──────────────────────────────────────────
 # Create AWS KMS Key with tags via the 'awscc' provider
 
 resource "awscc_kms_key" "this" {
@@ -190,8 +184,7 @@ resource "awscc_kms_key" "this" {
   }]
 }
 
-
-# ── awscc_kms_key_with_tags_p2.tf ────────────────────────────────────
+# ── awscc_kms_key_with_tags_p2.tf ──────────────────────────────────────────
 # Terraform code to create KMS Key with tags via the 'awscc' provider
 
 resource "awscc_kms_key" "this" {
@@ -221,8 +214,7 @@ resource "awscc_kms_key" "this" {
   }]
 }
 
-
-# ── awscc_kms_key_with_tags_p3.tf ────────────────────────────────────
+# ── awscc_kms_key_with_tags_p3.tf ──────────────────────────────────────────
 # Write Terraform configuration that creates KMS Key with tags, use awscc provider
 
 resource "awscc_kms_key" "this" {

@@ -1,4 +1,4 @@
-# ── aws_rds_aurora_module.tf ────────────────────────────────────
+# ── aws_rds_aurora_module.tf ──────────────────────────────────────────
 # Write Terraform configuration that creates RDS aurora postgres, use module
 
 module "database" {
@@ -15,7 +15,7 @@ module "database" {
   db_subnet_group_name = "default"
 }
 
-# ── aws_rds_mysql_protect_destroy.tf ────────────────────────────────────
+# ── aws_rds_mysql_protect_destroy.tf ──────────────────────────────────────────
 # Write Terraform configuration that creates RDS instance with mysql engine, protect against destroy
 
 resource "aws_db_instance" "example" {
@@ -27,7 +27,7 @@ resource "aws_db_instance" "example" {
   username             = "foo"
   password             = "foobarbaz"
   storage_encrypted    =  true
-  
+
   lifecycle {
     prevent_destroy = true
   }

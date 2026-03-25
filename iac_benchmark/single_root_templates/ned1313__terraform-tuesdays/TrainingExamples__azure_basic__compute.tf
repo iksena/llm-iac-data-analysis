@@ -3,7 +3,7 @@ resource "azurerm_linux_virtual_machine" "main" {
 }
 
 variable "computer_name" {
-  
+
 }
 
 output "private_ip" {

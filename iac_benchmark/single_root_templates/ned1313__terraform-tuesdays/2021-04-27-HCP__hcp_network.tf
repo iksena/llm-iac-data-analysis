@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 ## Cloud Provider Information
 variable "cloud_provider" {
   description = "Cloud provider to use for HVN - AWS is the default"
@@ -25,9 +25,7 @@ variable "prefix" {
   default = "taco"
 }
 
-
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "hvn_id" {
   value = hcp_hvn.hvn.hvn_id
 }
@@ -36,7 +34,7 @@ output "hvn_cidr_block" {
   value = var.hvn_cidr_block
 }
 
-# ── resources.tf ────────────────────────────────────
+# ── resources.tf ──────────────────────────────────────────
 locals {
   name = "${lower(var.prefix)}-${random_id.seed.hex}"
 }
@@ -52,9 +50,7 @@ resource "hcp_hvn" "hvn" {
   cidr_block     = var.hvn_cidr_block
 }
 
-
-
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
       hcp = {

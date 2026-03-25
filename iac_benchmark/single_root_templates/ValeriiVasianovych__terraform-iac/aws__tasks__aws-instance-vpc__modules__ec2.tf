@@ -1,6 +1,6 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "aws_instance" "this" {
-  ami             = var.instance_ami 
+  ami             = var.instance_ami
   instance_type   = var.instance_type
   subnet_id       = var.subnet_id
   security_groups = [var.security_group_id]
@@ -13,7 +13,7 @@ resource "aws_instance" "this" {
   )
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "instance_type" {
   description = "Type of the EC2 instance"
   type        = string
@@ -39,7 +39,7 @@ variable "common_tags" {
   type        = map(string)
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "instance_id" {
   value = aws_instance.this.id
 }

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "aws_vpc" "my_vpc" {
   cidr_block = var.network_config.vpc_cidr
   tags = {
@@ -14,8 +14,7 @@ resource "aws_subnet" "my_subnet" {
   }
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "network_config" {
   type = object({
     vpc_name = string
@@ -25,8 +24,7 @@ variable "network_config" {
   })
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vpc" {
   value = aws_vpc.my_vpc
 }

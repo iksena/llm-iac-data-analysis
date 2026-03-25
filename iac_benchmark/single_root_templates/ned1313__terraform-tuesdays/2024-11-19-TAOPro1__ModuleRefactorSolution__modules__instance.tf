@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "aws_security_group" "allow_http" {
   vpc_id = var.vpc_id
 
@@ -31,7 +31,7 @@ resource "aws_instance" "web" {
   }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "ami_id" {
   description = "The AMI ID to use for the instance"
   type        = string
@@ -71,8 +71,7 @@ variable "vpc_id" {
 
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "public_dns" {
   value = aws_instance.web.public_dns
 

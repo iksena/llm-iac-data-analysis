@@ -1,7 +1,7 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Copyright (c) 2021, 2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 ##**************************************************************************
 ##                            OCI KMS Vault
@@ -47,10 +47,10 @@ locals {
   oci_vault_key_id              = var.use_encryption_from_oci_vault ? (var.create_new_encryption_key ? oci_kms_key.oke_key[0].id : var.existent_encryption_key_id) : "void"
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # Copyright (c) 2021, 2022, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 # OKE Encryption details
 variable "use_encryption_from_oci_vault" {
@@ -107,19 +107,19 @@ locals {
   deploy_id           = var.oci_tag_values.freeformTags.DeploymentID
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Copyright (c) 2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 output "oci_vault_key_id" {
   value = var.use_encryption_from_oci_vault ? (var.create_new_encryption_key ? oci_kms_key.oke_key[0].id : var.existent_encryption_key_id) : null
 }
 
-# ── providers.tf ────────────────────────────────────
+# ── providers.tf ──────────────────────────────────────────
 # Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 terraform {
   required_version = ">= 1.5" # ">= 1.1"
@@ -138,10 +138,10 @@ terraform {
   }
 }
 
-# ── policies.tf ────────────────────────────────────
+# ── policies.tf ──────────────────────────────────────────
 # Copyright (c) 2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 resource "oci_identity_dynamic_group" "app_dynamic_group" {
   name           = "${local.app_name_normalized}-kms-dg-${local.deploy_id}"

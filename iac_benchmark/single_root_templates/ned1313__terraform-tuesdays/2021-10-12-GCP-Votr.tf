@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Create a project for the resources hosting the application
 module "project" {
   source          = "./project_creation"
@@ -54,7 +54,7 @@ resource "google_sql_database_instance" "votr" {
   deletion_protection = false
 
   settings {
-    
+
     tier = var.database_tier
 
     ip_configuration {
@@ -195,7 +195,6 @@ resource "google_secret_manager_secret_version" "votr-secret-version" {
   })
 }
 
-
 resource "google_secret_manager_secret_iam_member" "votr-secret-member" {
   provider  = google-beta
   project   = module.project.project_id
@@ -210,7 +209,6 @@ resource "google_secret_manager_secret_iam_member" "votr-secret-member" {
 locals {
   instance_name = "votr-runner-vm"
 }
-
 
 module "mig_template" {
   source             = "terraform-google-modules/vm/google//modules/instance_template"
@@ -332,7 +330,7 @@ module "lb-http" {
   }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "billing_account" {
   type        = string
   description = "Billing account to associate with the project being created."
@@ -447,7 +445,7 @@ locals {
   cloud_sql_instance_name = "${random_id.id.hex}-db"
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     google = {

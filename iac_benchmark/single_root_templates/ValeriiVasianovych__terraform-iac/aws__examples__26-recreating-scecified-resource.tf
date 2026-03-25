@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "aws" {
   region = var.region
 
@@ -34,7 +34,7 @@ resource "aws_instance" "ec2_instance-2" {
   }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
     default = "us-east-1"
 }

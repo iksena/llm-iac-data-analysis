@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -20,7 +20,7 @@ module "common_vars" {
   source = "../common"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vpc_id" {
    value = aws_vpc.main
 }
@@ -33,13 +33,12 @@ output "owner" {
     value = data.aws_caller_identity.current.account_id
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 data "aws_caller_identity" "current" {}
 data "aws_availability_zones" "available" {}
 
-
-# ── vpc.tf ────────────────────────────────────
+# ── vpc.tf ──────────────────────────────────────────
 provider "aws" {
   region = module.common_vars.region
 }

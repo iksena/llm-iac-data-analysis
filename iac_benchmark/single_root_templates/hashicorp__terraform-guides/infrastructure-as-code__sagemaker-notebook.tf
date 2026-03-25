@@ -55,7 +55,7 @@ resource "aws_sagemaker_notebook_instance" "ni" {
   name          = "roger-notebook-instance"
   role_arn      = aws_iam_role.sagemaker.arn
   instance_type = "ml.t2.medium"
-  
+
   root_access = "Enabled"
   direct_internet_access = "Enabled"
 

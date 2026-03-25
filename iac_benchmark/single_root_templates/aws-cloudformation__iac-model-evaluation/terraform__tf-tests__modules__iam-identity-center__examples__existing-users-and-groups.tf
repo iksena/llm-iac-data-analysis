@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 module "aws-iam-identity-center" {
   source = "../.." // local example
   # source = "aws-ia/iam-identity-center/aws" // remote example
@@ -49,8 +49,7 @@ module "aws-iam-identity-center" {
 
 }
 
-
-# ── locals.tf ────────────────────────────────────
+# ── locals.tf ──────────────────────────────────────────
 locals {
   # Account IDs
   account1_account_id = "111111111111"

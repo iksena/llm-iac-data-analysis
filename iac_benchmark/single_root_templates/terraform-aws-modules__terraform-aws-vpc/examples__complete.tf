@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "aws" {
   region = local.region
 }
@@ -225,11 +225,9 @@ resource "aws_security_group" "rds" {
   tags = local.tags
 }
 
+# ── variables.tf ──────────────────────────────────────────
 
-# ── variables.tf ────────────────────────────────────
-
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vpc_id" {
   description = "The ID of the VPC"
   value       = module.vpc.vpc_id
@@ -761,8 +759,7 @@ output "vpc_endpoints_security_group_id" {
   value       = module.vpc_endpoints.security_group_id
 }
 
-
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.0"
 

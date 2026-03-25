@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Based on: https://www.terraform.io/docs/providers/aws/guides/serverless-with-aws-lambda-and-api-gateway.html
 # See also: https://github.com/hashicorp/terraform/issues/10157
 # See also: https://github.com/carrot/terraform-api-gateway-cors-module/
@@ -58,8 +58,7 @@ locals {
   function_invoke_arn = "${element(concat(aws_lambda_function.local_zipfile.*.invoke_arn, list("")), 0)}${element(concat(aws_lambda_function.s3_zipfile.*.invoke_arn, list("")), 0)}"
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "api_domain" {
   description = "Domain on which the Lambda will be made available (e.g. `\"api.example.com\"`)"
 }
@@ -154,8 +153,7 @@ locals {
   prefix_with_domain = "${var.name_prefix}${replace("${var.api_domain}", "/[^a-z0-9-]+/", "-")}" # only lowercase alphanumeric characters and hyphens are allowed in e.g. S3 bucket names
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "function_name" {
   description = "This is the unique name of the Lambda function that was created"
   value       = "${local.function_id}"
@@ -166,8 +164,7 @@ output "api_gw_invoke_url" {
   value       = "${aws_api_gateway_deployment.this.invoke_url}"
 }
 
-
-# ── api_gateway_config.tf ────────────────────────────────────
+# ── api_gateway_config.tf ──────────────────────────────────────────
 resource "aws_api_gateway_rest_api" "this" {
   name        = "${local.prefix_with_domain}"
   description = "${var.comment_prefix}${var.api_domain}"
@@ -219,8 +216,7 @@ resource "aws_api_gateway_base_path_mapping" "this" {
   domain_name = "${aws_api_gateway_domain_name.this.domain_name}"
 }
 
-
-# ── api_gateway_resources.tf ────────────────────────────────────
+# ── api_gateway_resources.tf ──────────────────────────────────────────
 # Add root resource to the API (it it needs to be included separately from the "proxy" resource defined below), which forwards to our Lambda:
 
 resource "aws_api_gateway_method" "proxy_root" {
@@ -286,8 +282,7 @@ resource "aws_api_gateway_integration_response" "proxy_other" {
   }
 }
 
-
-# ── certificate.tf ────────────────────────────────────
+# ── certificate.tf ──────────────────────────────────────────
 # Generate a certificate for the domain automatically using ACM
 # https://www.terraform.io/docs/providers/aws/r/acm_certificate.html
 resource "aws_acm_certificate" "this" {
@@ -311,14 +306,12 @@ resource "aws_acm_certificate_validation" "this" {
   validation_record_fqdns = ["${aws_route53_record.cert_validation.fqdn}"]
 }
 
-
-# ── data.tf ────────────────────────────────────
+# ── data.tf ──────────────────────────────────────────
 data "aws_route53_zone" "this" {
   name = "${replace("${var.api_domain}", "/.*\\b(\\w+\\.\\w+)\\.?$/", "$1")}" # e.g. "foo.example.com" => "example.com"
 }
 
-
-# ── permissions.tf ────────────────────────────────────
+# ── permissions.tf ──────────────────────────────────────────
 # Allow Lambda to invoke our functions:
 resource "aws_iam_role" "this" {
   name = "${local.prefix_with_domain}"
@@ -381,8 +374,7 @@ resource "aws_iam_role_policy_attachment" "this" {
   policy_arn = "${aws_iam_policy.this.arn}"
 }
 
-
-# ── route53.tf ────────────────────────────────────
+# ── route53.tf ──────────────────────────────────────────
 # Add an IPv4 DNS record pointing to the API Gateway
 resource "aws_route53_record" "ipv4" {
   zone_id = "${data.aws_route53_zone.this.zone_id}"

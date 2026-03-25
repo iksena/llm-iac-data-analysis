@@ -1,11 +1,11 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {
-    
+
   }
 }
 
-# ── generated.tf ────────────────────────────────────
+# ── generated.tf ──────────────────────────────────────────
 # __generated__ by Terraform
 # Please review these resources and move them into your main configuration files.
 
@@ -164,8 +164,7 @@ resource "azurerm_linux_virtual_machine" "main" {
   }
 }
 
-
-# ── imports.tf ────────────────────────────────────
+# ── imports.tf ──────────────────────────────────────────
 # Virtual network
 import {
     to = azurerm_virtual_network.main
@@ -208,15 +207,12 @@ import {
     id = "/subscriptions/4d8e572a-3214-40e9-a26f-8f71ecd24e0d/resourceGroups/tacoTruck/providers/Microsoft.Compute/virtualMachines/tacoVM"
 }
 
-
-
-
 import {
     to = "RESOURCE_ADDRESS"
     id = "UNIQUE_IDENTIFIER"
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">=1.5.0"
 

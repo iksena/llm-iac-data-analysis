@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket       = "terrafrom-tfstate-file-s3-bucket"
@@ -92,7 +92,7 @@ module "vpc-test_for_each" {
   }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   type    = string
   default = "us-west-1"
@@ -107,6 +107,6 @@ variable "vpc_cidr" {
   default = {
     prod = "10.10.0.0/16"
     dev  = "10.20.0.0/16"
-  } 
+  }
   type = map(string)
 }

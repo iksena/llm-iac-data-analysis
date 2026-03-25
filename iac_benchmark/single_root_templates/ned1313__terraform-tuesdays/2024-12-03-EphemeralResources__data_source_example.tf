@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
 
@@ -28,7 +28,7 @@ output "change" {
   value = "This is a change"
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "key_vault_secret_name" {
   description = "The name of the secret in the Azure Key Vault."
   type        = string
@@ -46,12 +46,12 @@ variable "key_vault_id" {
 
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 #output "name" {
 #  value = data.azurerm_key_vault_secret.example.name
 #}
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {

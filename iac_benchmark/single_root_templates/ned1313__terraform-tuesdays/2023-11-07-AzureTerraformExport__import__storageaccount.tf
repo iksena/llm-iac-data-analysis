@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "azapi_resource" "res-0" {
   body = jsonencode({
     kind = "StorageV2"
@@ -48,20 +48,17 @@ resource "azapi_resource" "res-0" {
   }
 }
 
-
-# ── import.tf ────────────────────────────────────
+# ── import.tf ──────────────────────────────────────────
 import {
   id = "/subscriptions/4d8e572a-3214-40e9-a26f-8f71ecd24e0d/resourceGroups/tacotruck-vms/providers/Microsoft.Storage/storageAccounts/tacotruckc997e06f"
   to = azapi_resource.res-0
 }
 
-
-# ── provider.tf ────────────────────────────────────
+# ── provider.tf ──────────────────────────────────────────
 provider "azapi" {
 }
 
-
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   backend "local" {}
 

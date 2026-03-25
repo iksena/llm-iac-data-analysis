@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "aws_vpc" "this" {
   cidr_block = var.vpc_cidr
 
@@ -69,7 +69,7 @@ resource "aws_security_group" "allow_traffic" {
     })
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "vpc_cidr" {
   description = "CIDR block for VPC"
   type        = string
@@ -90,7 +90,7 @@ variable "common_tags" {
     type        = map(string)
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vpc_id" {
     value = aws_vpc.this.id
 }
@@ -107,5 +107,5 @@ output "availability_zone" {
   value = aws_subnet.public.availability_zone
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_availability_zones" "available" {}

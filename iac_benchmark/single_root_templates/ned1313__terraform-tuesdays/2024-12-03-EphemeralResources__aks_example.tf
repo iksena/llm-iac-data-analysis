@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
 
@@ -19,7 +19,6 @@ provider "kubernetes" {
   cluster_ca_certificate = base64decode(ephemeral.azurerm_key_vault_secret.k8s["cluster-ca-certificate"].value)
 }
 
-
 resource "kubernetes_namespace" "example" {
   metadata {
     annotations = {
@@ -34,7 +33,7 @@ resource "kubernetes_namespace" "example" {
   }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "aks_cluster_host" {
   description = "The Kubernetes cluster host."
   type        = string
@@ -46,7 +45,7 @@ variable "key_vault_id" {
 
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.10"
 

@@ -1,5 +1,5 @@
 # You used to set the provider version in the provider block
-# But that is no longer the case, you now specify it in the 
+# But that is no longer the case, you now specify it in the
 # terraform.required_providers block
 
 # You can also do silly things, like name the provider whatever you want.

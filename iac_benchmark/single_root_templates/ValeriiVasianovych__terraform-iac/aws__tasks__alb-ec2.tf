@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket       = "terrafrom-tfstate-file-s3-bucket"
@@ -25,10 +25,10 @@ resource "aws_eip" "alb_eip" {
   tags = {
     Name = "alb-eip-${count.index + 1}-${var.env}"
   }
-  
+
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
     type = string
     description = "The region in which to launch the EC2 instance"
@@ -65,7 +65,7 @@ variable "count_instance" {
     default = 1
 }
 
-# ── alb.tf ────────────────────────────────────
+# ── alb.tf ──────────────────────────────────────────
 # Create Application Load Balancer
 resource "aws_lb" "web_alb" {
   name               = "web-alb-${var.env}"
@@ -125,7 +125,7 @@ resource "aws_lb_target_group_attachment" "web_tg_attachment" {
   port             = 80
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_caller_identity" "current" {}
 data "aws_subnets" "subnets" {}
 data "aws_availability_zones" "available" {}
@@ -144,8 +144,7 @@ data "aws_vpc" "default" {
   default = true
 }
 
-
-# ── instance.tf ────────────────────────────────────
+# ── instance.tf ──────────────────────────────────────────
 resource "aws_instance" "ubuntu_ec2" {
     count = var.count_instance
     ami = data.aws_ami.latest_ubuntu.id
@@ -158,9 +157,7 @@ resource "aws_instance" "ubuntu_ec2" {
     }
 }
 
-
-
-# ── sg.tf ────────────────────────────────────
+# ── sg.tf ──────────────────────────────────────────
 resource "aws_security_group" "web_sg" {
   name = "sg"
   description = "An example security group for Terraform"

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Set the Azure Provider source and version being used
 terraform {
   required_version = ">= 0.14"
@@ -42,15 +42,13 @@ resource "azurerm_storage_container" "terraform_state" {
   container_access_type = "private"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Output variable: Blob Storage container name
 output "blob_storage_container" {
   value = "https://${azurerm_storage_account.terraform_state.name}.blob.core.windows.net/${azurerm_storage_container.terraform_state.name}/"
 }
 
-
-# ── vars.tf ────────────────────────────────────
+# ── vars.tf ──────────────────────────────────────────
 # Input variable: Name of Storage Account
 variable "storage_account_name" {
   description = "The name of the storage account. Must be globally unique, length between 3 and 24 characters and contain numbers and lowercase letters only."

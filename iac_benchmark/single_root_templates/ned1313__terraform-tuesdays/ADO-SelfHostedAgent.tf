@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "azurerm_resource_group" "main" {
   name     = "ado-selfhosted-agent"
   location = var.location
@@ -51,7 +51,7 @@ resource "azuredevops_agent_pool" "main" {
   auto_update    = false
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "location" {
   type        = string
   description = "Location for Azure Resource Group."
@@ -79,7 +79,7 @@ variable "agent_image" {
   default     = "ned1313/azp-agent:1.2.0"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "dns_hostname" {
   value = azurerm_container_group.main.fqdn
 }
@@ -88,7 +88,7 @@ output "agent_pool_name" {
   value = local.agent_pool
 }
 
-# ── providers.tf ────────────────────────────────────
+# ── providers.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
 }
@@ -98,7 +98,7 @@ provider "azuredevops" {
   personal_access_token = var.azp_token
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {

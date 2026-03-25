@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "resource_group_name" {
   type        = string
   description = "Name of the resource group where resources are to be deployed"
@@ -45,8 +45,7 @@ locals {
   cleansed_prefix = replace(var.name_prefix, "/[^a-zA-Z0-9]+/", "")
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "app_service_name" {
   description = "This is the unique name of the App Service that was created"
   value       = azurerm_app_service.current.name
@@ -61,8 +60,7 @@ output "container_registry" {
   value = azurerm_container_registry.current.login_server
 }
 
-
-# ── access_policies.tf ────────────────────────────────────
+# ── access_policies.tf ──────────────────────────────────────────
 # Key vault access for the current client principal
 resource "azurerm_key_vault_access_policy" "principal" {
   key_vault_id = azurerm_key_vault.current.id
@@ -115,9 +113,7 @@ resource "azurerm_role_assignment" "app_service_next_slot_acr_pull" {
   principal_id         = azurerm_app_service_slot.next.identity.0.principal_id
 }
 
-
-# ── app_service.tf ────────────────────────────────────
-
+# ── app_service.tf ──────────────────────────────────────────
 locals {
   # Service plan needs to be unique only within the resource group
   app_service_plan_name = "${var.name_prefix}app-service-plan"
@@ -235,16 +231,14 @@ resource "azurerm_app_service_slot" "next" {
   }
 }
 
-
-# ── data.tf ────────────────────────────────────
+# ── data.tf ──────────────────────────────────────────
 data "azurerm_client_config" "current" {}
 
 data "azurerm_resource_group" "current" {
   name = var.resource_group_name
 }
 
-
-# ── monitoring.tf ────────────────────────────────────
+# ── monitoring.tf ──────────────────────────────────────────
 locals {
   healthcheck_endpoint = "https://${azurerm_app_service.current.default_site_hostname}/api/healthcheck"
 }
@@ -316,7 +310,6 @@ resource "azurerm_monitor_metric_alert" "app_availability" {
   }
 }
 
-
 # HTTP 5xx errors
 resource "azurerm_monitor_metric_alert" "ms_5xx_errors" {
   name                = "${azurerm_app_service.current.name} server had HTTP 5xx errors"
@@ -371,8 +364,7 @@ QUERY
   }
 }
 
-
-# ── provider.tf ────────────────────────────────────
+# ── provider.tf ──────────────────────────────────────────
 # Configure the Azure Provider
 provider "azurerm" {
   version                    = "= 2.37.0"
@@ -388,8 +380,7 @@ provider "template" {
   version = "~> 2.1"
 }
 
-
-# ── secrets.tf ────────────────────────────────────
+# ── secrets.tf ──────────────────────────────────────────
 # Application insights instrumentation key
 resource "azurerm_key_vault_secret" "app_insights_instrumentation_key" {
   key_vault_id = azurerm_key_vault.current.id
@@ -399,8 +390,7 @@ resource "azurerm_key_vault_secret" "app_insights_instrumentation_key" {
   depends_on = [azurerm_key_vault_access_policy.principal]
 }
 
-
-# ── shared.tf ────────────────────────────────────
+# ── shared.tf ──────────────────────────────────────────
 # Since many services require a globally unique name (such as keyvault),
 # generate random suffix for the resources
 resource "random_string" "suffix" {

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.11.11"
 }
@@ -161,8 +161,7 @@ resource "kubernetes_service" "cats-and-dogs-frontend" {
   }
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "tfe_organization" {
   description = "TFE organization"
   default = "RogerBerlind"
@@ -186,8 +185,7 @@ variable "frontend_image" {
   description = "Docker image location of the frontend app"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "cats_and_dogs_ip" {
   value = "${kubernetes_service.cats-and-dogs-frontend.load_balancer_ingress.0.ip}"
 }

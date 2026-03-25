@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "random_string" "container_name" {
   length  = 25
   lower   = true
@@ -9,7 +9,7 @@ resource "random_string" "container_name" {
 resource "azurerm_resource_group" "example" {
   name     = "rg-${local.default_suffix}"
   location = var.location
-  
+
 }
 
 resource "azapi_resource" "log_analytics_workspace" {
@@ -97,7 +97,7 @@ resource "azapi_resource" "container" {
   tags                      = local.default_tags
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "short_location_code" {
   description = "A short form of the location where resource are deployed, used in naming conventions."
   type        = string
@@ -123,7 +123,7 @@ variable "env_code" {
 # tags are expected to be provided
 variable "default_tags" {
   description = <<DESCRIPTION
-Tags to be applied to resources.  Default tags are expected to be provided in local.default_tags, 
+Tags to be applied to resources.  Default tags are expected to be provided in local.default_tags,
 which is merged with environment specific ones in ``environments\env.terraform.tfvars``.
 Most resources will simply apply the default tags like this:
 
@@ -206,7 +206,7 @@ variable "restart_policy" {
   }
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "resource_group_name" {
   value = local.resource_group_name
 }
@@ -215,14 +215,14 @@ output "container_ipv4_address" {
   value = azapi_resource.container.output.properties.ipAddress.ip
 }
 
-# ── locals.tf ────────────────────────────────────
+# ── locals.tf ──────────────────────────────────────────
 locals {
   appname        = "azapi-ephemeral-demo"
   default_suffix = "${local.appname}-${var.env_code}"
 
   # optional computed short name
   # this assume two letters for the resource type, three for the location, and three for the environment code (= 24 chars max)
-  # short_appname        = substr(replace(local.appname, "-", ""), 0, 16) 
+  # short_appname        = substr(replace(local.appname, "-", ""), 0, 16)
   # default_short_suffix = "${local.short_appname}${var.env_code}"
 
   # add resource names here, using CAF-aligned naming conventions
@@ -238,13 +238,13 @@ locals {
   )
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.8.0"
 
   required_providers {
     # The root of the configuration where Terraform Apply runs should specify the maximum allowed provider version.
-    # https://developer.hashicorp.com/terraform/language/providers/requirements#best-practices-for-provider-versions  
+    # https://developer.hashicorp.com/terraform/language/providers/requirements#best-practices-for-provider-versions
     azapi = {
       source  = "azure/azapi"
       version = "~> 2.4"

@@ -1,7 +1,7 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {
-    
+
   }
 }
 
@@ -10,7 +10,7 @@ resource "azurerm_resource_group" "main" {
   location = "eastus"
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   backend "azurerm" {
     storage_account_name = "STORAGE_ACCOUNT_NAME"

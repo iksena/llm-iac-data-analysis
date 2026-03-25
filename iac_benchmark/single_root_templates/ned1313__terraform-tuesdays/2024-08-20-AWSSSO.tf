@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "aws" {
   region = "us-east-1"
 }
@@ -10,7 +10,7 @@ resource "aws_organizations_organization" "main" {
     "sso.amazonaws.com",
     "account.amazonaws.com",
   ]
-  
+
 }
 
 data "aws_ssoadmin_instances" "main" {
@@ -18,7 +18,6 @@ data "aws_ssoadmin_instances" "main" {
 }
 
 data "aws_caller_identity" "current" {}
-
 
 resource "aws_ssoadmin_permission_set" "admin_access" {
   name         = "AdminAccess2"
@@ -68,7 +67,7 @@ resource "aws_ssoadmin_account_assignment" "admin_access" {
   target_type        = "AWS_ACCOUNT"
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     aws = {

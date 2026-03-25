@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "aws" {
   region = "us-east-1"
 }
@@ -18,7 +18,7 @@ import {
   to = aws_instance.ubuntu_ec2_2
 }
 
-# ── imports.tf ────────────────────────────────────
+# ── imports.tf ──────────────────────────────────────────
 # __generated__ by Terraform
 # Please review these resources and move them into your main configuration files.
 

@@ -1,5 +1,5 @@
-# ── variables.tf ────────────────────────────────────
-# Azure account region and authentication 
+# ── variables.tf ──────────────────────────────────────────
+# Azure account region and authentication
 variable "prefix" {
   description = "The prefix used for all resources in this example"
 }
@@ -11,25 +11,24 @@ variable "az_location" {
     variable "vnet_name" {
       default = "Terravnet"
     }
-    
+
     variable "vnet_cidr" {
       default = "192.168.0.0/16"
     }
 
 # SUBNET INFO
     variable "subnet_name"{
-      default = "terrasub" 
+      default = "terrasub"
       }
 
     variable "subnet_cidr"{
       default = "192.168.10.0/24"
-      } 
+      }
   variable "sg_name" {
     default = "terra_sg"
   }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vnet_name" {
   description = "The Name of the newly created vNet"
   value       = azurerm_virtual_network.terra_vnet.name
@@ -41,8 +40,8 @@ output "vnet_id" {
 output "vnet_CIDR" {
       description = "cidr block of created VNET. "
       value       = azurerm_virtual_network.terra_vnet.address_space
-    }    
-    
+    }
+
 output "Subnet_Name" {
       description = "Name of created VNET's Subnet. "
       value       =  azurerm_subnet.terra_sub.name
@@ -56,7 +55,6 @@ output "Subnet_CIDR" {
       value       = azurerm_subnet.terra_sub.address_prefixes
     }
 
-
 output "vnet_dedicated_security_group_Name" {
        description = "Security Group Name. "
        value       = azurerm_network_security_group.terra_nsg.name
@@ -68,19 +66,11 @@ output "vnet_dedicated_security_group_id" {
 output "vnet_dedicated_security_ingress_rules" {
       description = "Shows ingress rules of the Security group "
      value       = azurerm_network_security_group.terra_nsg.security_rule
-}      
+}
     # formatlist("%s:  %s" ,azurerm_network_security_group.terra_sg.ingress[*].description,formatlist("%s , CIDR: %s", azurerm_network_security_group.terra_sg.ingress[*].to_port,azurerm_network_security_group.terra_sg.ingress[*].cidr_blocks[0]))
 
-
-  
-
-
-
-
-
-
-# ── vnet.tf ────────────────────────────────────
- terraform {
+# ── vnet.tf ──────────────────────────────────────────
+terraform {
       required_version = ">= 1.0.3"
     }
 provider "azurerm" {
@@ -118,7 +108,7 @@ resource "azurerm_subnet" "terra_sub" {
 
 ######################
 # Network Security Group
-######################    
+######################
 # aws_security_group.terra_sg:
 resource "azurerm_network_security_group" "terra_nsg" {
   name                = "${var.prefix}-nsg"
@@ -146,10 +136,9 @@ security_rule {
     destination_port_ranges     = ["22","80","443","3389"]
     source_address_prefix      = "*"
     destination_address_prefix = "*"
-    description                = "RDP-HTTP-HTTPS ingress trafic" 
+    description                = "RDP-HTTP-HTTPS ingress trafic"
   }
 
-  
 tags = {
     Name = "SSH ,HTTP, and HTTPS"
   }

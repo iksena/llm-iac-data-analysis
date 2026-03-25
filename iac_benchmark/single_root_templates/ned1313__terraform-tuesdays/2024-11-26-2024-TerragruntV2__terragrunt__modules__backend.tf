@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "azurerm_resource_group" "backend" {
   name     = "${var.prefix}-be-rg"
   location = var.location
@@ -11,7 +11,6 @@ resource "azurerm_container_group" "backend" {
   os_type             = "Linux"
   ip_address_type     = "Private"
   subnet_ids          = [var.subnet_id]
-
 
   container {
     name   = "backend-container"
@@ -28,7 +27,7 @@ resource "azurerm_container_group" "backend" {
   tags = var.common_tags
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "common_tags" {
   description = "Common tags to be applied to resources"
   type        = map(string)
@@ -49,7 +48,7 @@ variable "subnet_id" {
   type        = string
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "backend_public_dns" {
   value = azurerm_container_group.backend.fqdn
 

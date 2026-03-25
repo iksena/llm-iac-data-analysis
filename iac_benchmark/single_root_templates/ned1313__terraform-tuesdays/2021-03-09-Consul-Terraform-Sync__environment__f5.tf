@@ -90,7 +90,6 @@ resource "azurerm_public_ip" "bigip" {
   allocation_method   = "Static"
 }
 
-
 resource "azurerm_network_interface" "bigip" {
   name = "bigipnic"
   resource_group_name = var.resource_group_name

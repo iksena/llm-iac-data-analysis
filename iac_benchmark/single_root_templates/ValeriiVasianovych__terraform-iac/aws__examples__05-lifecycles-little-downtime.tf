@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket  = "terrafrom-tfstate-file-s3-bucket"
@@ -8,10 +8,10 @@ terraform {
     region  = "us-east-1"
   }
   required_providers {
-	aws = {
-	  source = "hashicorp/aws"
-	  version = "~> 4.16"
-	}
+  aws = {
+    source = "hashicorp/aws"
+    version = "~> 4.16"
+  }
   }
   required_version = ">= 1.2.0"
 }
@@ -20,7 +20,7 @@ provider "aws" {
   region = "us-east-1"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "aws_region" {
   value = data.aws_region.current.name
 }
@@ -37,12 +37,12 @@ output "aws_caller_identity" {
   value = data.aws_caller_identity.current
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 data "aws_availability_zones" "available" {}
 data "aws_caller_identity" "current" {}
 
-# ── instance.tf ────────────────────────────────────
+# ── instance.tf ──────────────────────────────────────────
 resource "aws_eip" "static_ip" {
   instance = aws_instance.little_downtime.id
   }
@@ -65,7 +65,7 @@ resource "aws_instance" "little_downtime" {
   }
 }
 
-# ── security-group.tf ────────────────────────────────────
+# ── security-group.tf ──────────────────────────────────────────
 resource "aws_security_group" "lifecycle_security_group" {
   name        = "lifecycle_security_group"
   description = "An example security group for Terraform"

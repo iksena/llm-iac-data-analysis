@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   default = "us-east-1"
 }
@@ -31,7 +31,7 @@ variable "common_tags" {
   }
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vpc_id" {
   value = aws_vpc.main.id
 }
@@ -48,11 +48,11 @@ output "account_id" {
   value = data.aws_caller_identity.current.id
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_availability_zones" "available" {}
 data "aws_caller_identity" "current" {}
 
-# ── private-subnet.tf ────────────────────────────────────
+# ── private-subnet.tf ──────────────────────────────────────────
 resource "aws_eip" "nat" {
   count = length(var.private_subnet_cidrs) # Number of EIPs for NAT gateways based on the number of private subnets
   tags = merge(var.common_tags, {
@@ -101,7 +101,7 @@ resource "aws_route_table_association" "private_routes" {
   subnet_id      = element(aws_subnet.private_subnets[*].id, count.index) # Subnet ID based on the count.index
 }
 
-# ── public-subnet.tf ────────────────────────────────────
+# ── public-subnet.tf ──────────────────────────────────────────
 resource "aws_subnet" "public_subnets" {
   count                   = length(var.public_subnet_cidrs)
   vpc_id                  = aws_vpc.main.id
@@ -132,7 +132,7 @@ resource "aws_route_table_association" "public_routes" {
   subnet_id      = element(aws_subnet.public_subnets[*].id, count.index) # ID of public subnet based on the count.index
 }
 
-# ── vpc.tf ────────────────────────────────────
+# ── vpc.tf ──────────────────────────────────────────
 resource "aws_vpc" "main" {
   cidr_block = var.vpc_cidr
   tags = merge(var.common_tags, {

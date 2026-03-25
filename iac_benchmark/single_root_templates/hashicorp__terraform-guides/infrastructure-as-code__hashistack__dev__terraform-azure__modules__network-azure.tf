@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.10.1"
 }
@@ -9,8 +9,7 @@ module "images" {
   os = "${var.os}"
 }
 
-
-# ── _interface.tf ────────────────────────────────────
+# ── _interface.tf ──────────────────────────────────────────
 # Required Variables
 variable "environment_name" {
   type = "string"
@@ -75,8 +74,7 @@ output "subnet_private_ids" {
   value = ["${azurerm_subnet.private.*.id}"]
 }
 
-
-# ── firewalls-jumphost.tf ────────────────────────────────────
+# ── firewalls-jumphost.tf ──────────────────────────────────────────
 resource "azurerm_network_security_group" "jumphost" {
   name                = "${var.environment_name}-jumphost"
   location            = "${var.location}"
@@ -99,8 +97,7 @@ resource "azurerm_network_security_rule" "jumphost_ssh" {
   destination_address_prefix = "*"
 }
 
-
-# ── instances-jumphost.tf ────────────────────────────────────
+# ── instances-jumphost.tf ──────────────────────────────────────────
 resource "azurerm_virtual_machine" "jumphost" {
   count = "${length(var.network_cidrs_public)}"
 
@@ -182,8 +179,7 @@ resource "random_id" "jumphost" {
   byte_length = 3
 }
 
-
-# ── networks.tf ────────────────────────────────────
+# ── networks.tf ──────────────────────────────────────────
 resource "azurerm_virtual_network" "main" {
   name                = "${var.environment_name}"
   address_space       = ["${var.network_cidr}"]
@@ -191,8 +187,7 @@ resource "azurerm_virtual_network" "main" {
   resource_group_name = "${var.resource_group_name}"
 }
 
-
-# ── subnets.tf ────────────────────────────────────
+# ── subnets.tf ──────────────────────────────────────────
 resource "azurerm_subnet" "public" {
   count = "${length(var.network_cidrs_public)}"
 

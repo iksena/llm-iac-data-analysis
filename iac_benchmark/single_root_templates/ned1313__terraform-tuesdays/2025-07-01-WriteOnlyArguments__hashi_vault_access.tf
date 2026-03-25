@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "vault" {
   address = var.vault_address
   token   = var.vault_token
@@ -68,7 +68,7 @@ resource "azurerm_key_vault_secret" "write_only" {
   key_vault_id     = azurerm_key_vault.example.id
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "secret_mount_path" {
   description = "Mount path for the Vault KV v2 secret engine"
   type        = string
@@ -87,7 +87,7 @@ variable "secret_version" {
         condition     = var.secret_version > 0 && var.secret_version == floor(var.secret_version)
         error_message = "The secret_version must be a non-negative integer."
     }
-  
+
 }
 
 variable "vault_address" {
@@ -104,10 +104,9 @@ variable "vault_token" {
 
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 
-
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.11.0"
   required_providers {

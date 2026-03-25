@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Set the Azure Provider source and version being used
 terraform {
   required_version = ">= 0.14"
@@ -16,8 +16,7 @@ provider "azurerm" {
   features {}
 }
 
-
-# ── backend.tf ────────────────────────────────────
+# ── backend.tf ──────────────────────────────────────────
 # Define Terraform backend using a blob storage container on Microsoft Azure for storing the Terraform state
 terraform {
   backend "azurerm" {

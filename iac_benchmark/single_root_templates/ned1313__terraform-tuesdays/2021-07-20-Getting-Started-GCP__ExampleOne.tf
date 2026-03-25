@@ -56,7 +56,7 @@ resource "google_compute_instance" "apache" {
 resource "google_compute_firewall" "allow_http" {
     name = "allow-http-rule"
     network = "default"
-    
+
     allow {
       ports = ["80"]
       protocol = "tcp"
@@ -65,7 +65,7 @@ resource "google_compute_firewall" "allow_http" {
     target_tags = ["allow-http"]
 
     priority = 1000
-  
+
 }
 
 output "public_ip_address" {

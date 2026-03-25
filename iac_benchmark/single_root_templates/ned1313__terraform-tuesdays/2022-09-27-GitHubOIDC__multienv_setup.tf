@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Module for storage account with containers for each environment
 
 # Module for Service Principals
@@ -14,7 +14,6 @@ module "oidc_sp" {
   identity_name    = "oidc-test-${each.value}"
   repository_name  = var.repository_name
 }
-
 
 # Configure the federated application settings
 
@@ -146,7 +145,7 @@ resource "azurerm_role_assignment" "state" {
   principal_id = module.oidc_sp[each.value].service_principal.object_id
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # The GitHub repo where we'll be creating secrets and environments
 variable "repository_name" {
   type        = string
@@ -164,8 +163,7 @@ variable "azure_region" {
   default = "eastus"
 }
 
-
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     github = {

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "aws" {
   region = "us-east-1"
 }
@@ -50,7 +50,7 @@ resource "awscc_ec2_instance" "ubuntu_ec2" {
 resource "awscc_ec2_security_group" "sg" {
   group_description = "Security group allowing HTTP, HTTPS, SSH and ICMP access"
   vpc_id            = data.aws_vpc.default.id
-  
+
   security_group_ingress = [
     {
       ip_protocol = "tcp"
@@ -98,7 +98,7 @@ resource "awscc_ec2_security_group" "sg" {
   }])
 }
 
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_caller_identity" "current" {}
 data "aws_availability_zones" "available" {}
 data "aws_region" "current" {}
@@ -113,5 +113,3 @@ data "aws_ami" "latest_ubuntu" {
     values = ["ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"]
   }
 }
-
-

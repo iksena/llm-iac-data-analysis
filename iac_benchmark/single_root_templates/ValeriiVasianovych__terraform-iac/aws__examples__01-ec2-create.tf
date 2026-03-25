@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
     backend "s3" {
     bucket           = "terrafrom-tfstate-file-s3-bucket"
@@ -22,8 +22,7 @@ provider "aws" {
   region = "us-east-1"
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "monitoring_value" {
     description = "Enable detailed monitoring"
     type        = bool
@@ -52,7 +51,7 @@ variable "allow_security_groups_ports" {
     default     = [22, 80, 443]
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "aws_caller_identity" {
     value = data.aws_caller_identity.current
 }
@@ -69,8 +68,7 @@ output "aws_availability_zones" {
     value = data.aws_availability_zones.available
 }
 
-
-# ── datasource.tf ────────────────────────────────────
+# ── datasource.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 data "aws_region" "available" {}
 data "aws_availability_zones" "available" {}
@@ -84,10 +82,7 @@ data "aws_ami" "latest_ubuntu" {
   }
 }
 
-
-
-
-# ── ec2-resource.tf ────────────────────────────────────
+# ── ec2-resource.tf ──────────────────────────────────────────
 resource "aws_instance" "ubuntu_instance" {
     ami                    = data.aws_ami.latest_ubuntu.id
     instance_type          = var.instance_type

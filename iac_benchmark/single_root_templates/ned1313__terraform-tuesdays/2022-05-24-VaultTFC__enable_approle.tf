@@ -1,7 +1,6 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "role_id" {
   value = vault_approle_auth_backend_role.tfc_dev.role_id
 }
@@ -14,8 +13,7 @@ output "role_path" {
   value = vault_auth_backend.approle.path
 }
 
-
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     vault = {
@@ -39,8 +37,7 @@ provider "azurerm" {
   features {}
 }
 
-
-# ── app_role.tf ────────────────────────────────────
+# ── app_role.tf ──────────────────────────────────────────
 resource "vault_auth_backend" "approle" {
   type = "approle"
   path = "tfc-approle"
@@ -104,7 +101,7 @@ resource "vault_azure_secret_backend_role" "dev_role" {
   ]
 }
 
-# ── azure_config.tf ────────────────────────────────────
+# ── azure_config.tf ──────────────────────────────────────────
 # We are going to create a service principal for the vault to use.
 
 data "azuread_client_config" "current" {}
@@ -169,4 +166,3 @@ resource "azurerm_role_assignment" "dev_subscription" {
   role_definition_name = "Owner"
   principal_id         = azuread_service_principal.vault_tfc.object_id
 }
-

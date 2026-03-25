@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Create AWS networks
 module "vpc" {
   count = length(var.vpcs)
@@ -41,7 +41,7 @@ module "vault" {
   hvn_id = module.hvn.hvn_id
   public_endpoint = var.vault_public_endpoint
   prefix = var.prefix
-  
+
 }
 
 # Create Consul instance
@@ -51,7 +51,7 @@ module "consul" {
   hvn_id = module.hvn.hvn_id
   public_endpoint = var.consul_public_endpoint
   prefix = var.prefix
-  
+
 }
 
 # Create EC2 instance to access Vault and Consul
@@ -118,8 +118,7 @@ resource "aws_instance" "ec2" {
   })
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # AWS VPC Values
 variable "vpcs" {
     description = "A list of VPC configurations to create and peer with the HVN. Uses the VPC module."
@@ -190,7 +189,7 @@ variable "consul_public_endpoint" {
   default = false
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "ec2_public_dns" {
   value = aws_instance.ec2[*].public_ip
 }
@@ -211,7 +210,7 @@ output "consul_private_ip_address" {
   value = module.consul.consul_private_endpoint_url
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
       hcp = {

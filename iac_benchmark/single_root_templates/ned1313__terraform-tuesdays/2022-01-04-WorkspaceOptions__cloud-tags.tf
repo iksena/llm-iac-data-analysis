@@ -1,9 +1,9 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 output "workspace" {
   value = terraform.workspace
 }
 
-# ── backend.tf ────────────────────────────────────
+# ── backend.tf ──────────────────────────────────────────
 terraform {
     cloud {
         organization = "taconet"

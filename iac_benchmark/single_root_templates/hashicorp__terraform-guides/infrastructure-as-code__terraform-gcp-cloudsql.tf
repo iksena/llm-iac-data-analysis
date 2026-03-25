@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "google" {
   credentials = "${var.gcp_credentials}"
   project     = "${var.gcp_project}"
@@ -37,8 +37,7 @@ resource "google_sql_user" "users" {
   password = "${var.gcp_sql_root_user_pw}"
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "gcp_credentials" {
   description = "GCP credentials needed by Google Terraform provider"
 }
@@ -67,9 +66,7 @@ variable "database_version" {
   default = "POSTGRES_9_6"
 }
 
-
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "connection_name" {
   value = "${google_sql_database_instance.cloudsql-postgres-master.connection_name}"
 }
@@ -77,4 +74,3 @@ output "connection_name" {
 output "ip" {
   value = "${google_sql_database_instance.cloudsql-postgres-master.ip_address.0.ip_address}"
 }
-

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket         = "terrafrom-tfstate-file-s3-bucket"
@@ -21,10 +21,10 @@ provider "aws" {
   region = "us-east-1"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "aws_region" {
   value = data.aws_region.current.name
-} 
+}
 
 output "aws_region_description" {
   value = data.aws_region.current.description
@@ -34,10 +34,10 @@ output "aws_region_id" {
   value = data.aws_region.current.id
 }
 
-# ── datasorce.tf ────────────────────────────────────
+# ── datasorce.tf ──────────────────────────────────────────
 data "aws_region" "current" {}
 
-# ── s3-depends-on.tf ────────────────────────────────────
+# ── s3-depends-on.tf ──────────────────────────────────────────
 resource "aws_s3_bucket" "bucket-1" {
   bucket = "my-tf-bucket-1-s3"
   }

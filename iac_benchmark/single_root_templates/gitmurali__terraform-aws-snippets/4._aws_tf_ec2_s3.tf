@@ -1,11 +1,9 @@
-# ── versions.tf ────────────────────────────────────
-
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.12"
 }
 
-
-# ── iam.tf ────────────────────────────────────
+# ── iam.tf ──────────────────────────────────────────
 resource "aws_iam_role" "s3-mybucket-role" {
   name               = "s3-mybucket-role"
   assume_role_policy = <<EOF
@@ -61,9 +59,7 @@ resource "aws_iam_role_policy" "s3-mybucket-role-policy" {
 EOF
 }
 
-
-
-# ── instance.tf ────────────────────────────────────
+# ── instance.tf ──────────────────────────────────────────
 resource "aws_instance" "example" {
   ami           = var.AMIS[var.AWS_REGION]
   instance_type = "t2.micro"
@@ -81,31 +77,23 @@ resource "aws_instance" "example" {
   iam_instance_profile = aws_iam_instance_profile.s3-mybucket-role-instanceprofile.name
 }
 
-
-
-# ── key.tf ────────────────────────────────────
+# ── key.tf ──────────────────────────────────────────
 resource "aws_key_pair" "mykeypair" {
   key_name   = "mykeypair"
   public_key = file(var.PATH_TO_PUBLIC_KEY)
 }
 
-
-
-# ── output.tf ────────────────────────────────────
+# ── output.tf ──────────────────────────────────────────
 output "instance" {
   value = aws_instance.example.public_ip
 }
 
-
-
-# ── provider.tf ────────────────────────────────────
+# ── provider.tf ──────────────────────────────────────────
 provider "aws" {
   region = var.AWS_REGION
 }
 
-
-
-# ── s3.tf ────────────────────────────────────
+# ── s3.tf ──────────────────────────────────────────
 resource "aws_s3_bucket" "b" {
   bucket = "mybucket-c29df12344"
 
@@ -114,9 +102,7 @@ resource "aws_s3_bucket" "b" {
   }
 }
 
-
-
-# ── securitygroup.tf ────────────────────────────────────
+# ── securitygroup.tf ──────────────────────────────────────────
 resource "aws_security_group" "example-instance" {
   vpc_id      = aws_vpc.main.id
   name        = "allow-ssh"
@@ -139,9 +125,7 @@ resource "aws_security_group" "example-instance" {
   }
 }
 
-
-
-# ── vars.tf ────────────────────────────────────
+# ── vars.tf ──────────────────────────────────────────
 variable "AWS_REGION" {
   default = "us-east-1"
 }
@@ -161,8 +145,7 @@ variable "AMIS" {
   }
 }
 
-
-# ── vpc.tf ────────────────────────────────────
+# ── vpc.tf ──────────────────────────────────────────
 # Internet VPC
 resource "aws_vpc" "main" {
   cidr_block           = "10.0.0.0/16"
@@ -278,4 +261,3 @@ resource "aws_route_table_association" "main-public-3-a" {
   subnet_id      = aws_subnet.main-public-3.id
   route_table_id = aws_route_table.main-public.id
 }
-

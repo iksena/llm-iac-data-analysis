@@ -1,5 +1,5 @@
-# ── variables.tf ────────────────────────────────────
-# GCP Service account region and authentication 
+# ── variables.tf ──────────────────────────────────────────
+# GCP Service account region and authentication
 # variable "prefix" {
 #  description = "The prefix used for all resources in this example"
 #}
@@ -22,25 +22,24 @@ variable "zone" {
 variable "vnet_name" {
       default = "Terravpc"
     }
-    
+
 variable "subnet-02_cidr" {
       default = "192.168.0.0/16"
     }
 
 # SUBNET INFO
     variable "subnet_name"{
-      default = "terrasub" 
+      default = "terrasub"
       }
 
     variable "subnet_cidr"{
       default = "192.168.10.0/24"
-      } 
+      }
   variable "firewall_name" {
     default = "terra_fw"
   }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vpc_name" {
   description = "The Name of the newly created vpc"
   value       = google_compute_network.terra_vpc.name
@@ -48,8 +47,8 @@ output "vpc_name" {
 #output "vpc_id" {
 #      description = "id of created vpc. "
 #      value       = google_compute_network.terra_vpc.id
-#    } 
-    
+#    }
+
 output "Subnet_Name" {
       description = "Name of created vpc's Subnet. "
       value       =  google_compute_subnetwork.terra_sub.name
@@ -67,25 +66,21 @@ output "firewall_Name" {
        description = "Security Group Name. "
        value       = google_compute_firewall.web-server.name
    }
- 
+
 output "fire_wall_rules" {
       description = "Shows ingress rules of the Security group "
      value       = google_compute_firewall.web-server.allow
-}           
+}
 
-output "secondary_sub_ip_range" 
+output "secondary_sub_ip_range"
       description = "Shows ingress rules of the Security group "
       value       = google_compute_subnetwork.terra_sub.secondary_ip_range
-}           
+}
 
-
-
-
-
-# ── vpc.tf ────────────────────────────────────
+# ── vpc.tf ──────────────────────────────────────────
 provider "google" {
     credentials = file(var.gcp_credentials)
-    project = var.project 
+    project = var.project
     region  = var.region
     zone    = var.zone
   }
@@ -96,14 +91,14 @@ data "google_client_config" "current" {
 
 }
 #variable "project_id" {
-#  default = data.google_client_config.current.project 
+#  default = data.google_client_config.current.project
 #}
 
 ############################
 # SERVICE ACCOUNT (OPTIONAL)
 ############################
 # Note: The user running terraform needs to have the IAM Admin role assigned to them before you can do this.
-# resource "google_service_account" "instance_admin" { 
+# resource "google_service_account" "instance_admin" {
 #  account_id   = "instance-admin"
 #  display_name = "instance s-account"
 #  }
@@ -119,10 +114,10 @@ data "google_client_config" "current" {
 #################
 
 resource "google_compute_network" "terra_vpc" {
-    project   = data.google_client_config.current.project 
+    project   = data.google_client_config.current.project
     name = "terra-vpc"
     auto_create_subnetworks = false
-    mtu                     = 1460 
+    mtu                     = 1460
     }
 
 #################
@@ -139,18 +134,17 @@ resource "google_compute_subnetwork" "terra_sub" {
     aggregation_interval = "INTERVAL_10_MIN"
     flow_sampling        = 0.5
     metadata             = "INCLUDE_ALL_METADATA"
-  }   
+  }
 
     secondary_ip_range {
                 range_name    = "subnet-01-secondary-01"
                 ip_cidr_range = "192.168.64.0/24"
             }
-        
 
 }
 ######################
 # Firewall
-######################    
+######################
 # web network tag
 resource "google_compute_firewall" "web-server" {
   project     = data.google_client_config.current.project  # you can Replace this with your project ID in quotes var.project_id

@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   default = "us-east-1"
 }
@@ -32,7 +32,7 @@ variable "common_tags" {
   }
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "region" {
   value = data.aws_region.current.description
 }
@@ -65,14 +65,13 @@ output "private_subnet_cidrs" {
   value = var.private_subnet_cidrs
 }
 
-# ── datasource.tf ────────────────────────────────────
-# Global 
+# ── datasource.tf ──────────────────────────────────────────
+# Global
 data "aws_region" "current" {}
 data "aws_availability_zones" "available" {}
 data "aws_caller_identity" "current" {}
 
-
-# ── subnets.tf ────────────────────────────────────
+# ── subnets.tf ──────────────────────────────────────────
 # Public subnets
 resource "aws_subnet" "public_subnets" {
   count                   = length(var.public_subnet_cidrs)
@@ -161,8 +160,7 @@ resource "aws_route_table_association" "private_routes" {
   subnet_id      = element(aws_subnet.private_subnets[*].id, count.index)
 }
 
-
-# ── vpc.tf ────────────────────────────────────
+# ── vpc.tf ──────────────────────────────────────────
 resource "aws_vpc" "main" {
   cidr_block = var.vpc_cidr
 
@@ -174,7 +172,7 @@ resource "aws_vpc" "main" {
 
 resource "aws_internet_gateway" "main" {
   vpc_id = aws_vpc.main.id
-  
+
   tags = merge(var.common_tags, {
     Name   = "${var.env}-igw"
     Region = "Region: ${var.region}"

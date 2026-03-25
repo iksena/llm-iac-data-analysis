@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
 
@@ -33,7 +33,7 @@ resource "azurerm_mssql_server" "db" {
   administrator_login_password_wo_version = var.db_password_info.version
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "prefix" {
   description = "The prefix for the database naming."
   type        = string
@@ -47,7 +47,7 @@ variable "db_password_info" {
   })
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.11.0"
   required_providers {

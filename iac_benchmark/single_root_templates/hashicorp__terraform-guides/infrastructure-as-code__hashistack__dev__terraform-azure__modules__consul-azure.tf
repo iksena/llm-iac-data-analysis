@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.10.1"
 }
@@ -9,8 +9,7 @@ module "images" {
   os = "${var.os}"
 }
 
-
-# ── _interface.tf ────────────────────────────────────
+# ── _interface.tf ──────────────────────────────────────────
 # Required variables
 variable "resource_group_name" {
   description = "Azure Resource Group to provision resources into"
@@ -82,8 +81,7 @@ output "os_user" {
   value = "${module.images.os_user}"
 }
 
-
-# ── instances-consul.tf ────────────────────────────────────
+# ── instances-consul.tf ──────────────────────────────────────────
 resource "azurerm_virtual_machine" "consul" {
   count = "${length(var.network_cidrs_private)}"
 

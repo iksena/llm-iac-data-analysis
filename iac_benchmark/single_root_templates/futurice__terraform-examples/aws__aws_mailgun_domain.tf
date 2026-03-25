@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Create a new Mailgun domain
 resource "mailgun_domain" "this" {
   name          = "${var.mail_domain}"
@@ -35,8 +35,7 @@ resource "aws_route53_record" "receiving" {
   ]
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "mail_domain" {
   description = "Domain which you want to use for sending/receiving email (e.g. `\"example.com\"`)"
 }
@@ -61,8 +60,7 @@ variable "tags" {
   default     = {}
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "mail_domain" {
   value       = "${var.mail_domain}"
   description = "Domain which you want to use for sending/receiving email (e.g. `\"example.com\"`)"
@@ -73,8 +71,7 @@ output "api_base_url" {
   description = "Base URL of the Mailgun API for your domain"
 }
 
-
-# ── data.tf ────────────────────────────────────
+# ── data.tf ──────────────────────────────────────────
 data "aws_route53_zone" "this" {
   name = "${replace("${var.mail_domain}", "/.*\\b(\\w+\\.\\w+)\\.?$/", "$1")}" # e.g. "foo.example.com" => "example.com"
 }

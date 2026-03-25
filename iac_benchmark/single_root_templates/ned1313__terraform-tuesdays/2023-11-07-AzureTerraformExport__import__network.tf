@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "azurerm_virtual_network" "res-0" {
   address_space       = ["10.42.0.0/16"]
   location            = "eastus"
@@ -36,8 +36,7 @@ resource "azurerm_subnet" "res-3" {
   ]
 }
 
-
-# ── import.tf ────────────────────────────────────
+# ── import.tf ──────────────────────────────────────────
 import {
   id = "/subscriptions/4d8e572a-3214-40e9-a26f-8f71ecd24e0d/resourceGroups/tacotruck-network/providers/Microsoft.Network/virtualNetworks/tacotruck"
   to = azurerm_virtual_network.res-0
@@ -55,20 +54,17 @@ import {
   to = azurerm_subnet.res-3
 }
 
-
-# ── provider.aztfexport.tf ────────────────────────────────────
+# ── provider.aztfexport.tf ──────────────────────────────────────────
 provider "azapi" {
 }
 
-
-# ── provider.tf ────────────────────────────────────
+# ── provider.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {
   }
 }
 
-
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   backend "local" {}
 

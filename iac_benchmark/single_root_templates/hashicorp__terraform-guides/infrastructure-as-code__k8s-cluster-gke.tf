@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 0.11.11"
 }
@@ -46,8 +46,7 @@ resource "google_container_cluster" "k8sexample" {
   }
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "gcp_region" {
   description = "GCP region, e.g. us-east1"
   default = "us-east1"
@@ -100,8 +99,7 @@ variable "vault_addr" {
   description = "Address of Vault server including port"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "k8s_endpoint" {
   value = "${google_container_cluster.k8sexample.endpoint}"
 }

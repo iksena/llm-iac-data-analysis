@@ -1,7 +1,7 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Copyright (c) 2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 resource "oci_core_internet_gateway" "gateway" {
   compartment_id = var.compartment_ocid
@@ -61,10 +61,10 @@ resource "oci_core_local_peering_gateway" "gateway" {
   count = var.create_local_peering_gateway ? 1 : 0
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 variable "compartment_ocid" {}
 variable "vcn_id" {}
@@ -141,10 +141,10 @@ variable "gateways_tags" {
   description = "Tags to be added to the gateway resources"
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 # Copyright (c) 2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 output "internet_gateway_id" {
   value       = var.create_internet_gateway ? oci_core_internet_gateway.gateway[0].id : null
@@ -163,10 +163,10 @@ output "local_peering_gateway_id" {
   description = "The OCID of the Local Peering Gateway."
 }
 
-# ── providers.tf ────────────────────────────────────
+# ── providers.tf ──────────────────────────────────────────
 # Copyright (c) 2022, Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 terraform {
   required_version = ">= 1.1"
@@ -184,10 +184,10 @@ terraform {
   }
 }
 
-# ── datasources.tf ────────────────────────────────────
+# ── datasources.tf ──────────────────────────────────────────
 # Copyright (c) 2022 Oracle and/or its affiliates. All rights reserved.
 # Licensed under the Universal Permissive License v 1.0 as shown at http://oss.oracle.com/licenses/upl.
-# 
+#
 
 ## Available Services
 data "oci_core_services" "all_services" {

@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "azurerm_resource_group" "frontend" {
   name     = "${var.prefix}-fe-rg"
   location = var.location
@@ -11,7 +11,6 @@ resource "azurerm_container_group" "frontend" {
   os_type             = "Linux"
   ip_address_type     = "Public"
   dns_name_label      = "${var.prefix}-frontend-dns"
-
 
   container {
     name   = "frontend-container"
@@ -28,7 +27,7 @@ resource "azurerm_container_group" "frontend" {
   tags = var.common_tags
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "common_tags" {
   description = "Common tags to be applied to resources"
   type        = map(string)
@@ -44,13 +43,13 @@ variable "prefix" {
   type        = string
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "frontend_public_dns" {
   value = azurerm_container_group.frontend.fqdn
 
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {

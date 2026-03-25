@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
   #subscription_id = var.subscription_id
@@ -29,7 +29,7 @@ output "parsed_id_vnet" {
   value = provider::azurerm::parse_resource_id(azurerm_virtual_network.example.id)
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {

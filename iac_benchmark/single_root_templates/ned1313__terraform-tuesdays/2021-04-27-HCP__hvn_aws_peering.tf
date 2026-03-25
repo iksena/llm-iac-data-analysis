@@ -1,4 +1,4 @@
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "peer_vpc_id" {
   description = "VPC ID of the VPC to be paired with the HVN"
   type = string
@@ -19,10 +19,9 @@ variable "hvn_cidr_block" {
   type = string
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 
-
-# ── resources.tf ────────────────────────────────────
+# ── resources.tf ──────────────────────────────────────────
 data "aws_vpc" "peer" {
   id = var.peer_vpc_id
 }
@@ -51,7 +50,7 @@ resource "aws_route" "peer" {
   vpc_peering_connection_id = hcp_aws_network_peering.peer.provider_peering_id
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
       hcp = {

@@ -1,5 +1,5 @@
-# ── variables.tf ────────────────────────────────────
-# Azure account region and authentication 
+# ── variables.tf ──────────────────────────────────────────
+# Azure account region and authentication
 
 variable "prefix" {
   description = "The prefix used for all resources in this example"
@@ -12,30 +12,28 @@ variable "az_location" {
     variable "vnet_name" {
       default = "Terravnet"
     }
-    
+
     variable "vnet_cidr" {
       default = "192.168.0.0/16"
     }
 
 # SUBNET INFO
     variable "subnet_name"{
-      default = "terrasub" 
+      default = "terrasub"
       }
 
     variable "subnet_cidr"{
       default = "192.168.10.0/24"
-      } 
+      }
     variable "sg_name" {
     default = "terra_sg"
     }
-   
 
 # COMPUTE INSTANCE INFO
 
       variable "instance_name" {
         default = "TerraCompute"
       }
-
 
       variable "osdisk_size" {
         default = "30"
@@ -62,7 +60,7 @@ variable  "os_publisher" {
           publisher = "Oracle"
           offer     = "racle-Linux"
           sku       = "ol77-ci-gen2"
-        },     
+        },
     WINDOWS    =  {
           publisher = "MicrosoftWindowsServer"
           offer     = "WindowsServer"
@@ -81,38 +79,34 @@ variable  "os_publisher" {
           sku       = "19_10-daily-gen2"
           admin     = "azureuser"
         }
-    
-
 
        }
-     }  
+     }
 variable "OS" {
   description = "the selected ami based OS"
-  default       = "CENTOS7" 
+  default       = "CENTOS7"
 }
 
 # VNIC INFO
         variable "private_ip" {
         default = "192.168.10.51"
       }
-      
-# BOOT INFO      
-  # user data
-variable "user_data" { 
-  default = "./cloud-init/centos_userdata.txt"
-  }     
 
- # EBS 
+# BOOT INFO
+  # user data
+variable "user_data" {
+  default = "./cloud-init/centos_userdata.txt"
+  }
+
+ # EBS
 #
 variable "network_interface" {
   description = "Customize network interfaces to be attached at instance boot time"
   type        = list(map(string))
   default     = []
 }
-  
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vnet_name" {
   description = "The Name of the newly created vNet"
   value       = azurerm_virtual_network.terra_vnet.name
@@ -124,8 +118,8 @@ output "vnet_id" {
 output "vnet_CIDR" {
       description = "cidr block of created VNET. "
       value       = azurerm_virtual_network.terra_vnet.address_space
-    }    
-    
+    }
+
 output "Subnet_Name" {
       description = "Name of created VNET's Subnet. "
       value       =  azurerm_subnet.terra_sub.name
@@ -139,7 +133,6 @@ output "Subnet_CIDR" {
       value       = azurerm_subnet.terra_sub.address_prefixes
     }
 
-
 output "vnet_dedicated_security_group_Name" {
        description = "Security Group Name. "
        value       = azurerm_network_security_group.terra_nsg.name
@@ -151,20 +144,20 @@ output "vnet_dedicated_security_group_id" {
 output "vnet_dedicated_security_ingress_rules" {
       description = "Shows ingress rules of the Security group "
      value       = azurerm_network_security_group.terra_nsg.security_rule
-}           
-    
+}
+
 ##  INSTANCE OUTPUT
 
       output "instance_id" {
         description = " id of created instances. "
         value       = azurerm_linux_virtual_machine.terravm.id
       }
-      
+
       output "private_ip" {
         description = "Private IPs of created instances. "
         value       = azurerm_linux_virtual_machine.terravm.private_ip_address
       }
-      
+
       output "public_ip" {
         description = "Public IPs of created instances. "
         value       = azurerm_public_ip.terrapubip.ip_address
@@ -174,13 +167,8 @@ output "vnet_dedicated_security_ingress_rules" {
      value      = format("ssh connection to instance  ${var.prefix}-vm ==> sudo ssh -i ~/id_rsa_az centos@%s",azurerm_public_ip.terrapubip.ip_address)
 }
 
-  
-  
-    
-
-# ── compute.tf ────────────────────────────────────
-
-      terraform {
+# ── compute.tf ──────────────────────────────────────────
+terraform {
          required_version = ">= 1.0.3"
       }
 
@@ -235,45 +223,35 @@ admin_ssh_key {
   }
 ######################
 # IMAGE
-######################  
+######################
  source_image_reference {
     publisher = var.os_publisher[var.OS].publisher
     offer     = var.os_publisher[var.OS].offer
     sku       = var.os_publisher[var.OS].sku
     version   = "latest"
   }
- 
- 
-
 
   # Uncomment this line to delete the OS disk automatically when deleting the VM
   #delete_os_disk_on_termination = true
   # Uncomment this line to delete the data disks automatically when deleting the VM
   # delete_data_disks_on_termination = true
-  
-  
 
 ######################
 # VOLUME
-######################  
+######################
   os_disk {
     caching              = "ReadWrite"
     storage_account_type = "Standard_LRS"
     disk_size_gb         = var.osdisk_size
   }
- 
+
   tags = {
     environment = "demo"
   }
 }
 
-
-
-    
- 
-
-# ── vnet.tf ────────────────────────────────────
- terraform {
+# ── vnet.tf ──────────────────────────────────────────
+terraform {
       required_version = ">= 1.0.3"
     }
 provider "azurerm" {
@@ -283,8 +261,6 @@ provider "azurerm" {
 #################
 # RESOURCE GROUP
 #################
-
-
 
 #################
 # VNET
@@ -307,7 +283,7 @@ resource "azurerm_subnet" "terra_sub" {
 
 ######################
 # Network Security Group
-######################    
+######################
 resource "azurerm_network_security_group" "terra_nsg" {
   name                = "${var.prefix}-nsg"
   location            = azurerm_resource_group.rg.location
@@ -334,10 +310,9 @@ security_rule {
     destination_port_ranges     = ["22","80","443","3389"]
     source_address_prefix      = "*"
     destination_address_prefix = "*"
-    description                = "RDP-HTTP-HTTPS ingress trafic" 
+    description                = "RDP-HTTP-HTTPS ingress trafic"
   }
 
-  
 tags = {
     Name = "SSH ,HTTP, and HTTPS"
   }

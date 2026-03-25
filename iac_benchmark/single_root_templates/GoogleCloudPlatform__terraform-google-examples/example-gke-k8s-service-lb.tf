@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 variable "region" {
   default = "us-west1"
 }
@@ -42,7 +42,7 @@ resource "google_container_cluster" "default" {
   network            = "${google_compute_subnetwork.default.name}"
   subnetwork         = "${google_compute_subnetwork.default.name}"
 
-  // Use legacy ABAC until these issues are resolved: 
+  // Use legacy ABAC until these issues are resolved:
   //   https://github.com/mcuadros/terraform-provider-helm/issues/56
   //   https://github.com/terraform-providers/terraform-provider-kubernetes/pull/73
   enable_legacy_abac = true
@@ -74,8 +74,7 @@ output cluster_zone {
   value = "${google_container_cluster.default.zone}"
 }
 
-
-# ── k8s.tf ────────────────────────────────────
+# ── k8s.tf ──────────────────────────────────────────
 provider "kubernetes" {
   host                   = "${google_container_cluster.default.endpoint}"
   token                  = "${data.google_client_config.current.access_token}"

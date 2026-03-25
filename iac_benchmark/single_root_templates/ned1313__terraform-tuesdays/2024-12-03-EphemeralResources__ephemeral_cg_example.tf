@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "azurerm" {
   features {}
 
@@ -45,7 +45,7 @@ resource "azurerm_container_group" "example" {
 
   #provisioner "local-exec" {
   #  command = "echo ${ephemeral.azurerm_key_vault_secret.example.value}"
-  #  
+  #
   #}
 
   tags = {
@@ -53,7 +53,7 @@ resource "azurerm_container_group" "example" {
   }
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "key_vault_secret_name" {
   description = "The name of the secret in the Azure Key Vault."
   type        = string
@@ -71,7 +71,7 @@ variable "key_vault_id" {
 
 }
 
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "name" {
   value = var.key_vault_id
 
@@ -85,7 +85,7 @@ output "secret_name" {
 #  value = nonsensitive(ephemeral.azurerm_key_vault_secret.example.value)
 #}
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.10"
 

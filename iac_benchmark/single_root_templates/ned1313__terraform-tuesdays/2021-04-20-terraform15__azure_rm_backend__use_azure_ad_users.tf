@@ -27,7 +27,6 @@ variable "location" {
   default     = "eastus"
 }
 
-
 locals {
   name = "${lower(replace(var.prefix, "/[[:^alnum:]]/", ""))}-${random_id.seed.hex}"
 }

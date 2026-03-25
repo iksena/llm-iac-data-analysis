@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 variable "AWS_ACCESS_KEY" {
 
 }
@@ -62,7 +62,7 @@ output "ec2_instance_ip" {
   value = module.ec2-instance.ec2_instance_ip
 }
 
-# ── provider.tf ────────────────────────────────────
+# ── provider.tf ──────────────────────────────────────────
 provider "aws" {
   region     = var.AWS_REGION
   access_key = var.AWS_ACCESS_KEY

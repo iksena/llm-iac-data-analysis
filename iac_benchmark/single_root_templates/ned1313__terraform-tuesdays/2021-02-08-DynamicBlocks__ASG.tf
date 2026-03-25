@@ -1,5 +1,4 @@
-# ── variables.tf ────────────────────────────────────
-
+# ── variables.tf ──────────────────────────────────────────
 variable "region" {
   default = "us-east-1"
 }
@@ -24,7 +23,6 @@ variable "consul_datacenter" {
   default = "dc1"
 }
 
-
 # Application variables
 
 variable "ip_range" {
@@ -41,8 +39,7 @@ variable "rds_password" {
   description = "password, provide through your ENV variables"
 }
 
-
-# ── backend.tf ────────────────────────────────────
+# ── backend.tf ──────────────────────────────────────────
 ##################################################################################
 # BACKENDS
 ##################################################################################
@@ -53,8 +50,7 @@ terraform {
   }
 }
 
-
-# ── datasources.tf ────────────────────────────────────
+# ── datasources.tf ──────────────────────────────────────────
 ##################################################################################
 # DATA SOURCES
 ##################################################################################
@@ -64,7 +60,7 @@ data "consul_keys" "applications" {
       name = "applications"
       path = terraform.workspace == "default" ? "applications/configuration/globo-primary/app_info" : "applications/configuration/globo-primary/${terraform.workspace}/app_info"
   }
-  
+
   key {
     name = "common_tags"
     path = "applications/configuration/globo-primary/common_tags"
@@ -106,8 +102,7 @@ data "aws_ami" "aws_linux" {
   }
 }
 
-
-# ── resources.tf ────────────────────────────────────
+# ── resources.tf ──────────────────────────────────────────
 #Based on the work from https://github.com/arbabnazar/terraform-ansible-aws-vpc-ha-wordpress
 
 ##################################################################################
@@ -296,7 +291,7 @@ resource "aws_cloudwatch_metric_alarm" "scale_down_alarm" {
   alarm_actions     = [aws_autoscaling_policy.scale_down.arn]
 }
 
-## Database Config 
+## Database Config
 
 resource "aws_db_subnet_group" "db_subnet_group" {
   name       = "${terraform.workspace}-ddt-rds-subnet-group"
@@ -320,13 +315,12 @@ resource "aws_db_instance" "rds" {
   tags = local.common_tags
 }
 
-
-# ── s3.tf ────────────────────────────────────
+# ── s3.tf ──────────────────────────────────────────
 #### S3 buckets
 variable "aws_bucket_prefix" {
   type    = strings
   #type = string
-  
+
   default = "globo"
 }
 
@@ -369,7 +363,7 @@ resource "aws_iam_instance_profile" "asg" {
 resource "aws_iam_role" "asg" {
   name = "${terraform.workspace}_asg_role"
   path = "/"
-  
+
   assume_role_policy = <<EOF
 {
   "Version": "2012-10-17",
@@ -413,8 +407,7 @@ resource "aws_iam_role_policy" "asg" {
   EOF
 }
 
-
-# ── security_groups.tf ────────────────────────────────────
+# ── security_groups.tf ──────────────────────────────────────────
 ##################################################################################
 # RESOURCES
 ##################################################################################

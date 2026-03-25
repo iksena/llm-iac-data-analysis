@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 # Create Service Principals
 data "azuread_client_config" "current" {}
 
@@ -31,8 +31,6 @@ resource "azuread_application_federated_identity_credential" "pr" {
   issuer                = "https://token.actions.githubusercontent.com"
   subject               = "repo:${var.repository_name}:pull_request"
 }
-
-
 
 # Grant contributor role in current Azure subscription
 provider "azurerm" {
@@ -104,7 +102,7 @@ resource "github_actions_secret" "oidc" {
   repository      = data.github_repository.oidc.name
 }
 
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 # The GitHub repo where we'll be creating secrets
 variable "repository_name" {
   type        = string
@@ -122,7 +120,7 @@ variable "environments" {
   description = "(Requireds) The branches to use for the references."
 }
 
-# ── terraform.tf ────────────────────────────────────
+# ── terraform.tf ──────────────────────────────────────────
 terraform {
   required_providers {
     azurerm = {

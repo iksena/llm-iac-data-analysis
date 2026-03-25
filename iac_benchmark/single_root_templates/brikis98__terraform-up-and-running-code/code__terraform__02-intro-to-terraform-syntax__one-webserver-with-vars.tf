@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.0.0, < 2.0.0"
 
@@ -44,9 +44,7 @@ resource "aws_security_group" "instance" {
   }
 }
 
-
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "server_port" {
   description = "The port the server will use for HTTP requests"
   type        = number
@@ -105,8 +103,7 @@ variable "security_group_name" {
   default     = "terraform-example-instance"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "public_ip" {
   value       = aws_instance.example.public_ip
   description = "The public IP address of the web server"

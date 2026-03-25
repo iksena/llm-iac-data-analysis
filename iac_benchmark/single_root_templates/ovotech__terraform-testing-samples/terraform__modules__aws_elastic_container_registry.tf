@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 resource "aws_ecr_repository" "main" {
   name                 = var.ecr_name
   image_tag_mutability = "IMMUTABLE"
@@ -16,15 +16,13 @@ resource "aws_ecr_repository" "main" {
   }
 }
 
-
-# ── variables.tf ────────────────────────────────────
+# ── variables.tf ──────────────────────────────────────────
 variable "ecr_name" {
   type        = string
   description = "(Required) Name of the elastic container registry being created"
 }
 
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "repo_name" {
   value       = aws_ecr_repository.main.name
   description = "Provided name of the ECR repository."
@@ -40,8 +38,7 @@ output "repo_arn" {
   description = "Full ARN of the repository."
 }
 
-
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_version = "~> 1.0"
 

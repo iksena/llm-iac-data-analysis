@@ -17,14 +17,14 @@ locals {
 
 module "default_variable" {
     source = "./mock_mod"
-    
+
 }
 
 module "local_variable" {
     source = "./mock_mod"
 
     complex_object = local.rules
-    
+
 }
 
 output "default_variable" {

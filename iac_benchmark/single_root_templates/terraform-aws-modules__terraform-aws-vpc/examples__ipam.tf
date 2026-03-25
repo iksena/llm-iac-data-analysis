@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 provider "aws" {
   region = local.region
 }
@@ -149,11 +149,9 @@ resource "aws_vpc_ipam_pool" "ipv6" {
 #   }
 # }
 
+# ── variables.tf ──────────────────────────────────────────
 
-# ── variables.tf ────────────────────────────────────
-
-
-# ── outputs.tf ────────────────────────────────────
+# ── outputs.tf ──────────────────────────────────────────
 output "vpc_id" {
   description = "The ID of the VPC"
   value       = module.vpc_ipam_set_netmask.vpc_id
@@ -669,8 +667,7 @@ output "elasticache_network_acl_arn" {
   value       = module.vpc_ipam_set_netmask.elasticache_network_acl_arn
 }
 
-
-# ── versions.tf ────────────────────────────────────
+# ── versions.tf ──────────────────────────────────────────
 terraform {
   required_version = ">= 1.0"
 

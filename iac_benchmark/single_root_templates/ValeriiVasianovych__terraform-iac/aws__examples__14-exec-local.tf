@@ -1,4 +1,4 @@
-# ── main.tf ────────────────────────────────────
+# ── main.tf ──────────────────────────────────────────
 terraform {
   backend "s3" {
     bucket = "terrafrom-tfstate-file-s3-bucket"
@@ -19,8 +19,7 @@ provider "aws" {
   region = "us-east-1"
 }
 
-
-# ── exec-local.tf ────────────────────────────────────
+# ── exec-local.tf ──────────────────────────────────────────
 resource "null_resource" "com1" {
   provisioner "local-exec" {
     command = "touch file.txt;"
@@ -52,7 +51,7 @@ resource "null_resource" "com4" {
 resource "aws_instance" "ubuntu" {
     ami           = "0866a3c8686eaeeba"
     instance_type = "t2-micro"
-    provisioner "local-exec" { # Inside EC2 instance. If I create an instance, I can run this command inside the instance. 
+    provisioner "local-exec" { # Inside EC2 instance. If I create an instance, I can run this command inside the instance.
       command = "ping -c 5 www.google.com"
     }
 

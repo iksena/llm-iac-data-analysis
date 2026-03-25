@@ -30,4 +30,3 @@ output "data_json" {
 output "vault_aws_creds" {
     value = data.vault_aws_access_credentials.creds
 }
-
