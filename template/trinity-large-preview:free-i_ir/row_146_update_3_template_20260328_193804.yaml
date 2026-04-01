@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Automated Image Analysis Pipeline with S3, Lambda, Step Functions, and Rekognition
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RekognitionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rekognition:DetectFaces
+                  - rekognition:DetectLabels
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${ImageAnalysisBucket}/*'
+        - PolicyName: SNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref SNSTopic
+    Metadata:
+      Effect: least-privilege
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt RekognitionLambda.Arn
+                  - !GetAtt SNSLambda.Arn
+    Metadata:
+      Effect: least-privilege
+
+  ImageAnalysisBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: image-analysis-bucket
+      VersioningConfiguration:
+        Status: Enabled
+    Metadata:
+      Effect: versioned
+
+  ImageUploadLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs24.x
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            const AWS = require('aws-sdk');
+            const stepfunctions = new AWS.StepFunctions();
+            const s3Records = event.Records;
+            for (const record of s3Records) {
+              const params = {
+                stateMachineArn: process.env.STATE_MACHINE_ARN,
+                input: JSON.stringify({
+                  bucket: record.s3.bucket.name,
+                  key: record.s3.object.key
+                })
+              };
+              await stepfunctions.startExecution(params).promise();
+            }
+            return {
+              statusCode: 200,
+              body: JSON.stringify('Processing initiated')
+            };
+          };
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+    Metadata:
+      Effect: encrypted
+
+  RekognitionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs24.x
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const rekognition = new AWS.Rekognition();
+          exports.handler = async (event) => {
+            const s3 = new AWS.S3();
+            const image = await s3.getObject({
+              Bucket: event.bucket,
+              Key: event.key
+            }).promise();
+            const params = {
+              Image: {
+                Bytes: image.Body
+              },
+              MaxLabels: 10,
+              MinConfidence: 75
+            };
+            const result = await rekognition.detectLabels(params).promise();
+            return result;
+          };
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+    Metadata:
+      Effect: encrypted
+
+  SNSLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: nodejs24.x
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const sns = new AWS.SNS();
+          exports.handler = async (event) => {
+            const message = `Human detected in image: ${JSON.stringify(event.rekognitionResult)}`;
+            const params = {
+              TopicArn: process.env.SNS_TOPIC_ARN,
+              Message: message,
+              Subject: 'Image Analysis Alert'
+            };
+            await sns.publish(params).promise();
+            return {
+              statusCode: 200,
+              body: JSON.stringify('Alert sent')
+            };
+          };
+      Timeout: 30
+      MemorySize: 128
+      Role: !GetAtt LambdaExecutionRole.Arn
+    Metadata:
+      Effect: encrypted
+
+  StepFunctionsStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: |
+        {
+          "StartAt": "RekognitionAnalysis",
+          "States": {
+            "RekognitionAnalysis": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "Fn::GetAtt::RekognitionLambda::Arn",
+                "Payload": {
+                  "bucket.$": "$.bucket",
+                  "key.$": "$.key"
+                }
+              },
+              "ResultPath": "$.rekognitionResult",
+              "Next": "CheckHumanDetection"
+            },
+            "CheckHumanDetection": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.rekognitionResult.Labels",
+                  "StringEquals": "Human",
+                  "Next": "SendAlert"
+                }
+              ],
+              "Default": "End"
+            },
+            "SendAlert": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "Fn::GetAtt::SNSLambda::Arn",
+                "Payload": {
+                  "rekognitionResult.$": "$.rekognitionResult"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+    Metadata:
+      Effect: encrypted
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: ImageAnalysisAlerts
+    Metadata:
+      Effect: encrypted
+
+  SNSTMSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: +1234567890
+      Protocol: sms
+      TopicArn: !Ref SNSTopic
+    Metadata:
+      Effect: public
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt ImageUploadLambda.Arn
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::${ImageAnalysisBucket}'
+
+Outputs:
+  ImageAnalysisBucketName:
+    Description: Name of the S3 bucket for image analysis
+    Value: !Ref ImageAnalysisBucket
+  StepFunctionsStateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !Ref StepFunctionsStateMachine
