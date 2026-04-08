@@ -1,0 +1,32 @@
+resource "google_compute_target_ssl_proxy" "default" {
+  name             = "test-proxy-${local.name_suffix}"
+  backend_service  = google_compute_backend_service.default.id
+  ssl_certificates = [google_compute_ssl_certificate.default.id]
+  certificate_map = "//certificatemanager.googleapis.com/${google_certificate_manager_certificate_map.default.id}"
+}
+
+resource "google_compute_ssl_certificate" "default" {
+  name        = "default-cert-${local.name_suffix}"
+  private_key = file("../static/ssl_cert/test.key")
+  certificate = file("../static/ssl_cert/test.crt")
+}
+
+resource "google_compute_backend_service" "default" {
+  name          = "backend-service-${local.name_suffix}"
+  protocol      = "SSL"
+  health_checks = [google_compute_health_check.default.id]
+}
+
+resource "google_compute_health_check" "default" {
+  name               = "health-check-${local.name_suffix}"
+  check_interval_sec = 1
+  timeout_sec        = 1
+  tcp_health_check {
+    port = "443"
+  }
+}
+
+resource "google_certificate_manager_certificate_map" "default" {
+  name        = "certificate-map-test"
+  description = "My acceptance test certificate map"
+}

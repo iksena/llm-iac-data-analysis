@@ -1,0 +1,180 @@
+resource "mongodbatlas_stream_instance" "example" {
+  project_id    = var.project_id
+  instance_name = "InstanceName"
+  data_process_region = {
+    region         = "VIRGINIA_USA"
+    cloud_provider = "AWS"
+  }
+}
+
+resource "mongodbatlas_stream_connection" "example-cluster" {
+  project_id      = var.project_id
+  workspace_name  = mongodbatlas_stream_instance.example.instance_name
+  connection_name = "ClusterConnection"
+  type            = "Cluster"
+  cluster_name    = var.cluster_name
+  db_role_to_execute = {
+    role = "atlasAdmin"
+    type = "BUILT_IN"
+  }
+}
+
+resource "mongodbatlas_stream_connection" "example-cross-project-cluster" {
+  project_id         = var.project_id
+  workspace_name     = mongodbatlas_stream_instance.example.instance_name
+  connection_name    = "ClusterCrossProjectConnection"
+  type               = "Cluster"
+  cluster_name       = var.other_cluster
+  cluster_project_id = var.other_project_id
+  db_role_to_execute = {
+    role = "atlasAdmin"
+    type = "BUILT_IN"
+  }
+}
+
+resource "mongodbatlas_stream_connection" "example-kafka-plaintext" {
+  project_id      = var.project_id
+  workspace_name  = mongodbatlas_stream_instance.example.instance_name
+  connection_name = "KafkaPlaintextConnection"
+  type            = "Kafka"
+  authentication = {
+    mechanism = "PLAIN"
+    username  = var.kafka_username
+    password  = var.kafka_password
+  }
+  bootstrap_servers = "localhost:9092,localhost:9092"
+  config = {
+    "auto.offset.reset" : "earliest"
+  }
+  security = {
+    protocol = "SASL_PLAINTEXT"
+  }
+  networking = {
+    access = {
+      type = "PUBLIC"
+    }
+  }
+}
+
+resource "mongodbatlas_stream_connection" "example-kafka-oauthbearer" {
+  project_id      = var.project_id
+  instance_name   = mongodbatlas_stream_instance.example.instance_name
+  connection_name = "KafkaOAuthbearerConnection"
+  type            = "Kafka"
+  authentication = {
+    mechanism                   = "OAUTHBEARER"
+    method                      = "OIDC"
+    token_endpoint_url          = "https://example.com/oauth/token"
+    client_id                   = "auth0Client"
+    client_secret               = var.kafka_client_secret
+    scope                       = "read:messages write:messages"
+    sasl_oauthbearer_extensions = "logicalCluster=lkc-kmom,identityPoolId=pool-lAr"
+  }
+  bootstrap_servers = "localhost:9092,localhost:9092"
+  config = {
+    "auto.offset.reset" : "earliest"
+  }
+  security = {
+    protocol = "SASL_PLAINTEXT"
+  }
+  networking = {
+    access = {
+      type = "PUBLIC"
+    }
+  }
+}
+
+resource "mongodbatlas_stream_connection" "example-kafka-ssl" {
+  project_id      = var.project_id
+  workspace_name  = mongodbatlas_stream_instance.example.instance_name
+  connection_name = "KafkaSSLConnection"
+  type            = "Kafka"
+  authentication = {
+    mechanism = "PLAIN"
+    username  = var.kafka_username
+    password  = var.kafka_password
+  }
+  bootstrap_servers = "localhost:9092,localhost:9092"
+  config = {
+    "auto.offset.reset" : "earliest"
+  }
+  security = {
+    broker_public_certificate = var.kafka_ssl_cert
+    protocol                  = "SASL_SSL"
+  }
+}
+
+resource "mongodbatlas_stream_connection" "example-sample" {
+  project_id      = var.project_id
+  workspace_name  = mongodbatlas_stream_instance.example.instance_name
+  connection_name = "sample_stream_solar"
+  type            = "Sample"
+}
+
+resource "mongodbatlas_stream_connection" "example-aws-lambda" {
+  project_id      = var.project_id
+  workspace_name  = mongodbatlas_stream_instance.example.instance_name
+  connection_name = "AWSLambdaConnection"
+  type            = "AWSLambda"
+  aws = {
+    role_arn = "arn:aws:iam::<AWS_ACCOUNT_ID>:role/lambdaRole"
+  }
+}
+
+resource "mongodbatlas_stream_connection" "example-https" {
+  project_id      = var.project_id
+  instance_name   = mongodbatlas_stream_instance.example.instance_name
+  connection_name = "HttpsConnection"
+  type            = "Https"
+  url             = "https://example.com"
+  headers = {
+    key1 = "value1"
+    key2 = "value2"
+  }
+}
+
+resource "mongodbatlas_stream_connection" "example-schema-registry-user-info" {
+  project_id               = var.project_id
+  workspace_name           = mongodbatlas_stream_instance.example.instance_name
+  connection_name          = "SchemaRegistryUserInfoConnection"
+  type                     = "SchemaRegistry"
+  schema_registry_provider = "CONFLUENT"
+  schema_registry_urls     = ["https://schemaregistry.example.com"]
+  schema_registry_authentication = {
+    type     = "USER_INFO"
+    username = var.schema_registry_username
+    password = var.schema_registry_password
+  }
+}
+
+resource "mongodbatlas_stream_connection" "example-schema-registry-sasl-inherit" {
+  project_id               = var.project_id
+  workspace_name           = mongodbatlas_stream_instance.example.instance_name
+  connection_name          = "SchemaRegistrySASLInheritConnection"
+  type                     = "SchemaRegistry"
+  schema_registry_provider = "CONFLUENT"
+  schema_registry_urls     = ["https://schemaregistry.example.com"]
+  schema_registry_authentication = {
+    type = "SASL_INHERIT"
+  }
+}
+
+data "mongodbatlas_stream_connection" "example-kafka-ssl" {
+  project_id      = var.project_id
+  workspace_name  = mongodbatlas_stream_instance.example.instance_name
+  connection_name = mongodbatlas_stream_connection.example-kafka-ssl.connection_name
+}
+
+data "mongodbatlas_stream_connections" "example" {
+  project_id    = var.project_id
+  instance_name = mongodbatlas_stream_instance.example.instance_name
+}
+
+# example making use of data sources
+output "stream_connection_bootstrap_servers" {
+  value = data.mongodbatlas_stream_connection.example-kafka-ssl.bootstrap_servers
+}
+
+output "stream_connection_total_count" {
+  value = data.mongodbatlas_stream_connections.example.total_count
+}

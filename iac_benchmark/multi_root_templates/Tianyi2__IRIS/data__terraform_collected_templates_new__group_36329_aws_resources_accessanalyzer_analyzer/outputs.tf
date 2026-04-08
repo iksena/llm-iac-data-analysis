@@ -1,0 +1,14 @@
+output "arn" {
+  description = "ARN of the Analyzer."
+  value       = aws_accessanalyzer_analyzer.this.arn
+}
+
+output "id" {
+  description = "Name of the analyzer."
+  value       = aws_accessanalyzer_analyzer.this.id
+}
+
+output "tags_all" {
+  description = "Map of tags assigned to the resource, including those inherited from the provider default_tags configuration block."
+  value       = aws_accessanalyzer_analyzer.this.tags_all
+}

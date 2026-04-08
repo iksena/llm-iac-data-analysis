@@ -1,0 +1,104 @@
+resource "xray_security_policy" "min_severity" {
+  name        = "test-security-policy-severity"
+  description = "Security policy description"
+  type        = "security"
+  project_key = "testproj"
+
+  rule {
+    name     = "rule-name-severity"
+    priority = 1
+
+    criteria {
+      min_severity          = "High"
+      fix_version_dependant = false
+    }
+
+    actions {
+      webhooks                           = []
+      mails                              = ["test@email.com"]
+      block_release_bundle_distribution  = true
+      block_release_bundle_promotion     = true
+      fail_build                         = true
+      notify_watch_recipients            = true
+      notify_deployer                    = true
+      create_ticket_enabled              = false // set to true only if Jira integration is enabled
+      fail_pull_request                  = true
+      build_failure_grace_period_in_days = 5     // use only if fail_build is enabled
+
+      block_download {
+        unscanned = true
+        active    = true
+      }
+    }
+  }
+}
+
+resource "xray_security_policy" "cvss_score" {
+  name        = "test-security-policy-cvss"
+  description = "Security policy description"
+  type        = "security"
+  project_key = "testproj"
+
+  rule {
+    name     = "rule-name-cvss"
+    priority = 1
+
+    criteria {
+
+      cvss_range {
+        from = 1.5
+        to   = 5.3
+      }
+    }
+
+    actions {
+      webhooks                           = []
+      mails                              = ["test@email.com"]
+      block_release_bundle_distribution  = true
+      fail_build                         = true
+      notify_watch_recipients            = true
+      notify_deployer                    = true
+      create_ticket_enabled              = false // set to true only if Jira integration is enabled
+      fail_pull_request                  = true
+      build_failure_grace_period_in_days = 5     // use only if fail_build is enabled
+
+      block_download {
+        unscanned = true
+        active    = true
+      }
+    }
+  }
+}
+
+resource "xray_security_policy" "malicious_package" {
+  name        = "test-security-policy-mal-pkg"
+  description = "Security policy description"
+  type        = "security"
+  project_key = "testproj"
+
+  rule {
+    name     = "rule-name-mp"
+    priority = 1
+
+    criteria {
+      malicious_package = true
+    }
+
+    actions {
+      webhooks                           = []
+      mails                              = ["test@email.com"]
+      block_release_bundle_distribution  = true
+      fail_build                         = true
+      notify_watch_recipients            = true
+      notify_deployer                    = true
+      create_ticket_enabled              = false // set to true only if Jira integration is enabled
+      fail_pull_request                  = true
+      build_failure_grace_period_in_days = 5     // use only if fail_build is enabled
+
+      block_download {
+        unscanned = true
+        active    = true
+      }
+    }
+  }
+}

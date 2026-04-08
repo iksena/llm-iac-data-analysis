@@ -1,0 +1,1 @@
+# This resource exports no additional attributes according to the AWS documentation

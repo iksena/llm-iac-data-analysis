@@ -1,0 +1,99 @@
+module "lambda_post_authentication" {
+  count = var.post_authentication_trigger == null ? 0 : 1
+
+  source  = "cornerman/lambda/aws"
+  version = "0.1.5"
+
+  name                  = "${local.prefix}-post-authentication-trigger"
+  log_retention_in_days = var.log_retention_in_days
+
+  source_bucket = var.post_authentication_trigger.source_bucket
+  source_dir    = var.post_authentication_trigger.source_dir
+  timeout       = var.post_authentication_trigger.timeout
+  memory_size   = var.post_authentication_trigger.memory_size
+  runtime       = var.post_authentication_trigger.runtime
+  handler       = var.post_authentication_trigger.handler
+
+  architecture  = var.post_authentication_trigger.architecture
+
+  environment = var.post_authentication_trigger.environment
+
+  vpc_config = var.post_authentication_trigger.vpc_config
+
+  layers = var.post_authentication_trigger.layers
+}
+
+module "lambda_post_confirmation" {
+  count = var.post_confirmation_trigger == null ? 0 : 1
+
+  source  = "cornerman/lambda/aws"
+  version = "0.1.5"
+
+  name                  = "${local.prefix}-post-confirmation-trigger"
+  log_retention_in_days = var.log_retention_in_days
+
+  source_bucket = var.post_confirmation_trigger.source_bucket
+  source_dir    = var.post_confirmation_trigger.source_dir
+  timeout       = var.post_confirmation_trigger.timeout
+  memory_size   = var.post_confirmation_trigger.memory_size
+  runtime       = var.post_confirmation_trigger.runtime
+  handler       = var.post_confirmation_trigger.handler
+
+  architecture  = var.post_confirmation_trigger.architecture
+
+  environment = var.post_confirmation_trigger.environment
+
+  vpc_config = var.post_confirmation_trigger.vpc_config
+
+  layers = var.post_confirmation_trigger.layers
+}
+
+module "lambda_pre_authentication" {
+  count = var.pre_authentication_trigger == null ? 0 : 1
+
+  source  = "cornerman/lambda/aws"
+  version = "0.1.5"
+
+  name                  = "${local.prefix}-pre-authentication-trigger"
+  log_retention_in_days = var.log_retention_in_days
+
+  source_bucket = var.pre_authentication_trigger.source_bucket
+  source_dir    = var.pre_authentication_trigger.source_dir
+  timeout       = var.pre_authentication_trigger.timeout
+  memory_size   = var.pre_authentication_trigger.memory_size
+  runtime       = var.pre_authentication_trigger.runtime
+  handler       = var.pre_authentication_trigger.handler
+
+  architecture  = var.pre_authentication_trigger.architecture
+
+  environment = var.pre_authentication_trigger.environment
+
+  vpc_config = var.pre_authentication_trigger.vpc_config
+
+  layers = var.pre_authentication_trigger.layers
+}
+
+module "lambda_pre_sign_up" {
+  count = var.pre_sign_up_trigger == null ? 0 : 1
+
+  source  = "cornerman/lambda/aws"
+  version = "0.1.5"
+
+  name                  = "${local.prefix}-pre-sign-up-trigger"
+  log_retention_in_days = var.log_retention_in_days
+
+  source_bucket = var.pre_sign_up_trigger.source_bucket
+  source_dir    = var.pre_sign_up_trigger.source_dir
+  timeout       = var.pre_sign_up_trigger.timeout
+  memory_size   = var.pre_sign_up_trigger.memory_size
+  runtime       = var.pre_sign_up_trigger.runtime
+  handler       = var.pre_sign_up_trigger.handler
+
+  architecture  = var.pre_sign_up_trigger.architecture
+
+  environment = var.pre_sign_up_trigger.environment
+
+  vpc_config = var.pre_sign_up_trigger.vpc_config
+
+  layers = var.pre_sign_up_trigger.layers
+}

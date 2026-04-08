@@ -1,0 +1,114 @@
+variable "name" {
+  type = string
+}
+
+variable "vpc_id" {
+  type = string
+}
+
+variable "subnets" {
+  type = list(string)
+}
+
+variable "tags" {
+  type    = map(string)
+  default = {}
+}
+
+variable "userdata" {
+  type    = string
+  default = ""
+}
+
+variable "instance_type" {
+  default = "t3.medium"
+}
+
+variable "ami" {
+  type    = string
+  default = ""
+}
+
+variable "iam_instance_profile" {
+  type    = string
+  default = ""
+}
+
+variable "health_check_type" {
+  type    = string
+  default = "EC2"
+}
+
+variable "wait_for_capacity_timeout" {
+  description = "How long Terraform should wait for ASG instances to be healthy before timing out."
+  type        = string
+  default     = "10m"
+}
+
+variable "target_group_arns" {
+  type    = list(string)
+  default = []
+}
+
+variable "load_balancers" {
+  type    = list(string)
+  default = []
+}
+
+variable "vpc_security_group_ids" {
+  type    = list(string)
+  default = []
+}
+
+variable "block_device_mappings" {
+  type    = map(string)
+  default = {}
+}
+
+variable "extra_block_device_mappings" {
+  type    = list(map(string))
+  default = []
+}
+
+variable "asg" {
+  type = object({
+    min                  = number
+    max                  = number
+    desired              = number
+    suspended_processes  = list(string)
+    termination_policies = list(string)
+  })
+  default = {
+    min                  = 1
+    max                  = 7
+    desired              = 3
+    suspended_processes  = []
+    termination_policies = []
+  }
+}
+
+variable "spot" {
+  default = false
+  type    = bool
+}
+
+variable "associate_public_ip_address" {
+  default = null
+  type    = bool
+}
+
+variable "min_elb_capacity" {
+  type    = number
+  default = null
+}
+
+variable "metadata_options" {
+  type        = map(any)
+  description = "Instance Metadata Options"
+}
+
+variable "extra_cloud_config_config" {
+  description = "extra config to append to cloud-config"
+  type        = string
+  default     = ""
+}

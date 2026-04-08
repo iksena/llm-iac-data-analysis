@@ -1,0 +1,84 @@
+resource "aws_ssoadmin_permission_set" "content_s3_write" {
+  instance_arn = local.instance_arn
+  name         = "ContentS3Write"
+}
+
+resource "aws_ssoadmin_permission_set_inline_policy" "content_s3_write" {
+  instance_arn       = local.instance_arn
+  permission_set_arn = aws_ssoadmin_permission_set.content_s3_write.arn
+
+  inline_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "S3ListAllBuckets"
+        Effect = "Allow"
+        Action = [
+          "s3:ListAllMyBuckets",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "S3ListContentBucket"
+        Effect = "Allow"
+        Action = [
+          "s3:ListBucket",
+          "s3:GetBucketLocation",
+        ]
+        Resource = [
+          "arn:aws:s3:::rust-content-internal",
+          "arn:aws:s3:::rust-content-public"
+        ]
+      },
+      {
+        Sid    = "S3Permissions"
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectAttributes",
+          "s3:GetObjectTagging",
+          "s3:PutObject",
+          "s3:PutObjectTagging",
+          "s3:DeleteObject",
+          "s3:DeleteObjectTagging",
+        ]
+        Resource = [
+          "arn:aws:s3:::rust-content-internal/*",
+          "arn:aws:s3:::rust-content-public/*"
+        ]
+      },
+      {
+        Sid    = "CloudFrontUnrestrictedPermissions"
+        Effect = "Allow"
+        Action = [
+          # Distributions
+          "cloudfront:ListDistributions",
+          "cloudfront:ListStreamingDistributions",
+
+          # Cache policies
+          "cloudfront:GetCachePolicy",
+          "cloudfront:GetCachePolicyConfig",
+          "cloudfront:ListCachePolicies"
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "CloudFrontPermissions"
+        Effect = "Allow"
+        Action = [
+          "cloudfront:CreateInvalidation",
+          "cloudfront:GetInvalidation",
+          "cloudfront:ListInvalidations",
+          "cloudfront:GetDistribution",
+          "cloudfront:GetDistributionConfig",
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "cloudfront:ResourceTag/TeamAccess" = "content"
+          }
+        }
+      }
+    ]
+  })
+}

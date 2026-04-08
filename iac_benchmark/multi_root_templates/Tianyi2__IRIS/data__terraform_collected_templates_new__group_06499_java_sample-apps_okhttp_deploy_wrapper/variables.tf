@@ -1,0 +1,17 @@
+variable "function_name" {
+  type        = string
+  description = "Name of sample app function / API gateway"
+  default     = "lambda-java-okhttp-wrapper-amd64"
+}
+
+variable "architecture" {
+  type        = string
+  description = "Lambda function architecture, either arm64 or x86_64"
+  default     = "x86_64"
+}
+
+variable "runtime" {
+  type        = string
+  description = "java runtime used for Lambda Function"
+  default     = "java17"
+}

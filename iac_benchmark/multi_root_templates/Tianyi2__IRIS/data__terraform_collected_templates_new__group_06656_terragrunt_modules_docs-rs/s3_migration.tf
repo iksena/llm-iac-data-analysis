@@ -1,0 +1,194 @@
+// Role assumed by DataSync for reads from the source bucket.
+resource "aws_iam_role" "datasync_source_location" {
+  count = var.s3_migration_enabled ? 1 : 0
+
+  name = "docs-rs-datasync-source-location"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "datasync.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "datasync_source_location_s3" {
+  count = var.s3_migration_enabled ? 1 : 0
+
+  role = aws_iam_role.datasync_source_location[0].id
+  name = "docs-rs-datasync-source-location-s3"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetBucketLocation",
+          "s3:ListBucket",
+          "s3:ListBucketMultipartUploads"
+        ]
+        Resource = "arn:aws:s3:::${var.s3_migration_source_bucket_name}"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetObject",
+          "s3:GetObjectTagging",
+          "s3:GetObjectVersion",
+          "s3:GetObjectVersionTagging",
+          "s3:ListMultipartUploadParts"
+        ]
+        Resource = "arn:aws:s3:::${var.s3_migration_source_bucket_name}/*"
+      }
+    ]
+  })
+}
+
+// Role assumed by DataSync for writes into the destination bucket.
+resource "aws_iam_role" "datasync_destination_location" {
+  count = var.s3_migration_enabled ? 1 : 0
+
+  name = "docs-rs-datasync-destination-location"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = {
+          Service = "datasync.amazonaws.com"
+        }
+        Action = "sts:AssumeRole"
+      }
+    ]
+  })
+}
+
+resource "aws_iam_role_policy" "datasync_destination_location_s3" {
+  count = var.s3_migration_enabled ? 1 : 0
+
+  role = aws_iam_role.datasync_destination_location[0].id
+  name = "docs-rs-datasync-destination-location-s3"
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:GetBucketLocation",
+          "s3:ListBucket",
+          "s3:ListBucketMultipartUploads"
+        ]
+        Resource = aws_s3_bucket.storage.arn
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "s3:AbortMultipartUpload",
+          "s3:DeleteObject",
+          "s3:GetObject",
+          "s3:GetObjectTagging",
+          "s3:ListMultipartUploadParts",
+          "s3:PutObject",
+          "s3:PutObjectTagging"
+        ]
+        Resource = "${aws_s3_bucket.storage.arn}/*"
+      }
+    ]
+  })
+}
+
+resource "aws_cloudwatch_log_group" "datasync_s3_migration" {
+  count = var.s3_migration_enabled ? 1 : 0
+
+  # Enhanced mode DataSync tasks require the log group to be exactly /aws/datasync.
+  name              = "/aws/datasync"
+  retention_in_days = 30
+}
+
+resource "aws_cloudwatch_log_resource_policy" "datasync_s3_migration" {
+  count = var.s3_migration_enabled ? 1 : 0
+
+  policy_name = "docs-rs-datasync-s3-migration-logs"
+  policy_document = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid    = "AllowDataSyncToWriteLogs"
+        Effect = "Allow"
+        Principal = {
+          Service = "datasync.amazonaws.com"
+        }
+        Action = [
+          "logs:CreateLogStream",
+          "logs:PutLogEvents"
+        ]
+        Resource = "${aws_cloudwatch_log_group.datasync_s3_migration[0].arn}:*"
+      }
+    ]
+  })
+}
+
+resource "aws_datasync_location_s3" "migration_source" {
+  provider = aws.west1
+  count    = var.s3_migration_enabled ? 1 : 0
+
+  s3_bucket_arn = "arn:aws:s3:::${var.s3_migration_source_bucket_name}"
+  subdirectory  = "/"
+
+  s3_config {
+    bucket_access_role_arn = aws_iam_role.datasync_source_location[0].arn
+  }
+
+  depends_on = [aws_iam_role_policy.datasync_source_location_s3]
+}
+
+resource "aws_datasync_location_s3" "migration_destination" {
+  count = var.s3_migration_enabled ? 1 : 0
+
+  s3_bucket_arn = aws_s3_bucket.storage.arn
+  subdirectory  = "/"
+
+  s3_config {
+    bucket_access_role_arn = aws_iam_role.datasync_destination_location[0].arn
+  }
+
+  # DataSync validates S3 access when creating the location.
+  depends_on = [aws_iam_role_policy.datasync_destination_location_s3]
+}
+
+resource "aws_datasync_task" "migration" {
+  count = var.s3_migration_enabled ? 1 : 0
+
+  name                     = "docs-rs-storage-import"
+  source_location_arn      = aws_datasync_location_s3.migration_source[0].arn
+  destination_location_arn = aws_datasync_location_s3.migration_destination[0].arn
+  cloudwatch_log_group_arn = "${aws_cloudwatch_log_group.datasync_s3_migration[0].arn}:*"
+
+  # Can avoid network errors when transfering between different accounts and regions
+  task_mode = "ENHANCED"
+
+  options {
+    # Unlimited bandwidth to minimize migration time
+    bytes_per_second = -1
+    log_level        = "BASIC"
+    # Enhanced mode doesn't support full source/destination sync verification.
+    verify_mode = "ONLY_FILES_TRANSFERRED"
+    # Mirror source deletions into destination on each execution.
+    preserve_deleted_files = "REMOVE"
+    task_queueing          = "ENABLED"
+    # Incremental sync: copy only new/changed objects since the previous run.
+    transfer_mode = "CHANGED"
+
+    # Values I had to set to None to avoid aws errors
+    posix_permissions = "NONE"
+    uid               = "NONE"
+    gid               = "NONE"
+  }
+}

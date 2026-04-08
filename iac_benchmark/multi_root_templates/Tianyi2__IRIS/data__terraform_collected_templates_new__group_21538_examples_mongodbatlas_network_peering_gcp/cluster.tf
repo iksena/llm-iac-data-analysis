@@ -1,0 +1,41 @@
+# This cluster is in GCP cloud-provider with VPC peering enabled
+# Note: Using use_effective_fields = true eliminates the need for lifecycle.ignore_changes
+# See: https://registry.terraform.io/providers/mongodb/mongodbatlas/latest/docs/resources/advanced_cluster#auto-scaling-with-effective-fields
+
+resource "mongodbatlas_advanced_cluster" "cluster" {
+  project_id           = var.project_id
+  name                 = "cluster-test"
+  cluster_type         = "REPLICASET"
+  backup_enabled       = true # enable cloud provider snapshots
+  use_effective_fields = true
+
+  replication_specs = [{
+    region_configs = [{
+      priority      = 7
+      provider_name = "GCP"
+      region_name   = var.atlas_region
+      electable_specs = {
+        instance_size = "M10" # Initial size value that won't change in Terraform state, actual size in Atlas may differ due to auto-scaling
+        node_count    = 3
+      }
+      auto_scaling = {
+        compute_enabled            = true
+        compute_scale_down_enabled = true
+        compute_min_instance_size  = "M10"
+        compute_max_instance_size  = "M20"
+        disk_gb_enabled            = true
+      }
+    }]
+  }]
+  tags = {
+    environment = "prod"
+  }
+  advanced_configuration = {
+    minimum_enabled_tls_protocol = "TLS1_2"
+  }
+}
+
+# The connection strings available for the GCP MongoDB Atlas cluster
+output "connection_string" {
+  value = mongodbatlas_advanced_cluster.cluster.connection_strings
+}

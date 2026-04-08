@@ -1,0 +1,234 @@
+/**
+ * Copyright 2019 Google LLC
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+locals {
+  auto_discovered_subnet = try(
+    [
+      for s in var.subnets : s.id
+      if s.region == var.region && (s.purpose == "PRIVATE")
+    ][0],
+    ""
+  )
+
+  # Logic: Determination of which subnetwork to use.
+  # 1. Use the explicitly looked-up self_link if found by name.
+  # 2. Otherwise, if var.subnetwork was provided, use it directly (it might be a self_link).
+  # 3. Finally, fall back to the auto-discovered subnet from the connection list.
+  final_subnetwork = try(
+    data.google_compute_subnetworks.lookup.subnetworks[0].self_link,
+    var.subnetwork != "" && var.subnetwork != null ? var.subnetwork : local.auto_discovered_subnet # Provided string or auto-discovery
+  )
+
+  # Logic: Determine source IP ranges for the firewall
+  resolved_source_ip_ranges = (
+    length(try(var.source_ip_ranges, [])) > 0 ? var.source_ip_ranges :
+    try(
+      [
+        for s in var.subnets : s.ip_cidr_range
+        if s.region == var.region && (s.purpose == "REGIONAL_MANAGED_PROXY")
+      ],
+      []
+    )
+  )
+}
+
+data "google_compute_network" "network" {
+  name    = var.network
+  project = var.network_project == "" ? var.project_id : var.network_project
+}
+
+# Fix: Use the PLURAL data source.
+# This does not require a 'count' and will not error if var.subnetwork is empty.
+# It returns an empty list if no match is found, avoiding the 'must provide name' error.
+data "google_compute_subnetworks" "lookup" {
+  project = var.network_project == "" ? var.project_id : var.network_project
+  region  = var.region
+  filter  = var.subnetwork != "" && var.subnetwork != null ? "name = \"${var.subnetwork}\"" : "name = \"DISABLED_BY_MODULE_LOGIC\""
+}
+
+resource "google_compute_forwarding_rule" "default" {
+  project                = var.project_id
+  name                   = var.name
+  region                 = var.region
+  network                = data.google_compute_network.network.self_link
+  subnetwork             = local.final_subnetwork
+  allow_global_access    = var.global_access
+  load_balancing_scheme  = "INTERNAL"
+  is_mirroring_collector = var.is_mirroring_collector
+  backend_service        = google_compute_region_backend_service.default.self_link
+  ip_address             = var.ip_address
+  ip_protocol            = var.ip_protocol
+  ports                  = var.ports
+  all_ports              = var.all_ports
+  service_label          = var.service_label
+  labels                 = var.labels
+}
+
+resource "google_compute_region_backend_service" "default" {
+  project = var.project_id
+  name = {
+    "tcp"   = "${var.name}-with-tcp-hc",
+    "http"  = "${var.name}-with-http-hc",
+    "https" = "${var.name}-with-https-hc",
+  }[var.health_check["type"]]
+  region                          = var.region
+  protocol                        = var.ip_protocol
+  network                         = data.google_compute_network.network.self_link
+  connection_draining_timeout_sec = var.connection_draining_timeout_sec
+  session_affinity                = var.session_affinity
+
+  dynamic "backend" {
+    for_each = var.backends
+    content {
+      group          = lookup(backend.value, "group", null)
+      description    = lookup(backend.value, "description", null)
+      failover       = lookup(backend.value, "failover", null)
+      balancing_mode = lookup(backend.value, "balancing_mode", "CONNECTION")
+    }
+  }
+  health_checks = concat(google_compute_health_check.tcp[*].self_link, google_compute_health_check.http[*].self_link, google_compute_health_check.https[*].self_link)
+}
+
+resource "google_compute_health_check" "tcp" {
+  provider = google-beta
+  count    = var.health_check["type"] == "tcp" ? 1 : 0
+  project  = var.project_id
+  name     = "${var.name}-hc-tcp"
+
+  timeout_sec         = var.health_check["timeout_sec"]
+  check_interval_sec  = var.health_check["check_interval_sec"]
+  healthy_threshold   = var.health_check["healthy_threshold"]
+  unhealthy_threshold = var.health_check["unhealthy_threshold"]
+
+  tcp_health_check {
+    port         = var.health_check["port"]
+    request      = var.health_check["request"]
+    response     = var.health_check["response"]
+    port_name    = var.health_check["port_name"]
+    proxy_header = var.health_check["proxy_header"]
+  }
+
+  dynamic "log_config" {
+    for_each = var.health_check["enable_log"] ? [true] : []
+    content {
+      enable = true
+    }
+  }
+}
+
+resource "google_compute_health_check" "http" {
+  provider = google-beta
+  count    = var.health_check["type"] == "http" ? 1 : 0
+  project  = var.project_id
+  name     = "${var.name}-hc-http"
+
+  timeout_sec         = var.health_check["timeout_sec"]
+  check_interval_sec  = var.health_check["check_interval_sec"]
+  healthy_threshold   = var.health_check["healthy_threshold"]
+  unhealthy_threshold = var.health_check["unhealthy_threshold"]
+
+  http_health_check {
+    port         = var.health_check["port"]
+    request_path = var.health_check["request_path"]
+    host         = var.health_check["host"]
+    response     = var.health_check["response"]
+    port_name    = var.health_check["port_name"]
+    proxy_header = var.health_check["proxy_header"]
+  }
+
+  dynamic "log_config" {
+    for_each = var.health_check["enable_log"] ? [true] : []
+    content {
+      enable = true
+    }
+  }
+}
+
+resource "google_compute_health_check" "https" {
+  provider = google-beta
+  count    = var.health_check["type"] == "https" ? 1 : 0
+  project  = var.project_id
+  name     = "${var.name}-hc-https"
+
+  timeout_sec         = var.health_check["timeout_sec"]
+  check_interval_sec  = var.health_check["check_interval_sec"]
+  healthy_threshold   = var.health_check["healthy_threshold"]
+  unhealthy_threshold = var.health_check["unhealthy_threshold"]
+
+  https_health_check {
+    port         = var.health_check["port"]
+    request_path = var.health_check["request_path"]
+    host         = var.health_check["host"]
+    response     = var.health_check["response"]
+    port_name    = var.health_check["port_name"]
+    proxy_header = var.health_check["proxy_header"]
+  }
+
+  dynamic "log_config" {
+    for_each = var.health_check["enable_log"] ? [true] : []
+    content {
+      enable = true
+    }
+  }
+}
+
+resource "google_compute_firewall" "default-ilb-fw" {
+  count   = var.create_backend_firewall ? 1 : 0
+  project = var.network_project == "" ? var.project_id : var.network_project
+  name    = "${var.name}-ilb-fw"
+  network = data.google_compute_network.network.name
+
+  allow {
+    protocol = lower(var.ip_protocol)
+    ports    = var.ports
+  }
+
+  source_ranges           = local.resolved_source_ip_ranges
+  source_tags             = length(var.source_tags) > 0 ? var.source_tags : null
+  source_service_accounts = var.source_service_accounts
+  target_tags             = length(var.target_tags) > 0 ? var.target_tags : null
+  target_service_accounts = var.target_service_accounts
+
+  dynamic "log_config" {
+    for_each = var.firewall_enable_logging ? [true] : []
+    content {
+      metadata = "INCLUDE_ALL_METADATA"
+    }
+  }
+}
+
+resource "google_compute_firewall" "default-hc" {
+  count   = var.create_health_check_firewall ? 1 : 0
+  project = var.network_project == "" ? var.project_id : var.network_project
+  name    = "${var.name}-hc"
+  network = data.google_compute_network.network.name
+
+  allow {
+    protocol = "tcp"
+    ports    = [var.health_check["port"]]
+  }
+
+  source_ranges           = ["130.211.0.0/22", "35.191.0.0/16", "34.124.104.0/22"]
+  target_tags             = length(var.target_tags) > 0 ? var.target_tags : null
+  target_service_accounts = var.target_service_accounts
+
+  dynamic "log_config" {
+    for_each = var.firewall_enable_logging ? [true] : []
+    content {
+      metadata = "INCLUDE_ALL_METADATA"
+    }
+  }
+}

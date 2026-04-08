@@ -1,0 +1,1 @@
+# This resource does not support any arguments according to the documentation

@@ -1,0 +1,112 @@
+resource "proxmox_virtual_environment_vm" "this" {
+  for_each = { for k, v in local.all_nodes : k => v if v.is_vm }
+
+  name      = each.value.hostname
+  node_name = each.value.host_node
+  vm_id     = each.value.vm_id
+  tags = toset(concat([
+    "talos",
+    "tofu",
+    var.environment,
+    each.value.machine_type,
+    each.value.host_node,
+  ], each.value.vm_tag != null ? [each.value.vm_tag] : []))
+  machine       = "q35"
+  scsi_hardware = "virtio-scsi-single"
+  bios          = each.value.vm_tag == "intel-gpu" ? "seabios" : var.bios_type
+
+  started         = true
+  on_boot         = true
+  stop_on_destroy = true
+  migrate         = true
+
+  agent {
+    enabled = true
+    trim    = true
+  }
+
+  dynamic "efi_disk" {
+    for_each = each.value.vm_tag != "intel-gpu" ? [1] : []
+    content {
+      datastore_id = var.vm_datastore_id
+      type         = "4m"
+    }
+  }
+
+  dynamic "hostpci" {
+    for_each = try(each.value.hostpci, {})
+    content {
+      device = "hostpci${hostpci.key}"
+      id     = hostpci.value
+      pcie   = true
+      rombar = true
+    }
+  }
+
+  cpu {
+    cores = each.value.cpu
+    type  = "host"
+  }
+
+  memory {
+    dedicated = each.value.memory
+    floating  = 0
+  }
+
+  network_device {
+    model   = "virtio"
+    bridge  = var.network_bridge
+    trunks  = var.network_trunks
+    vlan_id = var.vlan_id
+    mtu     = var.mtu
+  }
+
+  disk {
+    datastore_id = var.vm_datastore_id
+    interface    = "scsi0"
+    iothread     = true
+    cache        = "writethrough"
+    discard      = "on"
+    ssd          = true
+    file_format  = "raw"
+    size         = each.value.disk_size
+    file_id      = each.value.vm_tag == "intel-gpu" ? proxmox_virtual_environment_download_file.intel_gpu[0].id : (each.value.vm_tag == "amd-gpu" ? proxmox_virtual_environment_download_file.amd_gpu[0].id : proxmox_virtual_environment_download_file.this.id)
+  }
+
+  dynamic "disk" {
+    for_each = each.value.disk_size_user != null ? [each.value.disk_size_user] : []
+    content {
+      datastore_id = var.vm_datastore_id
+      interface    = "scsi1"
+      iothread     = true
+      cache        = "writethrough"
+      discard      = "on"
+      ssd          = true
+      file_format  = "raw"
+      size         = disk.value
+    }
+  }
+
+  boot_order = ["scsi0"]
+
+  operating_system {
+    type = "l26" # Linux Kernel 2.6 - 6.X.
+  }
+
+
+  initialization {
+    datastore_id = var.vm_datastore_id
+    dns {
+      servers = var.dns_servers
+    }
+    ip_config {
+      ipv4 {
+        address = "${each.value.ip}/24"
+        gateway = var.network_gateway
+      }
+      ipv6 {
+        address = "dhcp"
+      }
+    }
+  }
+}

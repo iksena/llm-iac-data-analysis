@@ -1,0 +1,7 @@
+# Copyright © 2020-2024, SAS Institute Inc., Cary, NC, USA. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+output "kube_config" {
+  value     = local_file.kubeconfig.content
+  sensitive = true
+}

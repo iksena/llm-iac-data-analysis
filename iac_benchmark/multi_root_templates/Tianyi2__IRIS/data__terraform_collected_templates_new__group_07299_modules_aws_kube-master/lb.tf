@@ -1,0 +1,74 @@
+resource "aws_elb" "master_internal" {
+  name     = "${var.name}-master"
+  subnets  = split(",", var.endpoint_public_access == true ? join(",", var.public_subnet_ids) : join(",", var.private_subnet_ids))
+  internal = var.endpoint_public_access == true ? false : true
+
+  security_groups = compact(concat(
+    [aws_security_group.master_lb.id],
+    var.lb_security_group_ids
+  ))
+
+  dynamic "access_logs" {
+    for_each = var.lb_master_access_log_bucket != "" ? [1] : []
+    content {
+      bucket        = var.lb_master_access_log_bucket
+      bucket_prefix = var.lb_master_access_log_prefix != "" ? var.lb_master_access_log_prefix : "${var.name}-master"
+    }
+  }
+
+  idle_timeout                = var.lb_master_idle_timeout
+  connection_draining         = var.lb_master_connection_draining
+  connection_draining_timeout = var.lb_master_connection_draining_timeout
+
+  listener {
+    instance_port     = var.apiserver_secure_port
+    instance_protocol = "tcp"
+    lb_port           = 443
+    lb_protocol       = "tcp"
+  }
+
+  health_check {
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+    timeout             = 3
+    target              = "SSL:${var.apiserver_secure_port}"
+    interval            = 5
+  }
+
+  tags = merge(var.extra_tags, {
+    "Name"                              = "${var.name}-master"
+    "Role"                              = "k8s-master"
+    "kubernetes.io/cluster/${var.name}" = "owned"
+  })
+}
+
+resource "aws_security_group" "master_lb" {
+  name_prefix = "${var.name}-master-lb-"
+  vpc_id      = data.aws_vpc.master.id
+
+  tags = merge(var.extra_tags, {
+    "Name"                              = "${var.name}-master-lb"
+    "Role"                              = "k8s-master"
+    "kubernetes.io/cluster/${var.name}" = "owned"
+  })
+}
+
+resource "aws_security_group_rule" "master_lb_egress" {
+  type              = "egress"
+  security_group_id = aws_security_group.master_lb.id
+
+  protocol    = "-1"
+  cidr_blocks = ["0.0.0.0/0"]
+  from_port   = 0
+  to_port     = 0
+}
+
+resource "aws_security_group_rule" "master_lb_ingress_from_internal" {
+  type              = "ingress"
+  security_group_id = aws_security_group.master_lb.id
+
+  protocol    = "tcp"
+  cidr_blocks = [var.endpoint_public_access == true ? "0.0.0.0/0" : data.aws_vpc.master.cidr_block]
+  from_port   = 443
+  to_port     = 443
+}
