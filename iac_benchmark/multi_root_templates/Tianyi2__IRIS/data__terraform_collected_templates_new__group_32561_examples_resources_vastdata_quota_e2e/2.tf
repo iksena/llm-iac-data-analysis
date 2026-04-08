@@ -1,0 +1,55 @@
+# ignore:e2e
+
+resource "vastdata_group" "vastdb_quota_group" {
+  name              = "vastdb_quota_group"
+  gid               = 5001
+  local_provider_id = 1
+}
+
+resource "vastdata_user" "vastdb_quota_user" {
+  name              = "vastdb-quota-user"
+  uid               = 5002
+  local_provider_id = 1
+}
+
+resource "vastdata_view_policy" "vastdb_view_policy" {
+  name          = "vastdb_view_policy_example"
+  flavor        = "NFS"
+  nfs_no_squash = ["10.0.0.1", "10.0.0.2"]
+}
+
+resource "vastdata_view" "vastdb_view" {
+  path       = "/vastdb_view/quota-example"
+  policy_id  = vastdata_view_policy.vastdb_view_policy.id
+  create_dir = true
+  protocols  = ["NFS", "NFS4"]
+}
+
+resource "vastdata_quota" "vastdb_quota" {
+  name          = "vastdb_quota_example"
+  default_email = "user@example.com"
+  path          = vastdata_view.vastdb_view.path
+  soft_limit    = 100000
+  hard_limit    = 100000
+  is_user_quota = true
+
+  user_quotas = [{
+    name            = vastdata_user.vastdb_quota_user.name
+    identifier      = vastdata_user.vastdb_quota_user.name
+    email           = "user1@example.com"
+    identifier_type = "username"
+    is_group        = false
+    hard_limit      = 100000
+    soft_limit      = 50000
+    grace_period    = "90m"
+  }]
+  group_quotas = [{
+    name            = vastdata_group.vastdb_quota_group.name
+    identifier      = vastdata_group.vastdb_quota_group.name
+    identifier_type = "group"
+    is_group        = true
+    hard_limit      = 100000
+    soft_limit      = 50000
+    grace_period    = "90m"
+  }]
+}

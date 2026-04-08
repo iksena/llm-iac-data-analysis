@@ -1,0 +1,35 @@
+terraform {
+  backend "s3" {
+    bucket = "terraform"
+    key    = "github/github.tfstate"
+    region = "main"
+
+
+    # endpoints = {
+    #   s3 = "https://s3.garb.dev"
+    # }
+    endpoints = {
+      s3 = "http://192.168.1.3:9000"
+    }
+    skip_credentials_validation = true
+    skip_requesting_account_id  = true
+    skip_metadata_api_check     = true
+    skip_region_validation      = true
+    use_path_style              = true
+  }
+
+  required_providers {
+    github = {
+      source  = "integrations/github"
+      version = "< 6.12"
+    }
+    sops = {
+      source  = "carlpett/sops"
+      version = "1.4.0"
+    }
+    onepassword = {
+      source  = "1Password/onepassword"
+      version = "~> 3.3.0"
+    }
+  }
+}

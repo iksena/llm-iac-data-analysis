@@ -1,0 +1,15 @@
+# Copyright (c) HashiCorp, Inc.
+# SPDX-License-Identifier: MPL-2.0
+
+resource "azurerm_storage_account" "tfe_redis_storage_account" {
+  count = var.redis.rdb_backup_enabled == true && var.redis.rdb_existing_storage_account == null ? 1 : 0
+
+  name                = substr(random_pet.tfe_redis_random_pet.id, 0, 24)
+  location            = var.location
+  resource_group_name = var.resource_group_name
+
+  account_tier             = "Premium"
+  account_replication_type = "LRS"
+
+  tags = var.tags
+}

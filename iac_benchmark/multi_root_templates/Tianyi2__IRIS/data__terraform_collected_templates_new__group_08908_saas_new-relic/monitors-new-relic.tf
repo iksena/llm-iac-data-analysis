@@ -1,0 +1,59 @@
+resource "datadog_monitor" "app_error_rate" {
+  count   = var.app_error_rate_enabled == "true" ? 1 : 0
+  name    = "${var.prefix_slug == "" ? "" : "[${var.prefix_slug}]"}[${var.environment}] New Relic Error rate {{#is_alert}}{{{comparator}}} {{threshold}}errs/min ({{value}}errs/min){{/is_alert}}{{#is_warning}}{{{comparator}}} {{warn_threshold}}errs/min ({{value}}errs/min){{/is_warning}}"
+  message = coalesce(var.app_error_rate_message, var.message)
+  type    = "query alert"
+
+  query = <<EOQ
+    ${var.app_error_rate_time_aggregator}(${var.app_error_rate_timeframe}):
+      avg:new_relic.errors.all.errors_per_minute${module.filter-tags.query_alert} by {application}
+    > ${var.app_error_rate_threshold_critical}
+EOQ
+
+  monitor_thresholds {
+    warning  = var.app_error_rate_threshold_warning
+    critical = var.app_error_rate_threshold_critical
+  }
+
+  evaluation_delay    = var.evaluation_delay
+  new_group_delay     = var.new_group_delay
+  notify_no_data      = false
+  renotify_interval   = 0
+  notify_audit        = false
+  timeout_h           = var.timeout_h
+  include_tags        = true
+  require_full_window = false
+  priority            = var.priority
+
+  tags = concat(local.common_tags, var.tags, var.app_error_rate_extra_tags)
+}
+
+resource "datadog_monitor" "app_apdex_score" {
+  count   = var.app_apdex_score_enabled == "true" ? 1 : 0
+  name    = "${var.prefix_slug == "" ? "" : "[${var.prefix_slug}]"}[${var.environment}] New Relic Apdex score ratio {{#is_alert}}{{{comparator}}} {{threshold}}% ({{value}}%){{/is_alert}}{{#is_warning}}{{{comparator}}} {{warn_threshold}}% ({{value}}%){{/is_warning}}"
+  message = coalesce(var.app_apdex_score_message, var.message)
+  type    = "query alert"
+
+  query = <<EOQ
+    ${var.app_apdex_score_time_aggregator}(${var.app_apdex_score_timeframe}):
+      avg:new_relic.apdex.score${module.filter-tags.query_alert} by {application}
+    < ${var.app_apdex_score_threshold_critical}
+EOQ
+
+  monitor_thresholds {
+    warning  = var.app_apdex_score_threshold_warning
+    critical = var.app_apdex_score_threshold_critical
+  }
+
+  evaluation_delay    = var.evaluation_delay
+  new_group_delay     = var.new_group_delay
+  notify_no_data      = false
+  renotify_interval   = 0
+  notify_audit        = false
+  timeout_h           = var.timeout_h
+  include_tags        = true
+  require_full_window = false
+  priority            = var.priority
+
+  tags = concat(local.common_tags, var.tags, var.app_apdex_score_extra_tags)
+}

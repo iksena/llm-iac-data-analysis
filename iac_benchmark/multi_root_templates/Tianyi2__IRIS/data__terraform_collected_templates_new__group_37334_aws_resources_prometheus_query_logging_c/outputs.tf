@@ -1,0 +1,1 @@
+# This resource exports no additional attributes beyond the arguments

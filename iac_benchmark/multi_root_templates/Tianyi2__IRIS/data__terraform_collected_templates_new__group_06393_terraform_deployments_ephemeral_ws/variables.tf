@@ -1,0 +1,33 @@
+variable "ephemeral_cluster_id" {
+  type = string
+}
+
+variable "organization" {
+  type    = string
+  default = "govuk"
+}
+
+variable "name" {
+  type = string
+}
+
+variable "terraform_version" {
+  type    = string
+  default = "~> 1.14.7"
+}
+
+variable "variable_set_id" {
+  type = string
+}
+
+variable "git_branch" {
+  type        = string
+  description = "The branch of the source repo to deploy"
+  default     = "main"
+}
+
+variable "tfvars" {
+  type        = map(any)
+  description = "Additional tfvars to set on the workspace"
+  default     = {}
+}

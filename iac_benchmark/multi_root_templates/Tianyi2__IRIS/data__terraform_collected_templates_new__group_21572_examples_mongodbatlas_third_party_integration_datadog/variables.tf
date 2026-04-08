@@ -1,0 +1,53 @@
+variable "atlas_client_id" {
+  description = "MongoDB Atlas Service Account Client ID"
+  type        = string
+  default     = ""
+}
+variable "atlas_client_secret" {
+  description = "MongoDB Atlas Service Account Client Secret"
+  type        = string
+  sensitive   = true
+  default     = ""
+}
+variable "project_id" {
+  description = "MongoDB Atlas project id"
+  type        = string
+}
+variable "datadog_api_key" {
+  description = "Datadog api key"
+  type        = string
+}
+variable "datadog_region" {
+  description = "Datadog region"
+  default     = "US5"
+  type        = string
+}
+variable "cluster_name" {
+  description = "Cluster to test regional mode"
+  default     = "datadog-test-cluster"
+  type        = string
+}
+
+variable "send_collection_latency_metrics" {
+  description = "Send collection latency metrics (only for Datadog integrations)"
+  default     = false
+  type        = bool
+}
+
+variable "send_database_metrics" {
+  description = "Send database metrics (only for Datadog integrations)"
+  default     = false
+  type        = bool
+}
+
+variable "send_user_provided_resource_tags" {
+  description = "Send user provided resource tags (only for Datadog integrations)"
+  default     = false
+  type        = bool
+}
+
+variable "send_query_stats_metrics" {
+  description = "Send query shape metrics (only for Datadog integrations)"
+  default     = false
+  type        = bool
+}

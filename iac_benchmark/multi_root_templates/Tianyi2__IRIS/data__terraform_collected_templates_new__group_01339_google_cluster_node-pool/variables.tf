@@ -1,0 +1,82 @@
+variable "configuration" {
+  type = map(object({
+    project_id = optional(string)
+
+    name = optional(string)
+
+    location        = optional(string)
+    node_locations  = optional(list(string))
+    location_policy = optional(string)
+
+    initial_node_count = optional(number)
+    min_node_count     = optional(number)
+    max_node_count     = optional(number)
+
+    disk_size_gb = optional(number)
+    disk_type    = optional(string)
+    image_type   = optional(string)
+    machine_type = optional(string)
+
+    preemptible  = optional(bool)
+    auto_repair  = optional(bool)
+    auto_upgrade = optional(bool)
+
+    taints = optional(set(object({
+      key    = string
+      value  = string
+      effect = string
+    })))
+
+    labels = optional(map(string))
+
+    extra_oauth_scopes = optional(list(string))
+
+    node_workload_metadata_config = optional(string)
+
+    service_account_email = optional(string)
+
+    ephemeral_storage_local_ssd_config = optional(object({
+      local_ssd_count = number
+    }))
+
+    guest_accelerator = optional(object({
+      type               = string
+      count              = number
+      gpu_partition_size = optional(string)
+      gpu_sharing_config = optional(object({
+        gpu_sharing_strategy       = optional(string)
+        max_shared_clients_per_gpu = optional(number)
+      }))
+    }))
+
+    network_config = optional(object({
+      enable_private_nodes = bool
+      create_pod_range     = bool
+      pod_ipv4_cidr_block  = string
+    }))
+
+    instance_tags = optional(list(string))
+  }))
+
+  description = "Map with per workspace cluster configuration."
+  nullable    = false
+}
+
+variable "configuration_base_key" {
+  type        = string
+  description = "The key in the configuration map all other keys inherit from."
+  default     = "apps"
+  nullable    = false
+}
+
+variable "cluster" {
+  type        = any
+  description = "The cluster output from the cluster module."
+  nullable    = false
+}
+
+variable "cluster_metadata" {
+  type        = any
+  description = "Metadata of the cluster to attach the node pool to."
+  nullable    = false
+}

@@ -1,0 +1,65 @@
+variable "region" {
+  description = "AWS region to deploy to (e.g. ap-southeast-2)"
+}
+
+variable "name" {
+  description = "Name of project (used in AWS resource names)"
+}
+
+variable "kms_key_arns" {
+  description = "Array of KMS Key ARNs used to decrypt secrets specified via ssm_parameter_arns variable"
+}
+
+variable "ssm_parameter_arns" {
+  description = "Array of SSM Parameter ARNs used to set secret build environment variables via SSM Parameter Store"
+}
+
+variable "build_docker_image" {
+  description = "Docker image to use as build environment"
+}
+
+variable "build_docker_tag" {
+  description = "Docker image tag to use as build environment"
+}
+
+variable "buildspec" {
+  description = "The build spec declaration to use"
+}
+
+variable "github_connection_arn" {
+  description = "ARN of the GitHub App connection for CodePipeline source authentication"
+}
+
+variable "github_repository_owner" {
+  description = "Owner of GitHub repository to use as CodePipeline source"
+}
+
+variable "github_repository_name" {
+  description = "Name of GitHub repository to use as CodePipeline source"
+}
+
+variable "github_branch_name" {
+  description = "GitHub repository branch to use as CodePipeline source"
+}
+
+variable "dns_name" {
+  description = "DNS name for app"
+}
+
+variable "cloudflare_zone_id" {
+  description = "Cloudflare Zone ID for the apex domain"
+}
+
+variable "acm_arn" {
+  description = "ARN of ACM SSL certificate"
+}
+
+variable "cache_bucket" {
+  description = "S3 bucket to use as build cache, the value must be a valid S3 bucket name/prefix"
+  default     = ""
+}
+
+variable "build_compute_type" {
+  description = "CodeBuild compute type (e.g. BUILD_GENERAL1_SMALL, BUILD_GENERAL1_MEDIUM, BUILD_GENERAL1_LARGE)"
+  default     = "BUILD_GENERAL1_SMALL"
+}
