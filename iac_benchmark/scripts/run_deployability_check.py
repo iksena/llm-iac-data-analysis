@@ -9,9 +9,9 @@ Supports two backends, selected via --backend:
   localstack  (default)  uses tflocal; resets via POST /_localstack/state/reset after each apply
   aws                    uses terraform directly; resets via terraform destroy after each apply
 
-Workflow per template
+Workflow per scenario
 ─────────────────────
-1. Write content to a fresh isolated temp directory
+1. Copy scenario .tf folder to a fresh isolated temp directory
 2. tf init
 3. tf validate
 4. tf apply -auto-approve          ← REAL deployability check (not just plan)
@@ -79,19 +79,32 @@ LOCALSTACK_STATE_RESET = f"{LOCALSTACK_ENDPOINT}/_localstack/state/reset"
 
 OUTPUT_COLS = [
     'source_slug', 'source_category', 'primary_cloud', 'licence_spdx',
-    'dest_file', 'github_url', 'loc', 'tokens', 'difficulty',
+    'dest_file', 'content_hash', 'github_url', 'loc', 'tokens', 'difficulty',
     'hcl2_valid', 'tflint_pass', 'yaml_valid', 'targets_aws',
     'init_ok', 'validate_ok', 'apply_ok',
     'deploy_error', 'deploy_stage', 'reset_ok', 'backend', 'checked_at',
 ]
 
 
-# ── Provider injection ────────────────────────────────────────────────────────
-def _inject_provider(content: str, region: str) -> str:
-    """Prepend a minimal AWS provider block if none exists."""
-    if 'provider "aws"' not in content and "provider 'aws'" not in content:
-        return f'provider "aws" {{\n  region = "{region}"\n}}\n\n' + content
-    return content
+# ── Provider injection (entrypoint-only fallback) ────────────────────────────
+def _inject_provider_if_missing(tmpd: str, entrypoint_name: str, region: str) -> None:
+    """Inject minimal AWS provider into entrypoint only if no provider exists in folder."""
+    tf_files = sorted(Path(tmpd).glob('*.tf'))
+    folder_text = "\n".join(
+        p.read_text(encoding='utf-8', errors='replace') for p in tf_files
+    )
+    if 'provider "aws"' in folder_text or "provider 'aws'" in folder_text:
+        return
+
+    entry = Path(tmpd) / entrypoint_name
+    if not entry.exists():
+        entry = Path(tmpd) / 'main.tf'
+    if not entry.exists():
+        return
+
+    original = entry.read_text(encoding='utf-8', errors='replace')
+    injected = f'provider "aws" {{\n  region = "{region}"\n}}\n\n' + original
+    entry.write_text(injected, encoding='utf-8')
 
 
 # ── Reset helpers ─────────────────────────────────────────────────────────────
@@ -133,8 +146,8 @@ def _destroy_terraform(tmpd: str, tf_bin: str, env: dict) -> tuple[bool, str]:
 
 # ── Core deploy cycle ─────────────────────────────────────────────────────────
 def run_deploy_cycle(
-    content: str,
-    dest_file: str,
+    scenario_dir: Path,
+    entrypoint_name: str,
     region: str,
     backend: str,           # 'localstack' | 'aws'
     skip_destroy: bool,
@@ -182,10 +195,27 @@ def run_deploy_cycle(
     if tf_plugin_cache:
         env['TF_PLUGIN_CACHE_DIR'] = tf_plugin_cache
 
+    def _ignore_scenario_files(_src_dir: str, names: list[str]) -> set[str]:
+        ignored = set()
+        for name in names:
+            if name in {'.terraform', '.git', '__pycache__'}:
+                ignored.add(name)
+            elif name.startswith('.terraform') and name.endswith('.lock.hcl'):
+                ignored.add(name)
+        return ignored
+
     # ── Isolated temp directory (wipes itself on context exit) ────────────────
     with tempfile.TemporaryDirectory(prefix='iac_deploy_') as tmpd:
-        tf_file = Path(tmpd) / 'main.tf'
-        tf_file.write_text(_inject_provider(content, region), encoding='utf-8')
+        # Copy the full normalized scenario tree so Terraform sees all sibling
+        # files, nested modules, and auto-loaded tfvars in the original folder.
+        shutil.copytree(
+            scenario_dir,
+            tmpd,
+            dirs_exist_ok=True,
+            ignore=_ignore_scenario_files,
+        )
+
+        _inject_provider_if_missing(tmpd, entrypoint_name, region)
 
         def _run(cmd: list[str], timeout: int):
             return subprocess.run(
@@ -305,13 +335,27 @@ def _append_row(output_path: Path, row: dict):
         writer.writerow(row)
 
 
-def _already_checked(output_path: Path) -> set[str]:
+def _already_checked(output_path: Path, df: pd.DataFrame) -> tuple[str | None, set[str]]:
     if not output_path.exists():
-        return set()
+        return None, set()
+
     try:
-        return set(pd.read_csv(output_path)['dest_file'].dropna().tolist())
+        out_df = pd.read_csv(output_path)
     except Exception:
-        return set()
+        return None, set()
+
+    if 'content_hash' in df.columns and 'content_hash' in out_df.columns:
+        done = set(out_df['content_hash'].dropna().astype(str).tolist())
+        if done:
+            return 'content_hash', done
+
+    # Backward compatibility with older outputs when checksum-based resume
+    # is not possible.
+    for fallback_col in ('dest_file', 'github_url', 'source_slug'):
+        if fallback_col in df.columns and fallback_col in out_df.columns:
+            return fallback_col, set(out_df[fallback_col].dropna().astype(str).tolist())
+
+    return None, set()
 
 
 # ── Stratified sample ─────────────────────────────────────────────────────────
@@ -367,11 +411,26 @@ def main():
     df = pd.read_csv(index_path)
     log.info('Loaded index: %d rows', len(df))
 
+    # Normalize scenario identity to content hash when available.
+    if 'content_hash' in df.columns:
+        before_unique = len(df)
+        df = df.drop_duplicates(subset=['content_hash'], keep='first').copy()
+        log.info('Unique scenarios by content_hash: %d -> %d', before_unique, len(df))
+
     if args.resume:
-        done   = _already_checked(output_path)
+        resume_col, done = _already_checked(output_path, df)
         before = len(df)
-        df     = df[~df['dest_file'].isin(done)].copy()
-        log.info('Resume: skipping %d done, %d remaining', before - len(df), len(df))
+        if resume_col is not None:
+            df_ids = df[resume_col].astype(str)
+            df = df[~df_ids.isin(done)].copy()
+            log.info(
+                'Resume: using %s, skipping %d done, %d remaining',
+                resume_col,
+                before - len(df),
+                len(df),
+            )
+        else:
+            log.info('Resume: no compatible output identity columns found; processing all rows')
 
     if args.sample:
         df = _stratified_sample(df, args.sample)
@@ -392,6 +451,7 @@ def main():
     def process_row(row_tuple):
         idx, row = row_tuple
         dest_file_path = base_dir / row['dest_file']
+        scenario_dir   = dest_file_path.parent
 
         if not dest_file_path.exists():
             log.warning('File not found: %s', dest_file_path)
@@ -403,11 +463,10 @@ def main():
                 'checked_at': datetime.utcnow().isoformat(),
             }
         else:
-            content = dest_file_path.read_text(encoding='utf-8', errors='replace')
             try:
                 result = run_deploy_cycle(
-                    content        = content,
-                    dest_file      = row['dest_file'],
+                    scenario_dir   = scenario_dir,
+                    entrypoint_name= dest_file_path.name,
                     region         = args.region,
                     backend        = args.backend,
                     skip_destroy   = args.skip_destroy,
