@@ -1,569 +1,489 @@
 #!/usr/bin/env python3
 """
-checkov_intent_audit.py
-=======================
-Measures **user-intent compliance** for LLM-generated IaC templates stored in
-a CSV file (e.g. DeepseekV4Flash_security.csv) by running Checkov with the
-custom YAML policy files defined in the IaCGen benchmark.
+checkov_intent_audit.py — v5
+=================================
+[FIX v5] AttributeError: 'Record' object has no attribute 'check'
 
-Methodology mirrors `process_templates` / `validate_with_checkov_package` from
-Tianyi2/IaCGen/Code/user_intent.py:
-  - Only rows where `user_intent_file_path` is non-empty are processed.
-  - For each such row the generated template (from `final_template` column) is
-    written to a temp file, then Checkov runs with all default CKV_* checks
-    skipped so only the custom intent checks are evaluated.
-  - Results are merged with the benchmark metadata and written to a CSV.
+  Checkov's graph-based custom policy runner (used for YAML policies like
+  UIV_CUSTOM_ROW_*) returns `Record` namedtuples, not `CheckResult` objects.
+  `Record` does NOT have a `.check` attribute — the check name is absent or
+  accessible only via other fields.
 
-Usage
------
-    python checkov_intent_audit.py \\
-        --input      Result/iacgod/DeepseekV4Flash_security.csv \\
-        --benchmark  Data/iac_with_user_intent.csv \\
-        --output-csv Result/intent/DeepseekV4Flash_checkov_intent.csv \\
-        [--output-json results.json] \\
-        [--limit 20] \\
-        [--skip-unmatched]
+  Fix: replace direct `c.check.name` access with safe getattr fallbacks in
+  both _record_to_passed() and _record_to_failed() helpers, so both Record
+  (graph checks) and CheckResult (attribute checks) are handled identically.
 
-The generated template can be CloudFormation (YAML/JSON) or Terraform (HCL).
-Checkov auto-detects the framework from the file extension, which is set by
---type (default: cloudformation → .yaml, terraform → .tf).
-
-Requirements
-------------
-    pip install checkov pandas pyyaml
+All fixes from v4 are preserved.
 """
 
 import argparse
 import csv
 import json
 import os
+import re
 import shutil
-import sys
 import tempfile
-from pathlib import Path
+import time
 import traceback
+from pathlib import Path
+from typing import Any
 
-try:
-    import pandas as pd
-except ImportError:
-    sys.exit("[ERROR] pandas not installed.  Run: pip install pandas")
+import yaml
 
-try:
-    from checkov.cloudformation.runner import Runner as CfnRunner
-    from checkov.terraform.runner import Runner as TfRunner
-    from checkov.runner_filter import RunnerFilter
-except ImportError:
-    sys.exit(
-        "[ERROR] checkov not installed.  Run: pip install checkov\n"
-        "        Minimum version: checkov >= 3.0"
+from checkov.cloudformation.runner import Runner
+from checkov.runner_filter import RunnerFilter
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Registry / singleton cleanup
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _purge_custom_graph_checks(runner: Runner) -> None:
+    greg = runner.graph_registry
+    if not hasattr(greg, "checks"):
+        return
+    greg.checks = [c for c in greg.checks if not c.id.startswith("UIV_CUSTOM")]
+
+
+def _purge_custom_registry_checks(check_id_prefix: str = "UIV_CUSTOM") -> None:
+    try:
+        from checkov.cloudformation.checks.resource.registry import cfn_registry
+        cfn_registry.checks = {
+            rt: [c for c in ch if not c.id.startswith(check_id_prefix)]
+            for rt, ch in cfn_registry.checks.items()
+        }
+        cfn_registry.wildcard_checks = [
+            c for c in cfn_registry.wildcard_checks
+            if not c.id.startswith(check_id_prefix)
+        ]
+    except (ImportError, AttributeError):
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Temp-dir helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_realpath_tmpdir(prefix: str) -> str:
+    return os.path.realpath(tempfile.mkdtemp(prefix=prefix))
+
+
+def _safe_rmtree(path: str) -> None:
+    for attempt in range(3):
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError:
+            if attempt < 2:
+                time.sleep(0.1)
+    shutil.rmtree(path, ignore_errors=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Policy YAML helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def extract_check_id_from_policy(policy_path: str) -> str | None:
+    try:
+        with open(policy_path, encoding="utf-8") as fh:
+            doc = yaml.safe_load(fh)
+        return (doc or {}).get("metadata", {}).get("id") or None
+    except Exception:
+        return None
+
+
+def ids_from_policy_files(policy_files: list[str]) -> list[str]:
+    ids = []
+    for pf in policy_files:
+        cid = extract_check_id_from_policy(pf)
+        if cid:
+            ids.append(cid)
+        else:
+            print(f"\n  [WARN] Could not extract check ID from: {pf}", flush=True)
+    return ids
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# [FIX v5] Safe result-record accessors
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _result_name(c) -> str:
+    """
+    Return the human-readable check name from either a CheckResult or a Record.
+
+    CheckResult (attribute/resource checks):  c.check  is a BaseCheck with .name
+    Record      (graph / YAML policy checks): c.check  does NOT exist;
+                                               c.check_id is the best identifier.
+    """
+    check_obj = getattr(c, "check", None)
+    return (
+        getattr(check_obj, "name", None)
+        or getattr(c, "name", None)
+        or getattr(c, "check_id", "")
     )
 
 
-def _split_cell(value, delimiter: str = ",") -> list[str]:
-    """
-    Safely split a CSV cell that may be NaN (float) or an empty string.
-    Normalises backslash path separators in each token as a side-effect.
-    """
-    if not value or (isinstance(value, float)):   # catches NaN / None / 0.0
-        return []
-    return [
-        Path(tok.strip().replace("\\", "/")).as_posix()
-        for tok in str(value).replace(";", delimiter).split(delimiter)
-        if tok.strip()
-    ]
-
-# ---------------------------------------------------------------------------
-# Temp-dir helper (mirrors make_temp_dir in user_intent.py)
-# ---------------------------------------------------------------------------
-
-def _make_temp_policy_dir(policy_files: list[str]) -> str | None:
-    """
-    Copy all valid policy files into a single freshly-created temp directory
-    so that Checkov's external_checks_dir can find them together.
-    Returns the temp-dir path, or None if no valid files were found.
-    """
-    valid = [f for f in policy_files if f and Path(f).is_file()]
-    if not valid:
-        return None
-
-    temp_dir = tempfile.mkdtemp(prefix="checkov_intent_")
-    for src in valid:
-        dest = os.path.join(temp_dir, os.path.basename(src))
-        shutil.copy2(src, dest)
-    return temp_dir
+def _result_guideline(c) -> str | None:
+    check_obj = getattr(c, "check", None)
+    return (
+        getattr(check_obj, "guideline", None)
+        or getattr(c, "guideline", None)
+    )
 
 
-# ---------------------------------------------------------------------------
-# Core: validate one template string against custom intent policies
-# ---------------------------------------------------------------------------
-from checkov.cloudformation.runner import Runner as CfnRunner
-from checkov.runner_filter import RunnerFilter
-
-class _SafeCfnRunner(CfnRunner):
-    """
-    Subclass that skips get_graph_checks_report entirely.
-
-    The upstream runner crashes with a KeyError when graph checks fire on a
-    temp file whose absolute path was never indexed into self.context — this
-    happens because the custom USER_INTENT category policies are loaded as
-    graph checks in newer Checkov versions. Overriding the method to return
-    an empty report prevents the crash while keeping all attribute-check
-    results intact.
-    """
-    def get_graph_checks_report(self, root_folder, runner_filter):
-        from checkov.common.output.report import Report
-        return Report(self.check_type)
+# ─────────────────────────────────────────────────────────────────────────────
+# Core scan helper
+# ─────────────────────────────────────────────────────────────────────────────
 
 def validate_with_checkov(
-    template_str: str,
-    iac_type: str,
-    user_intent_files: list[str],
-    user_intent_ids: list[str],
-) -> dict:
-    """
-    Validate a generated IaC template against custom Checkov YAML intent policies.
+    template: str,
+    policy_files: list[str],
+    check_ids: list[str],
+    iac_type: str = "cloudformation",
+) -> dict[str, Any]:
+    filename = "template.yaml" if iac_type == "cloudformation" else "main.tf"
 
-    Key fixes vs. naive runner.run():
-      1. category is rewritten to "GENERAL_SECURITY" before loading so Checkov's
-         YAML policy parser doesn't silently drop the check.
-      2. The global cfn_registry is cleared of stale custom checks between rows
-         to prevent cross-row contamination.
-      3. get_graph_checks_report is no-op'd to avoid the self.context KeyError
-         that fires when the temp-file path is not indexed.
-      4. RunnerFilter uses check_ids (allowlist) so only the intent checks run —
-         this means total_passed/total_failed count only intent checks, not all
-         default CKV_* rules.
-    """
-    import traceback
-    import re
-    from checkov.cloudformation.runner import Runner as CfnRunner
-    from checkov.terraform.runner import Runner as TfRunner
-    from checkov.runner_filter import RunnerFilter
-    from checkov.common.output.report import Report
+    blank: dict[str, Any] = dict(
+        passed_check_ids=[],
+        failed_check_ids=[],
+        passed_check_details=[],
+        failed_check_details=[],
+        total_passed=0,
+        total_failed=0,
+        error=None,
+    )
 
-    ext = ".tf" if iac_type == "terraform" else ".yaml"
-    temp_dir_policy: str | None = None
-    temp_dir_template: str | None = None
+    tmpdir = _make_realpath_tmpdir("checkov_tmpl_")
+    Path(tmpdir, filename).write_text(template, encoding="utf-8")
 
-    blank: dict = {
-        "pass_user_intent":    False,
-        "passed_checks":       [],
-        "failed_checks":       [],
-        "passed_intent_ids":   [],
-        "failed_intent_ids":   list(user_intent_ids),
-        "total_intent_checks": len(user_intent_ids),
-        "total_passed":        0,
-        "total_failed":        0,
-        "error":               None,
-    }
-
-    if not template_str.strip():
-        blank["error"] = "empty template"
-        return blank
-
-    if not user_intent_ids:
-        blank["error"] = "no user_intent_ids provided"
-        return blank
+    poldir = _make_realpath_tmpdir("checkov_policy_")
+    for src in policy_files:
+        shutil.copy2(src, os.path.join(poldir, os.path.basename(src)))
 
     try:
-        # --- 1. Write template to temp dir ---
-        temp_dir_template = tempfile.mkdtemp(prefix="checkov_tmpl_")
-        tmpl_path = os.path.join(temp_dir_template, f"template{ext}")
-        Path(tmpl_path).write_text(template_str, encoding="utf-8")
+        runner = Runner()
 
-        # --- 2. Copy policy files, rewriting category to a valid Checkov value ---
-        valid_files = [f for f in user_intent_files if f and Path(f).is_file()]
-        if not valid_files:
-            blank["error"] = f"No policy files found on disk: {user_intent_files}"
-            return blank
+        if hasattr(runner, "graph_manager") and runner.graph_manager is not None:
+            runner.graph_manager.graph = None
+            runner.graph_manager.definitions_raw = {}
 
-        temp_dir_policy = tempfile.mkdtemp(prefix="checkov_policy_")
-        for src in valid_files:
-            raw = Path(src).read_text(encoding="utf-8")
-            # Checkov's YAML loader only registers checks whose category is a
-            # recognised CheckCategories enum value.  USER_INTENT is not one of
-            # them, so rewrite it to GENERAL_SECURITY before loading.
-            patched = re.sub(
-                r'(category\s*:\s*["\']?)USER_INTENT(["\']?)',
-                r'\1GENERAL_SECURITY\2',
-                raw,
-                flags=re.IGNORECASE,
-            )
-            dest = os.path.join(temp_dir_policy, os.path.basename(src))
-            Path(dest).write_text(patched, encoding="utf-8")
+        _purge_custom_graph_checks(runner)
+        _purge_custom_registry_checks()
 
-        # --- 3. Clear stale custom checks from the global registry ---
-        # Checkov uses module-level singletons; without clearing them each new
-        # Runner() in the same process inherits checks from previous calls.
-        try:
-            from checkov.common.checks.base_check_registry import BaseCheckRegistry
-            from checkov.cloudformation.checks.resource.registry import cfn_registry
-            # Remove only the UIV_CUSTOM_* checks loaded in prior iterations
-            for check_id in list(cfn_registry.wildcard_checks) + [
-                cid
-                for checks in cfn_registry.checks.values()
-                for cid in [c.id for c in checks]
-            ]:
-                if check_id.startswith("UIV_CUSTOM"):
-                    cfn_registry.checks = {
-                        rt: [c for c in checks if c.id != check_id]
-                        for rt, checks in cfn_registry.checks.items()
-                    }
-        except Exception:
-            pass  # registry cleanup is best-effort
+        runner.context    = None
+        runner.definitions = None
+        runner.breadcrumbs = None
 
-        # --- 4. Build a runner that skips the graph phase ---
-        class _SafeRunner(CfnRunner if iac_type != "terraform" else TfRunner):
-            def get_graph_checks_report(self, root_folder, runner_filter):
-                return Report(self.check_type)
+        runner_filter = RunnerFilter(checks=check_ids)
 
-        runner = _SafeRunner()
-
-        # Use check_ids allowlist instead of skip_checks so ONLY the intent
-        # checks are evaluated — no default CKV_* noise in the results.
-        runner_filter = RunnerFilter(
-            checks=user_intent_ids,        # older Checkov API uses 'checks', not 'check_ids'
-            skip_checks=["CKV_*"],         # belt-and-suspenders: also skip all built-in rules
-        )
-
-        # --- 5. Run ---
         report = runner.run(
-            root_folder=None,
-            external_checks_dir=[temp_dir_policy],
-            files=[tmpl_path],
+            root_folder=tmpdir,
+            external_checks_dir=[poldir],
+            files=None,
             runner_filter=runner_filter,
         )
 
-        passed_checks = [
-            {"check_id": r.check_id, "check_name": r.check_name, "resource": r.resource}
-            for r in report.passed_checks
-        ]
-        failed_checks = [
+        _purge_custom_graph_checks(runner)
+        _purge_custom_registry_checks()
+
+        check_ids_set = set(check_ids)
+
+        # [FIX v5] Use safe accessors — works for both CheckResult and Record
+        passed_details = [
             {
-                "check_id":   r.check_id,
-                "check_name": r.check_name,
-                "resource":   r.resource,
-                "guideline":  getattr(r, "guideline", ""),
+                "check_id":   c.check_id,
+                "check_name": _result_name(c),
+                "resource":   c.resource,
             }
-            for r in report.failed_checks
+            for c in report.passed_checks
+            if c.check_id in check_ids_set
+        ]
+        failed_details = [
+            {
+                "check_id":   c.check_id,
+                "check_name": _result_name(c),
+                "resource":   c.resource,
+                "guideline":  _result_guideline(c),
+            }
+            for c in report.failed_checks
+            if c.check_id in check_ids_set
         ]
 
-        passed_ids    = {c["check_id"] for c in passed_checks}
-        passed_intent = [cid for cid in user_intent_ids if cid in passed_ids]
-        failed_intent = [cid for cid in user_intent_ids if cid not in passed_ids]
+        return blank | dict(
+            passed_check_ids=[d["check_id"] for d in passed_details],
+            failed_check_ids=[d["check_id"] for d in failed_details],
+            passed_check_details=passed_details,
+            failed_check_details=failed_details,
+            total_passed=len(passed_details),
+            total_failed=len(failed_details),
+        )
 
-        return {
-            "pass_user_intent":    len(failed_intent) == 0,
-            "passed_checks":       passed_checks,
-            "failed_checks":       failed_checks,
-            "passed_intent_ids":   passed_intent,
-            "failed_intent_ids":   failed_intent,
-            "total_intent_checks": len(user_intent_ids),
-            "total_passed":        len(passed_checks),
-            "total_failed":        len(failed_checks),
-            "error":               None,
-        }
-
+    except KeyError as exc:
+        return blank | {"error": f"KeyError: {exc}\n{traceback.format_exc()}"}
     except Exception as exc:
-        blank["error"] = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
-        return blank
-
+        return blank | {"error": f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"}
     finally:
-        for d in [temp_dir_policy, temp_dir_template]:
-            if d and os.path.isdir(d):
-                shutil.rmtree(d, ignore_errors=True)
+        _safe_rmtree(tmpdir)
+        _safe_rmtree(poldir)
 
 
-# ---------------------------------------------------------------------------
-# Aggregate helpers
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# ID / path parsing helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _aggregate(rows: list[dict]) -> dict:
-    eligible  = [r for r in rows if r.get("has_intent_data")]
-    processed = [r for r in eligible if not r.get("error")]
-    passed    = [r for r in processed if r.get("pass_user_intent")]
-
-    total_intent_checks = sum(r.get("total_intent_checks", 0) for r in processed)
-    # In _aggregate(), fix the accumulator:
-    total_intent_passed = sum(len(r.get("passed_intent_ids", "").split(";")) 
-                         if r.get("passed_intent_ids") else 0
-                         for r in processed)
-
-    return {
-        "total_input_rows":           len(rows),
-        "rows_with_intent_policy":    len(eligible),
-        "rows_processed":             len(processed),
-        "rows_with_errors":           sum(1 for r in eligible if r.get("error")),
-        "rows_passed_all_intent":     len(passed),
-        "rows_failed_any_intent":     len(processed) - len(passed),
-        "pass_rate_pct":              (
-            round(len(passed) / len(processed) * 100, 2) if processed else None
-        ),
-        # Micro-averaged across all individual intent checks
-        "total_intent_checks_run":    total_intent_checks,
-        "total_intent_checks_passed": total_intent_passed,
-        "micro_intent_pass_pct":      (
-            round(total_intent_passed / total_intent_checks * 100, 2)
-            if total_intent_checks else None
-        ),
-    }
+def parse_ids(raw: str) -> list[str]:
+    return [x.strip() for x in re.split(r"[;,]", raw or "") if x.strip()]
 
 
-# ---------------------------------------------------------------------------
-# Main processing function
-# ---------------------------------------------------------------------------
+def parse_file_paths(raw: str) -> list[str]:
+    return [x.strip() for x in re.split(r",\s*", raw or "") if x.strip()]
 
-def run_checkov_intent_audit(
-    input_csv: str,
-    benchmark_csv: str,
-    output_csv: str,
-    output_json: str | None,
-    iac_type: str,
-    limit: int | None,
-    skip_unmatched: bool,
-) -> None:
-    """
-    Core routine — mirrors `process_templates` from IaCGen/Code/user_intent.py
-    but adapted to work from `final_template` strings (not saved file paths)
-    and to produce a richer flat output CSV.
-    """
-    # --- Load benchmark ---
-    bench_path = Path(benchmark_csv)
-    if not bench_path.exists():
-        sys.exit(f"[ERROR] Benchmark not found: {bench_path}")
 
-    bench_df = pd.read_csv(bench_path, dtype=str)
-    bench_df["row_number"] = bench_df["row_number"].astype(str).str.strip()
+# ─────────────────────────────────────────────────────────────────────────────
+# Benchmark side-input loader
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Keep only rows that have a user_intent_file_path (mirrors the IaCGen filter)
-    intent_df = bench_df[bench_df["user_intent_file_path"].notna()].copy()
-    print(f"[INFO] Benchmark rows with intent policy : {len(intent_df)} / {len(bench_df)}")
+def load_benchmark_index(benchmark_csv: str | None) -> dict[str, dict]:
+    if not benchmark_csv:
+        return {}
+    path = Path(benchmark_csv)
+    if not path.exists():
+        raise SystemExit(f"[ERROR] Benchmark CSV not found: {path}")
+    index: dict[str, dict] = {}
+    with path.open(encoding="utf-8", newline="") as fh:
+        for row in csv.DictReader(fh):
+            rn = row.get("row_number", "").strip()
+            if rn:
+                index[rn] = row
+    print(f"[INFO] Benchmark index loaded: {len(index)} rows from {path.name}")
+    return index
 
-    bench_index: dict[str, dict] = {
-        row["row_number"]: row.to_dict()
-        for _, row in intent_df.iterrows()
-    }
 
-    # --- Load input CSV ---
-    input_path = Path(input_csv)
-    if not input_path.exists():
-        sys.exit(f"[ERROR] Input CSV not found: {input_path}")
+# ─────────────────────────────────────────────────────────────────────────────
+# Policy file resolver
+# ─────────────────────────────────────────────────────────────────────────────
 
-    with input_path.open(encoding="utf-8", newline="") as fh:
-        reader = csv.DictReader(fh)
-        fieldnames = reader.fieldnames or []
-        missing = [c for c in ("final_template", "row_number") if c not in fieldnames]
-        if missing:
-            sys.exit(
-                f"[ERROR] Input CSV missing column(s): {missing}\n"
-                f"        Found: {fieldnames}"
-            )
-        input_rows = list(reader)
+def _resolve_policy_files(
+    intent_file_raw: str,
+    check_ids_hint: list[str],
+    pol_dir: Path,
+    row_num: str,
+) -> list[str]:
+    policy_files: list[str] = []
 
-    print(f"[INFO] Input CSV loaded : {input_path}  ({len(input_rows)} rows)")
-    print(f"[INFO] IaC type         : {iac_type}")
-    if limit:
-        print(f"[INFO] Row limit        : {limit}")
-    print()
-
-    SEP = "─" * 76
-    row_results: list[dict] = []
-
-    for i, row in enumerate(input_rows):
-        if limit is not None and i >= limit:
-            break
-
-        row_num  = str(row.get("row_number", "")).strip()
-        template = (row.get("final_template") or "").strip()
-
-        # Base result skeleton
-        result: dict = {
-            "row_index":           i,
-            "row_number":          row_num,
-            "has_intent_data":     False,
-            "template_empty":      not bool(template),
-            # Benchmark metadata
-            "prompt":              None,
-            "difficulty_level":    None,
-            "ground_truth_path":   None,
-            "user_intent_file_path": None,
-            "user_intent_ids":     None,
-            # Checkov outputs
-            "pass_user_intent":    None,
-            "total_intent_checks": 0,
-            "passed_intent_ids":   "",
-            "failed_intent_ids":   "",
-            "total_passed":        0,
-            "total_failed":        0,
-            "passed_check_details": "",
-            "failed_check_details": "",
-            "error":               None,
-        }
-
-        bench_row = bench_index.get(row_num)
-        if bench_row is None:
-            label = "NO-INTENT-ROW (skipped)" if skip_unmatched else "NO-INTENT-ROW"
-            print(f"  [{i:>4}] row={row_num:<6}  {label}")
-            row_results.append(result)
-            continue
-
-        result["has_intent_data"]       = True
-        result["prompt"]                = bench_row.get("prompt", "")
-        result["difficulty_level"]      = bench_row.get("difficulty_level", "")
-        result["ground_truth_path"]     = bench_row.get("ground_truth_path", "")
-        result["user_intent_file_path"] = bench_row.get("user_intent_file_path", "")
-
-        # Parse semicolon- or comma-separated policy paths and IDs
-        raw_files = bench_row.get("user_intent_file_path", "") or ""
-        raw_ids   = bench_row.get("user_intent_id", "") or ""
-
-        # IaCGen uses ", " as delimiter (see process_templates)
-        policy_files = _split_cell(raw_files)   # NaN-safe, also normalises \ → /
-        intent_ids   = _split_cell(raw_ids)     # NaN-safe
-        result["user_intent_ids"] = ";".join(intent_ids)
-
-        if not template:
-            result["pass_user_intent"]  = False
-            result["error"]             = "empty template"
-            result["failed_intent_ids"] = ";".join(intent_ids)
-            result["total_intent_checks"] = len(intent_ids)
-            print(f"  [{i:>4}] row={row_num:<6}  FAIL  (empty template)")
-            row_results.append(result)
-            continue
-
-        print(f"  [{i:>4}] row={row_num:<6}  scanning {len(intent_ids)} intent check(s) ...", end=" ", flush=True)
-
-        chk = validate_with_checkov(
-            template_str=template,
-            iac_type=iac_type,
-            user_intent_files=policy_files,
-            user_intent_ids=intent_ids,
-        )
-
-        result.update({
-            "pass_user_intent":     chk["pass_user_intent"],
-            "total_intent_checks":  chk["total_intent_checks"],
-            "passed_intent_ids":    ";".join(chk["passed_intent_ids"]),
-            "failed_intent_ids":    ";".join(chk["failed_intent_ids"]),
-            "total_passed":         chk["total_passed"],
-            "total_failed":         chk["total_failed"],
-            "passed_check_details": json.dumps(chk["passed_checks"]),
-            "failed_check_details": json.dumps(chk["failed_checks"]),
-            "error":                chk["error"],
-        })
-
-        if chk["error"]:
-            label = f"ERROR  ({chk['error'][:60]})"
+    for raw_token in parse_file_paths(intent_file_raw):
+        p = raw_token.replace("\\", os.sep)
+        p_path = Path(p)
+        for cand in [p_path, pol_dir / p_path, pol_dir / p_path.name]:
+            if cand.exists():
+                policy_files.append(str(cand.resolve()))
+                break
         else:
-            n_pass = len(chk["passed_intent_ids"])
-            n_fail = len(chk["failed_intent_ids"])
-            verdict = "PASS" if chk["pass_user_intent"] else "FAIL"
-            label = (
-                f"{verdict:<4}  intent {n_pass}/{chk['total_intent_checks']} passed"
-                f"  [total_passed={chk['total_passed']} total_failed={chk['total_failed']}]"
+            print(f"\n  [WARN] row={row_num} policy not found: {raw_token!r}", flush=True)
+
+    # Fallback 1: derive from check IDs in the CSV hint
+    if not policy_files and check_ids_hint:
+        for cid in check_ids_hint:
+            m = re.search(r"ROW_(\d+[A-Za-z]*)", cid, re.I)
+            if m:
+                guessed = pol_dir / f"row_{m.group(1).lower()}.yaml"
+                if guessed.exists():
+                    policy_files.append(str(guessed.resolve()))
+
+    # Fallback 2: derive from row_number directly
+    if not policy_files:
+        plain = pol_dir / f"row_{row_num}.yaml"
+        if plain.exists():
+            policy_files.append(str(plain.resolve()))
+        else:
+            for suffix in "ABCDEF":
+                lettered = pol_dir / f"row_{row_num}{suffix}.yaml"
+                if lettered.exists():
+                    policy_files.append(str(lettered.resolve()))
+
+    return policy_files
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Main loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_audit(
+    csv_input: str,
+    policy_dir: str,
+    iac_type: str,
+    csv_output: str | None,
+    limit: int | None,
+    skip_empty: bool,
+    global_check_ids: list[str] | None,
+    benchmark_index: dict[str, dict],
+) -> None:
+    in_path = Path(csv_input)
+    if not in_path.exists():
+        raise SystemExit(f"[ERROR] Input CSV not found: {in_path}")
+
+    pol_dir = Path(policy_dir)
+    if not pol_dir.is_dir():
+        raise SystemExit(f"[ERROR] Policy directory not found: {pol_dir}")
+
+    out_rows: list[dict] = []
+
+    with in_path.open(encoding="utf-8", newline="") as fh:
+        reader = csv.DictReader(fh)
+
+        for i, row in enumerate(reader):
+            if limit is not None and i >= limit:
+                break
+
+            row_num  = str(row.get("row_number", i)).strip()
+            template = (row.get("final_template") or "").strip()
+
+            bench_row  = benchmark_index.get(row_num, {})
+            merged_row = {**row, **bench_row}
+
+            intent_file_raw = merged_row.get("user_intent_file_path", "")
+            csv_ids_hint    = parse_ids(merged_row.get("user_intent_ids", ""))
+
+            policy_files = _resolve_policy_files(
+                intent_file_raw, csv_ids_hint, pol_dir, row_num
             )
 
-        print(label)
-        row_results.append(result)
+            if global_check_ids:
+                check_ids = global_check_ids
+            else:
+                check_ids = ids_from_policy_files(policy_files)
+                if not check_ids:
+                    check_ids = csv_ids_hint
 
-    # -------------------------------------------------------------------
-    # Aggregate
-    # -------------------------------------------------------------------
-    agg = _aggregate(row_results)
+            ids_display = ";".join(check_ids)
 
-    print()
-    print(SEP)
-    print("AGGREGATE SUMMARY — CHECKOV USER-INTENT AUDIT")
-    print(SEP)
-    print(f"  Total rows in input              : {agg['total_input_rows']}")
-    print(f"  Rows with intent policy (scanned): {agg['rows_with_intent_policy']}")
-    print(f"  Rows processed (no error)        : {agg['rows_processed']}")
-    print(f"  Rows with errors                 : {agg['rows_with_errors']}")
-    print()
-    print(f"  Rows PASSED all intent checks    : {agg['rows_passed_all_intent']}")
-    print(f"  Rows FAILED ≥1 intent check      : {agg['rows_failed_any_intent']}")
-    print(f"  Row-level pass rate              : {agg['pass_rate_pct']} %")
-    print()
-    print(f"  Total intent checks run          : {agg['total_intent_checks_run']}")
-    print(f"  Total intent checks passed       : {agg['total_intent_checks_passed']}")
-    print(f"  Micro intent-check pass rate     : {agg['micro_intent_pass_pct']} %")
+            print(
+                f"[{i:>4}] row={row_num:<4}  "
+                f"ids={ids_display:<45}  "
+                f"policies={[os.path.basename(p) for p in policy_files]}",
+                end=" ... ",
+                flush=True,
+            )
 
-    # -------------------------------------------------------------------
-    # Write output CSV — only rows that had intent policy data
-    # -------------------------------------------------------------------
-    out_rows = [r for r in row_results if r.get("has_intent_data")]
+            if not template:
+                msg = "SKIP (empty)" if skip_empty else "empty template"
+                print(msg)
+                if skip_empty:
+                    continue
+                out_rows.append(merged_row | {"error": "empty template", "template_empty": True})
+                continue
+
+            if not check_ids:
+                print("SKIP (no check IDs — no policies found for this row)")
+                out_rows.append(merged_row | {
+                    "error": "no check IDs / policies found",
+                    "template_empty": False,
+                })
+                continue
+
+            result = validate_with_checkov(
+                template=template,
+                policy_files=policy_files,
+                check_ids=check_ids,
+                iac_type=iac_type,
+            )
+
+            n_p    = result["total_passed"]
+            n_f    = result["total_failed"]
+            n_t    = len(check_ids)
+            status = "PASS" if not result["error"] and n_f == 0 else "FAIL"
+            if result["error"]:
+                status = "ERROR"
+
+            print(
+                f"{status}  intent: {n_p}/{n_t} passed"
+                + (f"  ERR: {str(result['error'])[:80]}" if result["error"] else "")
+            )
+
+            out_rows.append(
+                merged_row | {
+                    "pass_user_intent":     n_f == 0 and not result["error"],
+                    "total_intent_checks":  n_t,
+                    "passed_intent_ids":    ";".join(result["passed_check_ids"]),
+                    "failed_intent_ids":    ";".join(result["failed_check_ids"]),
+                    "total_passed":         n_p,
+                    "total_failed":         n_f,
+                    "template_empty":       False,
+                    "error":                result["error"] or "",
+                    "passed_check_details": json.dumps(result["passed_check_details"]),
+                    "failed_check_details": json.dumps(result["failed_check_details"]),
+                }
+            )
+
     if not out_rows:
-        print("\n[WARN] No intent-policy rows found — output CSV not written.")
-    else:
-        out_cols = [
-            "row_index", "row_number",
-            "difficulty_level", "prompt",
-            "ground_truth_path", "user_intent_file_path", "user_intent_ids",
-            "pass_user_intent",
-            "total_intent_checks", "passed_intent_ids", "failed_intent_ids",
-            "total_passed", "total_failed",
-            "template_empty", "error",
-            "passed_check_details", "failed_check_details",
-        ]
-        out_path = Path(output_csv)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        with out_path.open("w", newline="", encoding="utf-8") as fh:
-            writer = csv.DictWriter(fh, fieldnames=out_cols, extrasaction="ignore")
-            writer.writeheader()
-            writer.writerows(out_rows)
-        print(f"\n[INFO] Output CSV written : {out_path}  ({len(out_rows)} rows)")
+        print("[WARN] No rows processed.")
+        return
 
-    # -------------------------------------------------------------------
-    # Optional JSON
-    # -------------------------------------------------------------------
-    if output_json:
-        payload = {"aggregate": agg, "rows": row_results}
-        Path(output_json).write_text(
-            json.dumps(payload, indent=2), encoding="utf-8"
-        )
-        print(f"[INFO] JSON written       : {output_json}")
+    total  = len(out_rows)
+    errors = sum(1 for r in out_rows if r.get("error"))
+    passed = sum(1 for r in out_rows if r.get("pass_user_intent") is True)
+    failed = sum(
+        1 for r in out_rows
+        if r.get("pass_user_intent") is False and not r.get("error")
+    )
+
+    print()
+    print("=" * 60)
+    print(f"SUMMARY  total={total}  passed={passed}  failed={failed}  errors={errors}")
+    print("=" * 60)
+
+    if csv_output:
+        all_keys = list(dict.fromkeys(k for r in out_rows for k in r))
+        with open(csv_output, "w", newline="", encoding="utf-8") as fh:
+            w = csv.DictWriter(fh, fieldnames=all_keys, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(out_rows)
+        print(f"[INFO] Output written: {csv_output}")
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _build_parser() -> argparse.ArgumentParser:
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="checkov_intent_audit.py",
-        description=(
-            "Run Checkov with custom user-intent YAML policies on LLM-generated "
-            "IaC templates from a results CSV."
-        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+        epilog="""
+Examples
+--------
+  python checkov_intent_audit.py \\
+      -i Intent_DSV4_CFN_Sec.csv -p Data/user_intent -o results.csv
+
+  python checkov_intent_audit.py \\
+      -i Result/iacgod/DeepseekV4Flash_security.csv \\
+      -p Data/user_intent \\
+      --benchmark Result/iacgod/Intent_DSV4_CFN_Sec.csv \\
+      -o deepseek_intent_results.csv
+""",
     )
-    p.add_argument("--input",       "-i", required=True, metavar="CSV",
-                   help="Input CSV with `final_template` and `row_number` columns.")
-    p.add_argument("--benchmark",   "-b", required=True, metavar="CSV",
-                   help="Benchmark CSV (iac_with_user_intent.csv from Tianyi2/IaCGen).")
-    p.add_argument("--output-csv",  "-o", required=True, metavar="CSV_OUT",
-                   help="Output CSV path for per-row intent results.")
-    p.add_argument("--output-json",        metavar="JSON",    default=None,
-                   help="Optional: write full results (rows + aggregate) to JSON.")
-    p.add_argument("--type", "-t", dest="iac_type",
-                   choices=["cloudformation", "terraform"], default="cloudformation",
-                   help="IaC type of the generated templates (default: cloudformation).")
-    p.add_argument("--limit",       type=int, default=None, metavar="N",
-                   help="Process only the first N rows of the input CSV.")
-    p.add_argument("--skip-unmatched", action="store_true",
-                   help="Suppress console warnings for rows absent from the benchmark.")
+    p.add_argument("--input",      "-i", required=True)
+    p.add_argument("--policy-dir", "-p", required=True)
+    p.add_argument("--benchmark",  "-b", default=None, metavar="CSV")
+    p.add_argument("--type",       "-t", default="cloudformation",
+                   choices=["cloudformation", "terraform"])
+    p.add_argument("--output",     "-o", default=None)
+    p.add_argument("--limit",      type=int, default=None)
+    p.add_argument("--skip-empty", action="store_true")
+    p.add_argument("--check-ids",  default=None, metavar="ID1,ID2,...")
     return p
 
 
 if __name__ == "__main__":
-    args = _build_parser().parse_args()
-    run_checkov_intent_audit(
-        input_csv      = args.input,
-        benchmark_csv  = args.benchmark,
-        output_csv     = args.output_csv,
-        output_json    = args.output_json,
-        iac_type       = args.iac_type,
-        limit          = args.limit,
-        skip_unmatched = args.skip_unmatched,
+    args   = build_parser().parse_args()
+    bindex = load_benchmark_index(args.benchmark)
+    run_audit(
+        csv_input=args.input,
+        policy_dir=args.policy_dir,
+        iac_type=args.type,
+        csv_output=args.output,
+        limit=args.limit,
+        skip_empty=args.skip_empty,
+        global_check_ids=parse_ids(args.check_ids or ""),
+        benchmark_index=bindex,
     )
