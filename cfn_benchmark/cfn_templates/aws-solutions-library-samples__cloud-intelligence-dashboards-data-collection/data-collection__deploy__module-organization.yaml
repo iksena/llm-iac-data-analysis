@@ -1,0 +1,383 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Lambda to collect Org data and store in S3
+Parameters:
+  DatabaseName:
+    Type: String
+    Description: Name of the Athena database to be created to hold lambda information
+    Default: optimization_data
+  DestinationBucket:
+    Type: String
+    Description: Name of the S3 Bucket that exists or needs to be created to hold rightsizing information
+    AllowedPattern: (?=^.{3,63}$)(?!^(\d+\.)+\d+$)(^(([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])\.)*([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])$)
+  DestinationBucketARN:
+    Type: String
+    Description: ARN of the S3 Bucket that exists or needs to be created to hold rightsizing information
+  ManagementRoleName:
+    Type: String
+    Description: The name of the IAM role that will be deployed in the management account which can retrieve AWS Organization data. KEEP THE SAME AS WHAT IS DEPLOYED INTO MANAGEMENT ACCOUNT
+  CFDataName:
+    Type: String
+    Description: The name of what this cf is doing.
+    Default: organizations
+  GlueRoleARN:
+    Type: String
+    Description: Arn for the Glue Crawler role
+  Schedule:
+    Type: String
+    Description: EventBridge Schedule to trigger the data collection
+    Default: "rate(14 days)"
+  ResourcePrefix:
+    Type: String
+    Description: This prefix will be placed in front of all roles created. Note you may wish to add a dash at the end to make more readable
+  LambdaAnalyticsARN:
+    Type: String
+    Description: Arn of lambda for Analytics
+  AccountCollectorLambdaARN:
+    Type: String
+    Description: Arn of the Account Collector Lambda
+  CodeBucket:
+    Type: String
+    Description: Source code bucket
+  StepFunctionTemplate:
+    Type: String
+    Description: S3 key to the JSON template for the StepFunction
+  StepFunctionExecutionRoleARN:
+    Type: String
+    Description: Common role for Step Function execution
+  SchedulerExecutionRoleARN:
+    Type: String
+    Description: Common role for module Scheduler execution
+  CURTable:
+    Type: String
+    Description: Athena Table with CUR
+    Default: cid_cur.cur
+  DataBucketsKmsKeysArns:
+    Type: String
+    Description: "ARNs of KMS Keys for data buckets and/or Glue Catalog. Comma separated list, no spaces. Keep empty if data Buckets and Glue Catalog are not Encrypted with KMS. You can also set it to '*' to grant decrypt permission for all the keys."
+    Default: ""
+
+Conditions:
+  NeedDataBucketsKms: !Not [ !Equals [ !Ref DataBucketsKmsKeysArns, "" ] ]
+
+Outputs:
+  StepFunctionARN:
+    Description: ARN for the module's Step Function
+    Value: !GetAtt ModuleStepFunction.Arn
+
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}${CFDataName}-LambdaRole"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - !Sub "lambda.${AWS::URLSuffix}"
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Path: /
+      Policies:
+        - PolicyName: !Sub "${CFDataName}-ManagementAccount-LambdaRole"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "sts:AssumeRole"
+                Resource: !Sub "arn:${AWS::Partition}:iam::*:role/${ManagementRoleName}" # Need to assume a Read role in management accounts
+        - !If
+          - NeedDataBucketsKms
+          - PolicyName: "KMS"
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action:
+                    - "kms:GenerateDataKey"
+                  Resource: !Split [ ',', !Ref DataBucketsKmsKeysArns ]
+          - !Ref AWS::NoValue
+        - PolicyName: "S3-Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub "${DestinationBucketARN}/*"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28 # Resource found with an explicit name, this disallows updates that require replacement of this resource
+            reason: "Need explicit name to identify role actions"
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}${CFDataName}-Lambda'
+      Description: !Sub "Lambda function to retrieve ${CFDataName}"
+      Runtime: python3.13
+      Architectures: [x86_64]
+      Code:
+        ZipFile: |
+          """ Get Account info from AWS Organizations and store on s3 bucket
+          """
+          import os
+          import re
+          import json
+          import logging
+          import datetime
+          from functools import lru_cache
+
+          import boto3
+          from botocore.exceptions import ClientError
+          from botocore.client import Config
+
+          BUCKET = os.environ.get('BUCKET_NAME')
+          ROLE = os.environ.get('ROLE_NAME')
+          PREFIX = os.environ.get('PREFIX')
+          REGIONS = ["us-east-1"] #This MUST be us-east-1 regardless of region of Lambda
+
+          logger = logging.getLogger(__name__)
+          logger.setLevel(getattr(logging, os.environ.get('LOG_LEVEL', 'INFO').upper(), logging.INFO))
+
+          def lambda_handler(event, context):
+              logger.info(f"Event data {json.dumps(event)}")
+              account = event.get("account")
+              if not account:
+                  raise ValueError(
+                      "Please do not trigger this Lambda manually."
+                      "Find the corresponding state machine in Step Functions and Trigger from there."
+                  )
+              account = account if isinstance(account, dict) else json.loads(account)
+              try:
+                  process_management_acc(account["account_id"])
+              except Exception as exc:
+                  logger.warning(exc)
+
+          def process_management_acc(management_account_id):
+              """Get info from management account and write to s3"""
+              logger.info(f'Assuming role {ROLE} in {management_account_id}')
+              partition = boto3.session.Session().get_partition_for_region(region_name=REGIONS[0])
+              cred = boto3.client('sts', region_name=REGIONS[0]).assume_role(
+                  RoleArn=f"arn:{partition}:iam::{management_account_id}:role/{ROLE}",
+                  RoleSessionName="data_collection"
+              )['Credentials']
+              client = boto3.client(
+                  "organizations",
+                  region_name=REGIONS[0],
+                  aws_access_key_id=cred['AccessKeyId'],
+                  aws_secret_access_key=cred['SecretAccessKey'],
+                  aws_session_token=cred['SessionToken'],
+              )
+              accounts = list(OrgController(client).iterate_accounts())
+              logger.debug(f'Uploading {len(accounts)} records')
+              s3_upload(management_account_id, accounts)
+
+          def s3_upload(payer_id, data):
+              """Upload records to s3"""
+              tmp_file = f'/tmp/accounts-{payer_id}.json'
+              with open(tmp_file, 'w', encoding='utf-8') as file_:
+                  for line in data:
+                      file_.write(json.dumps(line, default=json_converter) + '\n')
+              try:
+                  prefix = f"{PREFIX}/organization-data/payer_id={payer_id}/acc-org.json" # No time/date info. Each time we override data
+                  boto3.client('s3').upload_file(tmp_file, BUCKET, prefix)
+                  logger.info(f"Uploaded {len(data)} records in s3://{BUCKET}/{prefix}")
+              except Exception as exc:
+                  logger.error(exc)
+
+          def json_converter(obj):
+              """ Help json encode date"""
+              if isinstance(obj, datetime.datetime):
+                  return obj.strftime("%Y-%m-%d %H:%M:%S")
+              return obj
+
+          class OrgController():
+              """ AWS Organizations controller """
+              def __init__(self, client):
+                  self.org = client
+
+              @lru_cache(maxsize=10000)
+              def get_ou_name(self, id_):
+                  """get ou name"""
+                  resp = self.org.describe_organizational_unit(OrganizationalUnitId=id_)
+                  return resp['OrganizationalUnit']['Name']
+
+              @lru_cache(maxsize=10000)
+              def get_parent(self, id_):
+                  """list parents of account or ou"""
+                  return self.org.list_parents(ChildId=id_)['Parents'][0]
+
+              @lru_cache(maxsize=10000)
+              def get_ou_path(self, id_):
+                  """returns a list of OUs up to Root level"""
+                  path = []
+                  current = {'Id': id_}
+                  while current.get('Type') != 'ROOT':
+                      current = self.get_parent(current['Id'])
+                      if current.get('Type') == 'ORGANIZATIONAL_UNIT':
+                          current['Name'] = self.get_ou_name(current['Id'])
+                      elif current.get('Type') == 'ROOT':
+                          # If there are 2 or more orgs we can use a tag 'Name' to set the name of the root OU
+                          # otherwise we will use ID
+                          tags = self.get_tags(current["Id"])
+                          current['Name'] = tags.get('Name', f'ROOT({current["Id"]})')
+                      path.append(current)
+                  return path[::-1]
+
+              @lru_cache(maxsize=10000)
+              def get_tags(self, id_, athena_friendly=False):
+                  """returns a dict of tags"""
+                  paginator = self.org.get_paginator("list_tags_for_resource")
+                  tags = sum([resp['Tags'] for resp in paginator.paginate(ResourceId=id_)], [])
+                  return {tag['Key']: tag['Value'] for tag in tags}
+
+              @lru_cache(maxsize=10000)
+              def get_hierarchy_tags(self, id_):
+                  """returns a dict of tags, updated according AWS Org hierarchy"""
+                  tags = {}
+                  full_path = self.get_ou_path(id_) + [{'Id': id_}]
+                  for level in full_path:
+                      tags.update(self.get_tags(level['Id'], athena_friendly=True))
+                  return tags
+
+              def iterate_accounts(self):
+                  """iterate over accounts"""
+                  for page in self.org.get_paginator('list_accounts').paginate():
+                      for account in page['Accounts']:
+                          logger.info('processing %s', account['Id'])
+                          account['Hierarchy'] = self.get_ou_path(account['Id'])
+                          account['HierarchyPath'] = ' > '.join([
+                              lvl.get('Name', lvl.get('Id')) for lvl in account['Hierarchy']
+                          ])
+                          account['HierarchyTags'] = [ {'Key': key, 'Value': value} for key, value in self.get_hierarchy_tags(account['Id']).items()]
+                          account['ManagementAccountId'] =  account['Arn'].split(':')[4]
+                          account['Parent'] = account['Hierarchy'][-1].get('Name')
+                          account['ParentId'] = account['Hierarchy'][-1].get('Id')
+                          account['ParentTags'] = [ {'Key': key, 'Value': value} for key, value in self.get_tags(account['ParentId']).items()]
+                          #account['Parent_Tags'] = self.get_tags(account['ParentId']) # Uncomment for Backward Compatibility
+                          logger.debug(json.dumps(account, indent=2, default=json_converter))
+                          yield account
+
+          def test():
+              """ local test """
+              client = boto3.client(
+                  'organizations',
+                  region_name="us-east-1", #MUST be us-east-1 regardless of region you have the Lambda
+              )
+              res = []
+              for account in OrgController(client).iterate_accounts():
+                  res.append(account)
+                  print(json.dumps(account, default=json_converter))
+              return
+
+          #test()
+      Handler: 'index.lambda_handler'
+      MemorySize: 2688
+      Timeout: 600
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DestinationBucket
+          PREFIX: !Ref CFDataName
+          ROLE_NAME: !Ref ManagementRoleName
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89 # Lambda functions should be deployed inside a VPC
+            reason: "No need for VPC in this case"
+          - id: W92 #  Lambda functions should define ReservedConcurrentExecutions to reserve simultaneous executions
+            reason: "No need for simultaneous execution"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${LambdaFunction}"
+      RetentionInDays: 60
+
+  Crawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ResourcePrefix}${CFDataName}-Crawler'
+      Role: !Ref GlueRoleARN
+      DatabaseName: !Ref DatabaseName
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DestinationBucket}/${CFDataName}/organization-data/" #Preserve legacy name in Athena
+      Configuration: |
+        {
+          "Version": 1.0,
+          "Grouping": {
+            "TableGroupingPolicy": "CombineCompatibleSchemas"
+          },
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            },
+            "Tables": {
+              "TableThreshold": 1,
+              "AddOrUpdateBehavior": "MergeNewColumns"
+            }
+          }
+        }
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+  ModuleStepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ResourcePrefix}${CFDataName}-StateMachine'
+      StateMachineType: STANDARD
+      RoleArn: !Ref StepFunctionExecutionRoleARN
+      DefinitionS3Location:
+        Bucket: !Ref CodeBucket
+        Key: !Ref StepFunctionTemplate
+      DefinitionSubstitutions:
+        AccountCollectorLambdaARN: !Ref AccountCollectorLambdaARN
+        ModuleLambdaARN: !GetAtt LambdaFunction.Arn
+        Crawlers: !Sub '["${ResourcePrefix}${CFDataName}-Crawler"]'
+        CollectionType: "Payers"
+        Params: ''
+        Module: !Ref CFDataName
+        DeployRegion: !Ref AWS::Region
+        Account: !Ref AWS::AccountId
+        Prefix: !Ref ResourcePrefix
+        Bucket: !Ref DestinationBucket
+
+  ModuleRefreshSchedule:
+    Type: 'AWS::Scheduler::Schedule'
+    Properties:
+      Description: !Sub 'Scheduler for the ODC ${CFDataName} module'
+      Name: !Sub '${ResourcePrefix}${CFDataName}-RefreshSchedule'
+      ScheduleExpression: !Ref Schedule
+      State: ENABLED
+      FlexibleTimeWindow:
+        MaximumWindowInMinutes: 30
+        Mode: 'FLEXIBLE'
+      Target:
+        Arn: !GetAtt ModuleStepFunction.Arn
+        RoleArn: !Ref SchedulerExecutionRoleARN
+
+  AnalyticsExecutor:
+    Type: Custom::LambdaAnalyticsExecutor
+    Properties:
+      ServiceToken: !Ref LambdaAnalyticsARN
+      Name: !Ref CFDataName
+
+  AthenaQuery:
+      Type: AWS::Athena::NamedQuery
+      Properties:
+        Database: !Ref DatabaseName
+        Description: Provides a cur extended with organization info
+        Name: !Sub '${ResourcePrefix}view cur_with_org_data'
+        QueryString: !Sub |
+          CREATE OR REPLACE VIEW cur_with_org_data AS
+          SELECT *
+          FROM (${CURTable} cur
+          INNER JOIN "${DatabaseName}"."organization_data"
+            ON ("cur"."line_item_usage_account_id" = "${DatabaseName}"."organization_data"."id"))

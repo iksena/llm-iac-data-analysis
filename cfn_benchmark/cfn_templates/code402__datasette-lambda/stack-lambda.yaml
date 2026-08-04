@@ -1,0 +1,286 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Web service to host a Datasette instance on AWS.
+
+Parameters:
+  Bucket:
+    Type: String
+  CORS:
+    Type: String
+    Description: Whether to start the Datasette service with the --cors flag.
+    AllowedPattern: ^True$|^False$
+  DbFiles:
+    Type: String
+    Description: The names of the DB files to serve, separated by @ symbols.
+  Domain:
+    Type: String
+    Default: ''
+    Description: The custom CNAME for the CloudFront distribution, e.g. foo.example.com.
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: The Route 53 Zone ID for apex domain containing the CNAME, e.g. Z39FM...
+  Prefix:
+    Type: String
+    Default: ''
+    Description: The path on which the Datasette service is hosted.
+  ValidationDomain:
+    Type: String
+    Default: ''
+    Description: The apex domain containing the CNAME, e.g. example.com.
+
+Conditions:
+  CreateCNAME: !Not [!Equals [ !Ref HostedZoneId, '' ]]
+
+Resources:
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket: !Ref Bucket
+        S3Key: package.zip
+      Runtime: python3.8
+      Description: !Sub ${AWS::StackName} Datasette
+      FunctionName: !Sub ${AWS::StackName}-${AWS::AccountId}
+      Handler: index.handler
+      MemorySize: 1536
+      Role: !GetAtt LambdaIAMRole.Arn
+      Timeout: 15
+      Layers:
+        - arn:aws:lambda:us-east-1:562933535245:layer:datasette-0_39:11
+      Environment:
+        Variables:
+          Bucket: !Ref Bucket
+          CORS: !Ref CORS
+          DbFiles: !Ref DbFiles
+          Prefix: !Ref Prefix
+
+  LambdaIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-${AWS::AccountId}:*
+              - Action:
+                  - s3:GetObject
+                  - s3:HeadObject
+                Effect: Allow
+                Resource:
+                  - !Sub arn:aws:s3:::${Bucket}/*
+          PolicyName: lambda
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-${AWS::AccountId}
+      RetentionInDays: 14
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${AWS::StackName} Datasette Gateway
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  RootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: '200'
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt LambdaFunction.Arn
+      ResourceId: !GetAtt ApiGateway.RootResourceId
+      RestApiId: !Ref ApiGateway
+
+  ProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      RequestParameters:
+        method.request.path.proxy: true
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: '200'
+        RequestParameters:
+          integration.request.path.proxy: 'method.request.path.proxy'
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations
+          - LambdaArn: !GetAtt LambdaFunction.Arn
+      ResourceId: !Ref Resource
+      RestApiId: !Ref ApiGateway
+
+  Resource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      RestApiId: !Ref ApiGateway
+      PathPart: '{proxy+}'
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - RootMethod
+      - ProxyMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiGatewayDeployment
+      MethodSettings:
+        - HttpMethod: '*'
+          LoggingLevel: INFO
+          ResourcePath: '/'
+          DataTraceEnabled: true
+      RestApiId: !Ref ApiGateway
+      StageName: datasette
+
+  LambdaApiGatewayInvoke:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases: !If [ CreateCNAME, [ !Ref Domain ], !Ref "AWS::NoValue" ]
+        ViewerCertificate:
+          !If
+            - CreateCNAME
+            -
+              AcmCertificateArn: !Ref SSLCertificate
+              MinimumProtocolVersion: TLSv1
+              SslSupportMethod: sni-only
+            - !Ref "AWS::NoValue"
+        Origins:
+          - DomainName: !Sub ${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com
+            Id: datasette
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+            OriginPath: /datasette
+        Enabled: true
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          Compress: true
+          TargetOriginId: datasette
+          ForwardedValues:
+            QueryString: true
+            Headers:
+              - Referer
+              - CloudFront-Viewer-Country
+              - CloudFront-Is-Desktop-Viewer
+              - CloudFront-Is-Mobile-Viewer
+              - CloudFront-Is-SmartTV-Viewer
+              - CloudFront-Is-Tablet-Viewer
+              - X-Forwarded-Host
+              - User-Agent
+            Cookies:
+              Forward: none
+          ViewerProtocolPolicy: redirect-to-https
+          LambdaFunctionAssociations:
+            - EventType: viewer-request
+              LambdaFunctionARN: !Ref CFAddHostLambdaFunctionVersion
+        PriceClass: PriceClass_100
+
+  # Add X-Forwarded-Host header
+  # See https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/lambda-event-structure.html#example-viewer-request
+  # for description of input record structure.
+  CFAddHostLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          exports.handler = (event, context, callback) => {
+            const request = event.Records[0].cf.request;
+            const { headers } = request;
+
+            const hostname = headers.host[0].value;
+            headers['x-forwarded-host'] = [{
+              key:'X-Forwarded-Host',
+              value: hostname
+            }];
+
+            callback(null, request);
+          };
+      Runtime: nodejs10.x
+      Description: !Sub ${AWS::StackName} CloudFront X-Forwarded-Host
+      FunctionName: !Sub ${AWS::StackName}-cf-x-forwarded-host-${AWS::AccountId}
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt LambdaIAMRole.Arn
+      Timeout: 5
+
+  CFAddHostLambdaFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref CFAddHostLambdaFunction
+
+  SSLCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: CreateCNAME
+    Properties:
+      DomainName: !Sub ${Domain}
+      ValidationMethod: EMAIL
+      DomainValidationOptions:
+        - DomainName: !Sub ${Domain}
+          ValidationDomain: !Sub ${ValidationDomain}
+
+  CNAMERecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateCNAME
+    Properties:
+      HostedZoneId: !Sub ${HostedZoneId}
+      Name: !Sub ${Domain}
+      ResourceRecords:
+        - !GetAtt CloudFrontDistribution.DomainName
+      TTL: '60'
+      Type: CNAME
+
+Outputs:
+  ApiUrl:
+    Value: !Sub
+      - https://${ApiId}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+      - ApiId: !Ref ApiGateway
+        StageName: !Ref ApiStage
+
+  CloudFrontUrl:
+    Value: !Sub
+      - https://${DomainName}
+      - DomainName: !GetAtt CloudFrontDistribution.DomainName

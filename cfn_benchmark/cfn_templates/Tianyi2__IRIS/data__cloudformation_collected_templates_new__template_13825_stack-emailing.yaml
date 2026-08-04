@@ -1,0 +1,484 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Defines some resources so that emails adressed to the registered domain name could be received. Requires a running backend that can handle bounces and complaints.
+
+Parameters:
+  EmailsBucketName:
+    Type: String
+    Description: 'The name of the S3 bucket to store received emails on (ex: "my-emails-bucket")'
+  EmailsPrefix:
+    Type: String
+    Description: 'The prefix where the emails are written on the S3 bucket (ex: "emails/received-emails/")'
+  Recipients:
+    Type: CommaDelimitedList
+    Description: 'List of email addresses that can receive emails (adresses with the appropriate domain name ex: "john.doe@domain-name.com")'
+
+  EmailEvents:
+    Type: CommaDelimitedList
+    Description: The list of events that should be captured for sent emails
+    Default: "SEND,REJECT,BOUNCE,COMPLAINT,DELIVERY,OPEN,CLICK,SUBSCRIPTION"
+  EventsWebhookUrl:
+    Type: String
+    Description: 'Ignored if an empty string is passed. The url at which a POST request is sent to on email event, with an SNS event as plain text body (ex: "https://api.domain-name.com/mail-bounce-or-complaint"), containing the SES event in the "Message" field of SNSNotificationRequest. See the SESEmailEvent and SNSEventsTypes pydantic classes in "aws_tools" package.'
+    Default: ""
+  EventsQueueArn:
+    Type: String
+    Description: 'Ignored if an empty string is passed. The SQS queue in which a message is sent on email event.'
+
+Conditions:
+  EventsWebhookEnabled: !Not [!Equals [!Ref EventsWebhookUrl, ""]]
+  EventsQueueEnabled: !Not [!Equals [!Ref EventsQueueArn, ""]]
+
+Resources:
+  # save received emails in chosen prefix + "all/"
+  SESMailReceiptRuleSet:
+    Type: AWS::SES::ReceiptRuleSet
+    Properties:
+      RuleSetName: EMailReceiptRuleSet
+  SESMailReceiptRule:
+    Type: AWS::SES::ReceiptRule
+    DependsOn:
+      - InvokeDomainVerificationLambda
+      - BucketPolicy
+    Properties:
+      RuleSetName: !Ref SESMailReceiptRuleSet
+      Rule:
+        Name: StoreEmailInS3
+        Recipients: !Ref Recipients
+        Actions:
+          - S3Action:
+              BucketName: !Ref EmailsBucketName
+              ObjectKeyPrefix: !Sub "${EmailsPrefix}all/"
+        Enabled: true
+        ScanEnabled: true
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref EmailsBucketName
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Join
+              - ''
+              - - 'arn:aws:s3:::'
+                - !Ref EmailsBucketName
+                - /*
+
+  # Domain name verification for email sending
+  DMARCRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !ImportValue HostedZoneId
+      Name: !Join
+        - ''
+        - - _dmarc.
+          - !ImportValue DomainName
+          - .
+      Type: TXT
+      TTL: '300'
+      ResourceRecords:
+        - '"v=DMARC1; p=none;"'
+  MXRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !ImportValue HostedZoneId
+      Name: !ImportValue DomainName
+      Type: MX
+      TTL: '300'
+      ResourceRecords:
+        - !Join
+          - ''
+          - - 10 inbound-smtp.
+            - !Ref AWS::Region
+            - .amazonaws.com
+  MXMailFromRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !ImportValue HostedZoneId
+      Name: !Join
+        - ''
+        - - mail.
+          - !ImportValue DomainName
+      Type: MX
+      TTL: '300'
+      ResourceRecords:
+        - !Join
+          - ''
+          - - 10 feedback-smtp.
+            - !Ref AWS::Region
+            - .amazonses.com
+  TXTMailFromRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !ImportValue HostedZoneId
+      Name: !Join
+        - ''
+        - - mail.
+          - !ImportValue DomainName
+      Type: TXT
+      TTL: '300'
+      ResourceRecords:
+        - '"v=spf1 include:amazonses.com ~all"'
+  DomainVerificationLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: DomainVerificationLogGroup
+    Properties:
+      FunctionName: DomainVerificationLambda
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 600
+      Code:
+        ZipFile: |+
+          import time
+          import json
+          import boto3
+          import cfnresponse
+
+          def lambda_handler(event, context):
+              try:
+                  ses_client = boto3.client('ses')
+                  route53_client = boto3.client('route53')
+                  if event['RequestType'] == 'Delete':
+                      physical_resource_id = json.loads(event['PhysicalResourceId'])
+                      ses_client.set_active_receipt_rule_set()  # disable the active rule set, which is needed for it to be deleted
+                      for record_name in physical_resource_id:
+                          records = route53_client.list_resource_record_sets(HostedZoneId=event['ResourceProperties']['hosted_zone_id'], StartRecordName=record_name, MaxItems='1')
+                          if len(records['ResourceRecordSets']) > 0:
+                              record_to_delete = records['ResourceRecordSets'][0]
+                              route53_client.change_resource_record_sets(HostedZoneId=event['ResourceProperties']['hosted_zone_id'], ChangeBatch={'Comment': 'Adding CNAME record for SES DKIM configuration', 'Changes': [{'Action': 'DELETE', 'ResourceRecordSet': {'Name': record_to_delete['Name'], 'Type': record_to_delete['Type'], 'TTL': record_to_delete['TTL'], 'ResourceRecords': record_to_delete['ResourceRecords']}}]})
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  record_names = []
+                  domain_name = event['ResourceProperties']['domain_name']
+                  rule_set_name = event['ResourceProperties']['rule_set_name']
+                  response = ses_client.verify_domain_identity(Domain=domain_name)
+                  verification_token = response['VerificationToken']
+                  response = ses_client.verify_domain_dkim(Domain=domain_name)
+                  dkim_tokens = response['DkimTokens']
+                  record_name = f'_amazonses.{domain_name}.'
+                  record_names.append(record_name)
+                  route53_client.change_resource_record_sets(HostedZoneId=event['ResourceProperties']['hosted_zone_id'], ChangeBatch={'Comment': 'Adding TXT record for SES domain ownership verification', 'Changes': [{'Action': 'UPSERT', 'ResourceRecordSet': {'Name': record_name, 'Type': 'TXT', 'TTL': 300, 'ResourceRecords': [{'Value': f'"{verification_token}"'}]}}]})
+                  for token in dkim_tokens:
+                      record_name = f'{token}._domainkey.{domain_name}.'
+                      record_names.append(record_name)
+                      route53_client.change_resource_record_sets(HostedZoneId=event['ResourceProperties']['hosted_zone_id'], ChangeBatch={'Comment': 'Adding CNAME record for SES DKIM configuration', 'Changes': [{'Action': 'UPSERT', 'ResourceRecordSet': {'Name': record_name, 'Type': 'CNAME', 'TTL': 300, 'ResourceRecords': [{'Value': f'{token}.dkim.amazonses.com'}]}}]})
+                  done = False
+                  retries = 0
+                  while not done:
+                      identities = ses_client.list_identities(IdentityType='Domain')['Identities']
+                      for identity in identities:
+                          if identity == domain_name:
+                              verification_attributes = ses_client.get_identity_verification_attributes(Identities=[domain_name])
+                              identity_status = verification_attributes['VerificationAttributes'][domain_name]['VerificationStatus']
+                              print(f'{identity} verification status = {identity_status}')
+                              done = (identity_status == 'Success')
+                      if not done:
+                          retries += 1
+                          time.sleep(10)
+                          if retries >= 30:
+                              cfnresponse.send(event, context, cfnresponse.FAILED, {'reason': 'max retries exceeded'})
+                              return
+                  ses_client.set_active_receipt_rule_set(RuleSetName=rule_set_name)
+                  ses_client.set_identity_mail_from_domain(Identity=domain_name, MailFromDomain='mail.'+domain_name)
+                  physical_resource_id = json.dumps(record_names)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {}, physical_resource_id)
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {type(e).__name__: str(e)})
+  InvokeDomainVerificationLambda:
+    Type: Custom::DomainVerification
+    Properties:
+      ServiceToken: !GetAtt DomainVerificationLambda.Arn
+      domain_name: !ImportValue DomainName
+      hosted_zone_id: !ImportValue HostedZoneId
+      rule_set_name: !Ref SESMailReceiptRuleSet
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaSESVerifyPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                  - ses:VerifyDomainIdentity
+                  - ses:VerifyDomainDkim
+                  - ses:ListIdentities
+                  - ses:GetIdentityVerificationAttributes
+                  - ses:SetActiveReceiptRuleSet
+                  - ses:SetIdentityMailFromDomain
+                  - route53:ChangeResourceRecordSets
+                  - route53:ListResourceRecordSets
+                Resource: '*'
+  DomainVerificationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/DomainVerificationLambda
+      RetentionInDays: 30
+
+  # define webhook/SQS queue for email events
+  SESEventsSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: SESEventsTopic
+  SESEventsSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SESEventsSNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ses.amazonaws.com
+            Action: SNS:Publish
+            Resource: !Ref SESEventsSNSTopic
+  SESConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: SESConfigSet
+  SESConfigurationSetEventDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    Properties:
+      ConfigurationSetName: !Ref SESConfigurationSet
+      EventDestination:
+        Name: SESEventsNotifications
+        Enabled: true
+        MatchingEventTypes: !Ref EmailEvents
+        SnsDestination:
+          TopicARN: !Ref SESEventsSNSTopic
+  # SQS queue
+  SQSSubscription:
+    Condition: EventsQueueEnabled
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SESEventsSNSTopic
+      Protocol: sqs
+      Endpoint: !Ref EventsQueueArn
+  # webhook
+  WebhookSubscription:
+    Condition: EventsWebhookEnabled
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SESEventsSNSTopic
+      Protocol: !Select [0, !Split [":", !Ref EventsWebhookUrl]]  # https or http depending on the provided url
+      Endpoint: !Ref EventsWebhookUrl
+
+  # ressources to copy the received email in /all into the recipient folder
+  StoreEmailLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: StoreEmailLambdaLogGroup
+    Properties:
+      FunctionName: StoreEmailLambda
+      Handler: index.lambda_handler
+      Role: !GetAtt StoreEmailLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 1024
+      Environment:
+        Variables:
+          EMAILS_BUCKET: !Ref EmailsBucketName
+          PREFIX_BEFORE_RECIPIENT: !Ref EmailsPrefix
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import email
+          from datetime import datetime, UTC
+
+          s3 = boto3.client("s3")
+
+          def lambda_handler(event, context):
+              for record in event['Records']:
+                  bucket = record['s3']['bucket']['name']
+                  key = record['s3']['object']['key']
+
+                  print(f"Processing s3://{bucket}/{key}")
+
+                  # Fetch the raw email
+                  obj = s3.get_object(Bucket=bucket, Key=key)
+                  raw_email = obj['Body'].read()
+
+                  # Parse the email
+                  msg = email.message_from_bytes(raw_email)
+
+                  # Extract recipient(s) from headers
+                  recipients = msg.get_all("To", [])
+                  if not recipients:
+                      print("No recipients found, skipping.")
+                      continue
+
+                  # Use UTC date for folder structure
+                  now = datetime.now(UTC)
+
+                  for recipient in recipients:
+                      recipient_clean = recipient.strip().lower().replace("<", "").replace(">", "")
+
+                      # Build new S3 key: recipient/yyyy/mm/dd/messageId.eml
+                      message_id = f"{now.isoformat()}-{key.split('/')[-1]}"
+                      new_key = f"{os.environ['PREFIX_BEFORE_RECIPIENT']}{recipient_clean}/{now.year}/{now.month:02}/{now.day:02}/{message_id}.eml"
+
+                      # Copy the object under new key
+                      new_bucket = os.environ["EMAILS_BUCKET"]
+                      s3.put_object(
+                          Bucket=new_bucket,
+                          Key=new_key,
+                          Body=raw_email
+                      )
+                      print(f"Copied to s3://{new_bucket}/{new_key}")
+  StoreEmailLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StoreEmailLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource:
+                  - !Sub arn:aws:s3:::${EmailsBucketName}/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+  StoreEmailLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/StoreEmailLambda
+      RetentionInDays: 30
+  BucketInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref StoreEmailLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub arn:aws:s3:::${EmailsBucketName}
+
+  # resources to trigger email copy lambda on object creation in bucket
+  S3NotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3NotificationLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                  - s3:GetBucketNotification
+                Resource: !Sub arn:aws:s3:::${EmailsBucketName}
+              - Effect: Allow
+                Action: lambda:AddPermission
+                Resource: !GetAtt StoreEmailLambda.Arn
+  S3NotificationLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: S3NotificationLambdaLogGroup
+    Properties:
+      Handler: index.handler
+      FunctionName: S3NotificationLambda
+      Role: !GetAtt S3NotificationLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import cfnresponse
+
+          s3 = boto3.client("s3")
+
+          def handler(event, context):
+              print("Event:", event)
+              try:
+                  props = event["ResourceProperties"]
+                  bucket = props["BucketName"]
+                  function_arn = props["LambdaArn"]
+                  prefix = props["Prefix"]
+
+                  request_type = event["RequestType"]
+
+                  # Load existing notifications
+                  notification_conf = s3.get_bucket_notification_configuration(Bucket=bucket)
+                  lambda_configs = notification_conf.get("LambdaFunctionConfigurations", [])
+                  # Remove our Lambda configuration
+                  lambda_configs = [cfg for cfg in lambda_configs if cfg.get("Id") != function_arn]
+
+                  if request_type in ("Create", "Update"):
+                      # Add new configuration if not already present
+                      new_cfg = {
+                          "Id": function_arn,
+                          "LambdaFunctionArn": function_arn,
+                          "Events": ["s3:ObjectCreated:*"],
+                          "Filter": {"Key": {"FilterRules": [{"Name": "prefix", "Value": prefix}]}}
+                      }
+                      lambda_configs.append(new_cfg)
+                      # Update bucket notifications
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={"LambdaFunctionConfigurations": lambda_configs}
+                      )
+                  elif request_type == "Delete":
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket,
+                          NotificationConfiguration={"LambdaFunctionConfigurations": lambda_configs}
+                      )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print("Error:", e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+  S3NotificationLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/S3NotificationLambda
+      RetentionInDays: 30
+  AttachS3Notification:
+    Type: Custom::S3Notification
+    Properties:
+      ServiceToken: !GetAtt S3NotificationLambda.Arn
+      BucketName: !Ref EmailsBucketName
+      LambdaArn: !GetAtt StoreEmailLambda.Arn
+      Prefix: !Sub "${EmailsPrefix}all/"
+
+Outputs:
+  SESConfigurationSet:
+    Value: !Ref SESConfigurationSet

@@ -1,0 +1,591 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Organization data collections.
+Parameters:
+  ManagementRoleName:
+    Type: String
+    Description: The name of the IAM role that will be deployed in the management account which can retrieve AWS Organization data. KEEP THE SAME AS WHAT IS DEPLOYED INTO MANAGEMENT ACCOUNT
+  ManagementAccountID:
+    Type: String
+    AllowedPattern: ([a-z0-9\-, ]*?$)
+    Description: "(Ex: 123456789,098654321,789054312) List of Payer IDs you wish to collect data for. Can just be one Accounts"
+  ResourcePrefix:
+    Type: String
+    Description: This prefix will be placed in front of all roles created. Note you may wish to add a dash at the end to make more readable
+  DestinationBucket:
+    Type: String
+    Description: Name of the S3 Bucket to be created to hold data information
+    AllowedPattern: (?=^.{3,63}$)(?!^(\d+\.)+\d+$)(^(([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])\.)*([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])$)
+  DestinationBucketARN:
+    Type: String
+    Description: ARN of the S3 Bucket that exists or needs to be created to hold rightsizing information
+  DataBucketsKmsKeysArns:
+    Type: String
+    Description: "ARNs of KMS Keys for data buckets and/or Glue Catalog. Comma separated list, no spaces. Keep empty if data Buckets and Glue Catalog are not Encrypted with KMS. You can also set it to '*' to grant decrypt permission for all the keys."
+    Default: ""
+  EUCAccountIDs:
+    Type: String
+    Description: "Comma-separated list of account IDs that user has identified to have WorkSpaces running, used to collect WorkSpaces metrics from. If left blank, metrics will be checked from all linked accounts in Organization."
+    Default: ""
+  RegionsInScope:
+    Type: String
+    Description: "Comma Delimited list of AWS regions from which data about resources will be collected. Example: us-east-1,eu-west-1,ap-northeast-1"
+
+Outputs:
+  LambdaFunctionName:
+    Value: !Ref LambdaFunction
+  LambdaFunctionARN:
+    Description: Lambda function ARN
+    Value: !GetAtt LambdaFunction.Arn
+    Export:
+      Name: !Sub ${ResourcePrefix}AccountCollectorLambdaARN
+Conditions:
+  NeedDataBucketsKms: !Not [ !Equals [ !Ref DataBucketsKmsKeysArns, "" ] ]
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}account-collector-LambdaRole"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - !Sub "lambda.${AWS::URLSuffix}"
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Path: /
+      Policies:
+        - PolicyName: "AssumeManagementRole"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "sts:AssumeRole"
+                Resource: !Sub "arn:${AWS::Partition}:iam::*:role/${ManagementRoleName}" # Need to assume a Read role in all Management Accounts
+        - PolicyName: "CloudWatch"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                  - "logs:DescribeLogStreams"
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/*"
+        - PolicyName: "SSM"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "ssm:GetParameter"
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cid/${ResourcePrefix}*"
+        - PolicyName: "Lambda"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "lambda:GetAccountSettings"
+                Resource: "*"
+        - PolicyName: "S3-Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub "${DestinationBucketARN}/*"
+        - !If
+          - NeedDataBucketsKms
+          - PolicyName: "KMS"
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action:
+                    - "kms:GenerateDataKey"
+                  Resource: !Split [ ',', !Ref DataBucketsKmsKeysArns ]
+          - !Ref AWS::NoValue
+
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28 # Resource found with an explicit name, this disallows updates that require replacement of this resource
+            reason: "Need explicit name to identify role actions"
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}account-collector-Lambda'
+      Description: "Lambda function to retrieve the account list"
+      Runtime: python3.13
+      Architectures: [x86_64]
+      Code:
+          ZipFile: |
+            """Account collector Lambda for building linked and payer account lists with
+            optional inclusion, exclusion, and granular execution control."""
+
+            import os
+            import re
+            import json
+            import uuid
+            import logging
+            from datetime import datetime
+            from functools import partial
+            from collections import OrderedDict
+
+            import boto3
+
+            ROLE_NAME = os.environ.get('ROLE_NAME')
+            RESOURCE_PREFIX = os.environ.get('RESOURCE_PREFIX')
+            MANAGEMENT_ACCOUNT_IDS = os.environ.get('MANAGEMENT_ACCOUNT_IDS')
+            BUCKET = os.environ.get('BUCKET_NAME')
+            PREDEF_ACCOUNT_LIST_KEY = os.environ.get('PREDEF_ACCOUNT_LIST_KEY')
+            EXCLUDED_ACCOUNT_LIST_KEY = os.environ.get('EXCLUDED_ACCOUNT_LIST_KEY')
+            GRANULAR_EXECUTION_CONFIG_KEY = os.environ.get('GRANULAR_EXECUTION_CONFIG_KEY')
+            EUC_ACCOUNTS = os.environ.get('EUC_ACCOUNT_IDS', '').strip()
+            TMP_FILE = "/tmp/data.json"
+            START_TIME = str(datetime.now().isoformat())
+            LINKED_ACCOUNT_LIST_KEY = os.environ.get('LINKED_ACCOUNT_LIST_KEY', 'linked-account-list.json')
+            PAYER_ACCOUNT_LIST_KEY = os.environ.get('PAYER_ACCOUNT_LIST_KEY', 'payer-account-list.json')
+            REGIONS = os.environ.get('REGIONS', '*').replace(",", ":")
+
+            logger = logging.getLogger(__name__)
+            logger.setLevel(getattr(logging, os.environ.get('LOG_LEVEL', 'INFO').upper(), logging.INFO))
+
+            def lambda_handler(event, context): #pylint: disable=unused-argument
+                """Build account lists for data collection modules based on event type."""
+                logger.info(f"Incoming event: {event}")
+                # need to confirm that the Lambda concurrency limit is sufficient to avoid throttling
+                lambda_limit = boto3.client('lambda').get_account_settings()['AccountLimit']['ConcurrentExecutions']
+                if lambda_limit < 500:
+                    message = (f'Lambda concurrent executions limit of {lambda_limit} is not sufficient to run the Data Collection framework. '
+                                'Please increase the limit to at least 500 (1000 is recommended). '
+                                'See https://docs.aws.amazon.com/lambda/latest/dg/gettingstarted-limits.html.')
+                    logger.error(message)
+                    raise Exception(message) #pylint: disable=broad-exception-raised
+
+                module = event.get("module", '').lower()
+                params = event.get("params", '')
+                functions = { # keep keys same as boto3 services
+                    'linked': partial(iterate_linked_accounts, module, params),
+                    'euc': partial(iterate_accounts_with_filter, EUC_ACCOUNTS),
+                    'payers': partial(iterate_admins_accounts, None),
+                    'organizations': partial(iterate_admins_accounts, 'organizations'),
+                    'compute-optimizer': partial(iterate_admins_accounts, 'compute-optimizer'),
+                    'backup': partial(iterate_admins_accounts, 'backup'),
+                }
+                account_type = event.get("type", '').lower()
+                if account_type not in functions:
+                    raise Exception(f"Lambda event must have 'type' parameter with value = ({list(functions.keys())})") #pylint: disable=broad-exception-raised
+
+                account_iterator = functions[account_type]
+                with open(TMP_FILE, "w", encoding='utf-8') as f:
+                    count = 0
+                    f.write("[\n")
+                    for account in account_iterator():
+                        account['main_exe_uuid'] = event.get("main_exe_uuid", str(uuid.uuid4()))
+                        account['module'] = module
+                        account['bucket'] = BUCKET
+                        account['dc_account'] = boto3.client('sts').get_caller_identity()['Account']
+                        account['dc_region'] = boto3.session.Session().region_name
+                        account['params'] = params
+                        account['prefix'] = RESOURCE_PREFIX
+                        account['stack_version'] = event.get("stack_version", '')
+                        if count > 0:
+                            f.write(",\n")
+                        f.write(json.dumps(account))
+                        count += 1
+                    f.write("\n]")
+
+                if count == 0:
+                    raise Exception('No accounts found. Check the log.') #pylint: disable=broad-exception-raised
+
+                key = f"account-collector/{module+'-'+(params+'-' if params else '')+(LINKED_ACCOUNT_LIST_KEY if account_type == 'linked' else PAYER_ACCOUNT_LIST_KEY)}"
+                s3 = boto3.client('s3')
+                s3.upload_file(TMP_FILE, Bucket=BUCKET, Key=key)
+
+                return {'statusCode': 200, 'accountList': key, 'bucket': BUCKET}
+
+            def get_all_payers():
+                """Yield each payer account ID from the comma-separated management account list."""
+                for payer_id in MANAGEMENT_ACCOUNT_IDS.split(','):
+                    yield payer_id.strip()
+
+            def iterate_admins_accounts(service=None):
+                """Yield payer or delegated admin accounts, checking SSM for delegation overrides."""
+                ssm = boto3.client('ssm')
+                for payer_id in get_all_payers():
+                    account_id = payer_id # default
+                    if service:
+                        ssm_key = f'/cid/{RESOURCE_PREFIX}config/delegated-admin/{service}/{payer_id}'
+                        try:
+                            account_id = ssm.get_parameter(Name=ssm_key)['Parameter']['Value']
+                        except ssm.exceptions.ParameterNotFound:
+                            logger.info(f'Not found ssm parameter {ssm_key}. Will use Management Account Id {payer_id}')
+                    yield {"account": json.dumps({'account_id': account_id, 'account_name': '', 'payer_id': payer_id})}
+
+            def iterate_linked_accounts(module=None, params=None):
+                """Yield linked accounts using granular config, predefined list, or Organization discovery."""
+                granular_config = get_from_bucket(BUCKET, GRANULAR_EXECUTION_CONFIG_KEY)
+                try:
+                    # Test first to see if a granular config is setup for the current module
+                    if granular_config:
+                        logger.info("Using granular collection policy mode")
+                        if len(params):
+                            module = module + '-' + params
+                        policies, per_module = parse_granular_config(granular_config, module)
+                        # If there is a config file and it does not have any definition for the current module, proceed as normal
+                        if per_module > 0:
+                            account_policy_list = OrderedDict()
+                            for org_account_data in iterate_admins_accounts('organizations'):
+                                org_account = json.loads(org_account_data['account'])
+                                org_client = get_client_with_role(service="organizations", account_id=org_account['account_id'], region="us-east-1") #MUST be us-east-1
+                                account_policy_list |= OrganizationsPrincipalExpander(org_client, logger).process_policies(policies, module)
+                                for account_id, account_policy in account_policy_list.items():
+                                    regions_str = ','.join(account_policy['regions']) if len(account_policy['regions']) > 0 else ''
+                                    logger.debug(f"Allowing module {module}, account {account_id}, regions {regions_str}")
+                                    yield format_account(account_id=account_id, account_name='', payer_id=org_account['payer_id'], regions=regions_str, payload=account_policy['payload'])
+                            return
+
+                    defined_accounts, ext = get_defined_list(BUCKET, PREDEF_ACCOUNT_LIST_KEY)
+                    if defined_accounts:
+                        logger.info(f'Using defined account list found in s3://{BUCKET}/{PREDEF_ACCOUNT_LIST_KEY}{ext} instead of payer organization')
+                        for account_data in defined_accounts:
+                            if ext == ".json":
+                                account = json.loads(account_data)
+                                yield format_account(account['account_id'], account['account_name'], account['payer_id'])
+                            else:
+                                account = account_data.split(',')
+                                yield format_account(account[0].strip(), account[1].strip(), account[2].strip())
+                    else:
+                        logger.info('Using payer organization for the account list')
+                        excluded_accounts = get_from_bucket(BUCKET, EXCLUDED_ACCOUNT_LIST_KEY)
+                        if excluded_accounts:
+                            logger.info(f'Found list of accounts to exclude in s3://{BUCKET}/{EXCLUDED_ACCOUNT_LIST_KEY}. Will only collect accounts that are not in the list')
+                            excluded_accounts = [a.strip() for a in excluded_accounts[0].split(',') if a]
+                        for org_account_data in iterate_admins_accounts('organizations'):
+                            logger.info(f'Collecting accounts for payer {org_account_data}')
+                            org_account = json.loads(org_account_data['account'])
+                            logger.info(f'org_account: {org_account}')
+                            organizations = get_client_with_role(service="organizations", account_id=org_account['account_id'], region="us-east-1") #MUST be us-east-1
+                            for account in organizations.get_paginator("list_accounts").paginate().search("Accounts[?Status=='ACTIVE']"):
+                                if excluded_accounts and account.get('Id') in excluded_accounts:
+                                    logger.debug(f'Excluding account {account.get("Id")}')
+                                    continue
+                                yield format_account(account.get('Id'), account.get('Name'), org_account['payer_id'])
+                except Exception as exc: #pylint: disable=broad-exception-caught
+                    logger.error( f'{type(exc).__name__}: When trying to build linked account list. {exc} ')
+
+            def iterate_accounts_with_filter(filter_accounts):
+                """ same as iterate_linked_accounts but with additional filtering
+                filter_accounts: a comma separated list of accounts OR '*' or empty string
+                If filter_accounts is empty or '*', returns all linked accounts in the org.
+                If filter_accounts is a comma separated list of account IDs, returns only those accounts.
+                """
+                if not filter_accounts or filter_accounts.strip() == '' or filter_accounts.strip() == '*':
+                    logger.info("No specific accounts filter provided, collecting from all linked accounts in organization")
+                    yield from iterate_linked_accounts()
+                else:
+                    filter_list = [a.strip() for a in filter_accounts.split(',') if a.strip()]
+                    logger.info(f"Filtering accounts to specified list: {filter_list}")
+                    for acc in iterate_linked_accounts():
+                        account_id = json.loads(acc['account'])['account_id']
+                        if account_id in filter_list:
+                            yield acc
+
+            def get_defined_list(bucket, key):
+                """Try to load a predefined account list from S3 as JSON or CSV."""
+                s3 = boto3.client("s3")
+                exts = [".json", ".csv"]
+                for ext in exts:
+                    accts = get_from_bucket(bucket, key+ext, s3)
+                    if accts:
+                        return accts, ext
+                logger.debug(f'Predefined account list not retrieved or not being used')
+                return None, None
+
+            def get_from_bucket(bucket, key, client=None):
+                """Retrieve an object from S3 and return its lines, or None if not found."""
+                s3 = client if client else boto3.client("s3")
+                try:
+                    data = s3.get_object(Bucket=bucket, Key=key)
+                    return data['Body'].read().decode('utf-8').strip('\n').split('\n')
+                except Exception: #pylint: disable=broad-exception-caught
+                    return None
+
+            def format_account(account_id, account_name, payer_id='', regions='', payload=''):
+                """Return an account dict with a JSON-serialized account payload."""
+                return {
+                    "account": json.dumps({
+                        'account_id': account_id,
+                        'account_name': account_name,
+                        'payer_id': payer_id,
+                        "regions": regions,
+                        "payload": payload
+                    })
+                }
+
+            def get_client_with_role(account_id, service, region):
+                """Assume a cross-account role and return a boto3 client for the given service."""
+                partition = boto3.session.Session().get_partition_for_region(region_name=region)
+                credentials = boto3.client('sts').assume_role(
+                    RoleArn=f"arn:{partition}:iam::{account_id}:role/{ROLE_NAME}",
+                    RoleSessionName="data_collection"
+                )['Credentials']
+                return boto3.client(
+                    service,
+                    region_name=region,
+                    aws_access_key_id=credentials['AccessKeyId'],
+                    aws_secret_access_key=credentials['SecretAccessKey'],
+                    aws_session_token=credentials['SessionToken'],
+                )
+
+            def parse_granular_config(policy_lines, module_scope):
+                """Create policy dictionaries from a string with comma-separated values.
+
+                Format: module,policy_type,principal,regions,payload
+                Regions are separated by colons within the regions field.
+                Multiple lines are separated by linebreaks.
+
+                Returns a list of policy dictionaries.
+                """
+                instances = []
+                lines_for_module = 0
+
+                logger.info(f'Parsing granular config file, found {len(policy_lines) if policy_lines else 0} lines')
+                try:
+                    for line in policy_lines:
+                        line = line.strip()
+                        if not line or line[0] == '#':  # Skip empty or commented lines
+                            continue
+
+                        parts = line.split(',')
+                        if len(parts) < 3:
+                            continue # malformed so ignore
+                        while len(parts) < 5:
+                            parts.append('')
+
+                        module, policy_type, principal, regions_str, payload = [p.strip() for p in parts]
+                        module = module if len(module) > 0 and module != '*' else module_scope
+
+                        if module == module_scope:
+                            if len(regions_str) == 0 or regions_str == '*':
+                                regions_str = REGIONS
+                            # Parse regions (colon-separated)
+                            regions = [r.strip() for r in regions_str.split(':')]
+
+                            instance = {
+                                'principal': principal,
+                                'module': module,
+                                'policy_type': policy_type,
+                                'regions': regions,
+                                'payload': payload
+                            }
+                            instances.append(instance)
+                            lines_for_module += 1
+
+                    return instances, lines_for_module
+                except Exception as exc: #pylint: disable=broad-exception-caught
+                    logger.error( f'{type(exc).__name__}: When parsing granular config file. {exc}')
+                    return [], 0
+
+            class OrganizationsPrincipalExpander:
+                """Expands OU principals to individual account principals using AWS Organizations."""
+
+                def __init__(self, organizations_client=None, logger=None):
+                    """Initialize with optional Organizations client and logger."""
+                    self.organizations_client = organizations_client or boto3.client('organizations')
+                    self.logger = logger or logging.getLogger(__name__)
+
+                def process_policies(self, principal_policies, module=None):
+                    """Process policies with allow ('A') and deny ('D') types, applying deny precedence.
+
+                    Args:
+                        principal_policies: List of policy dictionaries
+
+                    Returns:
+                        OrderedDict with account IDs as keys and policy dictionaries as values
+                    """
+                    try:
+                        if module:
+                            principal_policies = [p for p in principal_policies if p['module'].upper() == module.upper()]
+
+                        # Filter policies by type
+                        allow_policies = [p for p in principal_policies if p['policy_type'][0].upper() == 'A']
+                        deny_policies = [p for p in principal_policies if p['policy_type'][0].upper() == 'D']
+
+                        # Process allow policies first
+                        allow_expanded = self._expand_principals(allow_policies)
+                        logger.debug(f"Expanded ALLOW policies are {allow_expanded}")
+
+                        # Process deny policies
+                        deny_expanded = self._expand_principals(deny_policies)
+                        logger.debug(f"Expanded DENY policies are {deny_expanded}")
+
+                        # Remove allow entries that intersect with deny entries
+                        # Region-aware: remove only matching regions, delete account if none remain
+                        for account_id, deny_policy in deny_expanded.items():
+                            deny_regions = set(deny_policy.get('regions', ['*']))
+                            logger.debug(f"Applying DENY policies to account {account_id}: {deny_policy}")
+
+                            # If denying all regions for all accounts then there are no possible allow rules
+                            if '*' in deny_regions and account_id == '*':
+                                logger.warning("Rule denies all regions for all accounts. Nothing will be invoked.")
+                                return []
+
+                            # Check if deny only certain regions for all accounts
+                            if account_id == '*':
+                                logger.debug(f"Deny all rule detected for specific regions {deny_regions}")
+                                for account_id, allow_policy in allow_expanded.items():
+                                    allow_regions = allow_policy.get('regions', [])
+                                    # Remove matching regions from the allow policy
+                                    remaining = [r for r in allow_regions if r not in deny_regions]
+                                    if remaining:
+                                        logger.debug(f"Remaining regions for account {account_id} are {remaining}")
+                                        allow_policy['regions'] = remaining
+                                    else:
+                                        logger.info(f"No remaining regions in scope for account {account_id} so removing entirely")
+                                        del allow_expanded[account_id]
+                                continue
+
+                            # Specified account to deny but not in the allow list so nothing to do
+                            if account_id not in allow_expanded:
+                                logger.info(f"DENY policy for account {account_id} is not in the account allow list")
+                                continue
+
+                            allow_policy = allow_expanded[account_id]
+                            allow_regions = allow_policy.get('regions', [])
+
+                            # Wildcard region deny removes the entire account
+                            if '*' in deny_regions:
+                                logger.warning(f"DENY policy for account {account_id} specifies all regions so removing account entirely")
+                                del allow_expanded[account_id]
+                                continue
+
+                            # Remove matching regions from the allow policy
+                            remaining = [r for r in allow_regions if r not in deny_regions]
+                            if remaining:
+                                logger.debug(f"Remaining regions for account {account_id} are {remaining}")
+                                allow_policy['regions'] = remaining
+                            else:
+                                logger.debug(f"No remaining regions in scope for account {account_id} so removing entirely")
+                                del allow_expanded[account_id]
+
+                        logger.debug(f"All policies successfully parsed and resulting in {allow_expanded}")
+                        return allow_expanded
+                    except Exception as exc: #pylint: disable=broad-exception-caught
+                        self.logger.error(f'{type(exc).__name__}: Error processing policies: {exc}')
+                        return []
+
+                def _expand_principals(self, principal_policies):
+                    """Private method to expand OU principals to individual account principals.
+
+                    Args:
+                        principal_policies: List of policy dictionaries
+
+                    Returns:
+                        OrderedDict with account IDs as keys and policy dictionaries as values
+                    """
+                    expanded_principals = OrderedDict()
+
+                    for policy in principal_policies:
+                        if self._is_ou_principal(policy['principal']):
+                            # Get all accounts under this OU with the policy object
+                            account_policy_dict = self._get_all_accounts_in_ou(policy['principal'], policy)
+
+                            # Add the dictionary contents to expanded_principals
+                            for account_id, original_policy in account_policy_dict.items():
+                                expanded_policy = {
+                                    'account_id': account_id,
+                                    'regions': original_policy['regions'].copy(),
+                                    'payload': original_policy['payload']
+                                }
+                                expanded_principals[account_id] = expanded_policy
+                        else:
+                            # Keep non-OU principals as-is
+                            expanded_principals[policy['principal']] = policy
+
+                    return expanded_principals
+
+                def _is_ou_principal(self, principal):
+                    """Check if principal represents an OU or root."""
+                    return principal and (principal.startswith(('r-', 'ou-')) and not re.match(r'^\d+$', principal))
+
+                def _get_all_accounts_in_ou(self, ou_id, principal_policy):
+                    """Recursively get all account IDs under an OU with their associated policy.
+
+                    Args:
+                        ou_id: The OU ID to expand
+                        principal_policy: The policy dictionary associated with this OU
+
+                    Returns:
+                        OrderedDict with account IDs as keys and policy dictionaries as values
+                    """
+                    accounts = OrderedDict()
+
+                    try:
+                        # Get direct account children with pagination
+                        paginator = self.organizations_client.get_paginator('list_children')
+                        account_pages = paginator.paginate(
+                            ParentId=ou_id,
+                            ChildType='ACCOUNT'
+                        )
+
+                        # Add all direct account children
+                        for page in account_pages:
+                            for child in page['Children']:
+                                accounts[child['Id']] = principal_policy
+
+                        # Get all child OUs with pagination
+                        ou_pages = paginator.paginate(
+                            ParentId=ou_id,
+                            ChildType='ORGANIZATIONAL_UNIT'
+                        )
+
+                        for page in ou_pages:
+                            for child_ou in page['Children']:
+                                # Recursively get accounts from child OUs
+                                child_accounts = self._get_all_accounts_in_ou(child_ou['Id'], principal_policy)
+                                accounts.update(child_accounts)
+
+                    except Exception as exc: #pylint: disable=broad-exception-caught
+                        self.logger.error( f'{type(exc).__name__}: Error retrieving children for OU {ou_id}: {exc}')
+
+                    return accounts
+      Handler: 'index.lambda_handler'
+      MemorySize: 2688
+      Timeout: 600
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          ROLE_NAME: !Ref ManagementRoleName
+          MANAGEMENT_ACCOUNT_IDS: !Ref ManagementAccountID
+          RESOURCE_PREFIX: !Ref ResourcePrefix
+          BUCKET_NAME: !Ref DestinationBucket
+          PREDEF_ACCOUNT_LIST_KEY: "account-list/account-list"
+          EXCLUDED_ACCOUNT_LIST_KEY: "account-list/excluded-linked-account-list.csv"
+          EUC_ACCOUNT_IDS: !Ref EUCAccountIDs
+          GRANULAR_EXECUTION_CONFIG_KEY: "account-list/granular-execution-config.csv"
+          REGIONS: !Ref RegionsInScope
+
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89 # Lambda functions should be deployed inside a VPC
+            reason: "No need for VPC in this case"
+          - id: W92 #  Lambda functions should define ReservedConcurrentExecutions to reserve simultaneous executions
+            reason: "No need for simultaneous execution"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${LambdaFunction}"
+      RetentionInDays: 60

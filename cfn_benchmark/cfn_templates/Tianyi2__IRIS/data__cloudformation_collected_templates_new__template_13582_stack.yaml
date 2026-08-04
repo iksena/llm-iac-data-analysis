@@ -1,0 +1,190 @@
+Description: Pass-through CloudFormation stack for BYO-VPC. Accepts existing VPC and subnet IDs, validates they belong together, and outputs them for use by Nuon.
+
+Parameters:
+  VpcID:
+    Description: The ID of the existing VPC (e.g., vpc-xxxxxxxxx).
+    Type: AWS::EC2::VPC::Id
+
+  PublicSubnetIDs:
+    Description: Comma-separated list of existing public subnet IDs.
+    Type: String
+
+  PrivateSubnetIDs:
+    Description: Comma-separated list of existing private subnet IDs.
+    Type: String
+
+  RunnerSubnetID:
+    Description: Subnet ID for the Nuon runner. Must have outbound internet access (e.g., via NAT Gateway).
+    Type: AWS::EC2::Subnet::Id
+
+  NuonInstallID:
+    Description: The Nuon Install ID.
+    Type: String
+
+  NuonOrgID:
+    Description: The Nuon Org ID. Used in tags.
+    Type: String
+
+  NuonAppID:
+    Description: The Nuon App ID. Used in tags.
+    Type: String
+
+Resources:
+  # Lambda execution role
+  SubnetValidatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${NuonInstallID}-subnet-validator-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DescribeSubnets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeNatGateways
+                Resource: "*"
+      Tags:
+        - Key: "install.nuon.co/id"
+          Value: !Ref NuonInstallID
+        - Key: "org.nuon.co/id"
+          Value: !Ref NuonOrgID
+        - Key: "app.nuon.co/id"
+          Value: !Ref NuonAppID
+
+  # Lambda function to validate subnets belong to VPC
+  SubnetValidatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${NuonInstallID}-subnet-validator
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt SubnetValidatorRole.Arn
+      Timeout: 30
+      Tags:
+        - Key: "install.nuon.co/id"
+          Value: !Ref NuonInstallID
+        - Key: "org.nuon.co/id"
+          Value: !Ref NuonOrgID
+        - Key: "app.nuon.co/id"
+          Value: !Ref NuonAppID
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  vpc_id = event['ResourceProperties']['VpcId']
+                  # Parse comma-separated strings into lists
+                  public_subnets_str = event['ResourceProperties']['PublicSubnets']
+                  private_subnets_str = event['ResourceProperties']['PrivateSubnets']
+                  runner_subnet = event['ResourceProperties']['RunnerSubnet']
+
+                  public_subnets = [s.strip() for s in public_subnets_str.split(',') if s.strip()]
+                  private_subnets = [s.strip() for s in private_subnets_str.split(',') if s.strip()]
+
+                  all_subnets = public_subnets + private_subnets + [runner_subnet]
+                  if not all_subnets:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                                       reason="At least one subnet must be provided")
+                      return
+
+                  ec2 = boto3.client('ec2')
+                  response = ec2.describe_subnets(SubnetIds=all_subnets)
+
+                  invalid_subnets = []
+                  for subnet in response['Subnets']:
+                      if subnet['VpcId'] != vpc_id:
+                          invalid_subnets.append(subnet['SubnetId'])
+
+                  if invalid_subnets:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                                       reason=f"Subnets do not belong to VPC {vpc_id}: {invalid_subnets}")
+                      return
+
+                  # Validate runner subnet has outbound internet access
+                  route_tables = ec2.describe_route_tables(
+                      Filters=[
+                          {'Name': 'association.subnet-id', 'Values': [runner_subnet]}
+                      ]
+                  )['RouteTables']
+
+                  # If no explicit association, get main route table for VPC
+                  if not route_tables:
+                      route_tables = ec2.describe_route_tables(
+                          Filters=[
+                              {'Name': 'vpc-id', 'Values': [vpc_id]},
+                              {'Name': 'association.main', 'Values': ['true']}
+                          ]
+                      )['RouteTables']
+
+                  has_internet_route = False
+                  for rt in route_tables:
+                      for route in rt.get('Routes', []):
+                          dest = route.get('DestinationCidrBlock', '')
+                          # Check for default route via NAT or IGW
+                          if dest == '0.0.0.0/0':
+                              if route.get('NatGatewayId') or route.get('GatewayId', '').startswith('igw-'):
+                                  has_internet_route = True
+                                  break
+                      if has_internet_route:
+                          break
+
+                  if not has_internet_route:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                                       reason=f"Runner subnet {runner_subnet} does not have outbound internet access (no route to NAT Gateway or Internet Gateway)")
+                      return
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'ValidatedPublicSubnets': ','.join(public_subnets),
+                      'ValidatedPrivateSubnets': ','.join(private_subnets),
+                      'ValidatedRunnerSubnet': runner_subnet,
+                      'VpcId': vpc_id
+                  })
+
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {},
+                                   reason=str(e))
+
+  # Custom resource that invokes the validator
+  SubnetValidation:
+    Type: Custom::SubnetValidation
+    Properties:
+      ServiceToken: !GetAtt SubnetValidatorFunction.Arn
+      VpcId: !Ref VpcID
+      PublicSubnets: !Ref PublicSubnetIDs
+      PrivateSubnets: !Ref PrivateSubnetIDs
+      RunnerSubnet: !Ref RunnerSubnetID
+
+Outputs:
+  VPC:
+    Description: The VPC ID.
+    Value: !Ref VpcID
+
+  PublicSubnets:
+    Description: List of public subnet IDs.
+    Value: !GetAtt SubnetValidation.ValidatedPublicSubnets
+
+  PrivateSubnets:
+    Description: List of private subnet IDs.
+    Value: !GetAtt SubnetValidation.ValidatedPrivateSubnets
+
+  RunnerSubnet:
+    Description: The subnet ID for the Nuon runner.
+    Value: !GetAtt SubnetValidation.ValidatedRunnerSubnet

@@ -1,0 +1,1018 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Retrieves Inventory data for the chosen service
+Parameters:
+  DatabaseName:
+    Type: String
+    Description: Name of the Athena database to be created to hold lambda information
+    Default: optimization_data
+  DataBucketsKmsKeysArns:
+    Type: String
+    Description: KMS Key ARNs used for encrypting data in S3 buckets (comma separated)
+  DestinationBucket:
+    Type: String
+    Description: Name of the S3 Bucket to be created to hold data information
+    AllowedPattern: (?=^.{3,63}$)(?!^(\d+\.)+\d+$)(^(([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])\.)*([a-z0-9]|[a-z0-9][a-z0-9\-]*[a-z0-9])$)
+  DestinationBucketARN:
+    Type: String
+    Description: ARN of the S3 Bucket that exists or needs to be created to hold rightsizing information
+  MultiAccountRoleName:
+    Type: String
+    Description: Name of the IAM role deployed in all accounts which can retrieve AWS Data.
+  CFDataName:
+    Type: String
+    Description: The name of what this cf is doing.
+    Default: trusted-advisor
+  GlueRoleARN:
+    Type: String
+    Description: Arn for the Glue Crawler role
+  Schedule:
+    Type: String
+    Description: EventBridge Schedule to trigger the data collection
+    Default: "rate(14 days)"
+  ResourcePrefix:
+    Type: String
+    Description: This prefix will be placed in front of all roles created. Note you may wish to add a dash at the end to make more readable
+  LambdaAnalyticsARN:
+    Type: String
+    Description: Arn of lambda for Analytics
+  AccountCollectorLambdaARN:
+    Type: String
+    Description: Arn of the Account Collector Lambda
+  CodeBucket:
+    Type: String
+    Description: Source code bucket
+  StepFunctionTemplate:
+    Type: String
+    Description: S3 key to the JSON template for the StepFunction
+  StepFunctionExecutionRoleARN:
+    Type: String
+    Description: Common role for Step Function execution
+  SchedulerExecutionRoleARN:
+    Type: String
+    Description: Common role for module Scheduler execution
+  LambdaManageGlueTableARN:
+    Type: String
+    Description: ARN of a Lambda for Managing GlueTable
+
+Outputs:
+  StepFunctionARN:
+    Description: ARN for the module's Step Function
+    Value: !GetAtt ModuleStepFunction.Arn
+
+Conditions:
+  NeedDataBucketsKms: !Not [!Equals [!Ref DataBucketsKmsKeysArns, '']]
+
+Resources:
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ResourcePrefix}${CFDataName}-LambdaRole"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - !Sub "lambda.${AWS::URLSuffix}"
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Path: /
+      Policies:
+        - !If
+          - NeedDataBucketsKms
+          - PolicyName: "KMS"
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action:
+                    - "kms:GenerateDataKey"
+                  Resource: !Split [ ',', !Ref DataBucketsKmsKeysArns ]
+          - !Ref AWS::NoValue
+        - PolicyName: "AssumeMultiAccountRole"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action: "sts:AssumeRole"
+                Resource: !Sub "arn:${AWS::Partition}:iam::*:role/${MultiAccountRoleName}"
+        - PolicyName: "S3Access"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "s3:PutObject"
+                Resource:
+                  - !Sub "${DestinationBucketARN}/*"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28 # Resource found with an explicit name, this disallows updates that require replacement of this resource
+            reason: "Need explicit name to identify role actions"
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}${CFDataName}-Lambda'
+      Description: !Sub "Lambda function to retrieve ${CFDataName}"
+      Runtime: python3.13
+      Architectures: [x86_64]
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import logging
+          from datetime import date, datetime
+          from json import JSONEncoder
+          import boto3
+          from botocore.client import Config
+
+          PREFIX = os.environ["PREFIX"]
+          BUCKET = os.environ["BUCKET_NAME"]
+          ROLE_NAME = os.environ['ROLENAME']
+          COSTONLY = os.environ.get('COSTONLY', 'no').lower() == 'yes'
+          TMP_FILE = "/tmp/data.json"
+          TMP_FILE_Priority = "/tmp/data_priority.json"
+          REGIONS = ["us-east-1"]
+
+          #config to avoid ThrottlingException
+          config = Config(
+              retries = {
+                  'max_attempts': 10,
+                  'mode': 'standard'
+              }
+          )
+
+          logger = logging.getLogger(__name__)
+          logger.setLevel(getattr(logging, os.environ.get('LOG_LEVEL', 'INFO').upper(), logging.INFO))
+
+          def lambda_handler(event, context): #pylint: disable=unused-argument
+              if 'account' not in event:
+                  raise ValueError(
+                      "Please do not trigger this Lambda manually."
+                      "Find the corresponding state machine in Step Functions and Trigger from there."
+                  )
+              try:
+                  account = json.loads(event["account"])
+                  account_id = account["account_id"]
+                  account_name = account["account_name"]
+                  payer_id = account["payer_id"]
+
+                  logger.info(f"Collecting TA for account: {account_id}")
+                  filename = read_ta(account_id, account_name)
+                  upload_to_s3(account_id, payer_id, "data", filename)
+
+                  logger.info(f"Collecting TA Priority for account: {account_id}")
+                  filename = read_ta_priority(account_id, account_name)
+                  upload_to_s3(account_id, payer_id, "priority-data", filename)
+
+              except Exception as e: #pylint: disable=broad-exception-caught
+                  logging.warning(e)
+
+          def upload_to_s3(account_id, payer_id, suffix, tmp_file):
+              key = datetime.now().strftime(
+                  f"{PREFIX}/{PREFIX}-{suffix}/payer_id={payer_id}/year=%Y/month=%m/{PREFIX}-{account_id}-%d%m%Y-%H%M%S.json"
+              )
+
+              if os.path.getsize(tmp_file) == 0:
+                  print(f"No data in file for {tmp_file}")
+                  return
+
+              try:
+                  boto3.client("s3").upload_file(tmp_file, BUCKET, key)
+                  print(f"Data for {account_id} in s3 - {key}")
+              except Exception as e: #pylint: disable=broad-exception-caught
+                  print(f"{type(e)}: {e}")
+
+          def assume_role(account_id, service, region, role):
+              partition = boto3.session.Session().get_partition_for_region(region_name=region)
+              assumed = boto3.client('sts', region_name=region).assume_role(
+                  RoleArn=f"arn:{partition}:iam::{account_id}:role/{role}",
+                  RoleSessionName='data_collection'
+              )
+              creds = assumed['Credentials']
+              return boto3.client(service, region_name=region,
+                  aws_access_key_id=creds['AccessKeyId'],
+                  aws_secret_access_key=creds['SecretAccessKey'],
+                  aws_session_token=creds['SessionToken'],
+                  config=config,
+              )
+
+          def _json_serial(self, obj):
+              return obj.isoformat() if isinstance(obj, (datetime, date)) else JSONEncoder.default(self, obj)
+
+          def read_ta(account_id, account_name):
+              with open(TMP_FILE, "w", encoding='utf-8') as f:
+                  support = assume_role(account_id, "support", REGIONS[0], ROLE_NAME)
+                  checks = support.describe_trusted_advisor_checks(language="en")["checks"]
+                  for check in checks:
+                      #print(json.dumps(check))
+                      if (COSTONLY and check.get("category") != "cost_optimizing"):
+                          continue
+                      try:
+                          result = support.describe_trusted_advisor_check_result(checkId=check["id"], language="en")['result']
+                          #print(json.dumps(result))
+                          if result.get("status") == "not_available":
+                              continue
+                          dt = result['timestamp']
+                          ts = datetime.strptime(dt, '%Y-%m-%dT%H:%M:%SZ').strftime('%s')
+                          for resource in result["flaggedResources"]:
+                              output = {}
+                              if "metadata" in resource:
+                                  output.update(dict(zip(check["metadata"], resource["metadata"])))
+                                  del resource['metadata']
+                              resource["Region"] = resource.pop("region") if "region" in resource else '-'
+                              resource["Status"] = resource.pop("status") if "status" in resource else '-'
+                              output.update({"AccountId":account_id, "AccountName":account_name, "Category": check["category"], 'DateTime': dt, 'Timestamp': ts, "CheckName": check["name"], "CheckId": check["id"]})
+                              output.update(resource)
+                              output = {k.lower(): v for k, v in output.items()}
+                              f.write(json.dumps(output, default=_json_serial) + "\n")
+                      except Exception as e: #pylint: disable=broad-exception-caught
+                          print(f'{type(e)}: {e}')
+              return TMP_FILE
+
+          def _isoformat(date_value, default='N/A'):
+              """ Converts a datetime value to ISO format string.
+              """
+              return date_value.isoformat() if isinstance(date_value, datetime) else default
+
+          def read_ta_priority(account_id, account_name):
+              """ Read recommendations and write to a file
+              """
+              trustedadvisor = assume_role(account_id, "trustedadvisor", REGIONS[0], ROLE_NAME)
+              try:
+                  # Get all checks metadata first for dynamic field mapping
+                  checks_metadata = {}
+                  try:
+                      for check in trustedadvisor.get_paginator('list_checks').paginate().search('checkSummaries'):
+                          # Store metadata dictionary for each check ARN
+                          checks_metadata[check['arn']] = check.get('metadata', {})
+                  except Exception as e:
+                      print(f"Warning: Could not fetch checks metadata: {str(e)}")
+                      checks_metadata = {}
+
+                  recommendations = (trustedadvisor
+                      .get_paginator('list_recommendations')
+                      .paginate(type='priority')
+                      .search('recommendationSummaries[]')
+                  )
+                  with open(TMP_FILE_Priority, 'w', encoding='utf-8') as jsonfile:
+                      for recommendation in recommendations:
+                          # Get recommendation details including resolved date
+                          recommendation_details = (trustedadvisor
+                              .get_recommendation(recommendationIdentifier=recommendation['arn'])
+                              .get('recommendation', {})
+                          )
+                          # Get resources for this recommendation
+                          try:
+                              resources = list(trustedadvisor
+                                  .get_paginator('list_recommendation_resources')
+                                  .paginate(recommendationIdentifier=recommendation['arn'])
+                                  .search('recommendationResourceSummaries[]')
+                              )
+                          except trustedadvisor.exceptions.ClientError as e:
+                              print(f"Error getting resources for recommendation {recommendation['arn']}: {str(e)}")
+                              resources = []
+
+                          # Base recommendation data
+                          rec_data = {
+                              'recommendationArn': recommendation['arn'],
+                              'name': recommendation['name'],
+                              'description': recommendation_details['description'],
+                              'awsServices': recommendation.get('awsServices', 'N/A'),
+                              'createdAt': _isoformat(recommendation['createdAt']),
+                              'resolvedAt': _isoformat(recommendation_details['resolvedAt']),
+                              'lastUpdatedAt': _isoformat(recommendation['lastUpdatedAt']),
+                              'lifecycleStage': recommendation['lifecycleStage'],
+                              'recommendationStatus': recommendation['status'],
+                              'pillars': recommendation['pillars'],
+                              'source': recommendation['source'],
+                              'accountID': account_id,
+                              'accountName': account_name
+                          }
+
+                          # Get check ARN from recommendation for metadata mapping
+                          check_arn = recommendation_details.get('checkArn')
+                          metadata_schema = checks_metadata.get(check_arn, {}) if check_arn else {}
+
+                          for resource in (resources or [{}]):
+                              resource_data = rec_data.copy()
+
+                              # Dynamically map metadata fields
+                              metadata_dict = {}
+                              if metadata_schema and 'metadata' in resource:
+                                  resource_metadata = resource['metadata']
+                                  if isinstance(resource_metadata, dict) and isinstance(metadata_schema, dict):
+                                      for key in metadata_schema.keys():
+                                          if key in resource_metadata:
+                                              field_name = metadata_schema[key].lower()
+                                              metadata_dict[field_name] = resource_metadata[key]
+
+                              # Update resource details
+                              resource_data.update({
+                                  'awsResourceDetails': json.dumps(metadata_dict) if metadata_dict else json.dumps({}),
+                                  'exclusionStatus': resource.get('exclusionStatus', 'N/A'),
+                                  'recommResourceId': resource.get('id', 'N/A'),
+                                  'recommResourceArn': resource.get('arn', 'N/A'),
+                                  'regionCode': resource.get('regionCode', 'N/A'),
+                                  'resourceStatus': resource.get('status', 'N/A')
+                              })
+
+                              jsonfile.write(json.dumps(resource_data) + '\n')
+
+              except Exception as e: #pylint: disable=broad-exception-caught
+                  print(f"Error processing TA-Priority: {str(e)}")
+                  raise
+              return TMP_FILE_Priority
+
+      Handler: 'index.lambda_handler'
+      MemorySize: 2688
+      Timeout: 300
+      Role: !GetAtt LambdaRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DestinationBucket
+          PREFIX: !Ref CFDataName
+          ROLENAME: !Ref MultiAccountRoleName
+          COSTONLY: "no"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89 # Lambda functions should be deployed inside a VPC
+            reason: "No need for VPC in this case"
+          - id: W92 #  Lambda functions should define ReservedConcurrentExecutions to reserve simultaneous executions
+            reason: "No need for simultaneous execution"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${LambdaFunction}"
+      RetentionInDays: 60
+
+  Crawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: !Sub '${ResourcePrefix}${CFDataName}-Crawler'
+      Role: !Ref GlueRoleARN
+      DatabaseName: !Ref DatabaseName
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DestinationBucket}/${CFDataName}/${CFDataName}-data/"
+          - Path: !Sub "s3://${DestinationBucket}/${CFDataName}/${CFDataName}-priority-data/"
+      Configuration: |
+        {
+          "Version": 1.0,
+          "Grouping": {
+            "TableGroupingPolicy": "CombineCompatibleSchemas"
+          },
+          "CrawlerOutput": {
+            "Partitions": {
+              "AddOrUpdateBehavior": "InheritFromTable"
+            },
+            "Tables": {
+              "TableThreshold": 2,
+              "AddOrUpdateBehavior": "MergeNewColumns"
+            }
+          }
+        }
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+  TADataTable:
+    Type: Custom::ManageGlueTable
+    Properties:
+      ServiceToken: !Ref LambdaManageGlueTableARN
+      TableInput:
+        Name: trusted_advisor_data
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          UPDATED_BY_CRAWLER: !Sub '${ResourcePrefix}${CFDataName}-Crawler'
+          compressionType: none
+        StorageDescriptor:
+          Columns:
+            - Name: "ip address"
+              Type: string
+            - Name: "checkname"
+              Type: string
+            - Name: "accountparentname"
+              Type: string
+            - Name: "accountid"
+              Type: string
+            - Name: "category"
+              Type: string
+            - Name: "checkid"
+              Type: string
+            - Name: "issuppressed"
+              Type: string
+            - Name: "resourceid"
+              Type: string
+            - Name: "region"
+              Type: string
+            - Name: "accountparentid"
+              Type: string
+            - Name: "timestamp"
+              Type: string
+            - Name: "accountname"
+              Type: string
+            - Name: "status"
+              Type: string
+            - Name: "acl allows list"
+              Type: string
+            - Name: "bucket name"
+              Type: string
+            - Name: "acl allows upload/delete"
+              Type: string
+            - Name: "region name"
+              Type: string
+            - Name: "policy allows access"
+              Type: string
+            - Name: "ignored bucket name"
+              Type: string
+            - Name: "region api parameter"
+              Type: string
+            - Name: "password policy"
+              Type: string
+            - Name: "reason"
+              Type: string
+            - Name: "number"
+              Type: string
+            - Name: "uppercase"
+              Type: string
+            - Name: "lowercase"
+              Type: string
+            - Name: "non-alphanumeric"
+              Type: string
+            - Name: "write enabled"
+              Type: string
+            - Name: "same owner"
+              Type: string
+            - Name: "target exists"
+              Type: string
+            - Name: "target name"
+              Type: string
+            - Name: "trail name"
+              Type: string
+            - Name: "logging status"
+              Type: string
+            - Name: "last delivery error"
+              Type: string
+            - Name: "access key"
+              Type: string
+            - Name: "key last rotated"
+              Type: string
+            - Name: "iam user"
+              Type: string
+            - Name: "mfa delete enabled"
+              Type: string
+            - Name: "versioning"
+              Type: string
+            - Name: "current usage"
+              Type: string
+            - Name: "service"
+              Type: string
+            - Name: "limit amount"
+              Type: string
+            - Name: "limit name"
+              Type: string
+            - Name: "snapshot id"
+              Type: string
+            - Name: "volume name"
+              Type: string
+            - Name: "snapshot age"
+              Type: string
+            - Name: "volume attachment"
+              Type: string
+            - Name: "volume id"
+              Type: string
+            - Name: "snapshot name"
+              Type: string
+            - Name: "volume type"
+              Type: string
+            - Name: "volume size"
+              Type: string
+            - Name: "monthly storage cost"
+              Type: string
+            - Name: "max daily median"
+              Type: string
+            - Name: "number of days over"
+              Type: string
+            - Name: "day 14"
+              Type: string
+            - Name: "day 13"
+              Type: string
+            - Name: "day 12"
+              Type: string
+            - Name: "day 11"
+              Type: string
+            - Name: "day 10"
+              Type: string
+            - Name: "day 1"
+              Type: string
+            - Name: "day 2"
+              Type: string
+            - Name: "day 3"
+              Type: string
+            - Name: "day 8"
+              Type: string
+            - Name: "day 9"
+              Type: string
+            - Name: "day 4"
+              Type: string
+            - Name: "day 5"
+              Type: string
+            - Name: "day 6"
+              Type: string
+            - Name: "day 7"
+              Type: string
+            - Name: "region/az"
+              Type: string
+            - Name: "14-day average cpu utilization"
+              Type: string
+            - Name: "instance type"
+              Type: string
+            - Name: "instance name"
+              Type: string
+            - Name: "estimated monthly savings"
+              Type: string
+            - Name: "14-day average network i/o"
+              Type: string
+            - Name: "number of days low utilization"
+              Type: string
+            - Name: "instance id"
+              Type: string
+            - Name: "instances in zone a"
+              Type: string
+            - Name: "instances in zone b"
+              Type: string
+            - Name: "instances in zone e"
+              Type: string
+            - Name: "instances in zone f"
+              Type: string
+            - Name: "instances in zone c"
+              Type: string
+            - Name: "instances in zone d"
+              Type: string
+            - Name: "load balancer associated"
+              Type: string
+            - Name: "auto scaling group name"
+              Type: string
+            - Name: "health check"
+              Type: string
+            - Name: "total inbound rules"
+              Type: string
+            - Name: "total outbound rules"
+              Type: string
+            - Name: "vpc id"
+              Type: string
+            - Name: "db instance"
+              Type: string
+            - Name: "multi-az"
+              Type: string
+            - Name: "security group id"
+              Type: string
+            - Name: "ports"
+              Type: string
+            - Name: "security group name"
+              Type: string
+            - Name: "protocol"
+              Type: string
+            - Name: "port"
+              Type: string
+            - Name: "ip range"
+              Type: string
+            - Name: "customer gateway"
+              Type: string
+            - Name: "vpc"
+              Type: string
+            - Name: "active tunnels"
+              Type: string
+            - Name: "vpn id"
+              Type: string
+            - Name: "virtual private gateway"
+              Type: string
+            - Name: "distribution domain name"
+              Type: string
+            - Name: "distribution id"
+              Type: string
+            - Name: "alternate domain name"
+              Type: string
+            - Name: "hosted zone name"
+              Type: string
+            - Name: "hosted zone id"
+              Type: string
+            - Name: "number of name server delegations used"
+              Type: string
+            - Name: "number of days over 90% cpu utilization"
+              Type: string
+            - Name: "resource name"
+              Type: string
+            - Name: "launch configuration name"
+              Type: string
+            - Name: "launch type"
+              Type: string
+            - Name: "resource type"
+              Type: string
+            - Name: "launch name"
+              Type: string
+            - Name: "backup retention period"
+              Type: string
+            - Name: "description"
+              Type: string
+            - Name: "instance count"
+              Type: string
+            - Name: "group id"
+              Type: string
+            - Name: "resource record set identifier"
+              Type: string
+            - Name: "resource record set type"
+              Type: string
+            - Name: "alias target"
+              Type: string
+            - Name: "resource record set name"
+              Type: string
+            - Name: "headers"
+              Type: string
+            - Name: "cache behavior path pattern"
+              Type: string
+            - Name: "lookback period (days)"
+              Type: string
+            - Name: "upfront cost"
+              Type: string
+            - Name: "payment option"
+              Type: string
+            - Name: "hourly commitment to purchase"
+              Type: string
+            - Name: "estimated savings percentage"
+              Type: string
+            - Name: "term (years)"
+              Type: string
+            - Name: "savings plan type"
+              Type: string
+            - Name: "estimated average utilization"
+              Type: string
+            - Name: "origin"
+              Type: string
+            - Name: "days since last connection"
+              Type: string
+            - Name: "db instance name"
+              Type: string
+            - Name: "storage provisioned (gb)"
+              Type: string
+            - Name: "estimated monthly savings (on demand)"
+              Type: string
+            - Name: "cluster"
+              Type: string
+            - Name: "estimated break even (months)"
+              Type: string
+            - Name: "platform"
+              Type: string
+            - Name: "expected average ri utilization"
+              Type: string
+            - Name: "estimated on-demand cost post recommended ri purchase (monthly)"
+              Type: string
+            - Name: "recommended number of ris to purchase"
+              Type: string
+            - Name: "upfront cost of ris"
+              Type: string
+            - Name: "estimated savings with recommendation (monthly)"
+              Type: string
+            - Name: "estimated cost of ris (monthly)"
+              Type: string
+            - Name: "load balancer name"
+              Type: string
+            - Name: "# of zones"
+              Type: string
+            - Name: "access key id"
+              Type: string
+            - Name: "case id"
+              Type: string
+            - Name: "certificate name"
+              Type: string
+            - Name: "connection details"
+              Type: string
+            - Name: "connection id for vif"
+              Type: string
+            - Name: "connection id"
+              Type: string
+            - Name: "current monthly cost"
+              Type: string
+            - Name: "data transfer out (gb)"
+              Type: string
+            - Name: "database edition"
+              Type: string
+            - Name: "database engine"
+              Type: string
+            - Name: "db instance or cluster id"
+              Type: string
+            - Name: "deadline"
+              Type: string
+            - Name: "deployment option"
+              Type: string
+            - Name: "ebs optimized"
+              Type: string
+            - Name: "estimated cost of reserved instances (monthly)"
+              Type: string
+            - Name: "estimated cost of reserved nodes (monthly)"
+              Type: string
+            - Name: "estimated on-demand cost post recommended reserved instance purchase (monthly)"
+              Type: string
+            - Name: "estimated on-demand cost post recommended reserved nodes purchase (monthly)"
+              Type: string
+            - Name: "expected average reserved instance utilization"
+              Type: string
+            - Name: "expected average reserved node utilization"
+              Type: string
+            - Name: "expected avergae reserved instance utilization"
+              Type: string
+            - Name: "expected avergae reserved node utilization"
+              Type: string
+            - Name: "expiration date"
+              Type: string
+            - Name: "family"
+              Type: string
+            - Name: "fraud type"
+              Type: string
+            - Name: "gateway id"
+              Type: string
+            - Name: "ingress rule"
+              Type: string
+            - Name: "instance class"
+              Type: string
+            - Name: "instance size"
+              Type: string
+            - Name: "license model"
+              Type: string
+            - Name: "load balancer port"
+              Type: string
+            - Name: "location for vif"
+              Type: string
+            - Name: "location"
+              Type: string
+            - Name: "node type"
+              Type: string
+            - Name: "private db instances"
+              Type: string
+            - Name: "product description"
+              Type: string
+            - Name: "public db instances"
+              Type: string
+            - Name: "ratio of transfer to storage"
+              Type: string
+            - Name: "rds security group name"
+              Type: string
+            - Name: "recommended number of reserved instances to purchase"
+              Type: string
+            - Name: "recommended number of reserved nodes to purchase"
+              Type: string
+            - Name: "reserved instance id"
+              Type: string
+            - Name: "resource record set id"
+              Type: string
+            - Name: "s3 storage (gb)"
+              Type: string
+            - Name: "security group ids"
+              Type: string
+            - Name: "time near maximum"
+              Type: string
+            - Name: "time updated"
+              Type: string
+            - Name: "ttl"
+              Type: string
+            - Name: "upfront cost of reserved instances"
+              Type: string
+            - Name: "upfront cost of reserved nodes"
+              Type: string
+            - Name: "usage (usd per day)"
+              Type: string
+            - Name: "user name (iam or root)"
+              Type: string
+            - Name: "zone"
+              Type: string
+            - Name: "function arn"
+              Type: string
+            - Name: "max daily error rate"
+              Type: string
+            - Name: "date for max error rate"
+              Type: string
+            - Name: "average daily error rate"
+              Type: string
+            - Name: "lost daily compute cost"
+              Type: string
+            - Name: "current day invokes"
+              Type: string
+            - Name: "current day error rate"
+              Type: string
+            - Name: "average daily invokes"
+              Type: string
+            - Name: "last refresh time"
+              Type: string
+            - Name: "max daily timeout rate"
+              Type: string
+            - Name: "date of max daily timeout rate"
+              Type: string
+            - Name: "average daily timeout rate"
+              Type: string
+            - Name: "function timeout setting"
+              Type: string
+            - Name: "current day timeout rate"
+              Type: string
+            - Name: "runtime"
+              Type: string
+            - Name: "days to deprecation"
+              Type: string
+            - Name: "deprecation date"
+              Type: string
+            - Name: "resource"
+              Type: string
+            - Name: "workload type"
+              Type: string
+            - Name: "workload last modified date"
+              Type: string
+            - Name: "workload started date"
+              Type: string
+            - Name: "number of questions answered for performance"
+              Type: string
+            - Name: "Number of hris resolved for performance"
+              Type: string
+            - Name: "total number of questions in performance pillar"
+              Type: string
+            - Name: "number of identified hris for performance"
+              Type: string
+            - Name: "reviewer name"
+              Type: string
+            - Name: "workload arn"
+              Type: string
+            - Name: "workload name"
+              Type: string
+            - Name: "number of hris resolved for reliability"
+              Type: string
+            - Name: "total number of questions in reliability pillar"
+              Type: string
+            - Name: "number of questions answered for reliability"
+              Type: string
+            - Name: "number of identified hris for reliability"
+              Type: string
+            - Name: "number of hris resolved for security"
+              Type: string
+            - Name: "total number of questions in security pillar"
+              Type: string
+            - Name: "number of questions answered for security"
+              Type: string
+            - Name: "number of identified hris for security"
+              Type: string
+            - Name: "number of hris resolved for cost optimization"
+              Type: string
+            - Name: "total number of questions in cost optimization pillar"
+              Type: string
+            - Name: "number of questions answered for cost optimization"
+              Type: string
+            - Name: "number of identified hris for cost optimization"
+              Type: string
+            - Name: "cluster name"
+              Type: string
+            - Name: "resource id"
+              Type: string
+            - Name: "recommended action"
+              Type: string
+            - Name: "current resource summary"
+              Type: string
+            - Name: "recommended resource summary"
+              Type: string
+            - Name: "estimated monthly cost"
+              Type: string
+            - Name: "last refresh time stamp"
+              Type: string
+            - Name: "logging enabled"
+              Type: string
+            - Name: "delivery error reported"
+              Type: string
+            - Name: "last updated time"
+              Type: string
+          Location: !Sub "s3://${DestinationBucket}/${CFDataName}/${CFDataName}-data/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Parameters:
+              UPDATED_BY_CRAWLER: !Sub '${ResourcePrefix}${CFDataName}-Crawler'
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+        PartitionKeys:
+          - Name: "payer_id"
+            Type: string
+          - Name: "year"
+            Type: string
+          - Name: "month"
+            Type: string
+
+  # Add glue table for trusted advisor priority data
+  TAPriorityTable:
+    Type: AWS::Glue::Table
+    Properties:
+      DatabaseName: !Ref DatabaseName
+      CatalogId: !Ref AWS::AccountId
+      TableInput:
+        Name: trusted_advisor_priority_data
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          UPDATED_BY_CRAWLER: !Sub '${ResourcePrefix}${CFDataName}-Crawler'
+          compressionType: none
+        StorageDescriptor:
+          Columns:
+            - Name: recommendationArn
+              Type: string
+            - Name: name
+              Type: string
+            - Name: description
+              Type: string
+            - Name: awsServices
+              Type: string
+            - Name: createdAt
+              Type: string
+            - Name: resolvedAt
+              Type: string
+            - Name: lastUpdatedAt
+              Type: string
+            - Name: lifecycleStage
+              Type: string
+            - Name: recommendationStatus
+              Type: string
+            - Name: pillars
+              Type: string
+            - Name: source
+              Type: string
+            - Name: accountID
+              Type: string
+            - Name: accountName
+              Type: string
+            - Name: awsResourceDetails
+              Type: string
+            - Name: recommResourceId
+              Type: string
+            - Name: recommResourceArn
+              Type: string
+            - Name: exclusionStatus
+              Type: string
+            - Name: regionCode
+              Type: string
+            - Name: resourceStatus
+              Type: string
+          Location: !Sub "s3://${DestinationBucket}/${CFDataName}/${CFDataName}-priority-data/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Parameters:
+              UPDATED_BY_CRAWLER: !Sub '${ResourcePrefix}${CFDataName}-Crawler'
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+        PartitionKeys:
+          - Name: payer_id
+            Type: string
+          - Name: year
+            Type: string
+          - Name: month
+            Type: string
+
+  ModuleStepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ResourcePrefix}${CFDataName}-StateMachine'
+      StateMachineType: STANDARD
+      RoleArn: !Ref StepFunctionExecutionRoleARN
+      DefinitionS3Location:
+        Bucket: !Ref CodeBucket
+        Key: !Ref StepFunctionTemplate
+      DefinitionSubstitutions:
+        AccountCollectorLambdaARN: !Ref AccountCollectorLambdaARN
+        ModuleLambdaARN: !GetAtt LambdaFunction.Arn
+        Crawlers: !Sub '["${ResourcePrefix}${CFDataName}-Crawler"]'
+        CollectionType: "LINKED"
+        Params: ''
+        Module: !Ref CFDataName
+        DeployRegion: !Ref AWS::Region
+        Account: !Ref AWS::AccountId
+        Prefix: !Ref ResourcePrefix
+        Bucket: !Ref DestinationBucket
+
+  ModuleRefreshSchedule:
+    Type: 'AWS::Scheduler::Schedule'
+    Properties:
+      Description: !Sub 'Scheduler for the ODC ${CFDataName} module'
+      Name: !Sub '${ResourcePrefix}${CFDataName}-RefreshSchedule'
+      ScheduleExpression: !Ref Schedule
+      State: ENABLED
+      FlexibleTimeWindow:
+        MaximumWindowInMinutes: 30
+        Mode: 'FLEXIBLE'
+      Target:
+        Arn: !GetAtt ModuleStepFunction.Arn
+        RoleArn: !Ref SchedulerExecutionRoleARN
+        Input: !Sub '{"module_lambda":"${LambdaFunction.Arn}","crawlers": ["${ResourcePrefix}${CFDataName}-Crawler"]}'
+
+  AnalyticsExecutor:
+    Type: Custom::LambdaAnalyticsExecutor
+    Properties:
+      ServiceToken: !Ref LambdaAnalyticsARN
+      Name: !Ref CFDataName

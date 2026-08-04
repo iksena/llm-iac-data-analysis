@@ -1,0 +1,577 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AWS CloudFormation template for dynamic Cloud 9 setups. Creates a Cloud9
+  bootstraps the instance. ONLY FOR TESTING - enables Instance with Administrative permissions!
+Parameters:
+  ExampleC9InstanceType:
+    Description: Example Cloud9 instance type
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t2.micro
+      - t3.micro
+      - t3.small
+      - t3.medium
+    ConstraintDescription: Must be a valid Cloud9 instance type
+  ExampleC9EnvType:
+    Description: Environment type.
+    Default: self
+    Type: String
+    AllowedValues:
+      - self
+      - 3rdParty
+    ConstraintDescription: must specify self or 3rdParty.
+  ExampleOwnerArn:
+    Type: String
+    Description: The Arn of the Cloud9 Owner to be set if 3rdParty deployment.
+    Default: ""
+  ExampleC9InstanceVolumeSize:
+    Type: String
+    Description: The Size in GB of the Cloud9 Instance Volume.
+    Default: "15"
+
+Conditions:
+  Create3rdPartyResources: !Equals [ !Ref ExampleC9EnvType, 3rdParty ]
+
+Resources:
+################## PERMISSIONS AND ROLES #################
+  ExampleC9Role:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: Environment
+          Value: AWS Example
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+            - ssm.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Path: "/"
+
+  ExampleC9LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName:
+          Fn::Join:
+          - ''
+          - - ExampleC9LambdaPolicy-
+            - Ref: AWS::Region
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action:
+            - cloudformation:DescribeStacks
+            - cloudformation:DescribeStackEvents
+            - cloudformation:DescribeStackResource
+            - cloudformation:DescribeStackResources
+            - ec2:DescribeInstances
+            - ec2:AssociateIamInstanceProfile
+            - ec2:ModifyInstanceAttribute
+            - ec2:ReplaceIamInstanceProfileAssociation
+            - ec2:RebootInstances
+            - iam:ListInstanceProfiles
+            - iam:PassRole
+            Resource: "*"
+
+################## LAMBDA BOOTSTRAP FUNCTION ################
+
+  ExampleC9BootstrapInstanceLambda:
+    Description: Bootstrap Cloud9 instance
+    Type: Custom::ExampleC9BootstrapInstanceLambda
+    DependsOn:
+    - ExampleC9BootstrapInstanceLambdaFunction
+    - ExampleC9Instance
+    - ExampleC9InstanceProfile
+    - ExampleC9LambdaExecutionRole
+    Properties:
+      Tags:
+        - Key: Environment
+          Value: AWS Example
+      ServiceToken:
+        Fn::GetAtt:
+        - ExampleC9BootstrapInstanceLambdaFunction
+        - Arn
+      REGION:
+        Ref: AWS::Region
+      StackName:
+        Ref: AWS::StackName
+      EnvironmentId:
+        Ref: ExampleC9Instance
+      LabIdeInstanceProfileName:
+        Ref: ExampleC9InstanceProfile
+      LabIdeInstanceProfileArn:
+        Fn::GetAtt:
+        - ExampleC9InstanceProfile
+        - Arn
+
+  ExampleC9BootstrapInstanceLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Tags:
+        - Key: Environment
+          Value: AWS Example
+      Handler: index.lambda_handler
+      Role:
+        Fn::GetAtt:
+        - ExampleC9LambdaExecutionRole
+        - Arn
+      Runtime: python3.12
+      MemorySize: 256
+      Timeout: '600'
+      Code:
+        ZipFile: |
+          from __future__ import annotations
+          from dataclasses import dataclass
+          from typing import Any, Dict, Optional
+          import boto3
+          import botocore
+          import time
+          import traceback
+          import cfnresponse
+          import logging
+          from functools import wraps
+
+          # Set up structured logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          @dataclass
+          class InstanceProfile:
+              """Data class for instance profile details."""
+              arn: str
+              name: str
+
+              def to_dict(self) -> dict[str, str]:
+                  """Convert to format required by boto3."""
+                  return {'Arn': self.arn, 'Name': self.name}
+
+          def log_execution(func):
+              """Decorator to log function execution with timing."""
+              @wraps(func)
+              def wrapper(*args, **kwargs):
+                  start_time = time.perf_counter()
+                  logger.info(f"Starting {func.__name__}")
+                  try:
+                      result = func(*args, **kwargs)
+                      execution_time = time.perf_counter() - start_time
+                      logger.info(f"Completed {func.__name__} in {execution_time:.2f} seconds")
+                      return result
+                  except Exception as e:
+                      logger.error(f"Failed {func.__name__}: {str(e)}")
+                      raise
+              return wrapper
+
+          class Cloud9InstanceManager:
+              """Manager class for Cloud9 instance operations."""
+
+              def __init__(self, ec2_client):
+                  self.ec2_client = ec2_client
+
+              @log_execution
+              def get_instance(self, stack_name: str, environment_id: str) -> Dict[str, Any]:
+                  """Get Cloud9 IDE instance details."""
+                  try:
+                      instances = self.ec2_client.describe_instances(
+                          Filters=[{
+                              'Name': 'tag:Name',
+                              'Values': [f'aws-cloud9-{stack_name}-{environment_id}']
+                          }]
+                      )['Reservations'][0]['Instances']
+
+                      if not instances:
+                          raise ValueError("No matching Cloud9 instance found")
+
+                      instance = instances[0]
+                      logger.info(f"Found Cloud9 instance: {instance['InstanceId']}")
+                      return instance
+
+                  except (IndexError, KeyError) as e:
+                      raise ValueError(f"Error finding Cloud9 instance: {str(e)}")
+
+              @log_execution
+              def attach_profile(self, instance_id: str, profile: InstanceProfile) -> None:
+                  """Attach IAM instance profile to EC2 instance."""
+                  try:
+                      self.ec2_client.associate_iam_instance_profile(
+                          IamInstanceProfile=profile.to_dict(),
+                          InstanceId=instance_id
+                      )
+                      logger.info(f"Successfully attached profile to instance {instance_id}")
+
+                      self.reboot_instance(instance_id)
+
+                  except botocore.exceptions.ClientError as error:
+                      error_code = error.response['Error']['Code']
+                      error_message = error.response['Error']['Message']
+
+                      if (error_code == 'IncorrectState' and
+                          f"There is an existing association for instance {instance_id}" in error_message):
+                          logger.warning(f"Instance profile already associated with {instance_id}")
+                          return
+
+                      raise error
+
+              @log_execution
+              def reboot_instance(self, instance_id: str) -> None:
+                  """Reboot EC2 instance."""
+                  self.ec2_client.reboot_instances(
+                      InstanceIds=[instance_id],
+                      DryRun=False
+                  )
+                  logger.info(f"Instance {instance_id} reboot initiated")
+
+              @log_execution
+              def wait_for_running_state(self, instance_id: str, timeout: int = 300) -> None:
+                  """Wait for instance to be in running state with timeout."""
+                  start_time = time.perf_counter()
+
+                  while True:
+                      if time.perf_counter() - start_time > timeout:
+                          raise TimeoutError(f"Instance {instance_id} did not reach running state within {timeout} seconds")
+
+                      response = self.ec2_client.describe_instances(InstanceIds=[instance_id])
+                      state = response['Reservations'][0]['Instances'][0]['State']['Name']
+
+                      if state == 'running':
+                          break
+
+                      logger.info(f"Waiting for instance {instance_id}. Current state: {state}")
+                      time.sleep(5)
+
+          class CustomResourceHandler:
+              """Handler for CloudFormation custom resource."""
+
+              def __init__(self, event: Dict[str, Any], context: Any):
+                  self.event = event
+                  self.context = context
+                  self.response_data: Dict[str, str] = {}
+                  self.status = cfnresponse.SUCCESS
+
+              def handle(self) -> None:
+                  """Main handler method."""
+                  try:
+                      if self.event['RequestType'] == 'Delete':
+                          self.handle_delete()
+                      elif self.event['RequestType'] == 'Create':
+                          self.handle_create()
+                  except Exception as e:
+                      logger.error(f"Error: {str(e)}")
+                      logger.error(f"Traceback: {traceback.format_exc()}")
+                      self.status = cfnresponse.FAILED
+                      self.response_data = {'Error': str(e)}
+                  finally:
+                      self.send_response()
+
+              def handle_delete(self) -> None:
+                  """Handle delete request."""
+                  self.response_data = {'Success': 'Custom Resource removed'}
+
+              @log_execution
+              def handle_create(self) -> None:
+                  """Handle create request."""
+                  props = self.event['ResourceProperties']
+                  ec2_client = boto3.client('ec2')
+                  manager = Cloud9InstanceManager(ec2_client)
+
+                  # Get Cloud9 instance
+                  instance = manager.get_instance(
+                      props['StackName'],
+                      props['EnvironmentId']
+                  )
+                  instance_id = instance['InstanceId']
+
+                  # Wait for instance to be ready
+                  manager.wait_for_running_state(instance_id)
+
+                  # Create and attach instance profile
+                  profile = InstanceProfile(
+                      arn=props['LabIdeInstanceProfileArn'],
+                      name=props['LabIdeInstanceProfileName']
+                  )
+                  manager.attach_profile(instance_id, profile)
+
+                  self.response_data = {
+                      'Success': f'Started bootstrapping for instance: {instance_id}'
+                  }
+
+              def send_response(self) -> None:
+                  """Send response to CloudFormation."""
+                  cfnresponse.send(
+                      self.event,
+                      self.context,
+                      self.status,
+                      self.response_data,
+                      'CustomResourcePhysicalID'
+                  )
+
+          def lambda_handler(event: Dict[str, Any], context: Any) -> None:
+              """Lambda handler function."""
+              logger.info(f"Received event: {event}")
+              handler = CustomResourceHandler(event, context)
+              handler.handle()
+
+################## SSM BOOTSRAP HANDLER ###############
+  ExampleC9OutputBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ExampleC9SSMDocument:
+    Type: AWS::SSM::Document
+    DependsOn: ExampleC9BootstrapInstanceLambdaFunction
+    Properties:
+      Tags:
+        - Key: Environment
+          Value: AWS Example
+      DocumentType: Command
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: "2.2"
+        description: "Bootstrap Cloud9 Instance with automatic region detection"
+        parameters:
+          ExampleC9InstanceVolumeSize:
+            type: String
+            default: !Ref ExampleC9InstanceVolumeSize
+            description: "Size of the volume in GB"
+        mainSteps:
+          - action: "aws:runShellScript"
+            name: "ExampleC9bootstrap"
+            inputs:
+              runCommand:
+                - |
+                  #!/bin/bash
+                  set -e
+
+                  # Set up logging
+                  exec 1> >(tee -a /var/log/cloud9-bootstrap.log)
+                  exec 2> >(tee -a /var/log/cloud9-bootstrap.error.log)
+
+                  # Function for logging
+                  log() {
+                    echo "$(date '+%Y-%m-%d %H:%M:%S'): $1"
+                  }
+
+                  # Function to handle errors
+                  handle_error() {
+                    log "ERROR: $1"
+                    exit 1
+                  }
+
+                  # Function to get instance metadata
+                  get_metadata() {
+                    TOKEN=`sudo curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"` \
+                    && sudo curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/$1 2>/dev/null
+                  }
+
+                  # Get instance region
+                  get_region() {
+                    local az region
+                    az=$(get_metadata "placement/availability-zone") || handle_error "Failed to get AZ"
+                    region=${az%?}
+                    echo "$region"
+                  }
+
+                  # 1. Initial Setup
+                  log "Setting up environment variables and basic configuration"
+                  {
+                    echo "LANG=en_US.utf-8" >> /etc/environment
+                    echo "LC_ALL=en_US.UTF-8" >> /etc/environment
+                    . /home/ec2-user/.bashrc
+                  } || handle_error "Failed to set up environment variables"
+
+                  # Get and set AWS region
+                  REGION=$(get_region)
+                  log "Detected AWS Region: $REGION"
+
+                  # 2. Package Management
+                  log "Installing required packages"
+                  {
+                    yum -y remove aws-cli
+                    yum -y install sqlite telnet jq strace tree gcc glibc-static python3 python3-pip gettext bash-completion
+                  } || handle_error "Failed to install packages"
+
+                  # 3. Python and AWS CLI Configuration
+                  log "Configuring Python and AWS CLI"
+                  {
+                    PATH=$PATH:/usr/bin
+                    sudo -H -u ec2-user bash -c "pip install --user -U boto boto3 botocore awscli"
+
+                    mkdir -p /home/ec2-user/.aws
+                    printf "[default]\nregion = %s\noutput = json\n" "$REGION" > /home/ec2-user/.aws/config
+                    chmod 600 /home/ec2-user/.aws/config
+                  } || handle_error "Failed to configure Python and AWS CLI"
+
+                  # 4. Volume Resizing
+                  log "Checking current volume size"
+                  {
+                    # Get current volume size in GB
+                    CURRENT_SIZE=$(df -BG / | awk 'NR==2 {print $2}' | sed 's/G//')
+                    TARGET_SIZE={{ ExampleC9InstanceVolumeSize }}
+
+                    log "Current size: ${CURRENT_SIZE}GB, Target size: ${TARGET_SIZE}GB"
+
+                    # Only proceed if current size is less than target size
+                    if [ "${CURRENT_SIZE}" -lt "${TARGET_SIZE}" ]; then
+                      log "Starting volume resize operation"
+                      {
+                        INSTANCEID=$(get_metadata "instance-id")
+                        VOLUMEID=$(sudo aws ec2 describe-instances \
+                          --instance-id $INSTANCEID \
+                          --query "Reservations[0].Instances[0].BlockDeviceMappings[0].Ebs.VolumeId" \
+                          --output text --region $REGION) || exit 3010
+
+                        log "Modifying volume $VOLUMEID"
+                        sudo aws ec2 modify-volume --volume-id $VOLUMEID --size {{ ExampleC9InstanceVolumeSize }} --region $REGION || exit 3010
+
+                        while [ \
+                          "$(sudo aws ec2 describe-volumes-modifications \
+                            --volume-id $VOLUMEID \
+                            --filters Name=modification-state,Values="optimizing","completed" \
+                            --query "length(VolumesModifications)" \
+                            --output text --region $REGION)" != "1" ]; do
+                          sleep 1
+                        done
+
+                        DEVICE_PATH=$(readlink -f /dev/xvda)
+                        if [ "$DEVICE_PATH" = "/dev/xvda" ]; then
+                          sudo growpart /dev/xvda 1 || exit 3010
+                          STR=$(cat /etc/os-release)
+                          if [[ "$STR" =~ "VERSION_ID=\"2\"" ]] || [[ "$STR" =~ "VERSION_ID=\"2022\"" ]] || [[ "$STR" =~ "VERSION_ID=\"2023\"" ]]; then
+                            sudo xfs_growfs -d / || exit 3010
+                          else
+                            sudo resize2fs /dev/xvda1 || exit 3010
+                          fi
+                        else
+                          sudo growpart /dev/nvme0n1 1 || exit 3010
+                          STR=$(cat /etc/os-release)
+                          if [[ "$STR" =~ "VERSION_ID=\"2\"" ]] || [[ "$STR" =~ "VERSION_ID=\"2022\"" ]] || [[ "$STR" =~ "VERSION_ID=\"2023\"" ]]; then
+                            sudo xfs_growfs -d / || exit 3010
+                          else
+                            sudo resize2fs /dev/nvme0n1p1 || exit 3010
+                          fi
+                        fi
+
+                        log "Volume resize completed successfully. Rebooting..."
+                        exit 3010
+                      } || {
+                        log "Error in volume resize operations"
+                        exit 3010
+                      }
+                    else
+                      log "Current volume size is adequate. Skipping resize operation."
+                    fi
+                  } || {
+                    log "Error in volume resize block"
+                    exit 3010
+                  }
+
+                  # 5. AWS Configuration
+                  log "Setting up additional AWS configuration"
+                  {
+                    echo 'PATH=$PATH:/usr/local/bin' >> /home/ec2-user/.bashrc
+                    echo 'export PATH' >> /home/ec2-user/.bashrc
+                  } || handle_error "Failed to set up AWS configuration"
+
+                  # 6. Cleanup
+                  log "Performing cleanup"
+                  {
+                    rm -rf /home/ec2-user/cloud9
+                    chown -R ec2-user:ec2-user /home/ec2-user/
+                  } || handle_error "Cleanup failed"
+
+                  # 7. Schedule Reboot
+                  log "Scheduling reboot"
+                  {
+                    FILE=$(mktemp)
+                    echo '#!/bin/bash' > $FILE
+                    echo 'reboot -f --verbose' >> $FILE
+                    at now + 1 minute -f $FILE
+                  } || handle_error "Failed to schedule reboot"
+
+                  log "Bootstrap completed successfully in region $REGION"
+
+  ExampleC9BootstrapAssociation:
+    Type: AWS::SSM::Association
+    DependsOn: ExampleC9OutputBucket
+    Properties:
+      Name: !Ref ExampleC9SSMDocument
+      OutputLocation:
+        S3Location:
+          OutputS3BucketName: !Ref ExampleC9OutputBucket
+          OutputS3KeyPrefix: bootstrapoutput
+      Targets:
+        - Key: tag:SSMBootstrap
+          Values:
+          - Active
+
+################## INSTANCE #####################
+  ExampleC9InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - Ref: ExampleC9Role
+
+  ExampleC9Instance:
+    Description: "Cloud9 Instance Example"
+    DependsOn: ExampleC9BootstrapAssociation
+    Type: AWS::Cloud9::EnvironmentEC2
+    Properties:
+      Description: AWS Cloud9 instance for Examples
+      AutomaticStopTimeMinutes: 3600
+      ImageId: amazonlinux-2023-x86_64
+      InstanceType:
+        Ref: ExampleC9InstanceType
+      Name:
+        Ref: AWS::StackName
+      OwnerArn: !If [Create3rdPartyResources, !Ref ExampleOwnerArn, !Ref "AWS::NoValue" ]
+      Tags:
+        -
+          Key: SSMBootstrap
+          Value: Active
+        -
+          Key: Environment
+          Value: AWS Example
+
+Outputs:
+  Cloud9IDE:
+    Value:
+      Fn::Join:
+      - ''
+      - - https://
+        - Ref: AWS::Region
+        - ".console.aws.amazon.com/cloud9/ide/"
+        - Ref: ExampleC9Instance
+        - "?region="
+        - Ref: AWS::Region

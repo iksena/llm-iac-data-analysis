@@ -1,0 +1,323 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Application Tier - API Gateway + Lambda (us-east-1)
+
+Parameters:
+  VpcId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /app-failover/vpc-id-us-east-1
+  PrivateSubnet1:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /app-failover/private-subnet-1-us-east-1
+  PrivateSubnet2:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /app-failover/private-subnet-2-us-east-1
+  AuroraSecurityGroup:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /app-failover/aurora-sg-us-east-1
+
+Resources:
+  # Lambda Security Group
+  AppLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: AppLambdaSG-us-east-1
+      GroupDescription: Security group for application Lambda functions
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          DestinationSecurityGroupId: !Ref AuroraSecurityGroup
+          Description: PostgreSQL to Aurora
+
+  # Allow Lambda to connect to Aurora
+  AuroraIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref AuroraSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref AppLambdaSecurityGroup
+      Description: Allow Lambda access
+
+  # Lambda Execution Role
+  AppLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AppLambdaRole-us-east-1
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: AppLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - ssm:GetParameter
+                Resource: '*'
+
+  # Lambda Function - Get Items
+  GetItemsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: GetItems-us-east-1
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt AppLambdaRole.Arn
+      Timeout: 30
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref AppLambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          SECRET_NAME: aurora-failover-db-secret
+          REGION: us-east-1
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              region = os.environ['REGION']
+
+              # Get database credentials
+              sm = boto3.client('secretsmanager')
+              secret = sm.get_secret_value(SecretId=os.environ['SECRET_NAME'])
+              db_creds = json.loads(secret['SecretString'])
+
+              try:
+                  import psycopg2
+                  conn = psycopg2.connect(
+                      host=db_creds['host'],
+                      database=db_creds['dbname'],
+                      user=db_creds['username'],
+                      password=db_creds['password']
+                  )
+
+                  cur = conn.cursor()
+                  cur.execute("SELECT id, name, created_at FROM items ORDER BY created_at DESC LIMIT 10")
+                  rows = cur.fetchall()
+
+                  items = []
+                  for row in rows:
+                      items.append({
+                          'id': row[0],
+                          'name': row[1],
+                          'created_at': str(row[2]),
+                          'served_from': region
+                      })
+
+                  cur.close()
+                  conn.close()
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'items': items,
+                          'region': region,
+                          'database': db_creds['host']
+                      })
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': str(e), 'region': region})
+                  }
+
+  # Lambda Function - Create Item
+  CreateItemFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CreateItem-us-east-1
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt AppLambdaRole.Arn
+      Timeout: 30
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref AppLambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          SECRET_NAME: aurora-failover-db-secret
+          REGION: us-east-1
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              region = os.environ['REGION']
+
+              # Parse request body
+              body = json.loads(event.get('body', '{}'))
+              item_name = body.get('name', 'Test Item')
+
+              # Get database credentials
+              sm = boto3.client('secretsmanager')
+              secret = sm.get_secret_value(SecretId=os.environ['SECRET_NAME'])
+              db_creds = json.loads(secret['SecretString'])
+
+              try:
+                  import psycopg2
+                  conn = psycopg2.connect(
+                      host=db_creds['host'],
+                      database=db_creds['dbname'],
+                      user=db_creds['username'],
+                      password=db_creds['password']
+                  )
+
+                  cur = conn.cursor()
+                  cur.execute(
+                      "INSERT INTO items (name, created_at) VALUES (%s, %s) RETURNING id",
+                      (item_name, datetime.utcnow())
+                  )
+                  item_id = cur.fetchone()[0]
+                  conn.commit()
+
+                  cur.close()
+                  conn.close()
+
+                  return {
+                      'statusCode': 201,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      },
+                      'body': json.dumps({
+                          'id': item_id,
+                          'name': item_name,
+                          'region': region,
+                          'database': db_creds['host']
+                      })
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'error': str(e), 'region': region})
+                  }
+
+  # Lambda Layer for psycopg2
+  PsycopgLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: psycopg2-layer
+      Description: PostgreSQL adapter for Python
+      Content:
+        S3Bucket: !Sub 'awslambda-${AWS::Region}-tasks'
+        S3Key: snapshots/python3.13/psycopg2-3.13.zip
+      CompatibleRuntimes:
+        - python3.13
+
+  # API Gateway
+  AppApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: app-api-us-east-1
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - '*'
+
+  # API Gateway Stage
+  AppApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref AppApi
+      StageName: prod
+      AutoDeploy: true
+
+  # Lambda Integration - Get Items
+  GetItemsIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref AppApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GetItemsFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  GetItemsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AppApi
+      RouteKey: 'GET /items'
+      Target: !Sub 'integrations/${GetItemsIntegration}'
+
+  GetItemsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetItemsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AppApi}/*/*'
+
+  # Lambda Integration - Create Item
+  CreateItemIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref AppApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CreateItemFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  CreateItemRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AppApi
+      RouteKey: 'POST /items'
+      Target: !Sub 'integrations/${CreateItemIntegration}'
+
+  CreateItemPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateItemFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AppApi}/*/*'
+
+  # Store API endpoint in SSM
+  ApiEndpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /app-failover/api-endpoint-us-east-1
+      Type: String
+      Value: !Sub 'https://${AppApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+
+Outputs:
+  ApiEndpoint:
+    Value: !Sub 'https://${AppApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    Description: API Gateway endpoint
+  GetItemsFunction:
+    Value: !Ref GetItemsFunction
+  CreateItemFunction:
+    Value: !Ref CreateItemFunction

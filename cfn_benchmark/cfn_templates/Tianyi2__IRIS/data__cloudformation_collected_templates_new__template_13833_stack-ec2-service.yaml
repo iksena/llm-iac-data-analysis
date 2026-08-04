@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Runs a service on a docker image by spinning a single ec2 instance.
+
+Parameters:
+  DockerImage:
+    Type: String
+    Description: The URI of the image to use (from AWS ECR or a public repository).
+  VpcId:
+    Type: String
+    Description: The VPC ID to create the instance in
+  SubnetId:
+    Type: String
+    Description: The ID of the VPC subnet to create the instance in
+  HostedZoneId:
+    Type: String
+    Description: The ID of the Route53 hosted zone to create the CNAME record in.
+  ServiceUrl:
+    Type: String
+    Description: The url at which the webapp is exposed. For example 'www.domain-name.com'. It must match with the HostedZone's domain name (here 'domain-name.com').
+
+  InstanceType:
+    Type: String
+    Description: EC2 instance Type
+    Default: t3.micro
+  DiskSpaceGib:
+    Type: Number
+    Description: Disk space in gB
+    Default: '20'
+  EnvironmentVariables:
+    Type: String
+    Default: ''
+    Description: 'The environment variables to pass to the docker image. Example: !Sub "-e AWS_DEFAULT_REGION=${AWS::Region} -e AWS_STACK_NAME=${AWS::StackName}"'
+  UsEast1CertificateArn:
+    Type: String
+    Description: Optional ARN of the ACM certificate for the hosted zone. If provided, a cloudfront distribution will be placed between DNS record and EC2 instance, to handle https to http conversion. An A record to the private IP will be created otherwise.
+    Default: ''
+  RolePolicyArn:
+    Type: String
+    Description: The Arn of an AWS::IAM::ManagedPolicy object that will be used to create the role EC2 endorses. Or an empty string for default rights.
+    Default: ''
+  SSHKeyName:
+    Type: String
+    Description: The name of an existing EC2 KeyPair to enable SSH access to the instances (optional). Leave empty to not use a key pair (ssh port will be closed).
+    Default: ''
+  LogGroupName:
+    Type: String
+    Default: "/ec2/service"
+
+Conditions:
+  HasSSHKeyName: !Not [!Equals ['', !Ref SSHKeyName]]
+  HandleHttps: !Not [!Equals ['', !Ref UsEast1CertificateArn]]
+  NotHandleHttps: !Equals ['', !Ref UsEast1CertificateArn]
+  NotHasPolicy: !Equals ['', !Ref RolePolicyArn]
+
+Resources:
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for runners
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - !If
+          - HasSSHKeyName
+          - IpProtocol: tcp
+            FromPort: 22
+            ToPort: 22
+            CidrIp: 0.0.0.0/0
+          - !Ref AWS::NoValue
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+  EC2LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref LogGroupName
+      RetentionInDays: 30
+  DefaultPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${AWS::StackName}-DefaultPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - ecr:GetAuthorizationToken
+              - ecr:BatchCheckLayerAvailability
+              - ecr:GetDownloadUrlForLayer
+              - ecr:BatchGetImage
+            Resource: "*"
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref DefaultPolicy
+        - !If
+          - NotHasPolicy
+          - !Ref AWS::NoValue
+          - !Ref RolePolicyArn
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2InstanceRole
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    DependsOn: EC2LogGroup
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}'
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref DiskSpaceGib
+            VolumeType: gp3
+            DeleteOnTermination: true
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      KeyName: !If
+        - HasSSHKeyName
+        - !Ref SSHKeyName
+        - !Ref AWS::NoValue
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -x
+          yum update -y
+          # Install CloudWatch Agent
+          yum install amazon-cloudwatch-agent -y
+          # Install and start Docker
+          amazon-linux-extras install docker -y
+          service docker start
+          usermod -a -G docker ec2-user
+          # Pull and run Docker container
+          aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${DockerImage}
+          docker pull ${DockerImage}
+          echo ${LogGroupName}
+          docker run -d --network host -e AWS_DEFAULT_REGION=${AWS::Region} --log-driver=awslogs --log-opt awslogs-region=${AWS::Region} --log-opt awslogs-group=${LogGroupName} --log-opt awslogs-stream=docker-logs-$(date +%s) ${DockerImage}
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-Instance
+  CloudFrontOriginRequestPolicy:
+    Type: AWS::CloudFront::OriginRequestPolicy
+    Condition: HandleHttps
+    Properties:
+      OriginRequestPolicyConfig:
+        Name: CloudFrontOriginRequestPolicy
+        CookiesConfig:
+          CookieBehavior: all
+        HeadersConfig:
+          HeaderBehavior: allViewer
+        QueryStringsConfig:
+          QueryStringBehavior: all
+  CloudFrontCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Condition: HandleHttps
+    Properties:
+      CachePolicyConfig:
+        Name: CloudFrontCachePolicy
+        DefaultTTL: 3600
+        MaxTTL: 86400
+        MinTTL: 0
+        ParametersInCacheKeyAndForwardedToOrigin:
+          CookiesConfig:
+            CookieBehavior: none
+          EnableAcceptEncodingBrotli: true
+          EnableAcceptEncodingGzip: true
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: HandleHttps
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Origins:
+          - Id: EC2Origin
+            DomainName: !GetAtt EC2Instance.PublicDnsName
+            CustomOriginConfig:
+              OriginProtocolPolicy: http-only
+              HTTPPort: 80
+        DefaultCacheBehavior:
+          TargetOriginId: EC2Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+            - PUT
+            - POST
+            - PATCH
+            - DELETE
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachePolicyId: !Ref CloudFrontCachePolicy
+          OriginRequestPolicyId: !Ref CloudFrontOriginRequestPolicy
+        ViewerCertificate:
+          AcmCertificateArn: !Ref UsEast1CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Aliases:
+          - !Ref ServiceUrl
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+  PublicCNAMERecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HandleHttps
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref ServiceUrl
+      Type: CNAME
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt CloudFrontDistribution.DomainName
+  PrivateARecord:
+    Type: AWS::Route53::RecordSet
+    Condition: NotHandleHttps
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref ServiceUrl
+      Type: A
+      TTL: '300'
+      ResourceRecords:
+        - !GetAtt EC2Instance.PrivateIp
+
+Outputs:
+  EC2InstanceId:
+    Value: !Ref EC2Instance
+  EC2PrivateIP:
+    Value: !GetAtt EC2Instance.PrivateIp

@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Defines the frontend resources
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: 'The domain name for your website (ex: domain-name.com)'
+  HostedZoneId:
+    Type: String
+    Description: The ID of the Route 53 hosted zone for the domain name
+
+Resources:
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub www.${DomainName}
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        IgnorePublicAcls: false
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+      WebsiteConfiguration:
+        IndexDocument: !Sub index.html
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+  MyCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: FrontendBucket
+    Properties:
+      DistributionConfig:
+        Origins:
+          - Id: S3Origin
+            DomainName: !Sub www.${DomainName}.s3.amazonaws.com
+            OriginPath: ''
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only
+        Enabled: true
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+        ViewerCertificate:
+          AcmCertificateArn: !GetAtt USCertificateRequestCustomResource.CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        PriceClass: PriceClass_100
+        DefaultRootObject: index.html
+        Aliases:
+          - !Sub www.${DomainName}
+  USCertificateRequestCustomResource:
+    Type: Custom::RequestCertificate
+    Properties:
+      ServiceToken: !GetAtt USCertificateRequestLambda.Arn
+      DomainName: !Sub '*.${DomainName}'
+      HostedZoneId: !Ref HostedZoneId
+  USCertificateRequestLambda:
+    Type: AWS::Lambda::Function
+    DependsOn: CertificateRequestLogGroup
+    Properties:
+      FunctionName: USCertificateRequestLambda
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 600
+      Code:
+        ZipFile: |+
+          def handler(event, context):
+              try:
+                  import traceback
+                  import json
+                  import time
+                  import boto3
+                  from botocore.exceptions import ClientError
+                  import cfnresponse
+
+                  # Initialize ACM and Route 53 clients
+                  acm = boto3.client('acm', region_name='us-east-1')
+                  route53 = boto3.client('route53')
+
+                  if event['RequestType'] == 'Delete':
+                      physical_resource_id = json.loads(event['PhysicalResourceId'])
+                      acm.delete_certificate(CertificateArn=event['CertificateArn'])
+                      records = route53.list_resource_record_sets(HostedZoneId=event['ResourceProperties']['HostedZoneId'], StartRecordName=event['PhysicalResourceId']['USRecordName'], MaxItems='1')
+                      if len(records['ResourceRecordSets']) > 0:
+                          record_to_delete = records['ResourceRecordSets'][0]
+                          route53.change_resource_record_sets(HostedZoneId=event['ResourceProperties']['HostedZoneId'], ChangeBatch={'Comment': 'Adding CNAME record for SES DKIM configuration', 'Changes': [{'Action': 'DELETE', 'ResourceRecordSet': {'Name': record_to_delete['Name'], 'Type': record_to_delete['Type'], 'TTL': record_to_delete['TTL'], 'ResourceRecords': record_to_delete['ResourceRecords']}}]})
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  # Waiting for the hosted zone resource to have completed it's creation
+                  HostedZoneId=event['ResourceProperties']['HostedZoneId']  # Hosted Zone ID of the domain
+                  while True:
+                      try:
+                          response = route53.get_hosted_zone(Id=HostedZoneId)
+                      except ClientError as e:
+                          if e.response['Error']['Code'] == 'NoSuchHostedZone':
+                              time.sleep(10.0)'
+                          else:
+                              raise
+                      else:
+                          break
+
+                  # Request certificate
+                  response = acm.request_certificate(DomainName=event['ResourceProperties']['DomainName'], ValidationMethod='DNS')
+                  certificate_arn = response['CertificateArn']
+
+                  # Retrieve the domain validation options
+                  describe_response = acm.describe_certificate(CertificateArn=certificate_arn)
+                  domain_validation_options = describe_response['Certificate']['DomainValidationOptions']
+
+                  # Find the DNS record required for certificate validation
+                  exports = {'CertificateArn': certificate_arn}
+                  for option in domain_validation_options:
+                      if 'ResourceRecord' not in option:
+                          continue;
+                      resource_record = option['ResourceRecord']
+
+                      # Create the DNS CNAME record in Route 53
+                      route53.change_resource_record_sets(HostedZoneId=HostedZoneId, ChangeBatch={'Changes': [{'Action': 'UPSERT', 'ResourceRecordSet': {'Name': resource_record['Name'], 'Type': resource_record['Type'], 'TTL': 300, 'ResourceRecords': [{'Value': resource_record['Value']}]}}]})
+                      exports['USRecordName'] = resource_record['Name']
+                      break
+
+                  # Send a SUCCESS response to CloudFormation
+                  physical_resource_id = json.dumps(exports)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, exports, physical_resource_id)
+
+              except Exception as e:
+                  print(traceback.format_exc())
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {type(e).__name__: str(e)})
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:*
+                  - acm:RequestCertificate
+                  - acm:DescribeCertificate
+                  - acm:DeleteCertificate
+                  - route53:ChangeResourceRecordSets
+                  - route53:ListHostedZones
+                  - route53:ListResourceRecordSets
+                  - route53:GetHostedZone
+                Resource: '*'
+  CertificateRequestLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/USCertificateRequestLambda
+      RetentionInDays: 30

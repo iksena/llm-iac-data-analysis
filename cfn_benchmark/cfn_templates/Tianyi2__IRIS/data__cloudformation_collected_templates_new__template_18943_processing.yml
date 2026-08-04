@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Processing Pipeline for the Data Master Project
+
+Resources:
+
+  ProcessingApp:
+    Type: AWS::EMRServerless::Application
+    Properties:
+      Name: dm-processing-app
+      ReleaseLabel: emr-7.9.0
+      Type: Spark
+      Architecture: ARM64
+      AutoStartConfiguration:
+        Enabled: true
+      AutoStopConfiguration:
+        Enabled: true
+        IdleTimeoutMinutes: 10
+      MaximumCapacity:
+        Cpu: "8 vCPU"
+        Memory: "32 GB"
+      NetworkConfiguration:
+        SubnetIds:
+          - !ImportValue dm-public-subnet-az1-id
+          - !ImportValue dm-public-subnet-az2-id
+        SecurityGroupIds:
+          - !ImportValue dm-processing-sg
+      Tags:
+        - Key: Project
+          Value: DataMaster
+        - Key: Component
+          Value: Processing
+
+  ProcessingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/stepfunctions/dm-processing-dispatcher
+      RetentionInDays: 7
+
+  ProcessingDispatcher:
+    Type: AWS::StepFunctions::StateMachine
+    DependsOn: ProcessingLogGroup
+    Properties:
+      StateMachineName: dm-processing-dispatcher
+      RoleArn: !ImportValue dm-step-function-role-arn
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt ProcessingLogGroup.Arn
+      DefinitionSubstitutions:
+        AppId: !Ref ProcessingApp
+        ExecutionRole: !ImportValue dm-emr-execution-role-arn
+        ArtifactsBucket: !ImportValue dm-artifacts-bucket
+        ObserverBucket: !ImportValue dm-observer-bucket
+      DefinitionString: !Sub
+        - |
+          {
+            "Comment": "Parallel processing from bronze to silver, then review_flat",
+            "TimeoutSeconds": 1800,
+            "StartAt": "ProcessTables",
+            "States": {
+              "ProcessTables": {
+                "Type": "Map",
+                "ItemsPath": "$.tables",
+                "MaxConcurrency": 1,
+                "Parameters": {
+                  "table.$": "$$.Map.Item.Value"
+                },
+                "Iterator": {
+                  "StartAt": "RunEMRJob",
+                  "States": {
+                    "RunEMRJob": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::emr-serverless:startJobRun.sync",
+                      "TimeoutSeconds": 900,
+                      "Parameters": {
+                        "ApplicationId": "${AppId}",
+                        "ExecutionRoleArn": "${ExecutionRole}",
+                        "JobDriver": {
+                          "SparkSubmit": {
+                            "EntryPoint": "s3://${ArtifactsBucket}/scripts/main.py",
+                            "SparkSubmitParameters": "--py-files s3://${ArtifactsBucket}/scripts/bundle.zip",
+                            "EntryPointArguments.$": "States.Array('--layer', 'silver', '--table', $.table)"
+                          }
+                        },
+                        "ConfigurationOverrides": {
+                          "MonitoringConfiguration": {
+                            "S3MonitoringConfiguration": {
+                              "LogUri": "s3://${ObserverBucket}/scripts/logs/"
+                            }
+                          }
+                        }
+                      },
+                      "Catch": [
+                        {
+                          "ErrorEquals": ["States.ALL"],
+                          "ResultPath": "$.error",
+                          "Next": "FailJob"
+                        }
+                      ],
+                      "End": true
+                    },
+                    "FailJob": {
+                      "Type": "Fail",
+                      "Error": "EMRJobFailed",
+                      "Cause": "EMR Serverless job failed inside Map.Iterator"
+                    }
+                  }
+                },
+                "ResultPath": "$.map",
+                "Next": "BuildReviewFlat"
+              },
+              "BuildReviewFlat": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::emr-serverless:startJobRun.sync",
+                "TimeoutSeconds": 900,
+                "Parameters": {
+                  "ApplicationId": "${AppId}",
+                  "ExecutionRoleArn": "${ExecutionRole}",
+                  "JobDriver": {
+                    "SparkSubmit": {
+                      "EntryPoint": "s3://${ArtifactsBucket}/scripts/main.py",
+                      "SparkSubmitParameters": "--py-files s3://${ArtifactsBucket}/scripts/bundle.zip",
+                      "EntryPointArguments": ["--layer", "silver", "--table", "review_flat"]
+                    }
+                  },
+                  "ConfigurationOverrides": {
+                    "MonitoringConfiguration": {
+                      "S3MonitoringConfiguration": {
+                        "LogUri": "s3://${ObserverBucket}/scripts/logs/"
+                      }
+                    }
+                  }
+                },
+                "End": true
+              }
+            }
+          }
+        - {
+          AppId: !Ref ProcessingApp,
+          ExecutionRole: !ImportValue dm-emr-execution-role-arn,
+          ArtifactsBucket: !ImportValue dm-artifacts-bucket,
+          ObserverBucket: !ImportValue dm-observer-bucket
+        }
+      Tags:
+        - Key: Project
+          Value: DataMaster
+        - Key: Component
+          Value: Processing
+
+  ProcessingCronRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: dm-processing-cron
+      ScheduleExpression: cron(0 6 * * ? *)  # 6h UTC daily
+      State: ENABLED
+      Targets:
+        - Arn: !Ref ProcessingDispatcher
+          Id: StepFunctionTarget
+          RoleArn: !ImportValue dm-pipe-execution-role-arn
+          Input: |
+            {
+              "tables": ["brewery", "beer", "profile", "review"]
+            }
+
+Outputs:
+
+  ProcessingAppId:
+    Description: EMR Serverless Application ID
+    Value: !Ref ProcessingApp
+    Export:
+      Name: dm-emr-processing-id
+
+  ProcessingDispatcherArn:
+    Description: ARN of the Step Function dispatcher
+    Value: !Ref ProcessingDispatcher
+    Export:
+      Name: dm-processing-dispatcher-arn

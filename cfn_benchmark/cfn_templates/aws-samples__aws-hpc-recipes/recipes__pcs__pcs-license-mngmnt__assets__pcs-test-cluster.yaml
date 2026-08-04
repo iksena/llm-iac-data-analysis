@@ -1,0 +1,580 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Test AWS PCS cluster for FlexLM license sync validation.
+  Deploys a VPC with public and private subnets, security groups,
+  IAM instance profile, EC2 launch templates for login and compute nodes,
+  a SMALL PCS cluster with the Slurm REST API enabled, a login node group
+  (always-on), a compute node group (scales 0 to MaxComputeNodes), and a
+  Slurm queue. The PCS sample AMI is resolved automatically at deploy time
+  via a Lambda custom resource so the template stays valid as new AMIs are
+  published. SlurmVersion defaults to 25.05 (latest supported in PCS as of
+  March 2026). The Slurm REST API (SlurmRest Mode STANDARD) requires 25.05
+  or higher.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+
+  ClusterName:
+    Type: String
+    Default: pcs-test
+    Description: Name prefix for all resources in this stack.
+
+  SlurmVersion:
+    Type: String
+    Default: "25.05"
+    AllowedValues:
+      - "25.05"
+    Description: >
+      Slurm version for the PCS cluster. Must match the version in the
+      PCS sample AMI. 25.05 is the latest version supported in PCS
+      (EOL November 2026). The Slurm REST API required by this solution
+      is available only on 25.05 or higher. Update this parameter when a
+      newer version becomes available.
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair for SSH access to the login node.
+
+  ClientIpCidr:
+    Type: String
+    Default: "0.0.0.0/0"
+    AllowedPattern: '(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})'
+    Description: >
+      CIDR range allowed to SSH into the login node on port 22. Restrict
+      to your own IP for security (e.g. 203.0.113.10/32). The default
+      0.0.0.0/0 is convenient for testing but not recommended for
+      production.
+
+  LoginNodeInstanceType:
+    Type: String
+    Default: c6i.xlarge
+    Description: Instance type for the always-on login node.
+
+  ComputeNodeInstanceType:
+    Type: String
+    Default: c6i.xlarge
+    Description: Instance type for compute nodes.
+
+  MaxComputeNodes:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 32
+    Description: Maximum number of compute nodes the cluster can scale to.
+
+  FlexlmServerName:
+    Type: String
+    Default: "flexlm-server"
+    Description: >
+      Logical name for the FlexLM server used when registering remote
+      license resources with sacctmgr. This becomes the suffix in the
+      Slurm license name (e.g. comsol@flexlm-server). Must not contain
+      spaces or special characters.
+
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: >
+      Availability zone for the private subnet used by PCS. All nodes
+      and the cluster ENI must be in the same AZ.
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # -------------------------------------------------------------------------
+  # VPC and networking
+  # -------------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-vpc"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-igw"
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public subnet: hosts the NAT gateway and the login node (needs a
+  # public IP for SSH access from outside the VPC).
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Ref AvailabilityZone
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-public"
+
+  # Private subnet: PCS cluster ENI, compute nodes, Lambda functions.
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Ref AvailabilityZone
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-private"
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-public-rt"
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-nat"
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-private-rt"
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetRTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # -------------------------------------------------------------------------
+  # Security Groups
+  # -------------------------------------------------------------------------
+
+  # Cluster security group. PCS requires:
+  #   Inbound: all traffic from self
+  #   Outbound: all traffic to 0.0.0.0/0 and to self
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PCS cluster security group (controller ENI, compute nodes, login node)
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-cluster-sg"
+
+  # Self-referencing inbound rule (required by PCS networking spec)
+  ClusterSGSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ClusterSecurityGroup
+      IpProtocol: "-1"
+      SourceSecurityGroupId: !Ref ClusterSecurityGroup
+      Description: All traffic between cluster members
+
+  # SSH access security group for the login node
+  SshSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Inbound SSH access to login node
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref ClientIpCidr
+          Description: SSH from allowed CIDR
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+          Description: All outbound
+      Tags:
+        - Key: Name
+          Value: !Sub "${ClusterName}-ssh-sg"
+
+  # -------------------------------------------------------------------------
+  # IAM: instance profile for all PCS nodes
+  # Role name MUST start with AWSPCS or have path /aws-pcs/ (PCS requirement)
+  # -------------------------------------------------------------------------
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "AWSPCS-${ClusterName}-node-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: PCSRegisterInstance
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - pcs:RegisterComputeNodeGroupInstance
+                Resource: "*"
+
+  NodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "AWSPCS-${ClusterName}-node-profile"
+      Roles:
+        - !Ref NodeRole
+
+  # -------------------------------------------------------------------------
+  # AMI Lookup Lambda (resolves the correct PCS sample AMI at deploy time)
+  # Pattern taken from the official AWS HPC Recipes template.
+  # -------------------------------------------------------------------------
+  AmiLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: EC2DescribeImages
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeImages
+                Resource: "*"
+
+  AmiLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ClusterName}-ami-lookup"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt AmiLookupRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import logging
+          import urllib3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def get_latest_ami(os_name, architecture, slurm_version):
+              prefix = f"aws-pcs-sample_ami-{os_name}-{architecture}-slurm-{slurm_version}"
+              ec2 = boto3.client("ec2")
+              response = ec2.describe_images(
+                  Filters=[
+                      {"Name": "name",        "Values": [f"{prefix}*"]},
+                      {"Name": "owner-alias", "Values": ["amazon"]},
+                      {"Name": "state",       "Values": ["available"]},
+                  ]
+              )
+              images = sorted(response["Images"], key=lambda x: x["CreationDate"], reverse=True)
+              if not images:
+                  raise ValueError(f"No AMI found matching prefix: {prefix}")
+              return images[0]["ImageId"]
+
+          def send_response(event, context, status, data, physical_id=None):
+              body = {
+                  "Status":             status,
+                  "Reason":             f"See CloudWatch: {context.log_stream_name}",
+                  "PhysicalResourceId": physical_id or context.log_stream_name,
+                  "StackId":            event["StackId"],
+                  "RequestId":          event["RequestId"],
+                  "LogicalResourceId":  event["LogicalResourceId"],
+                  "NoEcho":             False,
+                  "Data":               data,
+              }
+              http = urllib3.PoolManager()
+              http.request(
+                  "PUT", event["ResponseURL"],
+                  headers={"Content-Type": "application/json"},
+                  body=json.dumps(body).encode("utf-8"),
+              )
+
+          def handler(event, context):
+              logger.info(json.dumps(event))
+              try:
+                  if event["RequestType"] == "Delete":
+                      send_response(event, context, "SUCCESS", {})
+                      return
+                  props = event["ResourceProperties"]
+                  ami_id = get_latest_ami(
+                      props["OperatingSystem"],
+                      props["Architecture"],
+                      props["SlurmVersion"],
+                  )
+                  logger.info(f"Resolved AMI: {ami_id}")
+                  send_response(event, context, "SUCCESS", {"AmiId": ami_id}, ami_id)
+              except Exception as exc:
+                  logger.error(str(exc))
+                  send_response(event, context, "FAILED", {"Error": str(exc)})
+
+  # Custom resource that invokes the Lambda and stores the AMI ID
+  PcsSampleAmi:
+    Type: Custom::AmiLookup
+    Properties:
+      ServiceToken:    !GetAtt AmiLookupFunction.Arn
+      OperatingSystem: amzn2
+      Architecture:    x86_64
+      SlurmVersion:    !Ref SlurmVersion
+
+  # -------------------------------------------------------------------------
+  # EC2 Launch Templates
+  # Each launch template configures the security groups and key pair.
+  # The AMI is set at the ComputeNodeGroup level via AmiId, not here,
+  # so both node groups share one launch template version.
+  # -------------------------------------------------------------------------
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ClusterName}-node-lt"
+      LaunchTemplateData:
+        KeyName: !Ref KeyPairName
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ClusterName}-node"
+
+  # Launch template for the login node: same base + SSH security group
+  LoginLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ClusterName}-login-lt"
+      LaunchTemplateData:
+        KeyName: !Ref KeyPairName
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups:
+              - !Ref ClusterSecurityGroup
+              - !Ref SshSecurityGroup
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ClusterName}-login"
+
+  # Launch template for compute nodes: cluster SG only, no public IP
+  ComputeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ClusterName}-compute-lt"
+      LaunchTemplateData:
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: false
+            Groups:
+              - !Ref ClusterSecurityGroup
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ClusterName}-compute"
+
+  # -------------------------------------------------------------------------
+  # PCS Cluster
+  # SlurmRest Mode STANDARD enables the slurmrestd HTTP server on port 6820.
+  # Accounting Mode STANDARD starts managed slurmdbd — required for dynamic
+  # remote license resources via sacctmgr.
+  # -------------------------------------------------------------------------
+  PCSCluster:
+    Type: AWS::PCS::Cluster
+    DependsOn: PcsSampleAmi
+    Properties:
+      Name: !Ref ClusterName
+      Size: SMALL
+      Scheduler:
+        Type: SLURM
+        Version: !Ref SlurmVersion
+      Networking:
+        SubnetIds:
+          - !Ref PrivateSubnet
+        SecurityGroupIds:
+          - !Ref ClusterSecurityGroup
+      SlurmConfiguration:
+        ScaleDownIdleTimeInSeconds: 300
+        SlurmRest:
+          Mode: STANDARD
+        Accounting:
+          Mode: STANDARD
+
+  # -------------------------------------------------------------------------
+  # Login node group (MinInstanceCount=1, always running)
+  # Placed in the public subnet so it is reachable via SSH from outside.
+  # -------------------------------------------------------------------------
+  LoginNodeGroup:
+    Type: AWS::PCS::ComputeNodeGroup
+    Properties:
+      Name: login
+      ClusterId: !GetAtt PCSCluster.Id
+      SubnetIds:
+        - !Ref PublicSubnet
+      AmiId: !GetAtt PcsSampleAmi.AmiId
+      IamInstanceProfileArn: !GetAtt NodeInstanceProfile.Arn
+      CustomLaunchTemplate:
+        TemplateId: !Ref LoginLaunchTemplate
+        Version: !GetAtt LoginLaunchTemplate.LatestVersionNumber
+      InstanceConfigs:
+        - InstanceType: !Ref LoginNodeInstanceType
+      ScalingConfiguration:
+        MinInstanceCount: 1
+        MaxInstanceCount: 1
+      PurchaseOption: ONDEMAND
+
+  # -------------------------------------------------------------------------
+  # Compute node group (scales 0 to MaxComputeNodes)
+  # Placed in the private subnet.
+  # -------------------------------------------------------------------------
+  ComputeNodeGroup:
+    Type: AWS::PCS::ComputeNodeGroup
+    Properties:
+      Name: compute
+      ClusterId: !GetAtt PCSCluster.Id
+      SubnetIds:
+        - !Ref PrivateSubnet
+      AmiId: !GetAtt PcsSampleAmi.AmiId
+      IamInstanceProfileArn: !GetAtt NodeInstanceProfile.Arn
+      CustomLaunchTemplate:
+        TemplateId: !Ref ComputeLaunchTemplate
+        Version: !GetAtt ComputeLaunchTemplate.LatestVersionNumber
+      InstanceConfigs:
+        - InstanceType: !Ref ComputeNodeInstanceType
+      ScalingConfiguration:
+        MinInstanceCount: 0
+        MaxInstanceCount: !Ref MaxComputeNodes
+      PurchaseOption: ONDEMAND
+
+  # -------------------------------------------------------------------------
+  # Queue
+  # -------------------------------------------------------------------------
+  ComputeQueue:
+    Type: AWS::PCS::Queue
+    Properties:
+      Name: compute
+      ClusterId: !GetAtt PCSCluster.Id
+      ComputeNodeGroupConfigurations:
+        - ComputeNodeGroupId: !GetAtt ComputeNodeGroup.Id
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+
+  ClusterId:
+    Description: PCS cluster ID
+    Value: !GetAtt PCSCluster.Id
+    Export:
+      Name: !Sub "${ClusterName}-cluster-id"
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub "${ClusterName}-vpc-id"
+
+  PublicSubnetId:
+    Description: Public subnet ID (login node)
+    Value: !Ref PublicSubnet
+    Export:
+      Name: !Sub "${ClusterName}-public-subnet-id"
+
+  PrivateSubnetId:
+    Description: Private subnet ID (compute nodes, Lambda)
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub "${ClusterName}-private-subnet-id"
+
+  ClusterSecurityGroupId:
+    Description: >
+      Cluster security group ID. Use this as ControllerSecurityGroupId
+      in the flexlm-pcs-sync stack.
+    Value: !Ref ClusterSecurityGroup
+    Export:
+      Name: !Sub "${ClusterName}-cluster-sg-id"
+
+  ResolvedAmiId:
+    Description: PCS sample AMI ID resolved at deploy time
+    Value: !GetAtt PcsSampleAmi.AmiId
+
+  FlexlmServerName:
+    Description: >
+      Logical FlexLM server name used in sacctmgr resource registration.
+      License names in Slurm will be comsol@{FlexlmServerName}, etc.
+    Value: !Ref FlexlmServerName
+    Export:
+      Name: !Sub "${ClusterName}-flexlm-server-name"

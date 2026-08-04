@@ -1,0 +1,234 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: s3apt
+
+Outputs:
+  CNAMERecordValue:
+    Description: The value of the CNAME or alias record of the configured (sub)domain.
+    Value: !GetAtt CloudfrontDistribution.DomainName
+  UserDBTableName:
+    Value: !Ref UserDB
+
+Parameters:
+  S3BucketStackName:
+    Type: String
+  AcmCertificateArn:
+    Description: ARN of the ACM certificate for the domain name, must be registered
+      in us-east-1
+    Type: String
+
+Resources:
+  CloudfrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Aliases:
+          - Fn::ImportValue: !Sub '${S3BucketStackName}-DomainName'
+        Comment: !Sub ${AWS::StackName} s3apt
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: true
+          TargetOriginId: S3BucketOrigin
+          ViewerProtocolPolicy: https-only
+          LambdaFunctionAssociations:
+            - EventType: viewer-request
+              LambdaFunctionARN: !Ref AuthLambdaVersion
+        Enabled: true
+        Origins:
+          - S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudfrontOAI}'
+            DomainName:
+              Fn::ImportValue: !Sub '${S3BucketStackName}-BucketDomainName'
+            Id: S3BucketOrigin
+        PriceClass: PriceClass_All
+        ViewerCertificate:
+          AcmCertificateArn:
+            !Ref AcmCertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1
+
+  S3BucketBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket:
+        Fn::ImportValue: !Sub '${S3BucketStackName}-DomainName'
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:GetObject
+            Effect: Deny
+            Resource:
+              Fn::Sub:
+                - '${arn}/assets/*'
+                - arn:
+                    Fn::ImportValue: !Sub '${S3BucketStackName}-BucketArn'
+            Principal:
+              AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudfrontOAI}'
+          - Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource:
+              Fn::Sub:
+                - '${arn}/*'
+                - arn:
+                    Fn::ImportValue: !Sub '${S3BucketStackName}-BucketArn'
+            Principal:
+              AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudfrontOAI}'
+
+  CloudfrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Ref AWS::StackName
+
+  AuthLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          from base64 import b64decode
+          from hashlib import md5
+          from urllib import parse
+
+          import boto3
+
+          def error(reason):
+              print(f'Reject reason: {reason}')
+              return {
+                  'status': '404',
+                  'statusDescription': 'Not Found',
+                  'headers': {
+                      'cache-control': [
+                          {
+                              'key': 'Cache-Control',
+                              'value': 'no-store'
+                          }
+                      ],
+                      'content-type': [
+                          {
+                              'key': 'Content-Type',
+                              'value': 'text/plain'
+                          }
+                      ],
+                      'content-encoding': [
+                          {
+                              'key': 'Content-Encoding',
+                              'value': 'UTF-8'
+                          }
+                      ],
+                  },
+                  'body': '404 Not Found',
+              }
+
+          def get(headers, key, default=None):
+              if not isinstance(headers, dict):
+                  return default
+
+              header = headers.get(key)
+              if not header:
+                  return default
+
+              for item in header:
+                  if item.get('key', '') == key.title():
+                      return item.get('value')
+
+              return default
+
+          def handler(event, context):
+              ddb = boto3.resource('dynamodb', region_name='${AWS::Region}')
+              table = ddb.Table('${UserDB}')
+
+              print(event)
+              request = event['Records'][0]['cf']['request']
+              headers = request['headers']
+
+              if not get(headers, 'user-agent', '').startswith('Debian APT-HTTP'):
+                  return error('User agent does not match')
+
+              auth = get(headers, 'authorization')
+              if not auth:
+                  return error('Authorization header is not set')
+
+              basic = auth.split(' ')
+              if len(basic) != 2:
+                  return error('Invalid Authorization header')
+
+              try:
+                  raw = b64decode(basic[1])
+              except Exception as e:
+                  return error(f'Exception has occurred during b64 decode: {e}')
+
+              up = raw.decode().split(':')
+              if len(up) != 2:
+                  return error('Invalid authorization syntax after decode')
+
+              user, pw = up[0],  md5(up[1].encode()).digest().hex()
+
+              reg = table.get_item(Key={'U': user})
+              if not reg.get('Item'):
+                  return error(f'User {user} was not found')
+
+              if reg['Item'].get('P') != pw:
+                  return error(f'Password does not match')
+
+              hidden = user[:4] + "*" * (len(user) - 4)
+              print(f'Accept: {hidden}')
+              return request
+      Description: !Sub '${AWS::StackName} auth function'
+      Handler: index.handler
+      Role: !GetAtt AuthLambdaRole.Arn
+      Runtime: python3.7
+
+  AuthLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: !Sub '${AWS::StackName} auth function role'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${AWS::StackName}-AuthLambdaRole-Logs'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+        - PolicyName: !Sub '${AWS::StackName}-AuthLambdaRole-DDB'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Describe*
+                  - dynamodb:List*
+                  - dynamodb:GetItem
+                Resource: !GetAtt UserDB.Arn
+
+  AuthLambdaVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !GetAtt AuthLambda.Arn
+
+  UserDB:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: 'U'  # Username
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: 'U'  # Username
+          KeyType: HASH

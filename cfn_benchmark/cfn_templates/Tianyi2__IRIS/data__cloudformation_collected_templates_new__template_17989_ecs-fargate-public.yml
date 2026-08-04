@@ -1,0 +1,402 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: ECS Fargate (public subnets, no NAT) + ALB + Logs + IAM + CodeDeploy blue/green
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: "medical-chatbot-enterprise"
+  Env:
+    Type: String
+    AllowedValues: [staging, production]
+    Default: "staging"
+  AppPort:
+    Type: Number
+  DesiredCount:
+    Type: Number
+  ContainerCpu:
+    Type: Number
+  ContainerMemory:
+    Type: Number
+  ImageUri:
+    Type: String
+    Description: "ECR image URI (tag or digest)"
+  OpenAISecretArn:
+    Type: String
+    Description: "ARN of the Secrets Manager secret for OPENAI_API_KEY"
+  PineconeSecretArn:
+    Type: String
+    Description: "ARN of the Secrets Manager secret for PINECONE_API_KEY"
+  MinCapacity:
+    Type: Number
+    Default: 1
+  MaxCapacity:
+    Type: Number
+    Default: 2
+  CpuScaleTarget:
+    Type: Number
+    Default: 60
+  TGPrefix:
+    Type: String
+    Default: "medchat"
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: "If set, subscribe this email to SNS alerts"
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${Env}-vpc" }]
+
+  IGW:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${Env}-igw" }]
+
+  IGWAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref IGW
+      VpcId: !Ref VPC
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: 10.0.1.0/24
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${Env}-public-a" }]
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: 10.0.2.0/24
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${Env}-public-b" }]
+
+  PublicRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${Env}-public-rt" }]
+
+  PublicRouteDefault:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref IGW
+
+  AssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRT
+
+  AssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRT
+
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB SG
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80,   ToPort: 80,   CidrIp: 0.0.0.0/0 }
+        - { IpProtocol: tcp, FromPort: 9000, ToPort: 9000, CidrIp: 0.0.0.0/0 } # test listener
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${Env}-alb-sg" }]
+
+  EcsSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks SG (only ALB can reach)
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref AppPort
+          ToPort: !Ref AppPort
+          SourceSecurityGroupId: !Ref AlbSG
+      SecurityGroupEgress:
+        - { IpProtocol: -1, CidrIp: 0.0.0.0/0 }
+      Tags: [{ Key: Name, Value: !Sub "${ProjectName}-${Env}-ecs-sg" }]
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSG]
+      Scheme: internet-facing
+      IpAddressType: ipv4
+
+  TG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${TGPrefix}-${Env}-blue"
+      TargetType: ip
+      Protocol: HTTP
+      Port: !Ref AppPort
+      VpcId: !Ref VPC
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      Matcher: { HttpCode: 200-399 }
+
+  TGGreen:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${TGPrefix}-${Env}-green"
+      TargetType: ip
+      Protocol: HTTP
+      Port: !Ref AppPort
+      VpcId: !Ref VPC
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      Matcher: { HttpCode: 200-399 }
+
+  ListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TG
+
+  ListenerTestHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 9000
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TGGreen
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${ProjectName}-${Env}"
+      RetentionInDays: 14
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${ProjectName}-${Env}"
+
+  ExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Env}-exec"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Policies:
+        - PolicyName: AllowReadProjectSecrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref OpenAISecretArn
+                  - !Ref PineconeSecretArn
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${ProjectName}-${Env}"
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ExecRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: web
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - { ContainerPort: !Ref AppPort, Protocol: tcp }
+          Environment:
+            - { Name: PORT, Value: !Sub "${AppPort}" }
+          Secrets:
+            - Name: OPENAI_API_KEY
+              ValueFrom: !Ref OpenAISecretArn
+            - Name: PINECONE_API_KEY
+              ValueFrom: !Ref PineconeSecretArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ListenerHTTP
+      - ListenerTestHTTP
+    Properties:
+      ServiceName: !Sub "${ProjectName}-${Env}-svc"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      DeploymentController:
+        Type: CODE_DEPLOY
+      HealthCheckGracePeriodSeconds: 60
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+          SecurityGroups: [!Ref EcsSG]
+      LoadBalancers:
+        - TargetGroupArn: !Ref TG        # BLUE only
+          ContainerName: web
+          ContainerPort: !Ref AppPort
+
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: Service
+    Properties:
+      MaxCapacity: !Ref MaxCapacity
+      MinCapacity: !Ref MinCapacity
+      ResourceId: !Sub "service/${ProjectName}-${Env}/${ProjectName}-${Env}-svc"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  CpuTargetTracking:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${ProjectName}-${Env}-cpu-tt"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref CpuScaleTarget
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 60
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Env}-codedeploy"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codedeploy.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCodeDeployRoleForECS
+
+  CodeDeployApp:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub "${ProjectName}-${Env}"
+      ComputePlatform: ECS
+
+  CodeDeployDG:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    DependsOn:
+      - Service
+      - TG
+      - TGGreen
+      - ListenerHTTP
+      - ListenerTestHTTP
+    Properties:
+      ApplicationName: !Ref CodeDeployApp
+      DeploymentGroupName: !Sub "${ProjectName}-${Env}"
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentStyle:
+        DeploymentType: BLUE_GREEN
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events: [DEPLOYMENT_FAILURE, DEPLOYMENT_STOP_ON_ALARM, DEPLOYMENT_STOP_ON_REQUEST]
+      BlueGreenDeploymentConfiguration:
+        TerminateBlueInstancesOnDeploymentSuccess:
+          Action: TERMINATE
+          TerminationWaitTimeInMinutes: 1
+        DeploymentReadyOption:
+          ActionOnTimeout: CONTINUE_DEPLOYMENT
+      LoadBalancerInfo:
+        TargetGroupPairInfoList:
+          - TargetGroups:
+              - Name: !Sub "${TGPrefix}-${Env}-blue"
+              - Name: !Sub "${TGPrefix}-${Env}-green"
+            ProdTrafficRoute:
+              ListenerArns: [ !Ref ListenerHTTP ]
+            TestTrafficRoute:
+              ListenerArns: [ !Ref ListenerTestHTTP ]
+      ECSServices:
+        - ClusterName: !Sub "${ProjectName}-${Env}"
+          ServiceName: !Sub "${ProjectName}-${Env}-svc"
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasAlertEmail
+    Properties:
+      TopicName: !Sub "${ProjectName}-${Env}-alerts"
+
+  AlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasAlertEmail
+    Properties:
+      AlarmName: !Sub "${ProjectName}-${Env}-ALB-Target-5XX"
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+      EvaluationPeriods: 1
+      Period: 300
+      Statistic: Sum
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt ALB.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt TG.TargetGroupFullName
+      AlarmActions:
+        - !Ref AlertsTopic
+
+Outputs:
+  AlbDNS:
+    Description: "Public DNS of the Application Load Balancer"
+    Value: !GetAtt ALB.DNSName
+  Url:
+    Description: "App URL"
+    Value: !Sub "http://${ALB.DNSName}"
