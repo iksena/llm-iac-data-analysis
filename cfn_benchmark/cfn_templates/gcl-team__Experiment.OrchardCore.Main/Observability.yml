@@ -1,0 +1,184 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Observability Stack"
+
+Parameters:
+  CoreNetworkStackName:
+    Type: String
+    Default: cld-core-network
+  ServiceName:
+    Type: String
+    Default: cld-orchard-core-observability
+    Description: "The service name"
+  InstanceType:
+    Type: String
+    Default: "t3.medium"
+    Description: "EC2 instance type for Grafana server."
+  # References:
+  # 1. https://aws.amazon.com/blogs/compute/query-for-the-latest-amazon-linux-ami-ids-using-aws-systems-manager-parameter-store/
+  # 2. https://docs.aws.amazon.com/systems-manager/latest/userguide/parameter-store-public-parameters-ami.html
+  Ec2Ami:
+    Description: The Amazon Machine Image ID used for the instance
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+Resources:
+  # Unit 01: Security group for EC2
+  ec2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow access to the EC2 instance hosting Grafana
+      VpcId: {"Fn::ImportValue": !Sub "${CoreNetworkStackName}-${AWS::Region}-vpcId"}
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0  # Caution: SSH open to public, restrict as needed
+        - IpProtocol: tcp
+          FromPort: 3000
+          ToPort: 3000
+          CidrIp: 0.0.0.0/0  # Caution: Grafana open to public, restrict as needed
+        - IpProtocol: tcp
+          FromPort: 3200
+          ToPort: 3200
+          CidrIp: 0.0.0.0/0  # Caution: Tempo open to public, restrict as needed
+        - IpProtocol: tcp
+          FromPort: 4317
+          ToPort: 4317
+          CidrIp: 0.0.0.0/0  # Caution: Tempo open to public, restrict as needed
+        - IpProtocol: tcp
+          FromPort: 4318
+          ToPort: 4318
+          CidrIp: 0.0.0.0/0  # Caution: Tempo open to public, restrict as needed
+      Tags:
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+  # Unit 02: Enabling Grafana to access CloudWatch
+  ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+
+      Policies:
+        - PolicyName: EC2MetricsAndLogsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowReadingMetricsFromCloudWatch
+                Effect: Allow
+                Action:
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:GetMetricData
+                Resource: "*"
+              - Sid: AllowReadingLogsFromCloudWatch
+                Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                  - logs:GetLogGroupFields
+                  - logs:StartQuery
+                  - logs:StopQuery
+                  - logs:GetQueryResults
+                  - logs:GetLogEvents
+                Resource: "*"
+
+  ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - Ref: ec2InstanceRole
+
+  # Unit 03: EC2 with Grafana
+  ec2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref Ec2Ami
+      IamInstanceProfile:
+        Ref: ec2InstanceProfile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: true
+          DeviceIndex: 0
+          SubnetId: {"Fn::ImportValue": !Sub "${CoreNetworkStackName}-${AWS::Region}-publicSubnet1Id"}
+          GroupSet:
+            - !Ref ec2SecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y wget unzip
+          wget https://dl.grafana.com/oss/release/grafana-10.1.0-1.x86_64.rpm
+          yum install -y grafana-10.1.0-1.x86_64.rpm
+          systemctl enable --now grafana-server
+
+          # Install Tempo
+          wget https://github.com/grafana/tempo/releases/download/v2.7.2/tempo_2.7.2_linux_amd64.tar.gz
+          tar -xzvf tempo_2.7.2_linux_amd64.tar.gz
+          mv tempo /usr/local/bin/tempo
+          chmod +x /usr/local/bin/tempo
+
+          # Create a basic Tempo config file
+          echo "
+          server:
+            http_listen_port: 3200
+          distributor:
+            receivers:
+              otlp:
+                protocols:
+                  grpc:
+                    endpoint: 0.0.0.0:4317
+                  http:
+                    endpoint: 0.0.0.0:4318
+          storage:
+            trace:
+              backend: local
+              local:
+                path: /tmp/tempo/traces
+          " > /etc/tempo.yaml
+
+          # Start Tempo service
+          # Systemd service for Tempo
+          cat <<EOF > /etc/systemd/system/tempo.service
+          [Unit]
+          Description=Grafana Tempo service
+          After=network.target
+
+          [Service]
+          ExecStart=/usr/local/bin/tempo -config.file=/etc/tempo.yaml
+          Restart=always
+          RestartSec=5
+          User=root
+          LimitNOFILE=1048576
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reexec
+          systemctl daemon-reload
+          systemctl enable --now tempo
+      Tags:
+        - Key: Name
+          Value: "Observability-Instance"
+
+  ecsEip:
+    Type: AWS::EC2::EIP
+
+  ec2EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      AllocationId: !GetAtt ecsEip.AllocationId
+      InstanceId: !Ref ec2Instance
+
+Outputs:
+  GrafanaURL:
+    Description: "Grafana Web UI"
+    Value: !Sub "http://${ec2Instance.PublicIp}:3000"
+  TempoMetricsURL:
+    Description: "Tempo Metrics Endpoint"
+    Value: !Sub "http://${ec2Instance.PublicIp}:3200/metrics"

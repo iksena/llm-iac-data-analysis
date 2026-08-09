@@ -1,0 +1,313 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# This is sample code for demonstration purposes only. Do not deploy to
+# production without your own security review. See NOTICE file for details.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'GitHub MCP Server for AWS DevOps Agent (v2 - Human-in-the-Loop)'
+
+Parameters:
+  GitHubTokenSSMParam:
+    Type: String
+    Default: /devops-agent/github-token
+    Description: SSM Parameter Store path for the GitHub PAT (SecureString)
+
+  MCPApiKeySSMParam:
+    Type: String
+    Default: /github-mcp-server/MCP_API_KEY
+    Description: SSM Parameter Store path for the MCP server API key (SecureString)
+
+  GitHubRepo:
+    Type: String
+    Default: devops-runbooks/devops-agent-test
+    Description: GitHub repository (owner/repo format)
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: Branch to read runbooks from
+
+Resources:
+  MCPServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: devops-agent-mcp-server-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSMReadSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GitHubTokenSSMParam}
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${MCPApiKeySSMParam}
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !Sub arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub ssm.${AWS::Region}.amazonaws.com
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt MCPServerDLQ.Arn
+
+  MCPServerEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for MCP server Lambda encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowCloudWatchLogs
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt*
+              - kms:Decrypt*
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:Describe*
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+
+  MCPServerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: devops-agent-mcp-server-dlq
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+  MCPServerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: devops-agent-mcp-server
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt MCPServerRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      ReservedConcurrentExecutions: 10
+      KmsKeyArn: !GetAtt MCPServerEncryptionKey.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt MCPServerDLQ.Arn
+      Environment:
+        Variables:
+          GITHUB_TOKEN_SSM_PARAM: !Ref GitHubTokenSSMParam
+          MCP_API_KEY_SSM_PARAM: !Ref MCPApiKeySSMParam
+          GITHUB_REPO: !Ref GitHubRepo
+          GITHUB_BRANCH: !Ref GitHubBranch
+      Code:
+        ZipFile: |
+          import json, os, urllib.request, urllib.error, base64, uuid, time, boto3
+
+          ssm = boto3.client('ssm', region_name=os.environ.get('AWS_REGION', 'us-east-1'))
+          _cache = {}
+
+          def get_secret(param):
+              if param not in _cache:
+                  _cache[param] = ssm.get_parameter(Name=param, WithDecryption=True)['Parameter']['Value']
+              return _cache[param]
+
+          def get_github_token():
+              return get_secret(os.environ['GITHUB_TOKEN_SSM_PARAM'])
+
+          def get_mcp_api_key():
+              return get_secret(os.environ['MCP_API_KEY_SSM_PARAM'])
+
+          GITHUB_REPO = os.environ.get('GITHUB_REPO')
+          GITHUB_BRANCH = os.environ.get('GITHUB_BRANCH', 'main')
+          pending_actions = {}
+          SAFE_PREFIXES = ["kubectl get ", "kubectl describe ", "kubectl logs ", "kubectl cluster-info", "kubectl top ", "aws eks describe-", "aws eks list-", "aws ecr describe-"]
+
+          def github_request(path):
+              url = f"https://api.github.com{path}"
+              headers = {'Authorization': f'Bearer {get_github_token()}', 'Accept': 'application/vnd.github.v3+json', 'User-Agent': 'DevOps-Agent-MCP-Server'}
+              req = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(req) as response:
+                  return json.loads(response.read().decode())
+
+          def list_runbooks():
+              try:
+                  contents = github_request(f"/repos/{GITHUB_REPO}/contents/runbooks?ref={GITHUB_BRANCH}")
+                  return [i['name'] for i in contents if i['name'].endswith('.md')]
+              except:
+                  contents = github_request(f"/repos/{GITHUB_REPO}/contents?ref={GITHUB_BRANCH}")
+                  return [i['name'] for i in contents if i['name'].endswith('.md')]
+
+          def get_runbook(filename):
+              try:
+                  p = f"runbooks/{filename}" if not filename.startswith('runbooks/') else filename
+                  c = github_request(f"/repos/{GITHUB_REPO}/contents/{p}?ref={GITHUB_BRANCH}")
+                  return base64.b64decode(c['content']).decode('utf-8')
+              except:
+                  c = github_request(f"/repos/{GITHUB_REPO}/contents/{filename}?ref={GITHUB_BRANCH}")
+                  return base64.b64decode(c['content']).decode('utf-8')
+
+          def search_runbooks(query):
+              matches = []
+              for rb in list_runbooks():
+                  if query.lower() in rb.lower():
+                      matches.append(rb)
+                  else:
+                      try:
+                          if query.lower() in get_runbook(rb).lower(): matches.append(rb)
+                      except: pass
+              return matches
+
+          def is_safe(cmd):
+              return any(cmd.strip().startswith(p) for p in SAFE_PREFIXES)
+
+          def propose_action(runbook, cause, commands, description, severity="medium"):
+              aid = str(uuid.uuid4())[:8]
+              safe = [c for c in commands if is_safe(c)]
+              needs = [c for c in commands if not is_safe(c)]
+              action = {"id": aid, "runbook": runbook, "cause": cause, "description": description, "severity": severity, "safe_commands": safe, "commands_needing_approval": needs, "status": "pending_approval" if needs else "approved", "proposed_at": int(time.time()), "reviewed_at": None, "reviewed_by": None, "review_comment": None}
+              pending_actions[aid] = action
+              return action
+
+          def review_action_fn(action_id, decision, reviewer, comment=None):
+              if action_id not in pending_actions: return {"error": f"Action {action_id} not found"}
+              a = pending_actions[action_id]
+              if a["status"] != "pending_approval": return {"error": f"Already reviewed ({a['status']})"}
+              a["status"] = "approved" if decision == "approve" else "rejected"
+              a["reviewed_at"] = int(time.time())
+              a["reviewed_by"] = reviewer
+              a["review_comment"] = comment
+              return a
+
+          def handle_initialize(params):
+              return {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}}, "serverInfo": {"name": "devops-agent-mcp-server", "version": "2.0.0"}}
+
+          def handle_tools_list():
+              return {"tools": [
+                  {"name": "list_runbooks", "description": "List all available runbooks", "inputSchema": {"type": "object", "properties": {}}},
+                  {"name": "get_runbook", "description": "Get runbook content by filename", "inputSchema": {"type": "object", "properties": {"filename": {"type": "string"}}, "required": ["filename"]}},
+                  {"name": "search_runbooks", "description": "Search runbooks by keyword", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}},
+                  {"name": "propose_remediation", "description": "Propose remediation for human approval. Read-only commands auto-approved; mutating commands need human review.", "inputSchema": {"type": "object", "properties": {"runbook": {"type": "string"}, "cause": {"type": "string"}, "commands": {"type": "array", "items": {"type": "string"}}, "description": {"type": "string"}, "severity": {"type": "string", "enum": ["low","medium","high","critical"]}}, "required": ["runbook","cause","commands","description"]}},
+                  {"name": "get_pending_approvals", "description": "List actions awaiting human approval", "inputSchema": {"type": "object", "properties": {}}},
+                  {"name": "get_action_status", "description": "Check status of a proposed action", "inputSchema": {"type": "object", "properties": {"action_id": {"type": "string"}}, "required": ["action_id"]}},
+                  {"name": "review_action", "description": "Approve or reject a proposed action (human operator only)", "inputSchema": {"type": "object", "properties": {"action_id": {"type": "string"}, "decision": {"type": "string", "enum": ["approve","reject"]}, "reviewer": {"type": "string"}, "comment": {"type": "string"}}, "required": ["action_id","decision","reviewer"]}}
+              ]}
+
+          def handle_tools_call(params):
+              name = params.get('name')
+              args = params.get('arguments', {})
+              try:
+                  if name == 'list_runbooks': return {"content": [{"type": "text", "text": json.dumps(list_runbooks(), indent=2)}]}
+                  elif name == 'get_runbook': return {"content": [{"type": "text", "text": get_runbook(args['filename'])}]}
+                  elif name == 'search_runbooks': return {"content": [{"type": "text", "text": json.dumps(search_runbooks(args['query']), indent=2)}]}
+                  elif name == 'propose_remediation':
+                      a = propose_action(args['runbook'], args['cause'], args['commands'], args['description'], args.get('severity','medium'))
+                      txt = f"Proposed (ID: {a['id']})\nSafe: {a['safe_commands']}\nNeeds approval: {a['commands_needing_approval']}\nStatus: {a['status']}"
+                      return {"content": [{"type": "text", "text": txt}]}
+                  elif name == 'get_pending_approvals':
+                      p = [a for a in pending_actions.values() if a['status'] == 'pending_approval']
+                      return {"content": [{"type": "text", "text": json.dumps(p, indent=2, default=str) if p else "No pending actions."}]}
+                  elif name == 'get_action_status':
+                      a = pending_actions.get(args['action_id'], {"error": "Not found"})
+                      return {"content": [{"type": "text", "text": json.dumps(a, indent=2, default=str)}]}
+                  elif name == 'review_action':
+                      r = review_action_fn(args['action_id'], args['decision'], args['reviewer'], args.get('comment'))
+                      return {"content": [{"type": "text", "text": json.dumps(r, indent=2, default=str)}]}
+                  else: return {"content": [{"type": "text", "text": f"Unknown tool: {name}"}], "isError": True}
+              except Exception as e: return {"content": [{"type": "text", "text": f"Error: {str(e)}"}], "isError": True}
+
+          def lambda_handler(event, context):
+              if event.get('requestContext', {}).get('http', {}).get('method') == 'OPTIONS':
+                  return {'statusCode': 200, 'headers': {'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Methods': 'POST, OPTIONS', 'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Api-Key'}}
+              # Validate API key
+              api_key = get_mcp_api_key()
+              headers = event.get('headers', {})
+              provided_key = headers.get('x-api-key', '')
+              if not provided_key:
+                  auth = headers.get('authorization', '')
+                  if auth.startswith('Bearer '): provided_key = auth[7:]
+              if provided_key != api_key:
+                  return {'statusCode': 401, 'headers': {'Content-Type': 'application/json'}, 'body': json.dumps({"error": "Unauthorized"})}
+              try: body = json.loads(event.get('body', '{}'))
+              except: body = {}
+              method, params = body.get('method', ''), body.get('params', {})
+              if method == 'initialize': result = handle_initialize(params)
+              elif method == 'tools/list': result = handle_tools_list()
+              elif method == 'tools/call': result = handle_tools_call(params)
+              else: result = {"error": {"code": -32601, "message": f"Method not found: {method}"}}
+              return {'statusCode': 200, 'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'}, 'body': json.dumps({"jsonrpc": "2.0", "id": body.get('id'), "result": result})}
+
+  MCPServerApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: devops-agent-mcp-server-api
+      ProtocolType: HTTP
+
+  MCPServerApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref MCPServerApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt MCPServerFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  MCPServerApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref MCPServerApi
+      RouteKey: 'POST /'
+      Target: !Sub integrations/${MCPServerApiIntegration}
+
+  MCPServerApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/devops-agent-mcp-server
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt MCPServerEncryptionKey.Arn
+
+  MCPServerApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref MCPServerApi
+      StageName: '$default'
+      AutoDeploy: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt MCPServerApiLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","routeKey":"$context.routeKey","status":"$context.status","errorMessage":"$context.error.message"}'
+
+  MCPServerApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MCPServerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${MCPServerApi}/*/*
+
+Outputs:
+  MCPServerEndpoint:
+    Description: MCP Server Endpoint URL for DevOps Agent
+    Value: !GetAtt MCPServerApi.ApiEndpoint
+
+  FunctionName:
+    Description: Lambda Function Name
+    Value: !Ref MCPServerFunction

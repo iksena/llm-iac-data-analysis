@@ -1,0 +1,402 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Comprehensive Region Switch Orchestration - Handles all services
+
+Resources:
+  RegionSwitchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: RegionSwitchOrchestrationRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      Policies:
+        - PolicyName: RegionSwitchPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:*
+                  - route53-recovery-control-config:*
+                  - route53-recovery-cluster:*
+                  - secretsmanager:*
+                  - ssm:*
+                  - logs:*
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:PublishVersion
+                  - apigateway:*
+                  - cloudfront:*
+                  - s3:*
+                  - dynamodb:*
+                  - sns:Publish
+                Resource: '*'
+
+  ComprehensiveRegionSwitchDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: ComprehensiveRegionSwitchDocument
+      DocumentType: Automation
+      DocumentFormat: YAML
+      Content:
+        schemaVersion: '0.3'
+        description: Orchestrates complete region switch including all services
+        assumeRole: !GetAtt RegionSwitchRole.Arn
+        parameters:
+          NotificationTopicArn:
+            type: String
+            description: SNS topic for notifications
+            default: ''
+        mainSteps:
+          # Step 1: Pre-flight checks
+          - name: PreFlightChecks
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.11
+              Handler: script_handler
+              Script: |
+                import boto3
+                def script_handler(events, context):
+                  # Check current state
+                  ssm = boto3.client('ssm', region_name='us-east-1')
+                  control1 = ssm.get_parameter(Name='/app-failover/arc-control-us-east-1')['Parameter']['Value']
+                  cluster = ssm.get_parameter(Name='/app-failover/arc-cluster')['Parameter']['Value']
+
+                  config = boto3.client('route53-recovery-control-config', region_name='us-west-2')
+                  cluster_info = config.describe_cluster(ClusterArn=cluster)
+                  endpoint = cluster_info['Cluster']['ClusterEndpoints'][0]['Endpoint']
+
+                  import re
+                  region_match = re.search(r'\.([a-z]{2}-[a-z]+-\d)\.amazonaws\.com', endpoint)
+                  endpoint_region = region_match.group(1) if region_match else 'us-east-1'
+
+                  arc = boto3.client('route53-recovery-cluster', endpoint_url=endpoint, region_name=endpoint_region)
+                  state1 = arc.get_routing_control_state(RoutingControlArn=control1)['RoutingControlState']
+
+                  current_active = 'us-east-1' if state1 == 'On' else 'us-west-2'
+                  target_region = 'us-west-2' if current_active == 'us-east-1' else 'us-east-1'
+
+                  # Verify target region resources are healthy
+                  rds = boto3.client('rds', region_name=target_region)
+                  response = rds.describe_global_clusters(GlobalClusterIdentifier='aurora-global-test')
+
+                  for member in response['GlobalClusters'][0]['GlobalClusterMembers']:
+                    if target_region in member['DBClusterArn']:
+                      cluster_id = member['DBClusterArn'].split(':')[-1]
+                      cluster_info = rds.describe_db_clusters(DBClusterIdentifier=cluster_id)
+                      status = cluster_info['DBClusters'][0]['Status']
+                      if status != 'available':
+                        raise Exception(f"Target cluster not available: {status}")
+
+                  return {
+                    'current_active': current_active,
+                    'target_region': target_region,
+                    'control1': control1,
+                    'endpoint': endpoint,
+                    'endpoint_region': endpoint_region
+                  }
+            outputs:
+              - Name: CurrentActive
+                Selector: $.Payload.current_active
+                Type: String
+              - Name: TargetRegion
+                Selector: $.Payload.target_region
+                Type: String
+              - Name: Control1
+                Selector: $.Payload.control1
+                Type: String
+              - Name: Endpoint
+                Selector: $.Payload.endpoint
+                Type: String
+              - Name: EndpointRegion
+                Selector: $.Payload.endpoint_region
+                Type: String
+
+          # Step 2: Notify start
+          - name: NotifyStart
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.11
+              Handler: script_handler
+              InputPayload:
+                CurrentActive: '{{PreFlightChecks.CurrentActive}}'
+                TargetRegion: '{{PreFlightChecks.TargetRegion}}'
+                TopicArn: '{{NotificationTopicArn}}'
+              Script: |
+                import boto3
+                def script_handler(events, context):
+                  if events.get('TopicArn'):
+                    sns = boto3.client('sns')
+                    sns.publish(
+                      TopicArn=events['TopicArn'],
+                      Subject='Region Switch Started',
+                      Message=f"Starting region switch from {events['CurrentActive']} to {events['TargetRegion']}"
+                    )
+                  return {'status': 'notified'}
+
+          # Step 3: Stop writes to current region (optional - set read-only mode)
+          - name: PrepareForSwitch
+            action: aws:sleep
+            inputs:
+              Duration: PT5S
+
+          # Step 4: Failover Aurora Global Database
+          - name: FailoverAurora
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.11
+              Handler: script_handler
+              InputPayload:
+                CurrentActive: '{{PreFlightChecks.CurrentActive}}'
+              Script: |
+                import boto3
+                import time
+                def script_handler(events, context):
+                  active_region = events['CurrentActive']
+                  rds = boto3.client('rds', region_name=active_region)
+
+                  # Wait for global cluster available
+                  while True:
+                    response = rds.describe_global_clusters(GlobalClusterIdentifier='aurora-global-test')
+                    if response['GlobalClusters'][0]['Status'] == 'available':
+                      break
+                    time.sleep(10)
+
+                  # Get reader cluster
+                  response = rds.describe_global_clusters(GlobalClusterIdentifier='aurora-global-test')
+                  members = response['GlobalClusters'][0]['GlobalClusterMembers']
+
+                  reader_cluster_arn = None
+                  for member in members:
+                    if not member['IsWriter']:
+                      reader_cluster_arn = member['DBClusterArn']
+                      break
+
+                  # Wait for target cluster available
+                  target_region = reader_cluster_arn.split(':')[3]
+                  target_cluster_id = reader_cluster_arn.split(':')[-1]
+                  rds_target = boto3.client('rds', region_name=target_region)
+
+                  while True:
+                    cluster_info = rds_target.describe_db_clusters(DBClusterIdentifier=target_cluster_id)
+                    if cluster_info['DBClusters'][0]['Status'] == 'available':
+                      break
+                    time.sleep(10)
+
+                  # Failover
+                  rds.failover_global_cluster(
+                    GlobalClusterIdentifier='aurora-global-test',
+                    TargetDbClusterIdentifier=reader_cluster_arn
+                  )
+
+                  # Wait for completion
+                  while True:
+                    response = rds.describe_global_clusters(GlobalClusterIdentifier='aurora-global-test')
+                    if response['GlobalClusters'][0]['Status'] == 'available':
+                      break
+                    time.sleep(10)
+
+                  return {'status': 'success', 'new_writer_region': target_region}
+            outputs:
+              - Name: NewWriterRegion
+                Selector: $.Payload.new_writer_region
+                Type: String
+
+          # Step 5: Update Secrets Manager
+          - name: UpdateSecrets
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.11
+              Handler: script_handler
+              Script: |
+                import boto3
+                import json
+                def script_handler(events, context):
+                  rds = boto3.client('rds', region_name='us-east-1')
+                  response = rds.describe_global_clusters(GlobalClusterIdentifier='aurora-global-test')
+
+                  writer_cluster_arn = None
+                  for member in response['GlobalClusters'][0]['GlobalClusterMembers']:
+                    if member['IsWriter']:
+                      writer_cluster_arn = member['DBClusterArn']
+                      break
+
+                  cluster_region = writer_cluster_arn.split(':')[3]
+                  cluster_id = writer_cluster_arn.split(':')[-1]
+
+                  rds_regional = boto3.client('rds', region_name=cluster_region)
+                  cluster_info = rds_regional.describe_db_clusters(DBClusterIdentifier=cluster_id)
+                  endpoint = cluster_info['DBClusters'][0]['Endpoint']
+
+                  # Update secret in both regions
+                  for region in ['us-east-1', 'us-west-2']:
+                    try:
+                      sm = boto3.client('secretsmanager', region_name=region)
+                      secret = sm.get_secret_value(SecretId='aurora-failover-db-secret')
+                      secret_data = json.loads(secret['SecretString'])
+                      secret_data['host'] = endpoint
+                      sm.put_secret_value(SecretId='aurora-failover-db-secret', SecretString=json.dumps(secret_data))
+                    except:
+                      pass  # Secret may not exist in both regions
+
+                  return {'new_endpoint': endpoint}
+
+          # Step 6: Update Lambda environment variables (if needed)
+          - name: UpdateLambdaConfig
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.11
+              Handler: script_handler
+              InputPayload:
+                TargetRegion: '{{PreFlightChecks.TargetRegion}}'
+              Script: |
+                import boto3
+                def script_handler(events, context):
+                  # Update Lambda functions that need to know active region
+                  # This is application-specific
+                  return {'status': 'skipped - no Lambda updates needed'}
+
+          # Step 7: Flip ARC controls
+          - name: FlipARCControls
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.11
+              Handler: script_handler
+              InputPayload:
+                Control1: '{{PreFlightChecks.Control1}}'
+                Endpoint: '{{PreFlightChecks.Endpoint}}'
+                EndpointRegion: '{{PreFlightChecks.EndpointRegion}}'
+                CurrentActive: '{{PreFlightChecks.CurrentActive}}'
+              Script: |
+                import boto3
+                def script_handler(events, context):
+                  ssm = boto3.client('ssm', region_name='us-east-1')
+                  control1 = events['Control1']
+                  control2 = ssm.get_parameter(Name='/app-failover/arc-control-us-west-2')['Parameter']['Value']
+                  endpoint = events['Endpoint']
+                  endpoint_region = events['EndpointRegion']
+                  active_region = events['CurrentActive']
+
+                  arc = boto3.client('route53-recovery-cluster', endpoint_url=endpoint, region_name=endpoint_region)
+
+                  if active_region == 'us-east-1':
+                    arc.update_routing_control_state(RoutingControlArn=control1, RoutingControlState='Off')
+                    arc.update_routing_control_state(RoutingControlArn=control2, RoutingControlState='On')
+                    return {'status': 'success', 'new_active': 'us-west-2'}
+                  else:
+                    arc.update_routing_control_state(RoutingControlArn=control2, RoutingControlState='Off')
+                    arc.update_routing_control_state(RoutingControlArn=control1, RoutingControlState='On')
+                    return {'status': 'success', 'new_active': 'us-east-1'}
+
+          # Step 8: Verify new region
+          - name: VerifyNewRegion
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.11
+              Handler: script_handler
+              InputPayload:
+                TargetRegion: '{{PreFlightChecks.TargetRegion}}'
+              Script: |
+                import boto3
+                def script_handler(events, context):
+                  target_region = events['TargetRegion']
+
+                  # Verify Aurora is writer
+                  rds = boto3.client('rds', region_name=target_region)
+                  response = rds.describe_global_clusters(GlobalClusterIdentifier='aurora-global-test')
+
+                  writer_found = False
+                  for member in response['GlobalClusters'][0]['GlobalClusterMembers']:
+                    if member['IsWriter'] and target_region in member['DBClusterArn']:
+                      writer_found = True
+                      break
+
+                  if not writer_found:
+                    raise Exception(f"Writer not in target region {target_region}")
+
+                  # Verify ARC controls
+                  ssm = boto3.client('ssm', region_name='us-east-1')
+                  control_param = f'/app-failover/arc-control-{target_region}'
+                  control = ssm.get_parameter(Name=control_param)['Parameter']['Value']
+                  cluster = ssm.get_parameter(Name='/app-failover/arc-cluster')['Parameter']['Value']
+
+                  config = boto3.client('route53-recovery-control-config', region_name='us-west-2')
+                  cluster_info = config.describe_cluster(ClusterArn=cluster)
+                  endpoint = cluster_info['Cluster']['ClusterEndpoints'][0]['Endpoint']
+
+                  import re
+                  region_match = re.search(r'\.([a-z]{2}-[a-z]+-\d)\.amazonaws\.com', endpoint)
+                  endpoint_region = region_match.group(1) if region_match else 'us-east-1'
+
+                  arc = boto3.client('route53-recovery-cluster', endpoint_url=endpoint, region_name=endpoint_region)
+                  state = arc.get_routing_control_state(RoutingControlArn=control)['RoutingControlState']
+
+                  if state != 'On':
+                    raise Exception(f"ARC control for {target_region} is not On")
+
+                  return {'status': 'verified', 'new_active_region': target_region}
+
+          # Step 9: Notify completion
+          - name: NotifyCompletion
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.11
+              Handler: script_handler
+              InputPayload:
+                TargetRegion: '{{PreFlightChecks.TargetRegion}}'
+                TopicArn: '{{NotificationTopicArn}}'
+              Script: |
+                import boto3
+                def script_handler(events, context):
+                  if events.get('TopicArn'):
+                    sns = boto3.client('sns')
+                    sns.publish(
+                      TopicArn=events['TopicArn'],
+                      Subject='Region Switch Completed',
+                      Message=f"Region switch to {events['TargetRegion']} completed successfully"
+                    )
+                  return {'status': 'notified'}
+
+  TriggerComprehensiveSwitchFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TriggerComprehensiveRegionSwitch
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt RegionSwitchRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def lambda_handler(event, context):
+              ssm = boto3.client('ssm')
+
+              response = ssm.start_automation_execution(
+                  DocumentName='ComprehensiveRegionSwitchDocument',
+                  Parameters={
+                      'NotificationTopicArn': [event.get('notification_topic', '')]
+                  }
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Comprehensive region switch initiated',
+                      'executionId': response['AutomationExecutionId']
+                  })
+              }
+
+Outputs:
+  DocumentName:
+    Value: !Ref ComprehensiveRegionSwitchDocument
+  TriggerFunctionName:
+    Value: !Ref TriggerComprehensiveSwitchFunction

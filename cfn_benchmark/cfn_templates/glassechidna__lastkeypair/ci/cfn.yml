@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Parameters:
+  FunctionName:
+    Type: String
+    Default: LastKeypair
+  FunctionKmsAuthName:
+    Type: String
+    Default: LastKeypair
+  KeyAliasName:
+    Type: String
+    Default: alias/LastKeypair
+  PstoreCAKeyBytesName:
+    Type: String
+  S3Bucket:
+    Type: String
+  S3Key:
+    Type: String
+  S3ObjectVersion:
+    Type: String
+  MFARequired:
+    Type: String
+    Default: false
+  AllowedAwsAccounts:
+    Type: String
+  JumpboxDns:
+    Type: String
+Conditions:
+  MFARequired: !Equals [!Ref MFARequired, "true"]
+Resources:
+  Key:
+    Type: AWS::KMS::Key
+    Properties:
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: key-policy
+        Statement:
+          - Sid: Default
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:role/KMSAdminRole
+#              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+          - Sid: KmsDescribe
+            Effect: Allow
+            Principal:
+              AWS: "*" # we use kms:CallerAccount condition key instead
+            Action: kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Split [",", !Ref AllowedAwsAccounts]
+          - Sid: AllowIAMUserEncrypt
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action: kms:Encrypt
+            Resource: "*" # we use kms:CallerAccount condition key instead
+            Condition:
+              StringEquals:
+                kms:EncryptionContext:to: !Ref FunctionKmsAuthName
+                kms:EncryptionContext:type: "${aws:principaltype}"
+                kms:EncryptionContext:fromId: "${aws:userid}"
+                kms:EncryptionContext:fromAccount: "${kms:CallerAccount}"
+                kms:CallerAccount: !Split [",", !Ref AllowedAwsAccounts]
+              StringEqualsIfExists:
+                aws:username: "${kms:EncryptionContext:fromName}"
+                kms:EncryptionContext:fromName: "${aws:username}"
+                ec2:SourceInstanceARN: "${kms:EncryptionContext:hostInstanceArn}"
+                kms:EncryptionContext:hostInstanceArn: "${ec2:SourceInstanceARN}"
+#              Bool:
+#                aws:MultiFactorAuthPresent: true
+          - Sid: KmsLambdaAuth
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaRole.Arn
+            Action: kms:Decrypt
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:EncryptionContext:to:
+                  - !Ref FunctionKmsAuthName
+  KeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      TargetKeyId: !Ref Key
+      AliasName: !Ref KeyAliasName
+  Function:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: lambda_linux_amd64
+      FunctionName: !Ref FunctionName
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: go1.x
+      Timeout: 60
+      Code:
+        S3Bucket: !Ref S3Bucket
+        S3Key: !Ref S3Key
+        S3ObjectVersion: !Ref S3ObjectVersion
+      Environment:
+        Variables:
+          KMS_KEY_ID: !GetAtt Key.Arn
+          KMS_TOKEN_IDENTITY: !Ref FunctionKmsAuthName
+          VALIDITY_DURATION: 900
+          PSTORE_CA_KEY_BYTES: !Ref PstoreCAKeyBytesName
+          AUTHORIZATION_LAMBDA: !Ref AuthorizationFunction
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      Policies: []
+  Policy: # needed to avoid circular dependency between function, role and key
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles: [!Ref LambdaRole]
+      PolicyName: root
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: arn:aws:logs:*:*:*
+          - Effect: Allow
+            Action: ssm:GetParameters
+            Resource: "*"
+          - Effect: Allow
+            Action: kms:Decrypt
+            Resource: "*"
+          - Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !GetAtt AuthorizationFunction.Arn
+          - Effect: Allow
+            Action: kms:Describe*
+            Resource: !GetAtt Key.Arn
+  AuthorizationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      FunctionName: !Sub ${FunctionName}-Authorizer
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: nodejs6.10
+      Timeout: 60
+      Environment:
+        Variables:
+          JUMPBOX_DNS: !Ref JumpboxDns
+      Code:
+        ZipFile: |
+          exports.handler = function(event, context, callback) {
+            console.log(JSON.stringify(event));
+            var cb = function(err, resp) {
+              console.log(JSON.stringify(resp));
+              callback(err, resp);
+            }
+            if (event.Kind === "LkpHostCertAuthorizationRequest") {
+              cb(null, {
+                authorized: true,
+                principals: event.Principals
+              });
+              return;
+            }
+            if (event.RemoteInstanceArn == "abcdef") {
+              cb(null, {
+                authorized: true,
+                principals: [event.RemoteInstanceArn]
+              });
+            } else if (event.Vouchers && event.Vouchers.length > 0) {
+              cb(null, {
+                authorized: true,
+                principals: [event.RemoteInstanceArn, process.env.JUMPBOX_DNS],
+                jumpboxes: [{
+                  address: process.env.JUMPBOX_DNS,
+                  user: event.Vouchers[0].Name // really just for testing purposes
+                }]
+              });
+            } else {
+              cb(null, {
+                authorized: true,
+                principals: [event.RemoteInstanceArn, process.env.JUMPBOX_DNS],
+                jumpboxes: [{
+                  address: process.env.JUMPBOX_DNS,
+                  user: "ec2-user"
+                }],
+                TargetAddress: "78.65.43.21"
+              });
+            }
+          };
+Outputs:
+  FunctionArn:
+    Value: !GetAtt Function.Arn
+  KeyArn:
+    Value: !GetAtt Key.Arn

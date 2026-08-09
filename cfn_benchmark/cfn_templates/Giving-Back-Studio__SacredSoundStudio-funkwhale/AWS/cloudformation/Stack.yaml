@@ -1,0 +1,423 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description:
+  This template generates a Fargate Cluster and required resources
+
+Metadata:
+  Author: https://www.linkedin.com/in/jacob-foster-508280140/
+
+Parameters:
+  ClusterName:
+    Type: String
+    Description: The name of the Fargate Cluster
+
+  BaseImage:
+    Type: String
+    Description: ECR Image URI for the Base container
+
+  NginxImage:
+    Type: String
+    Description: ECR Image URI for the nginx container
+
+  ContainerPort:
+    Type: Number
+    Default: 5000
+
+  StaticSiteBucket:
+    Type: String
+
+Resources:
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      CapacityProviders:
+        - FARGATE
+      ClusterName: !Ref ClusterName
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: DEFAULT
+
+  RedisCache:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      Engine: redis
+      EngineVersion: 7.0
+      CacheNodeType: cache.t3.small
+      NumCacheNodes: 1
+      CacheSubnetGroupName:
+        Ref: RedisSubnetGroup
+      VpcSecurityGroupIds:
+      - Fn::GetAtt:
+        - RedisSecurityGroup
+        - GroupId
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Elasticache Security Group
+      VpcId:
+        Fn::GetAtt:
+        - VPC
+        - Outputs.VPCId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 6379
+        ToPort: 6379
+        CidrIp: 10.0.0.0/16
+
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName:
+        Fn::Sub: RedisSubnetGroup-${ClusterName}
+      Description: ElastiCache subnet group
+      SubnetIds:
+      - Fn::GetAtt:
+        - VPC
+        - Outputs.PrivateSubnet0
+      - Fn::GetAtt:
+        - VPC
+        - Outputs.PrivateSubnet1
+
+  RedisUrl:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name:
+        Fn::Sub: /${ClusterName}/redis/url
+      Type: String
+      Value:
+        Fn::Sub: redis://${RedisCache.RedisEndpoint.Address}:${RedisCache.RedisEndpoint.Port}/0
+      Description: SSM Parameter for the redis URL
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internet-facing
+      SecurityGroups:
+        - !GetAtt VPC.Outputs.LoadBalancerSecurityGroup
+      Subnets:
+        - !GetAtt VPC.Outputs.PublicSubnet0
+        - !GetAtt VPC.Outputs.PublicSubnet1
+
+  WafAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      DefaultAction:
+        Allow: {}
+      Description: !Sub "Protecting ALB for ${ClusterName}"
+      Scope: REGIONAL
+      VisibilityConfig:
+        CloudWatchMetricsEnabled: true
+        SampledRequestsEnabled: true
+        MetricName: !Sub "WebACL${ClusterName}Metric"
+      Rules:
+        - Name: RuleWithAWSManagedRules
+          OverrideAction:
+            None: {}
+          Priority: 0
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "AWSManagedRules${ClusterName}Metric"
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules:
+                - Name: SizeRestrictions_BODY
+                - Name: CrossSiteScripting_BODY
+        - Name: AWSManagedBadInputs
+          OverrideAction:
+            None: {}
+          Priority: 1
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "AWSBadInputs${ClusterName}Metric"
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+              ExcludedRules: []
+
+  WafAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      ResourceArn: !Ref LoadBalancer
+      WebACLArn: !GetAtt WafAcl.Arn
+
+  DjangoSecretKey:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Secret key for Django
+      GenerateSecretString:
+        PasswordLength: 42
+
+  MuxSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: Credentials for the MUX API
+      SecretString: '{"token_id":"secret", "token_secret":"secret"}'
+
+  Namespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Description: 'Service Discovery namespace for the cluster'
+      Name: !Ref ClusterName
+      Vpc: !GetAtt VPC.Outputs.VPCId
+
+  WorkerService:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        ServiceName: worker
+        Cluster: !Ref Cluster
+        Namespace: !GetAtt Namespace.Arn
+        Command: 'celery -A funkwhale_api.taskapp worker -l debug -B --concurrency=10'
+        VPC: !GetAtt VPC.Outputs.VPCId
+        ContainerSecurityGroup: !GetAtt VPC.Outputs.ContainerSecurityGroup
+        SubnetA: !GetAtt VPC.Outputs.PrivateSubnet0
+        SubnetB: !GetAtt VPC.Outputs.PrivateSubnet1
+        ExecutionRole: !Ref ExecutionRole
+        TaskRole: !Ref TaskRole
+        AutoScalingRole: !GetAtt AutoScalingRole.Arn
+        Image: !Ref BaseImage
+        AutoScalingTargetValue: 70
+        RDSConnectionSecret: !GetAtt RDSCluster.Outputs.ConnectionSecret
+        RedisUrl: !GetAtt RedisUrl.Value
+        S3Bucket: !GetAtt CDN.Outputs.Bucket
+        CdnId: !GetAtt CDN.Outputs.DistributionId
+        DjangoSecretKey: !Ref DjangoSecretKey
+        MuxSecret: !Ref MuxSecret
+        Cpu: 512
+        Memory: 2GB
+        EfsFileSystemId: !Ref EFS
+      TemplateURL: FargateService.yaml
+
+  WebService:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        ServiceName: web
+        Cluster: !Ref Cluster
+        Namespace: !GetAtt Namespace.Arn
+        Command: 'sh docker/server.sh'
+        HealthCheckPath: '/api/v2/instance/nodeinfo/2.1/'
+        VPC: !GetAtt VPC.Outputs.VPCId
+        SubnetA: !GetAtt VPC.Outputs.PrivateSubnet0
+        SubnetB: !GetAtt VPC.Outputs.PrivateSubnet1
+        ExecutionRole: !Ref ExecutionRole
+        TaskRole: !Ref TaskRole
+        AutoScalingRole: !GetAtt AutoScalingRole.Arn
+        LoadBalancer: !Ref LoadBalancer
+        LoadBalancerSecurityGroup: !GetAtt VPC.Outputs.LoadBalancerSecurityGroup
+        ContainerPort: !Ref ContainerPort
+        ContainerSecurityGroup: !GetAtt VPC.Outputs.ContainerSecurityGroup
+        Image: !Ref BaseImage
+        NginxImage: !Ref NginxImage
+        MaxContainers: 10
+        AutoScalingTargetValue: 75
+        AutoScalingRequestCountValue: 150
+        RDSConnectionSecret: !GetAtt RDSCluster.Outputs.ConnectionSecret
+        RedisUrl: !GetAtt RedisUrl.Value
+        S3Bucket: !GetAtt CDN.Outputs.Bucket
+        CdnId: !GetAtt CDN.Outputs.DistributionId
+        DjangoSecretKey: !Ref DjangoSecretKey
+        MuxSecret: !Ref MuxSecret
+        EfsFileSystemId: !Ref EFS
+      TemplateURL: FargateService.yaml
+
+  EFS:
+    Type: AWS::EFS::FileSystem
+
+  CDN:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        ClusterName: !Ref ClusterName
+        BackendLoadBalancerUrl: !GetAtt LoadBalancer.DNSName
+        Bucket: !Ref StaticSiteBucket
+      TemplateURL: CDN.yaml
+
+  VPC:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        VPCName: !Ref ClusterName
+        EfsFileSystemId: !Ref EFS
+      TemplateURL: VPC.yaml
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      Policies:
+        - PolicyName: AllowReadSecrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 'secretsmanager:GetSecretValue'
+                Resource:
+                  - !GetAtt RDSCluster.Outputs.ConnectionSecret
+                  - !Ref DjangoSecretKey
+                  - !Ref MuxSecret
+
+  TranscoderRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Rule to trigger transcoder on video upload"
+      EventPattern:
+        source: ["aws.s3"]
+        detail-type: ["Object Created"]
+        detail:
+          bucket:
+            name: [!Ref StaticSiteBucket]
+          object:
+            key:
+              - prefix: "videos/"
+      State: "ENABLED"
+      Targets:
+        - Arn: !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${Cluster}"
+          Id: "TranscoderTask"
+          RoleArn: !GetAtt EventsRole.Arn
+          EcsParameters:
+            TaskDefinitionArn: !GetAtt Transcoder.Outputs.TaskDefinition
+            TaskCount: 1
+            LaunchType: FARGATE
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                Subnets:
+                  - !GetAtt VPC.Outputs.PrivateSubnet0
+                  - !GetAtt VPC.Outputs.PrivateSubnet1
+                SecurityGroups:
+                  - !GetAtt VPC.Outputs.ContainerSecurityGroup
+          InputTransformer:
+            InputPathsMap:
+              key: "$.detail.object.key"
+            InputTemplate: '{"containerOverrides":[{"name":"transcoder","command":["funkwhale-manage","transcode_video","<key>"]}]}'
+
+  EventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowECSTaskRun
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "ecs:RunTask"
+                Resource: !GetAtt Transcoder.Outputs.TaskDefinition
+              - Effect: Allow
+                Action: "iam:PassRole"
+                Resource:
+                  - !GetAtt TaskRole.Arn
+                  - !GetAtt ExecutionRole.Arn
+
+  Transcoder:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        ServiceName: transcoder
+        Cpu: 2048
+        Memory: 4GB
+        Cluster: !Ref Cluster
+        Namespace: !GetAtt Namespace.Arn
+        Command: 'funkwhale-manage transcode_video'
+        VPC: !GetAtt VPC.Outputs.VPCId
+        SubnetA: !GetAtt VPC.Outputs.PrivateSubnet0
+        SubnetB: !GetAtt VPC.Outputs.PrivateSubnet1
+        ExecutionRole: !Ref ExecutionRole
+        TaskRole: !Ref TaskRole
+        ContainerSecurityGroup: !GetAtt VPC.Outputs.ContainerSecurityGroup
+        Image: !Ref BaseImage
+        MaxContainers: 0
+        RDSConnectionSecret: !GetAtt RDSCluster.Outputs.ConnectionSecret
+        RedisUrl: !GetAtt RedisUrl.Value
+        S3Bucket: !GetAtt CDN.Outputs.Bucket
+        CdnId: !GetAtt CDN.Outputs.DistributionId
+        DjangoSecretKey: !Ref DjangoSecretKey
+        MuxSecret: !Ref MuxSecret
+        EfsFileSystemId: !Ref EFS
+      TemplateURL: FargateService.yaml
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSXrayFullAccess
+        - arn:aws:iam::aws:policy/AmazonElasticFileSystemFullAccess
+        - arn:aws:iam::aws:policy/AmazonSESFullAccess
+      Policies:
+        - PolicyName: AllowECSExec
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource: '*'
+                Action:
+                  - 'ssmmessages:CreateControlChannel'
+                  - 'ssmmessages:CreateDataChannel'
+                  - 'ssmmessages:OpenControlChannel'
+                  - 'ssmmessages:OpenDataChannel'
+        - PolicyName: AllowS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Resource:
+                  - !Sub "arn:aws:s3:::${CDN.Outputs.Bucket}/*"
+                  - !Sub "arn:aws:s3:::${CDN.Outputs.Bucket}"
+                Action: "s3:*"
+
+  RDSCluster:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      Parameters:
+        ClusterName: !Ref ClusterName
+        SubnetA: !GetAtt VPC.Outputs.PrivateSubnet0
+        SubnetB: !GetAtt VPC.Outputs.PrivateSubnet1
+        ContainerSecurityGroup: !GetAtt VPC.Outputs.ContainerSecurityGroup
+        VPC: !GetAtt VPC.Outputs.VPCId
+      TemplateURL: RDS.yaml
+
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole'
+
+Outputs:
+  StageURL:
+    Description: "The publicly accessible application endpoints"
+    Value: !GetAtt LoadBalancer.DNSName

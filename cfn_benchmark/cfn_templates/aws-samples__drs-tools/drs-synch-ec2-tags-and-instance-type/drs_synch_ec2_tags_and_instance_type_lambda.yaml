@@ -1,0 +1,365 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Template to create the drs_synch_ec2_tags_and_instance_type AWS Lambda function.  The lambda function synchronizes tags from EC2 instances running in the region with their corresponding AWS Elastic Disaster Recovery service (DRS) source servers.  It also updates the DRS source server launch template instance type to correspond to the original EC2 instance type.
+Parameters:
+  RateString:
+    Description: The rate at which to synchronize tags, see https://docs.aws.amazon.com/AmazonCloudWatch/latest/events/ScheduledEvents.html#RateExpressions for valid values
+    Type: String
+    Default: 1 day
+  Memory:
+    Description: Memory to allocate to the AWS Lambda Function
+    Type: Number
+    Default: 128
+  DrsAssumeRoleName:
+    Description: The name of the AWS IAM role in the DRS account to assume in order to update tags on DRS source servers
+    Type: String
+    Default: drs_synch_ec2_tags_and_instance_type
+  DrsAccountNumber:
+    Description: The AWS account number where the DRS service is running
+    Type: String
+  DrsRegion:
+    Description: The name of the AWS region where the DRS service is running (e.g. "us-west-2")
+    Type: String
+  SourceRegions:
+    Description: A comma separated list of AWS regions containing the EC2 instances whose tags should be replicated to DRS (e.g. "us-east-1,us-west-1")
+    Type: String
+
+Resources:
+  lambdafunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: drs_synch_ec2_tags_and_instance_type
+      Description: "AWS Lambda function to synchronize AWS EC2 instance tags with AWS Elastic Disaster Recovery Service source servers"
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt lambdarole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      Environment:
+        Variables:
+          DRS_ASSUME_ROLE_NAME: !Ref DrsAssumeRoleName
+          DRS_ACCOUNT_NUMBER: !Ref DrsAccountNumber
+          DRS_REGION: !Ref DrsRegion
+          SOURCE_ACCOUNT: !Ref AWS::AccountId
+          SOURCE_REGIONS: !Ref SourceRegions
+      Code:
+        ZipFile: |
+          import boto3
+          import logging
+          import json
+          import uuid
+          from os import getenv
+          from botocore.config import Config
+
+          logger = logging.getLogger()
+          log_level = getenv("LOGLEVEL", "INFO")
+          level = logging.getLevelName(log_level)
+          logger.setLevel(level)
+
+          def handler(event, context):
+              drs_account_number = getenv("DRS_ACCOUNT_NUMBER", None)
+              drs_account_role = getenv("DRS_ASSUME_ROLE_NAME", None)
+              drs_account_region = getenv("DRS_REGION", None)
+              source_account = getenv("SOURCE_ACCOUNT", None)
+              source_regions = getenv("SOURCE_REGIONS", None)
+              source_regions = [x.strip() for x in source_regions.split(',')]
+
+              logger.info("Event received: {}".format(json.dumps(event)))
+
+              synch_tags = event.get('synch_tags', False)
+              synch_instance_type = event.get('synch_instance_type', False)
+
+              replicate_source_servers_tags_and_instance_type(drs_account_number, drs_account_role, drs_account_region,
+                                                              source_account,
+                                                              source_regions, synch_tags, synch_instance_type)
+
+          def replicate_source_servers_tags_and_instance_type(drs_account_number, drs_account_role, drs_account_region,
+                                                              source_account,
+                                                              source_regions, synch_tags, synch_instance_type):
+              try:
+                  logger.debug("assuming role {} in account {}, region {}".format(drs_account_role, drs_account_number,
+                                                                                  drs_account_region))
+                  drs_account_credentials = assume_role(drs_account_number, drs_account_role, "replicate_source_servers_tags",
+                                                        drs_account_region)
+                  drs_account_client = boto3_client('drs', drs_account_region, drs_account_credentials)
+                  drs_paginator = drs_account_client.get_paginator('describe_source_servers')
+                  response_iterator = drs_paginator.paginate(
+                      filters={},
+                      maxResults=200,
+                      PaginationConfig={
+                          'MaxItems': 200,
+                          'PageSize': 200
+                      }
+                  )
+                  source_servers_metadata = []
+                  for i in response_iterator:
+                      source_servers_metadata += i.get('items')
+
+                  logger.info('{} source servers found, gathering instance ids...'.format(len(source_servers_metadata)))
+
+                  source_servers_tags = {}
+                  for server_metadata in source_servers_metadata:
+                      if server_metadata['dataReplicationInfo']['dataReplicationState'] != 'DISCONNECTED':
+                          source_servers_tags[server_metadata['sourceProperties']['identificationHints']['awsInstanceID']] = {
+                              'arn': server_metadata['arn'],
+                              'instance_id': server_metadata['sourceProperties']['identificationHints']['awsInstanceID'],
+                              'source_servers_tags': server_metadata['tags'],
+                              'instance_tags': dict()
+                          }
+
+                  logger.debug("data for existing drs source servers is: {}".format(source_servers_tags))
+                  logger.info('processed {} source servers, getting tags..'.format(len(source_servers_tags)))
+                  ec2_instance_ids = list(source_servers_tags.keys())
+
+                  for source_server_region in source_regions:
+                      logger.info("Processing region {}".format(source_server_region))
+                      source_account_ec2_client = boto3.client('ec2', source_server_region)
+
+                      instances_paginator = source_account_ec2_client.get_paginator('describe_instances')
+
+                      instance_pages = instances_paginator.paginate()
+
+                      for instance_page in instance_pages:
+                          for reservation in instance_page['Reservations']:
+                              for instance in reservation['Instances']:
+                                  # determine if instance has a matching DRS source server
+                                  matched_instance = source_servers_tags.get(instance['InstanceId'], None)
+                                  if matched_instance:
+                                      logger.info("Matched instance {} to source server {}, updating source server tags.".format(
+                                          matched_instance['instance_id'], matched_instance['arn']))
+                                      instance_tags = matched_instance['instance_tags']
+                                      if len(instance['Tags']) > 0:
+                                          for tag in instance['Tags']:
+                                              logger.debug("tag is {}".format(tag))
+                                              if not tag['Key'].startswith("aws:"):
+                                                  instance_tags[tag['Key']] = tag['Value']
+                                              else:
+                                                  logger.debug("skipping aws reserved tag: {} for instance {}".format(tag['Key'],
+                                                                                                                      instance[
+                                                                                                                          'InstanceId']))
+                                          # add AWS information to tags
+                                          instance_tags['source:account'] = source_account
+                                          instance_tags['source:region'] = source_server_region
+                                          instance_tags['source:instance-id'] = instance['InstanceId']
+                                          instance_tags['source:instance-type'] = instance['InstanceType']
+
+                                          source_server_id = matched_instance['arn'].split('/')[-1]
+
+                                          if synch_tags:
+                                              response = drs_account_client.tag_resource(
+                                                  resourceArn=matched_instance['arn'],
+                                                  tags=instance_tags
+                                              )
+                                              logger.debug('drs_account_client.tag_resource() returned {}'.format(response))
+
+                                              logger.info("Enabling copy tags from source server to recovery instance for {}".format(source_server_id))
+
+                                              response = drs_account_client.update_launch_configuration(
+                                                  sourceServerID=source_server_id,
+                                                  copyTags=True
+                                              )
+                                              logger.debug("Launch configuration updated to: {}".format(response))
+                                          else:
+                                              logger.info("synch_tags in event is False, skipping tag update")
+                                          if synch_instance_type:
+                                              logger.info("Updating source server launch template instance type to: {}".format(
+                                                  instance['InstanceType']))
+                                              try:
+                                                  launch_configuration = drs_account_client.get_launch_configuration(
+                                                      sourceServerID=source_server_id)
+                                                  logger.info("Launch template id for source server {} is {}".format(
+                                                      source_server_id, launch_configuration["ec2LaunchTemplateID"]))
+                                                  drs_account_ec2_client = boto3_client('ec2', drs_account_region,
+                                                                                        drs_account_credentials)
+                                                  response = drs_account_ec2_client.describe_launch_template_versions(
+                                                      LaunchTemplateId=launch_configuration["ec2LaunchTemplateID"],
+                                                      Versions=["$Default"]
+                                                  )
+
+                                                  version_number = response["LaunchTemplateVersions"][0]["VersionNumber"]
+                                                  logger.info(
+                                                      "default launch template version is currently {}".format(version_number))
+                                                  launch_template_data = response["LaunchTemplateVersions"][0][
+                                                      "LaunchTemplateData"]
+
+                                                  current_instance_type = launch_template_data.get('InstanceType', None)
+
+                                                  if current_instance_type == instance['InstanceType']:
+                                                      logger.info("instance type in launch template is already the same as EC2 instance, skipping...")
+                                                      continue
+
+                                                  logger.info("Disabling instance type right sizing for {}".format(source_server_id))
+
+                                                  response = drs_account_client.update_launch_configuration(
+                                                      sourceServerID=source_server_id,
+                                                      targetInstanceTypeRightSizingMethod='NONE'
+                                                  )
+
+                                                  logger.debug("Launch configuration updated to: {}".format(response))
+
+                                                  logger.info(
+                                                      "Updating instance type from {} to {} for source server: {}".format(current_instance_type, instance['InstanceType'], source_server_id))
+
+                                                  launch_template_data['InstanceType'] = instance['InstanceType']
+                                                  # Create new launch template with overrides applied, mapped subnet based on source server IP, modified volumes
+                                                  unique_id = str(uuid.uuid4())
+                                                  new_launch_template = drs_account_ec2_client.create_launch_template_version(
+                                                      LaunchTemplateId=launch_configuration["ec2LaunchTemplateID"],
+                                                      SourceVersion=str(version_number),
+                                                      ClientToken=unique_id + "/" + source_server_id,
+                                                      VersionDescription="updated instance type by drs-synch-ec2-tags-and-instance-type",
+                                                      LaunchTemplateData=launch_template_data
+                                                  )
+                                                  new_template_id = new_launch_template["LaunchTemplateVersion"][
+                                                      "LaunchTemplateId"]
+                                                  new_template_version = str(
+                                                      new_launch_template["LaunchTemplateVersion"]["VersionNumber"])
+
+                                                  logger.info(
+                                                      "new launch template version created with id {} and version {}".format(
+                                                          new_template_id, new_template_version))
+
+                                                  response = drs_account_ec2_client.modify_launch_template(
+                                                      ClientToken=unique_id + "/" + matched_instance['arn'] + "/default",
+                                                      LaunchTemplateId=new_launch_template["LaunchTemplateVersion"][
+                                                          "LaunchTemplateId"],
+                                                      DefaultVersion=new_template_version
+                                                  )
+                                                  logger.info("default version of launch template updated", extra=dict(
+                                                      aws_request_id=response["ResponseMetadata"]["RequestId"],
+                                                      id=new_template_id,
+                                                      version=new_template_version,
+                                                      update_success="true"
+                                                  ))
+                                              except Exception as e:
+                                                  # If any other exceptions which we didn't expect are raised
+                                                  # then fail and log the exception message.
+                                                  logger.error(
+                                                      'Error updating source server launch template instance_type to {} for source server {}: {}'.format(
+                                                          instance['InstanceType'],
+                                                          matched_instance['arn'],
+                                                          e
+                                                      )
+                                                  )
+                                                  raise
+                                      else:
+                                          logger.debug(
+                                              "Instance {} doesn't have any tags, skipping...".format(instance['InstanceId']))
+
+              except Exception as e:
+                  # If any other exceptions which we didn't expect are raised
+                  # then fail and log the exception message.
+                  logger.error('Error replicating tags to DRS in account {} and region {}: {}'.format(
+                      drs_account_number,
+                      drs_account_region,
+                      e
+                  )
+                  )
+                  raise
+
+          def boto3_client(resource, region, assumed_credentials=None):
+              config = Config(
+                  retries=dict(
+                      max_attempts=40
+                  ),
+                  region_name=region
+              )
+              if assumed_credentials:
+                  client = boto3.client(
+                      resource,
+                      aws_access_key_id=assumed_credentials['AccessKeyId'],
+                      aws_secret_access_key=assumed_credentials['SecretAccessKey'],
+                      aws_session_token=assumed_credentials['SessionToken'],
+                      config=config
+                  )
+              else:
+                  client = boto3.client(
+                      resource,
+                      config=config
+                  )
+
+              return client
+
+          def assume_role(account_number, role_name, session_name, region):
+              logger.debug("getting sts client in region {}")
+              sts_client = boto3_client('sts', region)
+              logger.debug("received sts client")
+              logger.info("assuming role {} in account {}".format(role_name, account_number))
+              assumed_role_object = sts_client.assume_role(
+                  RoleArn="arn:aws:iam::{}:role/{}".format(account_number, role_name),
+                  RoleSessionName=session_name
+              )
+              logger.debug("assume role returned {}".format(assumed_role_object))
+              assumed_credentials = assumed_role_object['Credentials']
+              return assumed_credentials
+
+  lambdarole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: "drs_synch_ec2_tags_and_instance_type_lambda"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - sts:AssumeRole
+                Effect: Allow
+                Resource:
+                  - !Sub "arn:aws:iam::${DrsAccountNumber}:role/${DrsAssumeRoleName}"
+          PolicyName: LambdaLogging
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource:
+                  - "*"
+          PolicyName: DrsSynchSourceServerTagsLambdaLogging
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action:
+                  - ec2:DescribeInstances
+                Effect: Allow
+                Resource:
+                  - "*"
+          PolicyName: DescribeInstances
+
+  ScheduledRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Tag synchronization schedule, as rate expression, see https://docs.aws.amazon.com/AmazonCloudWatch/latest/events/ScheduledEvents.html#RateExpressions"
+      ScheduleExpression: !Sub "rate(${RateString})"
+      State: "ENABLED"
+      Targets:
+        -
+          Arn:
+            Fn::GetAtt:
+              - lambdafunction
+              - "Arn"
+          Id: "TargetFunctionV1"
+          Input: '{"synch_tags": true, "synch_instance_type": true}'
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref lambdafunction
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn:
+        Fn::GetAtt:
+          - "ScheduledRule"
+          - "Arn"

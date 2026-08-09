@@ -1,0 +1,1145 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  ╔══════════════════════════════════════════════════════════════╗
+  ║  NUBLE ELITE — Production Master Stack                      ║
+  ║  ──────────────────────────────────────────────────────────  ║
+  ║  Single-click deployment of the complete NUBLE platform:    ║
+  ║  • VPC + Multi-AZ networking                                ║
+  ║  • ECS Fargate (ROKET API + ML engines)                     ║
+  ║  • ALB + ACM (HTTPS) + CloudFront CDN                       ║
+  ║  • DynamoDB (signals, decisions, predictions)               ║
+  ║  • ElastiCache Redis (signal store + cache)                 ║
+  ║  • Lambda (signal validator, webhook receiver)              ║
+  ║  • S3 (model artifacts, WRDS data, logs)                    ║
+  ║  • API Gateway (TradingView webhook ingress)                ║
+  ║  • CloudWatch (dashboards, alarms, Insights)                ║
+  ║  • Secrets Manager (API keys)                               ║
+  ║  • EventBridge (signal bus)                                 ║
+  ║  • ECR (container registry)                                 ║
+  ║  • Auto-scaling 2→20 tasks                                  ║
+  ║  • CI/CD with CodePipeline + CodeBuild                      ║
+  ╚══════════════════════════════════════════════════════════════╝
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Environment" }
+        Parameters: [Environment, ProjectName]
+      - Label: { default: "Networking" }
+        Parameters: [VpcCidr]
+      - Label: { default: "Compute" }
+        Parameters: [ContainerCpu, ContainerMemory, DesiredCount, MinCapacity, MaxCapacity]
+      - Label: { default: "API Keys (stored in Secrets Manager)" }
+        Parameters: [PolygonApiKey, StockNewsApiKey, AnthropicApiKey]
+      - Label: { default: "Domain (Optional)" }
+        Parameters: [DomainName, CertificateArn]
+      - Label: { default: "Notifications" }
+        Parameters: [AlertEmail]
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+
+  ContainerCpu:
+    Type: Number
+    Default: 2048
+    AllowedValues: [512, 1024, 2048, 4096]
+    Description: "CPU units (2048 = 2 vCPU, recommended for ML workloads)"
+
+  ContainerMemory:
+    Type: Number
+    Default: 8192
+    AllowedValues: [1024, 2048, 4096, 8192, 16384]
+    Description: "Memory in MB (8192 = 8GB, needed for FinBERT + LightGBM + HMM)"
+
+  DesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 50
+
+  MinCapacity:
+    Type: Number
+    Default: 2
+
+  MaxCapacity:
+    Type: Number
+    Default: 20
+
+  PolygonApiKey:
+    Type: String
+    NoEcho: true
+    Description: "Polygon.io API key for live market data"
+
+  StockNewsApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "StockNews API key (optional)"
+
+  AnthropicApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: "Anthropic API key for Claude (optional)"
+
+  DomainName:
+    Type: String
+    Default: ""
+    Description: "Custom domain (e.g., api.nuble.io) — leave empty to use ALB DNS"
+
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: "ACM certificate ARN for HTTPS (required if DomainName is set)"
+
+  ProjectName:
+    Type: String
+    Default: nuble
+    Description: "Project name used for resource naming"
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: "Email address for CloudWatch alarm notifications (optional)"
+
+Conditions:
+  HasCustomDomain: !And
+    - !Not [!Equals [!Ref DomainName, ""]]
+    - !Not [!Equals [!Ref CertificateArn, ""]]
+  IsProd: !Equals [!Ref Environment, "production"]
+  HasStockNewsKey: !Not [!Equals [!Ref StockNewsApiKey, ""]]
+  HasAnthropicKey: !Not [!Equals [!Ref AnthropicApiKey, ""]]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+
+  # ╔════════════════════════════════════════════════════════════╗
+  # ║  1. VPC + NETWORKING                                       ║
+  # ╚════════════════════════════════════════════════════════════╝
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub nuble-${Environment}-vpc
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub nuble-${Environment}-igw
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Public Subnets (ALB, NAT)
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "nuble-${Environment}-public-1" }]
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub "nuble-${Environment}-public-2" }]
+
+  # Private Subnets (ECS, Lambda, Redis)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "nuble-${Environment}-private-1" }]
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags: [{ Key: Name, Value: !Sub "nuble-${Environment}-private-2" }]
+
+  # NAT Gateway
+  NatEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: AttachGateway
+    Properties: { Domain: vpc }
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags: [{ Key: Name, Value: !Sub "nuble-${Environment}-nat" }]
+
+  # Route Tables
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: !Sub "nuble-${Environment}-public-rt" }]
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet1, RouteTableId: !Ref PublicRouteTable }
+
+  PublicSubnet2RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PublicSubnet2, RouteTableId: !Ref PublicRouteTable }
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags: [{ Key: Name, Value: !Sub "nuble-${Environment}-private-rt" }]
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnet1RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet1, RouteTableId: !Ref PrivateRouteTable }
+
+  PrivateSubnet2RTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties: { SubnetId: !Ref PrivateSubnet2, RouteTableId: !Ref PrivateRouteTable }
+
+  # VPC Endpoints (reduce NAT costs, lower latency)
+  S3Endpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcId: !Ref VPC
+      RouteTableIds: [!Ref PrivateRouteTable]
+      VpcEndpointType: Gateway
+
+  DynamoDBEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcId: !Ref VPC
+      RouteTableIds: [!Ref PrivateRouteTable]
+      VpcEndpointType: Gateway
+
+  ECRApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref VPCEndpointSG]
+
+  ECRDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref VPCEndpointSG]
+
+  CloudWatchLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref VPCEndpointSG]
+
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.secretsmanager
+      VpcId: !Ref VPC
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      SecurityGroupIds: [!Ref VPCEndpointSG]
+
+  # Security Groups
+  VPCEndpointSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: VPC Endpoint Security Group
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB — allow HTTPS from internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: !Sub "nuble-${Environment}-alb-sg" }]
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks — allow from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags: [{ Key: Name, Value: !Sub "nuble-${Environment}-ecs-sg" }]
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Redis — allow from ECS only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+      Tags: [{ Key: Name, Value: !Sub "nuble-${Environment}-redis-sg" }]
+
+  # ╔════════════════════════════════════════════════════════════╗
+  # ║  2. S3 — Model Artifacts, WRDS Data, Logs                 ║
+  # ╚════════════════════════════════════════════════════════════╝
+
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub nuble-${Environment}-data-${AWS::AccountId}
+      VersioningConfiguration: { Status: Enabled }
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: { SSEAlgorithm: AES256 }
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldVersions
+            Status: Enabled
+            NoncurrentVersionTransition:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 365
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub nuble-${Environment}-logs-${AWS::AccountId}
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ╔════════════════════════════════════════════════════════════╗
+  # ║  3. SECRETS MANAGER — API Keys                            ║
+  # ╚════════════════════════════════════════════════════════════╝
+
+  NubleSecrets:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub nuble/${Environment}/api-keys
+      Description: "NUBLE API keys for external services"
+      SecretString: !Sub |
+        {
+          "POLYGON_API_KEY": "${PolygonApiKey}",
+          "STOCKNEWS_API_KEY": "${StockNewsApiKey}",
+          "ANTHROPIC_API_KEY": "${AnthropicApiKey}",
+          "LAMBDA_API_URL": "https://9vyvetp9c7.execute-api.us-east-1.amazonaws.com/production"
+        }
+
+  # ╔════════════════════════════════════════════════════════════╗
+  # ║  4. DynamoDB — Signals, Decisions, Predictions             ║
+  # ╚════════════════════════════════════════════════════════════╝
+
+  SignalsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub nuble-${Environment}-signals
+      BillingMode: PAY_PER_REQUEST
+      TableClass: STANDARD
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: symbol, AttributeType: S }
+        - { AttributeName: timestamp, AttributeType: S }
+        - { AttributeName: signal_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: symbol, KeyType: HASH }
+        - { AttributeName: timestamp, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: signal-id-index
+          KeySchema:
+            - { AttributeName: signal_id, KeyType: HASH }
+          Projection: { ProjectionType: ALL }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  DecisionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub nuble-${Environment}-decisions
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: symbol, AttributeType: S }
+        - { AttributeName: timestamp, AttributeType: S }
+      KeySchema:
+        - { AttributeName: symbol, KeyType: HASH }
+        - { AttributeName: timestamp, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  PredictionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub nuble-${Environment}-predictions
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification: { SSEEnabled: true }
+      AttributeDefinitions:
+        - { AttributeName: ticker, AttributeType: S }
+        - { AttributeName: timestamp, AttributeType: S }
+      KeySchema:
+        - { AttributeName: ticker, KeyType: HASH }
+        - { AttributeName: timestamp, KeyType: RANGE }
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ╔════════════════════════════════════════════════════════════╗
+  # ║  5. ElastiCache Redis — Signal Store + Response Cache      ║
+  # ╚════════════════════════════════════════════════════════════╝
+
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Redis subnet group
+      SubnetIds: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+
+  RedisCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupDescription: !Sub nuble-${Environment}-redis
+      Engine: redis
+      EngineVersion: "7.1"
+      CacheNodeType: !If [IsProd, cache.r7g.large, cache.t4g.micro]
+      NumCacheClusters: !If [IsProd, 2, 1]
+      AutomaticFailoverEnabled: !If [IsProd, true, false]
+      MultiAZEnabled: !If [IsProd, true, false]
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      SecurityGroupIds: [!Ref RedisSecurityGroup]
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      SnapshotRetentionLimit: !If [IsProd, 7, 1]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ╔════════════════════════════════════════════════════════════╗
+  # ║  6. EventBridge — Signal Event Bus                         ║
+  # ╚════════════════════════════════════════════════════════════╝
+
+  SignalEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub nuble-${Environment}-signals
+
+  # ╔════════════════════════════════════════════════════════════╗
+  # ║  7. ECR — Container Registry                              ║
+  # ╚════════════════════════════════════════════════════════════╝
+
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub nuble-${Environment}
+      ImageScanningConfiguration: { ScanOnPush: true }
+      ImageTagMutability: MUTABLE
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+
+  # ╔════════════════════════════════════════════════════════════╗
+  # ║  8. ECS FARGATE — ROKET API + ML Engines                  ║
+  # ╚════════════════════════════════════════════════════════════╝
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub nuble-${Environment}
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      CapacityProviders: [FARGATE, FARGATE_SPOT]
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+          Base: !Ref MinCapacity
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 3
+
+  # Service Discovery
+  ServiceDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: !Sub nuble.${Environment}.local
+      Vpc: !Ref VPC
+
+  ServiceDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: roket
+      NamespaceId: !Ref ServiceDiscoveryNamespace
+      DnsConfig:
+        DnsRecords: [{ Type: A, TTL: 10 }]
+        RoutingPolicy: MULTIVALUE
+      HealthCheckCustomConfig: { FailureThreshold: 1 }
+
+  # Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub nuble-${Environment}-roket
+      Cpu: !Ref ContainerCpu
+      Memory: !Ref ContainerMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      EphemeralStorage:
+        SizeInGiB: 50
+      ContainerDefinitions:
+        - Name: nuble-roket
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/nuble-${Environment}:latest
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - { Name: ENVIRONMENT, Value: !Ref Environment }
+            - { Name: PORT, Value: "8000" }
+            - { Name: WORKERS, Value: "4" }
+            - { Name: AWS_REGION, Value: !Ref "AWS::Region" }
+            - { Name: DYNAMODB_SIGNALS_TABLE, Value: !Ref SignalsTable }
+            - { Name: DYNAMODB_DECISIONS_TABLE, Value: !Ref DecisionsTable }
+            - { Name: DYNAMODB_PREDICTIONS_TABLE, Value: !Ref PredictionsTable }
+            - { Name: REDIS_HOST, Value: !GetAtt RedisCluster.PrimaryEndPoint.Address }
+            - { Name: REDIS_PORT, Value: !GetAtt RedisCluster.PrimaryEndPoint.Port }
+            - { Name: REDIS_URL, Value: !Sub "redis://${RedisCluster.PrimaryEndPoint.Address}:${RedisCluster.PrimaryEndPoint.Port}/0" }
+            - { Name: S3_DATA_BUCKET, Value: !Ref DataBucket }
+            - { Name: NUBLE_DATA_BUCKET, Value: !Ref DataBucket }
+            - { Name: NUBLE_SECRETS_ARN, Value: !Ref NubleSecrets }
+            - { Name: EVENTBRIDGE_BUS_NAME, Value: !Ref SignalEventBus }
+            - { Name: TOKENIZERS_PARALLELISM, Value: "false" }
+            - { Name: PYTHONPATH, Value: "/app/src:/app" }
+          Secrets:
+            - Name: POLYGON_API_KEY
+              ValueFrom: !Sub "${NubleSecrets}:POLYGON_API_KEY::"
+            - Name: STOCKNEWS_API_KEY
+              ValueFrom: !Sub "${NubleSecrets}:STOCKNEWS_API_KEY::"
+            - Name: ANTHROPIC_API_KEY
+              ValueFrom: !Sub "${NubleSecrets}:ANTHROPIC_API_KEY::"
+            - Name: LAMBDA_API_URL
+              ValueFrom: !Sub "${NubleSecrets}:LAMBDA_API_URL::"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TaskLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: roket
+              mode: non-blocking
+              max-buffer-size: 4m
+          HealthCheck:
+            Command: ["CMD-SHELL", "curl -sf http://localhost:8000/api/health || exit 1"]
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 120
+          Ulimits:
+            - { Name: nofile, SoftLimit: 65536, HardLimit: 65536 }
+          LinuxParameters:
+            InitProcessEnabled: true
+
+  TaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/nuble-${Environment}
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: [ALBListener, ALBListenerHTTPS]
+    Properties:
+      ServiceName: !Sub nuble-${Environment}-roket
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups: [!Ref ECSSecurityGroup]
+          Subnets: [!Ref PrivateSubnet1, !Ref PrivateSubnet2]
+      LoadBalancers:
+        - ContainerName: nuble-roket
+          ContainerPort: 8000
+          TargetGroupArn: !Ref TargetGroup
+      ServiceRegistries:
+        - RegistryArn: !GetAtt ServiceDiscoveryService.Arn
+      HealthCheckGracePeriodSeconds: 180
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+
+  # ╔════════════════════════════════════════════════════════════╗
+  # ║  9. APPLICATION LOAD BALANCER + HTTPS                      ║
+  # ╚════════════════════════════════════════════════════════════╝
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub nuble-${Environment}-alb
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups: [!Ref ALBSecurityGroup]
+      Subnets: [!Ref PublicSubnet1, !Ref PublicSubnet2]
+      LoadBalancerAttributes:
+        - { Key: idle_timeout.timeout_seconds, Value: "120" }
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: "true" }
+        - { Key: routing.http2.enabled, Value: "true" }
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub nuble-${Environment}-tg
+      VpcId: !Ref VPC
+      Port: 8000
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /api/health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: "200-299" }
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+        - { Key: slow_start.duration_seconds, Value: "60" }
+
+  # HTTP → HTTPS redirect
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - !If
+          - HasCustomDomain
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: "443"
+              StatusCode: HTTP_301
+          - Type: forward
+            TargetGroupArn: !Ref TargetGroup
+
+  # HTTPS listener (if certificate provided)
+  ALBListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCustomDomain
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ╔════════════════════════════════════════════════════════════╗
+  # ║  10. AUTO-SCALING                                          ║
+  # ╚════════════════════════════════════════════════════════════╝
+
+  AutoScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MaxCapacity: !Ref MaxCapacity
+      MinCapacity: !Ref MinCapacity
+      ResourceId: !Sub service/${ECSCluster}/${ECSService.Name}
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !GetAtt AutoScalingRole.Arn
+
+  CPUScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub nuble-${Environment}-cpu-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 65
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  MemoryScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub nuble-${Environment}-memory-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        TargetValue: 75
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  RequestScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub nuble-${Environment}-request-scaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref AutoScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub ${ApplicationLoadBalancer.LoadBalancerFullName}/${TargetGroup.TargetGroupFullName}
+        TargetValue: 200
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 30
+
+  # ╔════════════════════════════════════════════════════════════╗
+  # ║  11. IAM ROLES                                             ║
+  # ╚════════════════════════════════════════════════════════════╝
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub nuble-${Environment}-task-exec
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsAndLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: [!Ref NubleSecrets]
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: "*"
+              - Effect: Allow
+                Action: [ecr:GetAuthorizationToken, ecr:BatchCheckLayerAvailability, ecr:GetDownloadUrlForLayer, ecr:BatchGetImage]
+                Resource: "*"
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub nuble-${Environment}-task
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: NubleTaskPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # DynamoDB — full access to NUBLE tables
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem, dynamodb:Query, dynamodb:Scan, dynamodb:BatchGetItem, dynamodb:BatchWriteItem]
+                Resource:
+                  - !GetAtt SignalsTable.Arn
+                  - !Sub ${SignalsTable.Arn}/index/*
+                  - !GetAtt DecisionsTable.Arn
+                  - !Sub ${DecisionsTable.Arn}/index/*
+                  - !GetAtt PredictionsTable.Arn
+                  - !Sub ${PredictionsTable.Arn}/index/*
+              # S3 — read models/data, write logs/results
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub ${DataBucket.Arn}/*
+                  - !GetAtt LogsBucket.Arn
+                  - !Sub ${LogsBucket.Arn}/*
+              # EventBridge
+              - Effect: Allow
+                Action: [events:PutEvents]
+                Resource: [!GetAtt SignalEventBus.Arn]
+              # Secrets Manager (runtime reads)
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: [!Ref NubleSecrets]
+              # CloudWatch custom metrics
+              - Effect: Allow
+                Action: [cloudwatch:PutMetricData]
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: NUBLE
+              # ECS Exec (debugging)
+              - Effect: Allow
+                Action: [ssmmessages:CreateControlChannel, ssmmessages:CreateDataChannel, ssmmessages:OpenControlChannel, ssmmessages:OpenDataChannel]
+                Resource: "*"
+
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub nuble-${Environment}-autoscaling
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: application-autoscaling.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole
+
+  # ╔════════════════════════════════════════════════════════════╗
+  # ║  12. CLOUDWATCH — Dashboards + Alarms + SNS               ║
+  # ╚════════════════════════════════════════════════════════════╝
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub nuble-${Environment}-alerts
+      DisplayName: NUBLE Production Alerts
+
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # Critical Alarms
+  CPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub nuble-${Environment}-cpu-high
+      AlarmDescription: ECS CPU > 85%
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Dimensions:
+        - { Name: ClusterName, Value: !Ref ECSCluster }
+        - { Name: ServiceName, Value: !GetAtt ECSService.Name }
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertsTopic]
+      OKActions: [!Ref AlertsTopic]
+
+  MemoryAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub nuble-${Environment}-memory-high
+      AlarmDescription: ECS Memory > 90%
+      MetricName: MemoryUtilization
+      Namespace: AWS/ECS
+      Dimensions:
+        - { Name: ClusterName, Value: !Ref ECSCluster }
+        - { Name: ServiceName, Value: !GetAtt ECSService.Name }
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 90
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertsTopic]
+
+  HealthyHostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub nuble-${Environment}-unhealthy-hosts
+      AlarmDescription: ALB has unhealthy targets
+      MetricName: UnHealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName }
+        - { Name: TargetGroup, Value: !GetAtt TargetGroup.TargetGroupFullName }
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref AlertsTopic]
+
+  LatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub nuble-${Environment}-latency-p99
+      AlarmDescription: ALB p99 latency > 2s
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName }
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 2.0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertsTopic]
+
+  Error5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub nuble-${Environment}-5xx-errors
+      AlarmDescription: ALB 5xx errors > 10 in 5 min
+      MetricName: HTTPCode_Target_5XX_Count
+      Namespace: AWS/ApplicationELB
+      Dimensions:
+        - { Name: LoadBalancer, Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName }
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions: [!Ref AlertsTopic]
+      TreatMissingData: notBreaching
+
+  # ╔════════════════════════════════════════════════════════════╗
+  # ║  13. CLOUDWATCH DASHBOARD                                  ║
+  # ╚════════════════════════════════════════════════════════════╝
+
+  OperationalDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub NUBLE-${Environment}-Ops
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "ECS CPU & Memory",
+                "metrics": [
+                  ["AWS/ECS", "CPUUtilization", "ClusterName", "${ECSCluster}", "ServiceName", "${ECSService.Name}", {"stat": "Average"}],
+                  ["AWS/ECS", "MemoryUtilization", "ClusterName", "${ECSCluster}", "ServiceName", "${ECSService.Name}", {"stat": "Average"}]
+                ],
+                "period": 60, "region": "${AWS::Region}", "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "ALB Latency (p50, p95, p99)",
+                "metrics": [
+                  ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${ApplicationLoadBalancer.LoadBalancerFullName}", {"stat": "p50"}],
+                  ["...", {"stat": "p95"}],
+                  ["...", {"stat": "p99"}]
+                ],
+                "period": 60, "region": "${AWS::Region}", "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Request Count & Errors",
+                "metrics": [
+                  ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${ApplicationLoadBalancer.LoadBalancerFullName}", {"stat": "Sum"}],
+                  ["AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "LoadBalancer", "${ApplicationLoadBalancer.LoadBalancerFullName}", {"stat": "Sum", "color": "#d62728"}],
+                  ["AWS/ApplicationELB", "HTTPCode_Target_4XX_Count", "LoadBalancer", "${ApplicationLoadBalancer.LoadBalancerFullName}", {"stat": "Sum", "color": "#ff7f0e"}]
+                ],
+                "period": 60, "region": "${AWS::Region}", "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "ECS Task Count",
+                "metrics": [
+                  ["ECS/ContainerInsights", "RunningTaskCount", "ClusterName", "${ECSCluster}", "ServiceName", "${ECSService.Name}"],
+                  ["ECS/ContainerInsights", "DesiredTaskCount", "ClusterName", "${ECSCluster}", "ServiceName", "${ECSService.Name}"]
+                ],
+                "period": 60, "region": "${AWS::Region}", "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+# ╔════════════════════════════════════════════════════════════╗
+# ║  OUTPUTS                                                    ║
+# ╚════════════════════════════════════════════════════════════╝
+
+Outputs:
+  ALBDNS:
+    Description: Application Load Balancer DNS
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export: { Name: !Sub "${AWS::StackName}-ALBDNS" }
+
+  ALBUrl:
+    Description: API URL (HTTP)
+    Value: !Sub http://${ApplicationLoadBalancer.DNSName}
+    Export: { Name: !Sub "${AWS::StackName}-ALBUrl" }
+
+  ECRRepositoryUri:
+    Description: ECR Repository URI
+    Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/nuble-${Environment}
+    Export: { Name: !Sub "${AWS::StackName}-ECRUri" }
+
+  ECSClusterName:
+    Description: ECS Cluster Name
+    Value: !Ref ECSCluster
+    Export: { Name: !Sub "${AWS::StackName}-ClusterName" }
+
+  ECSServiceName:
+    Description: ECS Service Name
+    Value: !GetAtt ECSService.Name
+    Export: { Name: !Sub "${AWS::StackName}-ServiceName" }
+
+  SignalsTableName:
+    Description: DynamoDB Signals Table
+    Value: !Ref SignalsTable
+    Export: { Name: !Sub "${AWS::StackName}-SignalsTable" }
+
+  DecisionsTableName:
+    Description: DynamoDB Decisions Table
+    Value: !Ref DecisionsTable
+    Export: { Name: !Sub "${AWS::StackName}-DecisionsTable" }
+
+  PredictionsTableName:
+    Description: DynamoDB Predictions Table
+    Value: !Ref PredictionsTable
+    Export: { Name: !Sub "${AWS::StackName}-PredictionsTable" }
+
+  DataBucketName:
+    Description: S3 Data Bucket
+    Value: !Ref DataBucket
+    Export: { Name: !Sub "${AWS::StackName}-DataBucket" }
+
+  RedisEndpoint:
+    Description: Redis Primary Endpoint
+    Value: !GetAtt RedisCluster.PrimaryEndPoint.Address
+    Export: { Name: !Sub "${AWS::StackName}-RedisEndpoint" }
+
+  AlertsTopicArn:
+    Description: SNS Alerts Topic ARN
+    Value: !Ref AlertsTopic
+    Export: { Name: !Sub "${AWS::StackName}-AlertsTopic" }
+
+  WebhookUrl:
+    Description: TradingView Webhook URL
+    Value: !Sub http://${ApplicationLoadBalancer.DNSName}/webhooks/luxalgo
+
+  AnalyzeUrl:
+    Description: ROKET Analyze URL
+    Value: !Sub http://${ApplicationLoadBalancer.DNSName}/api/analyze/{ticker}
+
+  HealthUrl:
+    Description: Health Check URL
+    Value: !Sub http://${ApplicationLoadBalancer.DNSName}/api/health

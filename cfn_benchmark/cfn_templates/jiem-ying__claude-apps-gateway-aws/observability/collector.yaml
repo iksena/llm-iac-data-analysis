@@ -1,0 +1,1095 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  OPTIONAL self-hosted OTEL collector for the Claude Apps Gateway. ECS Fargate ADOT
+  collector behind an internal HTTPS ALB (443 -> OTLP/HTTP 4318). Default
+  (EnableCodingAgentInsights=true): metrics go to the NATIVE CloudWatch OTLP endpoint
+  so the managed GenAI Observability -> Coding Agent Insights dashboard auto-populates
+  (PromQL metrics + PromQL alarms), plus a governance/audit companion dashboard. Set
+  false for the legacy awsemf/EMF path (the -usage dashboard + classic alarms). TLS:
+  (A) MANAGED — PublicHostedZoneId + DomainName (public ACM cert the stock image
+  trusts); (B) BYO — CertificateArn + PrivateHostedZoneId + CollectorHostname (image
+  must trust the CA). Deploys INTO the gateway VPC. See observability/README.md.
+
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        # W1030: CertificateArn defaults to "" (managed mode) and is only used in
+        # the BYO branch of the listener !If, where it IS a valid ARN.
+        - W1030
+        # E3014: the PromQL alarms use AWS::CloudWatch::Alarm's EvaluationCriteria /
+        # PromQLCriteria shape (GA Apr 2026). cfn-lint's bundled resource spec predates
+        # it and still insists every alarm carry Metrics/MetricName — a false positive
+        # for the *-Cai alarms. The legacy (*-Legacy) alarms keep MetricName correctly.
+        - E3014
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Gateway VPC id (VpcId output of the gateway stack) — collector runs here so the gateway can reach it privately.
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: First private subnet of the gateway VPC.
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second private subnet of the gateway VPC.
+  # --- TLS / DNS: choose ONE of two modes (same as the gateway stack) ---
+  # (A) MANAGED (recommended): set PublicHostedZoneId + DomainName, leave CertificateArn empty.
+  #     Creates a DNS-validated PUBLIC ACM cert + public alias to the internal ALB. The gateway
+  #     (stock image, no baked CA) trusts it automatically.
+  # (B) BYO/self-signed: set CertificateArn + PrivateHostedZoneId + CollectorHostname.
+  DomainName:
+    Type: String
+    Default: ""
+    Description: (Managed mode) Public FQDN for the collector, e.g. claude-otel.example.com. Must be within PublicHostedZoneId's zone. Aliases the internal ALB (resolves to private IPs).
+  PublicHostedZoneId:
+    Type: String
+    Default: ""
+    Description: (Managed mode) Public Route53 hosted zone id authoritative for DomainName. MUST be public (a private zone makes ACM validation hang).
+  PrivateHostedZoneId:
+    Type: String
+    Default: ""
+    Description: (BYO/self-signed mode) The gateway stack's private hosted zone id. Leave empty in managed mode.
+  CollectorHostname:
+    Type: String
+    Default: "otel.internal.example.com"
+    Description: (BYO/self-signed mode) Private DNS name for the collector (within the gateway's private hosted zone).
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: (BYO/self-signed mode) ACM cert ARN for CollectorHostname. Leave EMPTY to use managed mode (PublicHostedZoneId + DomainName). If set, takes precedence.
+  VpcCidr:
+    Type: String
+    Default: "10.20.0.0/16"
+    Description: Gateway VPC CIDR — allowed to reach the collector ALB on 443 (gateway tasks forward OTLP from within the VPC).
+  CollectorImage:
+    Type: String
+    Default: "public.ecr.aws/aws-observability/aws-otel-collector:latest"
+    Description: ADOT collector image. Pin a digest/tag for production.
+  MetricsNamespace:
+    Type: String
+    Default: "ClaudeGateway"
+    Description: CloudWatch metrics namespace for gateway usage metrics.
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: Retention for the collector's CloudWatch metrics + events log groups.
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: (Optional) Email to subscribe to the gateway observability alarms. Leave empty to create the SNS topic with no subscription (wire it to Slack/PagerDuty yourself).
+  DailyCostThresholdUsd:
+    Type: Number
+    Default: 500
+    Description: Alarm when total daily Claude cost.usage (Sum over 1 day) exceeds this many USD.
+
+  # --- per-user cost alarm (real-time notification without blocking) ---
+  # Showcase of "alert-only" governance: watch one developer's spend and NOTIFY via SNS
+  # (email / Slack / PagerDuty / Lambda) without ever blocking them. Pair with a per-user
+  # `amount: null` spend override so they're notified but never locked out. The hard
+  # dollar CAP lives in the gateway's spend API; this is the observe-and-fan-out half.
+  PerUserAlarmEmailAddress:
+    Type: String
+    Default: ""
+    Description: (Optional) The user.email to raise a per-user daily-cost alarm on, e.g. jiemying@example.com. Must match the identity the gateway stamps on telemetry. Empty = no per-user alarm.
+  PerUserDailyThresholdUsd:
+    Type: Number
+    Default: 88
+    Description: Per-user daily Claude cost.usage (Sum over 1 day) that triggers the per-user alarm. Notify-only — never caps the user. Only used when PerUserAlarmEmailAddress is set.
+
+  # --- Coding Agent Insights (native CloudWatch OTLP metrics) ---
+  # When true (default), the collector exports metrics to the native CloudWatch OTLP
+  # metrics endpoint (https://monitoring.<region>.amazonaws.com/v1/metrics) so the
+  # managed GenAI Observability -> Coding Agent Insights -> Claude Code dashboard
+  # auto-populates, and the cost/usage alarms are created as PromQL alarms. Set to
+  # false to fall back to the legacy awsemf/EMF path (namespace MetricsNamespace, the
+  # -usage dashboard, classic metric alarms). See observability/README.md.
+  EnableCodingAgentInsights:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: true = export metrics to the native CloudWatch OTLP endpoint for Coding Agent Insights + PromQL alarms; false = legacy awsemf/EMF path + classic alarms.
+
+Conditions:
+  HasCertificateArn: !Not [!Equals [!Ref CertificateArn, ""]]
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+  HasPerUserAlarm: !Not [!Equals [!Ref PerUserAlarmEmailAddress, ""]]
+  # Native OTLP metrics path (Coding Agent Insights) vs. legacy awsemf/EMF path.
+  # These select the alarm *shape* via !If inside each alarm's Properties (one
+  # resource per alarm, stable logical id) rather than gating whole resources.
+  CodingAgentInsights: !Equals [!Ref EnableCodingAgentInsights, "true"]
+  LegacyEmf: !Not [!Condition CodingAgentInsights]
+  ManagedCertMode: !And
+    - !Not [!Equals [!Ref PublicHostedZoneId, ""]]
+    - !Not [!Equals [!Ref DomainName, ""]]
+    - !Not [!Condition HasCertificateArn]
+  CreatePrivateRecord: !Not [!Condition ManagedCertMode]
+
+Resources:
+  # --------------------------------------------- TLS cert (managed mode only)
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: ManagedCertMode
+    Properties:
+      DomainName: !Ref DomainName
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref PublicHostedZoneId
+      ValidationMethod: DNS
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-certificate" }
+
+  # ------------------------------------------------------- public DNS (managed)
+  # Alias in the PUBLIC zone to the INTERNAL ALB (resolves to private IPs). The
+  # gateway resolves this public name via NAT egress and reaches it in-VPC.
+  PublicDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: ManagedCertMode
+    Properties:
+      HostedZoneId: !Ref PublicHostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
+
+  # ----------------------------------------- private DNS (BYO/self-signed mode)
+  CollectorDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreatePrivateRecord
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZoneId
+      Name: !Ref CollectorHostname
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+
+  # ------------------------------------------------------------- security groups
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName} collector ALB - 443 from the gateway"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: HTTPS from within the VPC (gateway forwards OTLP here)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-alb-sg" }
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName} collector task - 4318 from ALB only"
+      VpcId: !Ref VpcId
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-task-sg" }
+
+  TaskIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref TaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 4318
+      ToPort: 4318
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: OTLP/HTTP from the collector ALB
+
+  # The ALB target group health-checks the ADOT health_check extension on 13133;
+  # the ALB must be able to reach it or ECS drains every task (circuit breaker).
+  TaskHealthIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref TaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 13133
+      ToPort: 13133
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: ADOT health_check port from the collector ALB
+
+  # ----------------------------------------------------------------------- ALB
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-alb" }
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: 4318
+      Protocol: HTTP
+      TargetType: ip
+      # ADOT health_check extension listens on 13133.
+      HealthCheckPort: "13133"
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !If [ManagedCertMode, !Ref Certificate, !Ref CertificateArn]
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ----------------------------------------------------------------- config SSM
+  # Two mutually-exclusive ADOT configs, selected by EnableCodingAgentInsights:
+  #
+  #  (A) CodingAgentInsights (default) — CollectorConfigParamCai below: metrics go to
+  #      the NATIVE CloudWatch OTLP endpoint (otlphttp/cwmetrics + sigv4auth) so the
+  #      managed Coding Agent Insights dashboard auto-populates and metrics are
+  #      PromQL-queryable. Resource attributes (user.email/user.groups/…) are forwarded
+  #      as-is (no resource_to_telemetry_conversion) — the shape the feature expects.
+  #  (B) LegacyEmf — CollectorConfigParamLegacy (this resource): metrics go to awsemf
+  #      as EMF custom metrics in namespace ${MetricsNamespace}, driving the -usage
+  #      dashboard + classic metric alarms.
+  #
+  # In BOTH configs the awscloudwatchlogs events pipeline is identical: it only
+  # receives data when the gateway forwards logs (FORWARD_LOGS=true -> `logs: true` in
+  # its telemetry block); otherwise it sits idle and harmless.
+  CollectorConfigParamCai:
+    Type: AWS::SSM::Parameter
+    Condition: CodingAgentInsights
+    Properties:
+      Name: !Sub "/${AWS::StackName}/collector-config-cai"
+      Type: String
+      Description: ADOT config (OTLP -> native CloudWatch OTLP metrics endpoint + awscloudwatchlogs events).
+      Value: !Sub |
+        extensions:
+          health_check:
+            endpoint: 0.0.0.0:13133
+            path: /
+          # SigV4 signer for the native CloudWatch OTLP metrics endpoint. The task
+          # role's cloudwatch:PutMetricData is the only permission it needs.
+          sigv4auth:
+            service: "monitoring"
+            region: ${AWS::Region}
+
+        receivers:
+          otlp:
+            protocols:
+              http:
+                endpoint: 0.0.0.0:4318
+
+        processors:
+          # The native OTLP metrics endpoint caps at 1000 datapoints per request; keep
+          # batches comfortably under it.
+          batch/metrics:
+            timeout: 60s
+            send_batch_size: 800
+            send_batch_max_size: 1000
+          batch/logs:
+            timeout: 10s
+          resource:
+            attributes:
+              - key: aws.account_id
+                value: "${AWS::AccountId}"
+                action: insert
+              - key: deployment.environment
+                value: "gateway"
+                action: insert
+
+        exporters:
+          # Native CloudWatch OTLP metrics endpoint. Metric names keep their dots
+          # (claude_code.*), and gateway-stamped identity resource attributes
+          # (user.email/user.groups/…) are forwarded as-is — this is exactly the shape
+          # the managed Coding Agent Insights dashboard consumes, and it makes metrics
+          # PromQL-queryable (@resource.<attr>). HTTP-only, gzip (endpoint supports
+          # gzip/none only).
+          otlphttp/cwmetrics:
+            metrics_endpoint: https://monitoring.${AWS::Region}.amazonaws.com/v1/metrics
+            compression: gzip
+            auth:
+              authenticator: sigv4auth
+          awscloudwatchlogs:
+            log_group_name: /aws/claude-gateway/events
+            log_stream_name: gateway-events
+            region: ${AWS::Region}
+            log_retention: ${LogRetentionDays}
+
+        service:
+          extensions: [health_check, sigv4auth]
+          telemetry:
+            logs:
+              level: info
+              encoding: json
+              output_paths: [stdout]
+          pipelines:
+            metrics:
+              receivers: [otlp]
+              processors: [resource, batch/metrics]
+              exporters: [otlphttp/cwmetrics]
+            logs:
+              receivers: [otlp]
+              processors: [resource, batch/logs]
+              exporters: [awscloudwatchlogs]
+
+  CollectorConfigParamLegacy:
+    Type: AWS::SSM::Parameter
+    Condition: LegacyEmf
+    Properties:
+      Name: !Sub "/${AWS::StackName}/collector-config-legacy"
+      Type: String
+      Description: ADOT collector config (OTLP -> awsemf metrics + awscloudwatchlogs events).
+      Value: !Sub |
+        extensions:
+          health_check:
+            endpoint: 0.0.0.0:13133
+            path: /
+
+        receivers:
+          otlp:
+            protocols:
+              http:
+                endpoint: 0.0.0.0:4318
+
+        processors:
+          batch/metrics:
+            timeout: 60s
+          batch/logs:
+            timeout: 10s
+          resource:
+            attributes:
+              - key: aws.account_id
+                value: "${AWS::AccountId}"
+                action: insert
+              - key: deployment.environment
+                value: "gateway"
+                action: insert
+
+        exporters:
+          awsemf:
+            namespace: ${MetricsNamespace}
+            log_group_name: /aws/claude-gateway/metrics
+            region: ${AWS::Region}
+            output_destination: cloudwatch
+            log_retention: ${LogRetentionDays}
+            resource_to_telemetry_conversion:
+              enabled: true
+            # Promote ONLY bounded-cardinality attributes to metric dimensions.
+            # NOTE: user.email / user.groups mint one custom metric per distinct
+            # value per metric — fine for a demo, real money at scale. For
+            # high-cardinality per-user / per-role forensics prefer the Logs
+            # Insights widgets over /aws/claude-gateway/events instead of adding
+            # more dimension sets here. Also note user.groups is an OIDC list that
+            # resource_to_telemetry_conversion stringifies, so the [[user.groups]]
+            # set keys on the whole group-SET, not per-group — per-team/role
+            # slicing is done by the Logs Insights `stats ... by user.groups`
+            # widgets, which split the array cleanly.
+            metric_declarations:
+              - dimensions: [[OTelLib]]                                  # catch-all
+                metric_name_selectors: [".*"]
+              - dimensions: [[model, OTelLib]]                           # per-model, all metrics
+                metric_name_selectors: [".*"]
+              - dimensions: [[user.email, OTelLib]]                      # per-user cost/tokens
+                metric_name_selectors: ["claude_code.token.usage", "claude_code.cost.usage"]
+              - dimensions: [[user.groups, OTelLib]]                     # per-team/role (group-set)
+                metric_name_selectors: ["claude_code.token.usage", "claude_code.cost.usage"]
+              - dimensions: [[type, OTelLib]]                            # token split in/out/cache
+                metric_name_selectors: ["claude_code.token.usage"]
+              - dimensions: [[model, type, OTelLib]]                     # cache economics per model
+                metric_name_selectors: ["claude_code.token.usage"]
+              - dimensions: [[decision, OTelLib]]                        # governance: accept/reject
+                metric_name_selectors: ["claude_code.code_edit_tool.decision"]
+          # OTLP logs -> a CloudWatch log group. Structured JSON envelope (raw_log
+          # omitted => false) so Logs Insights can filter on the event type via the
+          # top-level `body` (= claude_code.<name>) plus attributes.decision,
+          # attributes.tool_name, etc. See observability/README.md for the envelope.
+          awscloudwatchlogs:
+            log_group_name: /aws/claude-gateway/events
+            log_stream_name: gateway-events
+            region: ${AWS::Region}
+            log_retention: ${LogRetentionDays}
+
+        service:
+          extensions: [health_check]
+          telemetry:
+            logs:
+              level: info
+              encoding: json
+              output_paths: [stdout]
+          pipelines:
+            metrics:
+              receivers: [otlp]
+              processors: [resource, batch/metrics]
+              exporters: [awsemf]
+            logs:
+              receivers: [otlp]
+              processors: [resource, batch/logs]
+              exporters: [awscloudwatchlogs]
+
+  # ------------------------------------------------------------------- IAM roles
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - PolicyName: read-config
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ssm:GetParameters, ssm:GetParameter]
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/*"
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cloudwatch-observability
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # PutMetricData has no resource-level scoping — must be "*".
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+              # awsemf + awscloudwatchlogs exporters write to the two gateway log
+              # groups (metrics EMF + events); scope to the /aws/claude-gateway/* prefix.
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutRetentionPolicy
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/claude-gateway/*"
+                  - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/claude-gateway/*:*"
+
+  # ----------------------------------------------------------------------- ECS
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-collector"
+      RetentionInDays: !Ref LogRetentionDays
+
+  # Governance events land here (awscloudwatchlogs exporter). Declared as a
+  # managed resource so the api_error MetricFilter has a dependency target; the
+  # exporter reuses this group rather than auto-creating it.
+  EventsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/claude-gateway/events
+      RetentionInDays: !Ref LogRetentionDays
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-collector"
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: collector
+          Image: !Ref CollectorImage
+          Essential: true
+          PortMappings:
+            - { ContainerPort: 4318, Protocol: tcp }
+            - { ContainerPort: 13133, Protocol: tcp }
+          Secrets:
+            # ADOT reads its config from this env var when set. Points at the native
+            # OTLP config (CodingAgentInsights) or the legacy awsemf config.
+            - Name: AOT_CONFIG_CONTENT
+              ValueFrom: !If [CodingAgentInsights, !Ref CollectorConfigParamCai, !Ref CollectorConfigParamLegacy]
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: collector
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: HttpsListener
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 2
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+      LoadBalancers:
+        - ContainerName: collector
+          ContainerPort: 4318
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: 60
+
+  # --------------------------------------------------------------- CW dashboard
+  # Metric widgets use SEARCH() expressions to auto-expand across unknown
+  # dimension values (per-user, per-team, per-model). Logs Insights (type "log")
+  # widgets do the high-cardinality governance slicing over the events log group.
+  # The events widgets assume the awscloudwatchlogs JSON envelope exposes event
+  # fields under `attributes.*`; adjust these paths after the first smoke test if
+  # the exporter nests them differently (see observability/README.md).
+  # LEGACY (awsemf) dashboard — only created in LegacyEmf mode. In native mode the
+  # managed Coding Agent Insights dashboard covers cost/token/adoption/productivity and
+  # the -governance dashboard below covers the gateway-specific governance/audit views.
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: LegacyEmf
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-usage"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text", "x": 0, "y": 0, "width": 24, "height": 2,
+              "properties": { "markdown": "# Claude Apps Gateway — Enterprise Observability\nMetrics: namespace **${MetricsNamespace}** (awsemf). Governance events: log group **/aws/claude-gateway/events** (needs FORWARD_LOGS=true). Populates as developers run inference through the gateway." }
+            },
+
+            { "type": "text", "x": 0, "y": 2, "width": 24, "height": 1, "properties": { "markdown": "## Cost & token usage" } },
+            {
+              "type": "log", "x": 0, "y": 3, "width": 12, "height": 6,
+              "properties": {
+                "title": "Cost by user (one bar per developer, USD over selected range)",
+                "region": "${AWS::Region}", "view": "bar", "stacked": false,
+                "query": "SOURCE '/aws/claude-gateway/metrics' | filter ispresent(`user.email`) and ispresent(`claude_code.cost.usage`)\n| stats sum(`claude_code.cost.usage`) as cost_usd by `user.email`\n| sort cost_usd desc"
+              }
+            },
+            {
+              "type": "log", "x": 12, "y": 3, "width": 12, "height": 6,
+              "properties": {
+                "title": "Cost by team/role (one bar per group, USD over selected range)",
+                "region": "${AWS::Region}", "view": "bar", "stacked": false,
+                "query": "SOURCE '/aws/claude-gateway/metrics' | filter ispresent(`user.groups`) and ispresent(`claude_code.cost.usage`)\n| stats sum(`claude_code.cost.usage`) as cost_usd by `user.groups`\n| sort cost_usd desc"
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 9, "width": 12, "height": 6,
+              "properties": {
+                "title": "Token usage by type (input/output/cache)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": true, "period": 300,
+                "metrics": [ [ { "expression": "SEARCH('{${MetricsNamespace},type,OTelLib} MetricName=\"claude_code.token.usage\"', 'Sum', 300)", "id": "e3", "region": "${AWS::Region}" } ] ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 9, "width": 12, "height": 6,
+              "properties": {
+                "title": "Token usage by model",
+                "region": "${AWS::Region}", "view": "timeSeries", "period": 300,
+                "metrics": [ [ { "expression": "SEARCH('{${MetricsNamespace},model,OTelLib} MetricName=\"claude_code.token.usage\"', 'Sum', 300)", "id": "e4", "region": "${AWS::Region}" } ] ]
+              }
+            },
+
+            { "type": "text", "x": 0, "y": 15, "width": 24, "height": 1, "properties": { "markdown": "## Adoption & productivity" } },
+            {
+              "type": "metric", "x": 0, "y": 16, "width": 6, "height": 6,
+              "properties": {
+                "title": "Sessions", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [ [ "${MetricsNamespace}", "claude_code.session.count", "OTelLib", "com.anthropic.claude_code" ] ]
+              }
+            },
+            {
+              "type": "metric", "x": 6, "y": 16, "width": 6, "height": 6,
+              "properties": {
+                "title": "Active time (total)", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [ [ "${MetricsNamespace}", "claude_code.active_time.total", "OTelLib", "com.anthropic.claude_code" ] ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 16, "width": 6, "height": 6,
+              "properties": {
+                "title": "Lines of code", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [ [ "${MetricsNamespace}", "claude_code.lines_of_code.count", "OTelLib", "com.anthropic.claude_code" ] ]
+              }
+            },
+            {
+              "type": "metric", "x": 18, "y": 16, "width": 6, "height": 6,
+              "properties": {
+                "title": "Commits & PRs", "region": "${AWS::Region}", "stat": "Sum", "period": 300,
+                "metrics": [
+                  [ "${MetricsNamespace}", "claude_code.commit.count", "OTelLib", "com.anthropic.claude_code" ],
+                  [ "${MetricsNamespace}", "claude_code.pull_request.count", "OTelLib", "com.anthropic.claude_code" ]
+                ]
+              }
+            },
+
+            { "type": "text", "x": 0, "y": 22, "width": 24, "height": 1, "properties": { "markdown": "## Governance — tool decisions" } },
+            {
+              "type": "metric", "x": 0, "y": 23, "width": 12, "height": 6,
+              "properties": {
+                "title": "Edit-tool decisions: accept vs reject",
+                "region": "${AWS::Region}", "view": "timeSeries", "stacked": true, "stat": "Sum", "period": 300,
+                "metrics": [
+                  [ "${MetricsNamespace}", "claude_code.code_edit_tool.decision", "decision", "accept", "OTelLib", "com.anthropic.claude_code" ],
+                  [ "${MetricsNamespace}", "claude_code.code_edit_tool.decision", "decision", "reject", "OTelLib", "com.anthropic.claude_code" ]
+                ]
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 23, "width": 12, "height": 6,
+              "properties": {
+                "title": "API errors (from events, per 5 min)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [ [ "${MetricsNamespace}", "gateway.api_errors" ] ]
+              }
+            },
+
+            { "type": "text", "x": 0, "y": 29, "width": 24, "height": 1, "properties": { "markdown": "## Governance — audit events (Logs Insights, needs FORWARD_LOGS=true)" } },
+            {
+              "type": "log", "x": 0, "y": 30, "width": 12, "height": 6,
+              "properties": {
+                "title": "Top users by tool rejections",
+                "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '/aws/claude-gateway/events' | filter body = 'claude_code.tool_decision' and attributes.decision = 'reject'\n| stats count(*) as rejections by attributes.user.email\n| sort rejections desc\n| limit 20"
+              }
+            },
+            {
+              "type": "log", "x": 12, "y": 30, "width": 12, "height": 6,
+              "properties": {
+                "title": "Blocked / asked actions by tool",
+                "region": "${AWS::Region}", "view": "bar",
+                "query": "SOURCE '/aws/claude-gateway/events' | filter body = 'claude_code.tool_decision' and (attributes.decision = 'reject' or attributes.decision = 'ask')\n| stats count(*) as blocked by attributes.tool_name, attributes.decision\n| sort blocked desc"
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 36, "width": 12, "height": 6,
+              "properties": {
+                "title": "Authentication events (gateway auth log — outcome by event)",
+                "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '/ecs/claude-gateway-gateway' | filter evt in ['device.authorize','device.verify','session.mint','session.refresh','auth.denied']\n| stats count(*) as events by evt, result\n| sort events desc"
+              }
+            },
+            {
+              "type": "log", "x": 12, "y": 36, "width": 12, "height": 6,
+              "properties": {
+                "title": "API errors (recent — gateway upstream 4xx/5xx)",
+                "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '/ecs/claude-gateway-gateway' | fields @timestamp, email, model, status, request_id, ms\n| filter evt = 'inference' and status >= 400\n| sort @timestamp desc\n| limit 50"
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 42, "width": 24, "height": 6,
+              "properties": {
+                "title": "Per-team spend (from api_request events — splits the user.groups array)",
+                "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '/aws/claude-gateway/events' | filter body = 'claude_code.api_request'\n| stats sum(attributes.cost_usd) as cost_usd, sum(attributes.input_tokens) as in_tokens, sum(attributes.output_tokens) as out_tokens by attributes.user.groups\n| sort cost_usd desc"
+              }
+            },
+
+            { "type": "text", "x": 0, "y": 48, "width": 24, "height": 2, "properties": { "markdown": "## Cost breakdown by model & agent\nEach model / agent gets its **own bar** and totals over the **time range you select** (top-right picker). `agent.name` is the subagent that ran the inference: **Explore**, **Plan**, **general-purpose**, **claude-code-guide** are built-ins; **custom** is a user-defined subagent or main-loop work not tagged as a named agent." } },
+            {
+              "type": "log", "x": 0, "y": 50, "width": 12, "height": 6,
+              "properties": {
+                "title": "Cost by model (one bar per model, USD over selected range)",
+                "region": "${AWS::Region}", "view": "bar", "stacked": false,
+                "query": "SOURCE '/aws/claude-gateway/metrics' | filter ispresent(`model`) and ispresent(`claude_code.cost.usage`)\n| stats sum(`claude_code.cost.usage`) as cost_usd by `model`\n| sort cost_usd desc\n| limit 20"
+              }
+            },
+            {
+              "type": "log", "x": 12, "y": 50, "width": 12, "height": 6,
+              "properties": {
+                "title": "Cost by agent / subagent (one bar per agent, USD over selected range)",
+                "region": "${AWS::Region}", "view": "bar", "stacked": false,
+                "query": "SOURCE '/aws/claude-gateway/metrics' | filter ispresent(`agent.name`) and ispresent(`claude_code.cost.usage`)\n| stats sum(`claude_code.cost.usage`) as cost_usd by `agent.name`\n| sort cost_usd desc\n| limit 20"
+              }
+            }
+          ]
+        }
+
+  # ------------------------------------------- governance/audit dashboard (native)
+  # Companion to the managed Coding Agent Insights dashboard. Coding Agent Insights
+  # owns cost/token/adoption/productivity; this keeps ONLY the gateway-specific
+  # governance/audit views it does not provide (RBAC tool decisions, auth events,
+  # upstream API errors, per-team audit spend) plus a deep link to the managed one.
+  # All widgets here are Logs-Insights / gateway-log queries (no awsemf metrics), so
+  # they work identically in native mode. Requires FORWARD_LOGS=true on the gateway
+  # for the /aws/claude-gateway/events widgets.
+  GovernanceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: CodingAgentInsights
+    Properties:
+      DashboardName: !Sub "${AWS::StackName}-governance"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text", "x": 0, "y": 0, "width": 24, "height": 3,
+              "properties": { "markdown": "# Claude Apps Gateway — Governance & Audit\n**Usage, cost, token & productivity now live in the managed [Coding Agent Insights](https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#gen-ai-observability:coding-agent-insights) dashboard** (CloudWatch console → GenAI Observability → Coding Agent Insights → Claude Code tab). This dashboard keeps the gateway-specific governance signals that feature does not provide: RBAC tool decisions, authentication events, upstream API errors, and per-team audit spend. Governance-event widgets need **FORWARD_LOGS=true**." }
+            },
+
+            { "type": "text", "x": 0, "y": 3, "width": 24, "height": 1, "properties": { "markdown": "## Governance — RBAC tool decisions (Logs Insights, needs FORWARD_LOGS=true)" } },
+            {
+              "type": "log", "x": 0, "y": 4, "width": 12, "height": 6,
+              "properties": {
+                "title": "Top users by tool rejections",
+                "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '/aws/claude-gateway/events' | filter body = 'claude_code.tool_decision' and attributes.decision = 'reject'\n| stats count(*) as rejections by attributes.user.email\n| sort rejections desc\n| limit 20"
+              }
+            },
+            {
+              "type": "log", "x": 12, "y": 4, "width": 12, "height": 6,
+              "properties": {
+                "title": "Blocked / asked actions by tool",
+                "region": "${AWS::Region}", "view": "bar",
+                "query": "SOURCE '/aws/claude-gateway/events' | filter body = 'claude_code.tool_decision' and (attributes.decision = 'reject' or attributes.decision = 'ask')\n| stats count(*) as blocked by attributes.tool_name, attributes.decision\n| sort blocked desc"
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 10, "width": 24, "height": 6,
+              "properties": {
+                "title": "Tool-decision enforcement source (config vs hook vs user)",
+                "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '/aws/claude-gateway/events' | filter body = 'claude_code.tool_decision'\n| stats count(*) as decisions by attributes.tool_name, attributes.decision, attributes.source\n| sort decisions desc\n| limit 50"
+              }
+            },
+
+            { "type": "text", "x": 0, "y": 16, "width": 24, "height": 1, "properties": { "markdown": "## Governance — authentication & reliability (gateway log)" } },
+            {
+              "type": "log", "x": 0, "y": 17, "width": 12, "height": 6,
+              "properties": {
+                "title": "Authentication events (gateway auth log — outcome by event)",
+                "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '/ecs/claude-gateway-gateway' | filter evt in ['device.authorize','device.verify','session.mint','session.refresh','auth.denied']\n| stats count(*) as events by evt, result\n| sort events desc"
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 17, "width": 12, "height": 6,
+              "properties": {
+                "title": "API errors (upstream 4xx/5xx, per 5 min)",
+                "region": "${AWS::Region}", "view": "timeSeries", "stat": "Sum", "period": 300,
+                "metrics": [ [ "${MetricsNamespace}", "gateway.api_errors" ] ]
+              }
+            },
+            {
+              "type": "log", "x": 0, "y": 23, "width": 24, "height": 6,
+              "properties": {
+                "title": "API errors (recent — gateway upstream 4xx/5xx)",
+                "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '/ecs/claude-gateway-gateway' | fields @timestamp, email, model, status, request_id, ms\n| filter evt = 'inference' and status >= 400\n| sort @timestamp desc\n| limit 50"
+              }
+            },
+
+            { "type": "text", "x": 0, "y": 29, "width": 24, "height": 1, "properties": { "markdown": "## Governance — per-team audit spend (Logs Insights, needs FORWARD_LOGS=true)" } },
+            {
+              "type": "log", "x": 0, "y": 30, "width": 24, "height": 6,
+              "properties": {
+                "title": "Per-team spend (from api_request events — splits the user.groups array)",
+                "region": "${AWS::Region}", "view": "table",
+                "query": "SOURCE '/aws/claude-gateway/events' | filter body = 'claude_code.api_request'\n| stats sum(attributes.cost_usd) as cost_usd, sum(attributes.input_tokens) as in_tokens, sum(attributes.output_tokens) as out_tokens by attributes.user.groups\n| sort cost_usd desc"
+              }
+            }
+          ]
+        }
+
+  # ------------------------------------------------------------ alarms + SNS
+  # The topic is always created (harmless when unsubscribed) so peers can wire it
+  # to Slack/PagerDuty later; the email subscription is gated on AlarmEmail.
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alarms"
+      DisplayName: Claude Gateway Observability
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlarmEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmEmail
+
+  # API errors are gateway-side: the CLI events pipeline never emits an api_error,
+  # but the gateway logs every upstream inference call to /ecs/claude-gateway-gateway
+  # as {evt:"inference", status:<http>}. Derive a count metric from the 4xx/5xx ones
+  # so we can alarm on it. (Note: this reads the gateway container log, not the
+  # /aws/claude-gateway/events pipeline — see observability/README.md.)
+  ApiErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: /ecs/claude-gateway-gateway
+      FilterPattern: '{ $.evt = "inference" && $.status >= 400 }'
+      MetricTransformations:
+        - MetricNamespace: !Ref MetricsNamespace
+          MetricName: gateway.api_errors
+          MetricValue: "1"
+          DefaultValue: 0
+
+  # (1) Total daily cost over a static threshold.
+  # NATIVE (PromQL): rolling 24h sum of cost.usage across all series, re-evaluated
+  # hourly (EvaluationInterval caps at 3600s). The `> threshold` reduces the query to a
+  # contributor only while breaching; PendingPeriod 0 = fire on first breaching eval.
+  # ONE resource, stable logical id (matches the pre-native stack) — the mode toggle
+  # switches the alarm *shape* via !If, so flipping EnableCodingAgentInsights is an
+  # in-place update. (Do NOT split into two resources sharing an AlarmName: on an
+  # in-place mode switch CloudFormation creates the new one before deleting the old,
+  # and the duplicate physical AlarmName fails NAME_CONFLICT_VALIDATION.)
+  AlarmDailyCost:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-daily-cost"
+      AlarmDescription: !Sub "Total Claude cost.usage over 1 day exceeded ${DailyCostThresholdUsd} USD."
+      AlarmActions: [!Ref AlarmTopic]
+      # --- native PromQL shape ---
+      EvaluationInterval: !If [CodingAgentInsights, 3600, !Ref "AWS::NoValue"]
+      EvaluationCriteria: !If
+        - CodingAgentInsights
+        - PromQLCriteria:
+            Query: !Sub 'sum(sum_over_time({"claude_code.cost.usage"}[1d])) > ${DailyCostThresholdUsd}'
+            PendingPeriod: 0
+            RecoveryPeriod: 3600
+        - !Ref "AWS::NoValue"
+      # --- legacy classic (awsemf) shape ---
+      Namespace: !If [LegacyEmf, !Ref MetricsNamespace, !Ref "AWS::NoValue"]
+      MetricName: !If [LegacyEmf, claude_code.cost.usage, !Ref "AWS::NoValue"]
+      Dimensions: !If [LegacyEmf, [{ Name: OTelLib, Value: com.anthropic.claude_code }], !Ref "AWS::NoValue"]
+      Statistic: !If [LegacyEmf, Sum, !Ref "AWS::NoValue"]
+      Period: !If [LegacyEmf, 86400, !Ref "AWS::NoValue"]
+      EvaluationPeriods: !If [LegacyEmf, 1, !Ref "AWS::NoValue"]
+      Threshold: !If [LegacyEmf, !Ref DailyCostThresholdUsd, !Ref "AWS::NoValue"]
+      ComparisonOperator: !If [LegacyEmf, GreaterThanThreshold, !Ref "AWS::NoValue"]
+      TreatMissingData: !If [LegacyEmf, notBreaching, !Ref "AWS::NoValue"]
+
+  # (1b) PER-USER cost alarm — real-time notification WITHOUT blocking.
+  # Alerts on one developer's own daily spend and fans out through a dedicated SNS
+  # topic. This is the "alert-only" half of governance: pair it with a per-user
+  # `amount: null` spend override (see slides/DEMO-RUNBOOK.md 1b) so the person is
+  # NOTIFIED but never locked out — the hard dollar cap belongs to whoever you DO
+  # want capped. Keys on the [user.email, OTelLib] dimension the awsemf exporter
+  # already promotes (see metric_declarations above). CloudWatch alarm periods cap
+  # at 1 day, so this is a DAILY run-rate alarm; the monthly ceiling lives in the
+  # spend API. Only created when PerUserAlarmEmailAddress is set.
+  PerUserAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasPerUserAlarm
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-user-cost"
+      DisplayName: Claude Gateway per-user cost alert
+  # Subscribe the developer directly so it's THEIR channel. The topic is also a
+  # clean hook point — add Lambda / HTTPS / Slack-chatbot / PagerDuty subscriptions
+  # to trigger downstream actionables (auto-raise a spend cap, open a ticket, etc.).
+  PerUserAlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasPerUserAlarm
+    Properties:
+      TopicArn: !Ref PerUserAlarmTopic
+      Protocol: email
+      Endpoint: !Ref PerUserAlarmEmailAddress
+  # NATIVE (PromQL): filter on the @resource.user.email label the gateway stamps, sum
+  # the rolling 24h cost for that one user, re-evaluated hourly.
+  PerUserDailyCostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasPerUserAlarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-user-cost-${PerUserAlarmEmailAddress}"
+      AlarmDescription: !Sub "Daily Claude cost.usage for ${PerUserAlarmEmailAddress} exceeded ${PerUserDailyThresholdUsd} USD (notify only; not a hard cap)."
+      AlarmActions: [!Ref PerUserAlarmTopic]
+      # --- native PromQL shape: filter on the @resource.user.email label ---
+      EvaluationInterval: !If [CodingAgentInsights, 3600, !Ref "AWS::NoValue"]
+      EvaluationCriteria: !If
+        - CodingAgentInsights
+        - PromQLCriteria:
+            Query: !Sub 'sum(sum_over_time({"claude_code.cost.usage", "@resource.user.email"="${PerUserAlarmEmailAddress}"}[1d])) > ${PerUserDailyThresholdUsd}'
+            PendingPeriod: 0
+            RecoveryPeriod: 3600
+        - !Ref "AWS::NoValue"
+      # --- legacy classic (awsemf) shape: keys on the [user.email, OTelLib] dimension ---
+      Namespace: !If [LegacyEmf, !Ref MetricsNamespace, !Ref "AWS::NoValue"]
+      MetricName: !If [LegacyEmf, claude_code.cost.usage, !Ref "AWS::NoValue"]
+      Dimensions: !If
+        - LegacyEmf
+        - - { Name: user.email, Value: !Ref PerUserAlarmEmailAddress }
+          - { Name: OTelLib, Value: com.anthropic.claude_code }
+        - !Ref "AWS::NoValue"
+      Statistic: !If [LegacyEmf, Sum, !Ref "AWS::NoValue"]
+      Period: !If [LegacyEmf, 86400, !Ref "AWS::NoValue"]
+      EvaluationPeriods: !If [LegacyEmf, 1, !Ref "AWS::NoValue"]
+      Threshold: !If [LegacyEmf, !Ref PerUserDailyThresholdUsd, !Ref "AWS::NoValue"]
+      ComparisonOperator: !If [LegacyEmf, GreaterThanThreshold, !Ref "AWS::NoValue"]
+      TreatMissingData: !If [LegacyEmf, notBreaching, !Ref "AWS::NoValue"]
+
+  # (2) Cost anomaly — inline ANOMALY_DETECTION_BAND auto-provisions the detector.
+  # Metric-math feature with no PromQL equivalent, so it exists only in the legacy
+  # awsemf path. In native mode the managed Coding Agent Insights dashboard surfaces
+  # spend trends; a PromQL stddev/predict_linear approximation is a possible follow-up.
+  AlarmCostAnomaly:
+    Type: AWS::CloudWatch::Alarm
+    Condition: LegacyEmf
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-cost-anomaly"
+      AlarmDescription: Hourly Claude cost.usage fell outside its expected band.
+      ComparisonOperator: GreaterThanUpperThreshold
+      EvaluationPeriods: 1
+      ThresholdMetricId: ad1
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+      Metrics:
+        - Id: m1
+          MetricStat:
+            Metric:
+              Namespace: !Ref MetricsNamespace
+              MetricName: claude_code.cost.usage
+              Dimensions: [{ Name: OTelLib, Value: com.anthropic.claude_code }]
+            Period: 3600
+            Stat: Sum
+          ReturnData: true
+        - Id: ad1
+          Expression: "ANOMALY_DETECTION_BAND(m1, 2)"
+          Label: cost expected band
+          ReturnData: true
+
+  # (3) Governance: burst of edit-tool rejections.
+  # NATIVE (PromQL): `decision` is a datapoint attribute (bare label, no @resource.).
+  AlarmToolRejections:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-tool-rejections"
+      AlarmDescription: More than 25 edit-tool rejections in an hour.
+      AlarmActions: [!Ref AlarmTopic]
+      # --- native PromQL shape: `decision` is a datapoint attribute (bare label) ---
+      EvaluationInterval: !If [CodingAgentInsights, 3600, !Ref "AWS::NoValue"]
+      EvaluationCriteria: !If
+        - CodingAgentInsights
+        - PromQLCriteria:
+            Query: 'sum(sum_over_time({"claude_code.code_edit_tool.decision", "decision"="reject"}[1h])) > 25'
+            PendingPeriod: 0
+            RecoveryPeriod: 3600
+        - !Ref "AWS::NoValue"
+      # --- legacy classic (awsemf) shape ---
+      Namespace: !If [LegacyEmf, !Ref MetricsNamespace, !Ref "AWS::NoValue"]
+      MetricName: !If [LegacyEmf, claude_code.code_edit_tool.decision, !Ref "AWS::NoValue"]
+      Dimensions: !If [LegacyEmf, [{ Name: decision, Value: reject }], !Ref "AWS::NoValue"]
+      Statistic: !If [LegacyEmf, Sum, !Ref "AWS::NoValue"]
+      Period: !If [LegacyEmf, 3600, !Ref "AWS::NoValue"]
+      EvaluationPeriods: !If [LegacyEmf, 1, !Ref "AWS::NoValue"]
+      Threshold: !If [LegacyEmf, 25, !Ref "AWS::NoValue"]
+      ComparisonOperator: !If [LegacyEmf, GreaterThanThreshold, !Ref "AWS::NoValue"]
+      TreatMissingData: !If [LegacyEmf, notBreaching, !Ref "AWS::NoValue"]
+
+  # (4) API error spike (from the derived metric filter).
+  AlarmApiErrors:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: ApiErrorMetricFilter
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-api-errors"
+      AlarmDescription: More than 10 gateway api_error events in 5 minutes.
+      Namespace: !Ref MetricsNamespace
+      MetricName: gateway.api_errors
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  # (5) Availability: sessions dried up (possible outage / broken login).
+  # NATIVE (PromQL): a total absence of the metric yields NO series, so a `< 1`
+  # comparison would never produce a breaching contributor. absent_over_time() returns
+  # a 1-valued vector precisely when the metric has been missing for the whole window,
+  # so `== 1` fires exactly on "no sessions." PendingPeriod 3h matches the legacy
+  # 3-consecutive-hour intent.
+  AlarmSessionDrop:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-no-sessions"
+      AlarmDescription: No gateway sessions for 3 consecutive hours.
+      AlarmActions: [!Ref AlarmTopic]
+      # --- native PromQL shape: a total absence of the metric yields NO series, so a
+      # `< 1` comparison would never produce a breaching contributor. absent_over_time()
+      # returns a 1-valued vector precisely when the metric is missing for the whole
+      # window, so `== 1` fires exactly on "no sessions." PendingPeriod 3h matches the
+      # legacy 3-consecutive-hour intent. ---
+      EvaluationInterval: !If [CodingAgentInsights, 3600, !Ref "AWS::NoValue"]
+      EvaluationCriteria: !If
+        - CodingAgentInsights
+        - PromQLCriteria:
+            Query: 'absent_over_time({"claude_code.session.count"}[1h]) == 1'
+            PendingPeriod: 10800
+            RecoveryPeriod: 0
+        - !Ref "AWS::NoValue"
+      # --- legacy classic (awsemf) shape ---
+      Namespace: !If [LegacyEmf, !Ref MetricsNamespace, !Ref "AWS::NoValue"]
+      MetricName: !If [LegacyEmf, claude_code.session.count, !Ref "AWS::NoValue"]
+      Dimensions: !If [LegacyEmf, [{ Name: OTelLib, Value: com.anthropic.claude_code }], !Ref "AWS::NoValue"]
+      Statistic: !If [LegacyEmf, Sum, !Ref "AWS::NoValue"]
+      Period: !If [LegacyEmf, 3600, !Ref "AWS::NoValue"]
+      EvaluationPeriods: !If [LegacyEmf, 3, !Ref "AWS::NoValue"]
+      Threshold: !If [LegacyEmf, 1, !Ref "AWS::NoValue"]
+      ComparisonOperator: !If [LegacyEmf, LessThanThreshold, !Ref "AWS::NoValue"]
+      TreatMissingData: !If [LegacyEmf, breaching, !Ref "AWS::NoValue"]
+
+Outputs:
+  CollectorEndpoint:
+    Description: Pass as COLLECTOR_ENDPOINT to the gateway deploy (telemetry forward target).
+    Value: !If [ManagedCertMode, !Sub "https://${DomainName}", !Sub "https://${CollectorHostname}"]
+  DashboardName:
+    Description: The CloudWatch dashboard this stack creates (governance/audit in native mode; full -usage in legacy mode).
+    Value: !If [CodingAgentInsights, !Sub "${AWS::StackName}-governance", !Sub "${AWS::StackName}-usage"]
+  CodingAgentInsightsConsoleUrl:
+    Condition: CodingAgentInsights
+    Description: Managed Coding Agent Insights dashboard (usage/cost/token/productivity). Console → GenAI Observability → Coding Agent Insights → Claude Code tab.
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#gen-ai-observability:coding-agent-insights"
+  MetricsLogGroup:
+    Condition: LegacyEmf
+    Description: EMF metrics log group (legacy awsemf mode only; absent in native OTLP mode).
+    Value: /aws/claude-gateway/metrics
+  EventsLogGroup:
+    Description: Governance events log group (needs FORWARD_LOGS=true on the gateway).
+    Value: /aws/claude-gateway/events
+  AlarmTopicArn:
+    Description: SNS topic for observability alarms; wire to Slack/PagerDuty as needed.
+    Value: !Ref AlarmTopic

@@ -1,0 +1,840 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+    **WARNING** This template creates IAM roles, Lambda functions, a Step Functions state machine, and
+    related resources to automate Transit Gateway peering and static-route setup using pre-provisioned
+    Transit Gateways and Route Tables. You will be billed for the AWS resources used if you create a stack from this template.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Regions"
+        Parameters:
+          - PrimaryRegionParam
+          - RecoveryRegionParam
+      - Label:
+          default: "Recovery TGW Imports"
+        Parameters:
+          - RecoveryTransitGatewayId
+          - RecoveryPrivateRouteTableId
+          - RecoveryStagingPrivateRouteTableId
+      - Label:
+          default: "VPC CIDR Blocks"
+        Parameters:
+          - SourceVpcCidrParam
+          - SourceStagingVpcCidrParam
+          - RecoveryVpcCidrParam
+          - RecoveryStagingVpcCidrParam
+
+Parameters:
+  # Regions fetched from SSM Parameter Store
+  PrimaryRegionParam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: "/dr/primary/region"
+    Description: "Primary region (from SSM)"
+  RecoveryRegionParam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: "/dr/recovery/region"
+    Description: "Recovery region (from SSM)"
+
+  RecoveryTransitGatewayId:
+    Type: String
+    Description: Recovery-region Transit Gateway ID
+  RecoveryPrivateRouteTableId:
+    Type: String
+    Description: Recovery-region private subnet route table ID
+  RecoveryStagingPrivateRouteTableId:
+    Type: String
+    Description: Recovery-region staging subnet route table ID
+
+  # VPC CIDRs fetched from SSM Parameter Store
+  SourceVpcCidrParam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: "/dr/primary/sourceVpcCidr"
+    Description: CIDR block of your primary source VPC (from SSM)
+  SourceStagingVpcCidrParam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: "/dr/primary/stagingVpcCidr"
+    Description: CIDR block of your primary source staging VPC (from SSM)
+  RecoveryVpcCidrParam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: "/dr/recovery/vpcCidr"
+    Description: CIDR block of your DR VPC (from SSM)
+  RecoveryStagingVpcCidrParam:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: "/dr/recovery/stagingVpcCidr"
+    Description: CIDR block of your DR staging VPC (from SSM)
+
+Resources:
+
+  PeerTransitGatewayLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "PeerTransitGatewayLambdaPolicy-${AWS::Region}"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/peer-transit-gateway*"
+              - Sid: DescribeEC2
+                Effect: Allow
+                Action:
+                  - ec2:DescribeTransitGateways
+                  - ec2:DescribeTransitGatewayAttachments
+                Resource: "*"
+              - Sid: ManagePeering
+                Effect: Allow
+                Action:
+                  - ec2:CreateTransitGatewayPeeringAttachment
+                  - ec2:AcceptTransitGatewayPeeringAttachment
+                  - ec2:DeleteTransitGatewayPeeringAttachment
+                Resource:
+                  - !Sub "arn:aws:ec2:${PrimaryRegionParam}:${AWS::AccountId}:transit-gateway/*"
+                  - !Sub "arn:aws:ec2:${PrimaryRegionParam}:${AWS::AccountId}:transit-gateway-attachment/*"
+                  - !Sub "arn:aws:ec2:${RecoveryRegionParam}:${AWS::AccountId}:transit-gateway/*"
+                  - !Sub "arn:aws:ec2:${RecoveryRegionParam}:${AWS::AccountId}:transit-gateway-attachment/*"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Wildcard read permissions"
+
+  PeerTransitGateways:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "VPC not required"
+    Properties:
+      FunctionName: peer-transit-gateway
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      ReservedConcurrentExecutions: 5
+      Role: !GetAtt PeerTransitGatewayLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          PRIMARY_TGW_ID:              !ImportValue SourceTransitGatewayId
+          RECOVERY_TGW_ID:             !Ref RecoveryTransitGatewayId
+          SOURCE_REGION:               !Ref PrimaryRegionParam
+          TARGET_REGION:               !Ref RecoveryRegionParam
+          SOURCE_PRIVATE_RT_ID:        !ImportValue SourcePrivateRouteTableId
+          SOURCE_STAGING_PRIVATE_RT_ID: !ImportValue SourceStagingPrivateRouteTableId
+          RECOVERY_PRIVATE_RT_ID:      !Ref RecoveryPrivateRouteTableId
+          RECOVERY_STAGING_PRIVATE_RT_ID: !Ref RecoveryStagingPrivateRouteTableId
+      Code:
+        ZipFile: |
+          import os
+          import time
+          import boto3
+          from botocore.config import Config
+
+          # pulled from CFN environment
+          SRC_REGION = os.environ["SOURCE_REGION"]
+          TGT_REGION = os.environ["TARGET_REGION"]
+          SRC_TGW    = os.environ["PRIMARY_TGW_ID"]
+          TGT_TGW    = os.environ["RECOVERY_TGW_ID"]
+
+          # one-retry configs
+          src_cfg = Config(region_name=SRC_REGION, signature_version="v4", retries={"max_attempts":1})
+          tgt_cfg = Config(region_name=TGT_REGION, signature_version="v4", retries={"max_attempts":1})
+
+          ec2_src = boto3.client("ec2", config=src_cfg)
+          ec2_tgt = boto3.client("ec2", config=tgt_cfg)
+
+          def lambda_handler(event, context):
+              inp         = event["Input"]
+              requestType = inp["RequestType"]
+
+              # 1) Describe both TGWs by ID
+              src_info = ec2_src.describe_transit_gateways(TransitGatewayIds=[SRC_TGW])["TransitGateways"][0]
+              tgt_info = ec2_tgt.describe_transit_gateways(TransitGatewayIds=[TGT_TGW])["TransitGateways"][0]
+
+              activeTransitGatewayId = SRC_TGW
+              activeOwnerId          = src_info["OwnerId"]
+              activeTgRouteTableId   = src_info["Options"]["AssociationDefaultRouteTableId"]
+
+              passiveTransitGatewayId = TGT_TGW
+              passiveOwnerId          = tgt_info["OwnerId"]
+              passiveTgRouteTableId   = tgt_info["Options"]["AssociationDefaultRouteTableId"]
+
+              # 2) Check for any existing peering
+              atts = ec2_src.describe_transit_gateway_attachments(
+                  Filters=[
+                    {"Name":"transit-gateway-id",   "Values":[activeTransitGatewayId]},
+                    {"Name":"resource-type",        "Values":["peering"]},
+                    {"Name":"resource-id",          "Values":[passiveTransitGatewayId]},
+                    {"Name":"state",                "Values":["available","initiatingRequest","modifying",
+                                                              "pendingAcceptance","pending","rejected","rejecting"]}
+                  ]
+              )["TransitGatewayAttachments"]
+
+              transitGatewayAttachmentId = None
+              acceptingTgAttachmentId    = None
+
+              if requestType in ("Create", "Update"):
+                  if not atts:
+                      resp = ec2_src.create_transit_gateway_peering_attachment(
+                          TransitGatewayId=activeTransitGatewayId,
+                          PeerTransitGatewayId=passiveTransitGatewayId,
+                          PeerAccountId=passiveOwnerId,
+                          PeerRegion=TGT_REGION
+                      )["TransitGatewayPeeringAttachment"]
+
+                      transitGatewayAttachmentId = resp["TransitGatewayAttachmentId"]
+                      time.sleep(60)
+
+                      accept = ec2_tgt.accept_transit_gateway_peering_attachment(
+                          TransitGatewayAttachmentId=transitGatewayAttachmentId
+                      )["TransitGatewayPeeringAttachment"]
+                      acceptingTgAttachmentId = accept["TransitGatewayAttachmentId"]
+                  else:
+                      transitGatewayAttachmentId = atts[0]["TransitGatewayAttachmentId"]
+                      acceptingTgAttachmentId = atts[0].get("AccepterTransitGatewayAttachmentId")
+
+                  return {
+                      "ActiveTransitGatewayId":        activeTransitGatewayId,
+                      "ActiveOwnerId":                 activeOwnerId,
+                      "ActiveTgRouteTableId":          activeTgRouteTableId,
+                      "PassiveTransitGatewayId":       passiveTransitGatewayId,
+                      "PassiveOwnerId":                passiveOwnerId,
+                      "PassiveTgRouteTableId":         passiveTgRouteTableId,
+                      "AttachmentId":                  transitGatewayAttachmentId,
+                      "AcceptingAttachmentId":         acceptingTgAttachmentId,
+                      "RequestType":                   requestType,
+                  }
+
+              elif requestType == "Delete":
+                  if atts:
+                      transitGatewayAttachmentId = atts[0]["TransitGatewayAttachmentId"]
+                      ec2_src.delete_transit_gateway_peering_attachment(
+                          TransitGatewayAttachmentId=transitGatewayAttachmentId
+                      )
+
+                  return {
+                      "ActiveTransitGatewayId":        activeTransitGatewayId,
+                      "ActiveOwnerId":                 activeOwnerId,
+                      "ActiveTgRouteTableId":          activeTgRouteTableId,
+                      "PassiveTransitGatewayId":       passiveTransitGatewayId,
+                      "PassiveOwnerId":                passiveOwnerId,
+                      "PassiveTgRouteTableId":         passiveTgRouteTableId,
+                      "AttachmentId":                  None,
+                      "AcceptingAttachmentId":         None,
+                      "RequestType":                   requestType,
+                  }
+
+              else:
+                  raise ValueError(f"Unsupported RequestType: {requestType}")
+
+  GetPeeringStatusLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "GetPeeringStatusLambdaPolicy-${AWS::Region}"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/get-transit-gateway-peering-status*"
+              - Sid: DescribeEC2
+                Effect: Allow
+                Action:
+                  - ec2:DescribeTransitGatewayAttachments
+                  - ec2:AcceptTransitGatewayPeeringAttachment
+                Resource: "*"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Wildcard read permissions"
+
+  GetPeeringStatus:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "VPC not required"
+    Properties:
+      FunctionName: get-transit-gateway-peering-status
+      Runtime: python3.12
+      ReservedConcurrentExecutions: 5
+      Handler: index.lambda_handler
+      Role: !GetAtt GetPeeringStatusLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          SOURCE_REGION: !Ref PrimaryRegionParam
+          TARGET_REGION: !Ref RecoveryRegionParam
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+
+          ACTIVE_REGION  = os.environ["SOURCE_REGION"]
+          PASSIVE_REGION = os.environ["TARGET_REGION"]
+
+          active_ec2  = boto3.client("ec2", region_name=ACTIVE_REGION)
+          passive_ec2 = boto3.client("ec2", region_name=PASSIVE_REGION)
+
+          def lambda_handler(event, context):
+              inp = event["Input"]
+              active_tgw    = inp["ActiveTransitGatewayId"]
+              passive_tgw   = inp["PassiveTransitGatewayId"]
+              req_id        = inp.get("AttachmentId")
+              acc_id        = inp.get("AcceptingAttachmentId")
+              request_type  = inp["RequestType"]
+
+              if not req_id:
+                  resp = active_ec2.describe_transit_gateway_attachments(
+                      Filters=[
+                          {"Name": "transit-gateway-id", "Values": [active_tgw]},
+                          {"Name": "resource-type",        "Values": ["peering"]},
+                          {"Name": "resource-id",          "Values": [passive_tgw]},
+                          {"Name": "state",                "Values": ["available","pendingAcceptance","initiatingRequest","pending"]}
+                      ]
+                  )
+                  req_id = resp["TransitGatewayAttachments"][0]["TransitGatewayAttachmentId"]
+
+              if not acc_id:
+                  resp = passive_ec2.describe_transit_gateway_attachments(
+                      Filters=[
+                          {"Name": "transit-gateway-id", "Values": [passive_tgw]},
+                          {"Name": "resource-type",      "Values": ["peering"]},
+                          {"Name": "resource-id",        "Values": [active_tgw]},
+                          {"Name": "state",              "Values": ["available","pendingAcceptance","initiatingRequest","pending"]}
+                      ]
+                  )
+                  acc_id = resp["TransitGatewayAttachments"][0]["TransitGatewayAttachmentId"]
+
+              status_req = active_ec2.describe_transit_gateway_attachments(
+                  TransitGatewayAttachmentIds=[req_id]
+              )["TransitGatewayAttachments"][0]["State"]
+
+              status_acc = passive_ec2.describe_transit_gateway_attachments(
+                  TransitGatewayAttachmentIds=[acc_id]
+              )["TransitGatewayAttachments"][0]["State"]
+
+              if status_acc == "pendingAcceptance":
+                  status_acc = passive_ec2.accept_transit_gateway_peering_attachment(
+                      TransitGatewayAttachmentId=acc_id
+                  )["TransitGatewayPeeringAttachment"]["State"]
+
+              return {
+                  "status":               status_req,
+                  "acceptingTgstatus":    status_acc,
+                  "ActiveTransitGatewayId":   active_tgw,
+                  "PassiveTransitGatewayId":  passive_tgw,
+                  "ActiveTgRouteTableId":     inp["ActiveTgRouteTableId"],
+                  "PassiveTgRouteTableId":    inp["PassiveTgRouteTableId"],
+                  "AttachmentId":             req_id,
+                  "AcceptingAttachmentId":    acc_id,
+                  "RequestType":              request_type
+              }
+
+  ModifyTransitGatewayRoutesLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "ModifyTransitGatewayRoutesLambdaPolicy-${AWS::Region}"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/modify-transit-gateway-routes*"
+              - Sid: DescribeAndManageRoutes
+                Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:SearchTransitGatewayRoutes
+                  - ec2:CreateTransitGatewayRoute
+                  - ec2:DeleteTransitGatewayRoute
+                  - ec2:DescribeTransitGatewayRouteTables
+                  - ec2:CreateRoute
+                  - ec2:DeleteRoute
+                Resource: "*"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Wildcard read permissions"
+
+  ModifyTransitGatewayRoutes:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "VPC not required"
+    Properties:
+      FunctionName: modify-transit-gateway-routes
+      Runtime: python3.12
+      ReservedConcurrentExecutions: 5
+      Handler: index.lambda_handler
+      Role: !GetAtt ModifyTransitGatewayRoutesLambdaRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          SOURCE_REGION:                    !Ref PrimaryRegionParam
+          TARGET_REGION:                    !Ref RecoveryRegionParam
+          SOURCE_TGW_RT:                    !ImportValue SourcePrivateRouteTableId
+          SOURCE_STAGING_TGW_RT:            !ImportValue SourceStagingPrivateRouteTableId
+          RECOVERY_TGW_RT:                  !Ref RecoveryPrivateRouteTableId
+          RECOVERY_STAGING_TGW_RT:          !Ref RecoveryStagingPrivateRouteTableId
+          SOURCE_VPC_CIDR:                  !Ref SourceVpcCidrParam
+          SOURCE_STAGING_VPC_CIDR:          !Ref SourceStagingVpcCidrParam
+          RECOVERY_VPC_CIDR:                !Ref RecoveryVpcCidrParam
+          RECOVERY_STAGING_VPC_CIDR:        !Ref RecoveryStagingVpcCidrParam
+          PRIMARY_TGW_ID:                   !ImportValue SourceTransitGatewayId
+          RECOVERY_TGW_ID:                  !Ref RecoveryTransitGatewayId
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import logging
+          import time
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          # ─── Logging Setup ─────────────────────────────────────────────────────────────
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # ─── Env Vars ─────────────────────────────────────────────────────────────────
+          SRC_REGION             = os.environ["SOURCE_REGION"]
+          TGT_REGION             = os.environ["TARGET_REGION"]
+          SRC_TGW_ID             = os.environ["PRIMARY_TGW_ID"]
+          TGT_TGW_ID             = os.environ["RECOVERY_TGW_ID"]
+
+          # VPC route-table IDs
+          SRC_VPC_RT             = os.environ["SOURCE_TGW_RT"]
+          SRC_STG_VPC_RT         = os.environ["SOURCE_STAGING_TGW_RT"]
+          REC_VPC_RT             = os.environ["RECOVERY_TGW_RT"]
+          REC_STG_VPC_RT         = os.environ["RECOVERY_STAGING_TGW_RT"]
+
+          # CIDRs
+          SRC_VPC_CIDR           = os.environ["SOURCE_VPC_CIDR"]
+          SRC_STG_VPC_CIDR       = os.environ["SOURCE_STAGING_VPC_CIDR"]
+          REC_VPC_CIDR           = os.environ["RECOVERY_VPC_CIDR"]
+          REC_STG_VPC_CIDR       = os.environ["RECOVERY_STAGING_VPC_CIDR"]
+
+          # ─── EC2 Clients ────────────────────────────────────────────────────────────────
+          src_ec2 = boto3.client("ec2", region_name=SRC_REGION)
+          tgt_ec2 = boto3.client("ec2", region_name=TGT_REGION)
+
+          # ─── Helpers ───────────────────────────────────────────────────────────────────
+
+          def get_default_tgw_rt(ec2_client, tgw_id):
+              resp = ec2_client.describe_transit_gateway_route_tables(
+                  Filters=[
+                      {"Name":"transit-gateway-id",                  "Values":[tgw_id]},
+                      {"Name":"default-association-route-table",     "Values":["true"]},
+                  ]
+              )
+              tbls = resp.get("TransitGatewayRouteTables", [])
+              if not tbls:
+                  raise RuntimeError(f"No default TGW-RT for {tgw_id}")
+              rt = tbls[0]["TransitGatewayRouteTableId"]
+              logger.info(f"Default TGW-RT for {tgw_id}: {rt}")
+              return rt
+
+          def upsert_vpc_route(ec2, rt_id, cidr, tgw_id):
+              try:
+                  ec2.create_route(
+                      RouteTableId=rt_id,
+                      DestinationCidrBlock=cidr,
+                      TransitGatewayId=tgw_id
+                  )
+                  logger.info(f"[VPC-Create] {rt_id} → {cidr} via TGW {tgw_id}")
+              except ClientError as e:
+                  if e.response["Error"]["Code"] != "RouteAlreadyExists":
+                      raise
+
+          def delete_vpc_route(ec2, rt_id, cidr):
+              try:
+                  ec2.delete_route(
+                      RouteTableId=rt_id,
+                      DestinationCidrBlock=cidr
+                  )
+                  logger.info(f"[VPC-Delete] {rt_id} –/→ {cidr}")
+              except ClientError as e:
+                  if e.response["Error"]["Code"] != "InvalidRoute.NotFound":
+                      raise
+
+          def ensure_tgw_route(ec2, rt_id, cidr, attach_id, filter_name):
+              routes = ec2.search_transit_gateway_routes(
+                  TransitGatewayRouteTableId=rt_id,
+                  Filters=[{"Name":filter_name,"Values":[cidr]}]
+              )["Routes"]
+              if routes:
+                  return
+              try:
+                  ec2.create_transit_gateway_route(
+                      TransitGatewayRouteTableId=rt_id,
+                      DestinationCidrBlock=cidr,
+                      TransitGatewayAttachmentId=attach_id,
+                      Blackhole=False
+                  )
+                  logger.info(f"[TGW-Create] {rt_id} → {cidr} via attach {attach_id}")
+              except ClientError as e:
+                  code = e.response["Error"]["Code"]
+                  if code == "RouteAlreadyExists":
+                      return
+                  if code == "IncorrectState":
+                      logger.warning(f"[TGW-Retry] attach {attach_id} not ready for {cidr}; retrying…")
+                      time.sleep(5)
+                      ec2.create_transit_gateway_route(
+                          TransitGatewayRouteTableId=rt_id,
+                          DestinationCidrBlock=cidr,
+                          TransitGatewayAttachmentId=attach_id,
+                          Blackhole=False
+                      )
+                  else:
+                      raise
+
+          def remove_tgw_route(ec2, rt_id, cidr, filter_name):
+              routes = ec2.search_transit_gateway_routes(
+                  TransitGatewayRouteTableId=rt_id,
+                  Filters=[{"Name":filter_name,"Values":[cidr]}]
+              )["Routes"]
+              if not routes:
+                  return
+              ec2.delete_transit_gateway_route(
+                  TransitGatewayRouteTableId=rt_id,
+                  DestinationCidrBlock=cidr
+              )
+              logger.info(f"[TGW-Delete] {rt_id} –/→ {cidr}")
+
+          # ─── Lambda Handler ────────────────────────────────────────────────────────────
+
+          def lambda_handler(event, context):
+              inp    = event["Input"]
+              req_id = inp["AttachmentId"]
+              acc_id = inp["AcceptingAttachmentId"]
+              action = inp["RequestType"]
+
+              logger.info(f"ModifyRoutes({action}): req={req_id}, acc={acc_id}")
+
+              # 1) VPC-level routes (four RTs):
+              if action in ("Create","Update"):
+                  # Source → Recovery Staging
+                  upsert_vpc_route(src_ec2, SRC_VPC_RT,   REC_STG_VPC_CIDR, SRC_TGW_ID)
+                  # Source Staging → Recovery
+                  upsert_vpc_route(src_ec2, SRC_STG_VPC_RT, REC_VPC_CIDR,   SRC_TGW_ID)
+                  # Recovery → Source Staging
+                  upsert_vpc_route(tgt_ec2, REC_VPC_RT,   SRC_STG_VPC_CIDR, TGT_TGW_ID)
+                  # Recovery Staging → Source
+                  upsert_vpc_route(tgt_ec2, REC_STG_VPC_RT, SRC_VPC_CIDR,   TGT_TGW_ID)
+              else:
+                  delete_vpc_route(src_ec2, SRC_VPC_RT,      REC_STG_VPC_CIDR)
+                  delete_vpc_route(src_ec2, SRC_STG_VPC_RT,  REC_VPC_CIDR)
+                  delete_vpc_route(tgt_ec2, REC_VPC_RT,      SRC_STG_VPC_CIDR)
+                  delete_vpc_route(tgt_ec2, REC_STG_VPC_RT,  SRC_VPC_CIDR)
+
+              # 2) TGW-level static routes:
+              rt_src = get_default_tgw_rt(src_ec2, SRC_TGW_ID)
+              rt_tgt = get_default_tgw_rt(tgt_ec2, TGT_TGW_ID)
+
+              forward_map = {
+                  REC_VPC_CIDR:      rt_src,
+                  REC_STG_VPC_CIDR:  rt_src,
+              }
+              reverse_map = {
+                  SRC_VPC_CIDR:      rt_tgt,
+                  SRC_STG_VPC_CIDR:  rt_tgt,
+              }
+
+              for cidr, tbl in forward_map.items():
+                  if action in ("Create","Update"):
+                      ensure_tgw_route(src_ec2, tbl, cidr, req_id, "route-search.exact-match")
+                  else:
+                      remove_tgw_route(src_ec2, tbl, cidr, "route-search.exact-match")
+
+              for cidr, tbl in reverse_map.items():
+                  if action in ("Create","Update"):
+                      ensure_tgw_route(tgt_ec2, tbl, cidr, acc_id, "route-search.supernet-of-match")
+                  else:
+                      remove_tgw_route(tgt_ec2, tbl, cidr, "route-search.supernet-of-match")
+
+              return {
+                  "statusCode": 200,
+                  "body": json.dumps("Completed run successfully")
+              }
+
+  TransitGatewayAutomateStepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: !Sub "TransitGatewayStepFunctionPolicy-${AWS::Region}"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/states/*"
+              - Sid: InvokeLambdas
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt PeerTransitGateways.Arn
+                  - !GetAtt GetPeeringStatus.Arn
+                  - !GetAtt ModifyTransitGatewayRoutes.Arn
+
+  StepFunction:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: transit-gateway-automation
+      RoleArn: !GetAtt TransitGatewayAutomateStepFunctionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "PeerTransitGateway",
+          "States": {
+            "PeerTransitGateway": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${PeerTransitGateways.Arn}",
+                "Payload": { "Input.$": "$" }
+              },
+              "Next": "Wait30"
+            },
+            "Wait30": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "GetPeeringStatus"
+            },
+            "GetPeeringStatus": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${GetPeeringStatus.Arn}",
+                "Payload": { "Input.$": "$.Payload" }
+              },
+              "Next": "CheckAvailable"
+            },
+            "CheckAvailable": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "And": [
+                    { "Variable": "$.Payload.status", "StringEquals": "available" },
+                    { "Variable": "$.Payload.acceptingTgstatus", "StringEquals": "available" }
+                  ],
+                  "Next": "ModifyRoutes"
+                }
+              ],
+              "Default": "Wait30"
+            },
+            "ModifyRoutes": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ModifyTransitGatewayRoutes.Arn}",
+                "Payload": { "Input.$": "$.Payload" }
+              },
+              "End": true
+            }
+          }
+        }
+  StartAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: StartAutomationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Allow starting the state machine itself
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !GetAtt StepFunction.Arn
+
+              # Allow describing any execution of that state machine
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:transit-gateway-automation:*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/start-automation*
+
+  # StartAutomationRole:
+  #   Type: AWS::IAM::Role
+  #   Properties:
+  #     AssumeRolePolicyDocument:
+  #       Version: "2012-10-17"
+  #       Statement:
+  #         - Effect: Allow
+  #           Principal:
+  #             Service: lambda.amazonaws.com
+  #           Action: sts:AssumeRole
+  #     Path: "/"
+  #     Policies:
+  #       - PolicyName: StartAutomationPolicy
+  #         PolicyDocument:
+  #           Version: "2012-10-17"
+  #           Statement:
+  #             - Effect: Allow
+  #               Action:
+  #                 - states:StartExecution
+  #                 - states:DescribeExecution
+  #               Resource: !GetAtt StepFunction.Arn
+  #             - Effect: Allow
+  #               Action:
+  #                 - logs:CreateLogGroup
+  #                 - logs:CreateLogStream
+  #                 - logs:PutLogEvents
+  #               Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/start-automation*
+
+  StartExecution:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "VPC not required"
+    Properties:
+      FunctionName: start-automation
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt StartAutomationRole.Arn
+      Timeout: 300
+      MemorySize: 128
+      ReservedConcurrentExecutions: 5
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref StepFunction
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import time
+          import urllib3
+
+          http = urllib3.PoolManager()
+          sfn = boto3.client("stepfunctions")
+          SF_ARN = os.environ["STATE_MACHINE_ARN"]
+
+          def send_cfn_response(event, context, status, data):
+              response_body = {
+                  "Status": status,
+                  "Reason": f"See CloudWatch Log Stream: {context.log_stream_name}",
+                  "PhysicalResourceId": context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data,
+              }
+              encoded = json.dumps(response_body).encode("utf-8")
+              headers = {"Content-Type": "", "Content-Length": str(len(encoded))}
+              http.request("PUT", event["ResponseURL"], body=encoded, headers=headers)
+
+          def lambda_handler(event, context):
+              print("CFN event:", json.dumps(event))
+              req = event.get("RequestType")
+              if req not in ("Create", "Update", "Delete"):
+                  return send_cfn_response(event, context, "SUCCESS", {})
+
+              try:
+                  # start the state machine
+                  resp = sfn.start_execution(
+                      stateMachineArn=SF_ARN,
+                      input=json.dumps({"RequestType": req})
+                  )
+                  exe_arn = resp["executionArn"]
+
+                  # poll until done
+                  while True:
+                      desc = sfn.describe_execution(executionArn=exe_arn)
+                      status = desc["status"]
+                      print("SF status:", status)
+                      if status in ("SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"):
+                          break
+                      time.sleep(15)
+
+                  if status == "SUCCEEDED":
+                      send_cfn_response(event, context, "SUCCESS", {"Message": "Done"})
+                  else:
+                      send_cfn_response(event, context, "FAILED", {"Message": f"Ended {status}"})
+
+              except Exception as e:
+                  print("Error:", e)
+                  send_cfn_response(event, context, "FAILED", {"Error": str(e)})
+
+  StartAutomation:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt StartExecution.Arn
+
+Outputs:
+  StateMachineArn:
+    Description: ARN of the automation Step Function
+    Value: !Ref StepFunction

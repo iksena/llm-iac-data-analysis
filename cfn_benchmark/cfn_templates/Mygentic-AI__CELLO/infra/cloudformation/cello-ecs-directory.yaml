@@ -1,0 +1,498 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CELLO ECS Directory — Fargate service for the directory node.
+  IAM roles are defined in cello-iam.yaml and imported via !ImportValue.
+  Task definition uses least-privilege roles from the IAM stack.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, production]
+    Description: Deployment environment
+  # CELLO-M6B-019: RelayMultiaddr parameter removed.
+  # Relay addressing is now sourced from the SSM node registry at runtime.
+  # The directory reads /cello/{env}/nodes/relay/* via GetParametersByPath at startup.
+  Cpu:
+    Type: String
+    Default: "256"
+    AllowedValues: ["256", "512", "1024"]
+    Description: Fargate CPU units (256 = 0.25 vCPU)
+  Memory:
+    Type: String
+    Default: "512"
+    AllowedValues: ["512", "1024", "2048"]
+    Description: Fargate memory in MB
+  ImageUri:
+    Type: String
+    Description: "ECR image URI for the directory service (e.g. {account}.dkr.ecr.{region}.amazonaws.com/cello-directory:latest)"
+
+# Bootstrap endpoint hostname mapping removed — now uses SSM Parameter Store
+# for dynamic region expansion without template edits.
+# Parameter path: /cello/{Environment}/directory/hostname
+# Each region stores its own hostname (e.g., directory-us1.cello.mygentic.ai).
+# For new region expansion, create the SSM parameter before deploying the stack.
+
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "cello-${Environment}"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/cello-directory-${Environment}"
+      RetentionInDays: 90
+      Tags:
+        - Key: Project
+          Value: cello
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "cello-directory-${Environment}"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: "cello-${Environment}-directory-execution-role-arn"
+      TaskRoleArn: !ImportValue
+        Fn::Sub: "cello-${Environment}-directory-task-role-arn"
+      ContainerDefinitions:
+        - Name: directory
+          Image: !Ref ImageUri
+          Essential: true
+          # T-of-N (DOD-DKG-1) — the directory-side counterpart to the client's bundled roster: decode
+          # the signed consortium manifest (base64 from SSM via CELLO_DIRECTORY_CONSORTIUM_MANIFEST_B64)
+          # to a file the FileDirectoryManifestStore reads, so this directory declares the correct
+          # consortium participant count N in the registration DKG (directory-node.ts:
+          # consortiumNodeCount = manifest.nodes.length ?? 1). Without it the directory declares
+          # participants:1 (standalone) and a roster-aware client refuses to downgrade (dkg_below_threshold).
+          # Then run the ORIGINAL entrypoint unchanged (flyway migrate → node directory.js). Infra-only:
+          # no image rebuild; base image is node:24-slim (has /bin/sh + base64).
+          EntryPoint:
+            - /bin/sh
+            - -c
+            - >-
+              if [ -n "$CELLO_DIRECTORY_CONSORTIUM_MANIFEST_B64" ];
+              then printf '%s' "$CELLO_DIRECTORY_CONSORTIUM_MANIFEST_B64" | base64 -d > "${CELLO_DIRECTORY_CONSORTIUM_MANIFEST:-/tmp/consortium-manifest.json}";
+              fi;
+              exec /app/docker-entrypoint.sh
+          PortMappings:
+            # Port 8080: libp2p WebSocket listener (REPOSPLIT-001 AC-007).
+            # ALB forwards external port 80 → container port 8080 (WS upgrade).
+            - ContainerPort: 8080
+              Protocol: tcp
+            # Port 8081: internal API (/internal/* endpoints, ops-agent).
+            # M6B-004: ALB routes /internal/* → InternalApiTargetGroup → port 8081.
+            - ContainerPort: 8081
+              Protocol: tcp
+            # Port 9090: health check HTTP server. Not exposed via ALB.
+            # ECS health checks and ALB target group health checks use this port.
+            # Separated from port 8080 so the WS listener can own port 8080.
+            - ContainerPort: 9090
+              Protocol: tcp
+          Environment:
+            - Name: CELLO_ENV
+              Value: !Ref Environment
+            - Name: NODE_ID
+              Value: !Ref AWS::Region
+            - Name: HEALTH_PORT
+              Value: "9090"
+            # REPOSPLIT-001 AC-007: explicit WS listen address so this is visible in IaC
+            # and a new-region deploy works without manual steps.
+            # Port 8080 matches the ALB target group (HTTP forward → container 8080).
+            - Name: CELLO_DIRECTORY_WS_LISTEN_ADDR
+              Value: "/ip4/0.0.0.0/tcp/8080/ws"
+            # Bootstrap endpoint: publicly-routable hostname used to build the multiaddr
+            # returned by GET /bootstrap. Clients (cello-mcp) call this endpoint to
+            # auto-discover the directory multiaddr without manual CELLO_DIRECTORY_MULTIADDR config.
+            # Format: /dns4/<hostname>/tcp/80/ws/p2p/<peer-id>
+            # Fetched from SSM Parameter Store for dynamic region expansion.
+            - Name: CELLO_DIRECTORY_HOSTNAME
+              Value: !Sub "{{resolve:ssm:/cello/${Environment}/directory/hostname}}"
+            # T-of-N consortium topology (see EntryPoint above). CELLO_DIRECTORY_CONSORTIUM_MANIFEST is
+            # the path the entrypoint decodes the manifest to; _B64 is the signed manifest (base64) held
+            # in SSM (public data; same for all regions — it lists all 3 nodes). The directory serves it
+            # to polling clients and derives the DKG participant count from its nodes[].length.
+            - Name: CELLO_DIRECTORY_CONSORTIUM_MANIFEST
+              Value: /tmp/consortium-manifest.json
+            - Name: CELLO_DIRECTORY_CONSORTIUM_MANIFEST_B64
+              Value: !Sub "{{resolve:ssm:/cello/${Environment}/directory/consortium-manifest}}"
+            # M12 §1b: the directory VERIFIES the manifest at load (it is the anti-entropy trust
+            # anchor). Officer root pubkeys + threshold, pinned in SSM (cello-ssm-parameters.yaml,
+            # public data). The binary exits 1 if the manifest path is set without these — there is
+            # no unverified fallback. Stage-1 resolve: re-run deploy.sh to propagate SSM changes.
+            - Name: CELLO_CONSORTIUM_ROOT_KEYS
+              Value: !Sub "{{resolve:ssm:/cello/${Environment}/consortium/root-keys}}"
+            - Name: CELLO_CONSORTIUM_THRESHOLD
+              Value: !Sub "{{resolve:ssm:/cello/${Environment}/consortium/root-threshold}}"
+            # M8B-PREAUTH-CAP: pinned pre-auth issuer PUBLIC key — DKG Round 1 verifies a presented
+            # capability's signature against it (stateless, replaces the token validate/consume gate).
+            - Name: CELLO_PREAUTH_ISSUER_PUBKEY
+              Value: !Sub "{{resolve:ssm:/cello/${Environment}/preauth/issuer-pubkey}}"
+            - Name: HOME
+              Value: /tmp
+            - Name: CELLO_AUDIT_BUCKET
+              Value:
+                Fn::ImportValue: !Sub "cello-${Environment}-audit-bucket"
+            # SI-004 (SECOPS-004): inject the secret ARN, not the secret value.
+            # ECS Secrets.ValueFrom fetches the value once at task launch and injects
+            # it as an env var — this is a snapshot that goes stale after the first
+            # 30-day rotation. The application must call GetSecretValue(RDS_CREDENTIALS_SECRET_ARN)
+            # at connection-pool refresh time to pick up rotated credentials without
+            # a task restart. The ARN is stable; the value is fetched at runtime.
+            - Name: RDS_CREDENTIALS_SECRET_ARN
+              Value: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cello/${Environment}/directory/rds-credentials"
+            - Name: RDS_ENDPOINT
+              Value:
+                Fn::ImportValue: !Sub "cello-${Environment}-rds-endpoint"
+            - Name: RDS_PORT
+              Value:
+                Fn::ImportValue: !Sub "cello-${Environment}-rds-port"
+            - Name: RDS_DB_NAME
+              Value: !Sub "cello_${Environment}"
+            - Name: RELAY_MANIFEST_BUCKET
+              Value: !Sub "cello-relay-manifest-${Environment}-${AWS::Region}"
+            - Name: RELAY_MANIFEST_SIGNER_PUBKEY
+              Value: !Sub "{{resolve:ssm:/cello/${Environment}/directory/manifest-signer-pubkey}}"
+            # CELLO-M6B-009 AC-001/AC-010: explicit pg pool cap for 1000 concurrent users.
+            # db.t3.medium supports ~450 max connections; 50/node × 3 nodes = 150 app + ~50 overhead
+            # = 200 total, leaving 250 connections of headroom. Increase only after upgrading the
+            # RDS instance class — see cello-rds.yaml for capacity rationale.
+            - Name: DIRECTORY_PG_POOL_MAX
+              Value: "50"
+          Secrets:
+            # NODE_PRIVATE_KEY is safe to inject at task launch — it changes only
+            # on manual key rotation, which requires a coordinated task restart
+            # (documented in infra/runbooks/node-key-rotation.md).
+            # It is NOT injected via RDS_CREDENTIALS_SECRET_ARN pattern.
+            - Name: NODE_PRIVATE_KEY
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cello/${Environment}/directory/node-private-key"
+            # CELLO_DIRECTORY_NODE_KEY_HEX: the directory's Ed25519 node signing key (64-hex seed) —
+            # the SAME secret as NODE_PRIVATE_KEY. Enables M7-MANIFEST-002 step-6 directory identity
+            # proof: the directory signs the client's auth challenge with this key so a
+            # manifest-configured client can cryptographically verify it reached the REAL consortium
+            # node for this nodeId (=AWS::Region) — defeating a MITM on the plaintext /bootstrap that
+            # would otherwise redirect failover to a rogue directory. Its public key equals
+            # /cello/{env}/directory/manifest-signer-pubkey and the `pubkey` for this nodeId in the
+            # signed consortium manifest bundled in the client. Backward-compatible: clients WITHOUT a
+            # manifest never request/verify the proof and connect on the M6 path unchanged.
+            - Name: CELLO_DIRECTORY_NODE_KEY_HEX
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cello/${Environment}/directory/node-private-key"
+            # DEV_ENVELOPE_KEY: 64-char hex AES-256 key used by LocalEnvelopeKeyProvider
+            # for dev/staging (placeholder until KmsEnvelopeKeyProvider is wired in M5+).
+            - Name: DEV_ENVELOPE_KEY
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cello/${Environment}/directory/envelope-key"
+            # INTERNAL_API_KEY: shared bearer key used by /internal/pre-authorize endpoint.
+            # Same secret as ops-agent/directory-api-key — populated once by operator;
+            # the same value is injected into the Ops Agent as DIRECTORY_API_KEY.
+            - Name: INTERNAL_API_KEY
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cello/${Environment}/ops-agent/directory-api-key"
+            # CELLO_DIRECTORY_TRANSPORT_KEY_HEX: libp2p transport key (32-byte hex).
+            # Persisted in Secrets Manager so the directory peer ID is stable across ECS restarts.
+            # Without this, every deploy generates a new peer ID breaking all connected clients.
+            - Name: CELLO_DIRECTORY_TRANSPORT_KEY_HEX
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cello/${Environment}/directory/transport-key"
+            # M8B-PREAUTH-CAP: the pre-auth issuer SIGNING seed (Ed25519, 32-byte hex). Used at
+            # /internal/pre-authorize to sign capabilities. One issuer identity — the SAME value in every
+            # region (NOT a per-region transport key). Its public half is CELLO_PREAUTH_ISSUER_PUBKEY (SSM).
+            - Name: CELLO_PREAUTH_ISSUER_KEY_HEX
+              ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cello/${Environment}/preauth/issuer-key"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: directory
+          HealthCheck:
+            # REPOSPLIT-001 AC-007: health server moved to port 9090 so port 8080 is
+            # free for the libp2p WebSocket listener.
+            Command: ["CMD-SHELL", "curl -f http://localhost:9090/health || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "cello-dir-${Environment}"
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !ImportValue
+          Fn::Sub: "cello-${Environment}-public-subnet-a"
+        - !ImportValue
+          Fn::Sub: "cello-${Environment}-public-subnet-b"
+      SecurityGroups:
+        - !ImportValue
+          Fn::Sub: "cello-${Environment}-alb-sg"
+      # REPOSPLIT-001 AC-007: 300-second idle timeout so long-lived WebSocket
+      # connections (libp2p sessions) are not silently dropped by the ALB.
+      # AWS default is 60 seconds, which drops idle WebSocket connections.
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "300"
+      Tags:
+        - Key: Project
+          Value: cello
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      # REPOSPLIT-001 AC-007: port 8080 is the libp2p WebSocket listener.
+      # ALB forwards external port 80 → container port 8080 for WS connections.
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !ImportValue
+        Fn::Sub: "cello-${Environment}-vpc-id"
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      # REPOSPLIT-001 AC-007: health check uses port 9090 (health server port)
+      # because port 8080 is now owned by the libp2p WebSocket listener.
+      HealthCheckPort: "9090"
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      Tags:
+        - Key: Project
+          Value: cello
+
+  BootstrapTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 9090
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !ImportValue
+        Fn::Sub: "cello-${Environment}-vpc-id"
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "9090"
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      Tags:
+        - Key: Project
+          Value: cello
+
+  # M6B-004: Internal API target group for port 8081 (/internal/* endpoints).
+  # Used by ops-agent to call /internal/pre-authorize. Health check uses the
+  # health server on port 9090 (same as BootstrapTargetGroup) because port 8081
+  # serves only the internal API, not health checks.
+  InternalApiTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 8081
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !ImportValue
+        Fn::Sub: "cello-${Environment}-vpc-id"
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: "9090"
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      Tags:
+        - Key: Project
+          Value: cello
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # AC-007a (DX-001): /agent-lookup path rule — routes to BootstrapTargetGroup (port 9090).
+  # Same target group as /bootstrap since both live on the health server at port 9090.
+  AgentLookupPathRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    DependsOn: HttpListener
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 3
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - "/agent-lookup"
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BootstrapTargetGroup
+
+  BootstrapPathRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    DependsOn: HttpListener
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 4
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - "/bootstrap"
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BootstrapTargetGroup
+
+  # CELLO-M7-CONN-001 (DOD-CONN-3, AC-008): /manifest path rule — routes to
+  # BootstrapTargetGroup (port 9090, the health server), same as /bootstrap and
+  # /agent-lookup. The daemon polls the consortium manifest over this unauthenticated
+  # HTTP path (the keystone signaling poll is gone); the manifest is public,
+  # self-authenticating data (threshold-signed; clients verify against pinned root keys).
+  # In the template so a brand-new region serves /manifest with zero manual steps.
+  ManifestPathRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    DependsOn: HttpListener
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 6
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - "/manifest"
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BootstrapTargetGroup
+
+  # DOD-REGISTRY-1: /registry path rule — routes to BootstrapTargetGroup (port 9090),
+  # same as /manifest. The daemon polls the signed type registry over unauthenticated
+  # HTTP; the document is self-authenticating (clients verify the inner Ed25519
+  # signature against their pinned registry pubkey).
+  RegistryPathRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    DependsOn: HttpListener
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 7
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - "/registry"
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BootstrapTargetGroup
+
+  # AC-009d (OPS-AGENT-005A): /internal/* path protection.
+  # The directory /internal/pre-authorize endpoint is authenticated by x-cello-internal-api-key
+  # header (verified in directory code). The ALB forwards all /internal/* requests to the
+  # target group — the directory rejects unauthorized requests with HTTP 401.
+  #
+  # Previous design used source-ip restriction (VPC CIDR) as defense-in-depth, but this
+  # doesn't work: the internet-facing ALB resolves to public IPs, so Fargate tasks in the
+  # same VPC route via the internet gateway and arrive with their public IP (not VPC CIDR).
+  # The API key header is the sole access control — same security model as any API endpoint.
+  #
+  # M6B-004: Routes to InternalApiTargetGroup (port 8081), not TargetGroup (port 8080).
+  # Port 8081 is dedicated to the internal API — isolates it from the libp2p WebSocket
+  # listener on port 8080.
+
+  InternalApiPathRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    DependsOn: HttpListener
+    Properties:
+      ListenerArn: !Ref HttpListener
+      Priority: 5
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - "/internal/*"
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref InternalApiTargetGroup
+
+  DirectoryService:
+    Type: AWS::ECS::Service
+    # DependsOn ensures CloudFormation does not start registering targets before
+    # the /internal/* forward rule is active (AC-009d).
+    DependsOn: [HttpListener, InternalApiPathRule, BootstrapPathRule, AgentLookupPathRule]
+    Properties:
+      ServiceName: !Sub "cello-directory-${Environment}"
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue
+              Fn::Sub: "cello-${Environment}-private-subnet-a"
+            - !ImportValue
+              Fn::Sub: "cello-${Environment}-private-subnet-b"
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: "cello-${Environment}-ecs-directory-sg"
+      LoadBalancers:
+        - ContainerName: directory
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+        - ContainerName: directory
+          ContainerPort: 9090
+          TargetGroupArn: !Ref BootstrapTargetGroup
+        # M6B-004: Register port 8081 with InternalApiTargetGroup.
+        # CRITICAL: Without this LoadBalancers entry, ECS never auto-registers
+        # tasks into InternalApiTargetGroup on deploy or restart. The target group
+        # exists but remains empty, causing HTTP 504 from the ALB on every
+        # /internal/* request after any directory restart. This is the root cause
+        # of the ops-agent 504 issue observed after M6 directory restarts.
+        - ContainerName: directory
+          ContainerPort: 8081
+          TargetGroupArn: !Ref InternalApiTargetGroup
+      Tags:
+        - Key: Project
+          Value: cello
+
+Outputs:
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+    Export:
+      Name: !Sub "cello-${Environment}-cluster-arn"
+
+  DirectoryServiceArn:
+    Value: !Ref DirectoryService
+    Export:
+      Name: !Sub "cello-${Environment}-directory-service-arn"
+
+  AlbDnsName:
+    Value: !GetAtt Alb.DNSName
+    Export:
+      Name: !Sub "cello-${Environment}-alb-dns-name"
+
+  AlbHostedZoneId:
+    Value: !GetAtt Alb.CanonicalHostedZoneID
+    Export:
+      Name: !Sub "cello-${Environment}-alb-hosted-zone-id"
+
+  AlbArn:
+    Value: !Ref Alb
+    Export:
+      Name: !Sub "cello-${Environment}-alb-arn"

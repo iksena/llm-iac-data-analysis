@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  FSx for ONTAP Admin Audit Logs — Syslog VPC Endpoint to CloudWatch Logs.
+  Enables direct syslog forwarding from ONTAP cluster log-forwarding
+  to CloudWatch Logs via AWS PrivateLink (no EC2 syslog server required).
+
+  Post-deploy steps (not automatable via CloudFormation as of June 2026):
+    1. Create Syslog Configuration (maps VPCE to Log Group)
+    2. Configure ONTAP log-forwarding destination
+  See: docs/ja/syslog-vpce-setup-guide.md
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Network Configuration
+        Parameters:
+          - VpcId
+          - SubnetIds
+          - VpcCidr
+      - Label:
+          default: Log Configuration
+        Parameters:
+          - LogGroupName
+          - LogRetentionDays
+    ParameterLabels:
+      VpcId:
+        default: VPC ID (FSx for ONTAP が配置されている VPC)
+      SubnetIds:
+        default: Subnet ID(s) (FSx と同じ AZ を含むサブネット)
+      VpcCidr:
+        default: VPC CIDR (Security Group のイングレスソース)
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: >
+      VPC where FSx for ONTAP resides. The syslog VPC endpoint will be
+      created in this VPC.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Subnet(s) for the syslog VPC endpoint ENI. Must be in the same VPC.
+      For high availability, specify subnets in multiple AZs.
+      At minimum, include a subnet in the same AZ as your FSx for ONTAP.
+
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: >
+      VPC CIDR block to allow inbound syslog traffic. FSx for ONTAP nodes
+      use internal ENIs whose security group cannot be referenced directly.
+      Use the VPC CIDR to ensure connectivity.
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+
+  LogGroupName:
+    Type: String
+    Default: /syslog/fsxn-admin-audit
+    Description: >
+      CloudWatch Logs log group name. Recommended prefix: /syslog/
+      for organizational clarity.
+
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: Log retention period in days. 90 days recommended for audit compliance.
+
+Resources:
+  # --- Security Group for Syslog VPC Endpoint ---
+  # IMPORTANT: Use VPC CIDR, not FSx SG reference.
+  # FSx for ONTAP node ENIs do not share the user-facing FSx SG,
+  # so SG-to-SG references fail. Validated in testing.
+  SyslogVpceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >
+        Allow syslog traffic from FSx for ONTAP nodes to CloudWatch Logs
+        VPC Endpoint. Uses VPC CIDR as source (FSx node ENIs are internal).
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6514
+          ToPort: 6514
+          CidrIp: !Ref VpcCidr
+          Description: Syslog TCP+TLS (recommended for production)
+        - IpProtocol: tcp
+          FromPort: 1514
+          ToPort: 1514
+          CidrIp: !Ref VpcCidr
+          Description: Syslog TCP plaintext (PrivateLink-isolated, simpler setup)
+      Tags:
+        - Key: Name
+          Value: fsxn-syslog-vpce-sg
+        - Key: Project
+          Value: fsxn-observability-integrations
+
+  # --- VPC Endpoint for CloudWatch Logs Syslog Service ---
+  SyslogVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.syslog-logs
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref SyslogVpceSecurityGroup
+      PrivateDnsEnabled: true
+
+  # --- CloudWatch Logs Log Group ---
+  AdminAuditLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref LogGroupName
+      RetentionInDays: !Ref LogRetentionDays
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+
+  # --- Resource Policy: Allow syslog service to write to log group ---
+  SyslogResourcePolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub fsxn-syslog-ingestion-${AWS::StackName}
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "syslog.logs.amazonaws.com"
+              },
+              "Action": [
+                "logs:PutLogEvents",
+                "logs:CreateLogStream"
+              ],
+              "Resource": "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}:*",
+              "Condition": {
+                "ArnEquals": {
+                  "aws:SourceArn": "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc-endpoint/${SyslogVpcEndpoint}"
+                }
+              }
+            }
+          ]
+        }
+
+Outputs:
+  VpcEndpointId:
+    Description: Syslog VPC Endpoint ID (use in PutSyslogConfiguration)
+    Value: !Ref SyslogVpcEndpoint
+    Export:
+      Name: !Sub ${AWS::StackName}-VpceId
+
+  VpcEndpointDnsName:
+    Description: >
+      DNS name for the syslog VPC endpoint (Private DNS enabled).
+      From within the VPC, use the regional DNS: syslog-logs.<region>.amazonaws.com
+      or the ENI private IP directly.
+    Value: !Select [0, !GetAtt SyslogVpcEndpoint.DnsEntries]
+
+  LogGroupArn:
+    Description: CloudWatch Logs log group ARN
+    Value: !GetAtt AdminAuditLogGroup.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LogGroupArn
+
+  LogGroupName:
+    Description: Log group name
+    Value: !Ref LogGroupName
+
+  SecurityGroupId:
+    Description: Security Group ID for the syslog VPC endpoint
+    Value: !Ref SyslogVpceSecurityGroup
+
+  PostDeployStep1:
+    Description: >
+      REQUIRED: Create Syslog Configuration (maps VPCE to Log Group).
+      Run the helper script: bash shared/scripts/create-syslog-configuration.sh
+    Value: !Sub >
+      python3 shared/scripts/create-syslog-configuration.py
+      --vpce-id ${SyslogVpcEndpoint}
+      --log-group-arn arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}
+      --region ${AWS::Region}
+
+  PostDeployStep2:
+    Description: >
+      REQUIRED: Configure ONTAP log-forwarding.
+      SSH to FSx management endpoint and run:
+      security audit log-forwarding create -destination <VPCE_ENI_IP> -port 6514 -protocol tcp-encrypted -facility local7
+      (Use port 1514 + tcp-unencrypted as fallback if TLS validation fails)
+    Value: !Sub >
+      ssh fsxadmin@<FSx-Management-IP>
+      "security audit log-forwarding create
+      -destination <VPCE_ENI_IP>
+      -port 6514
+      -protocol tcp-encrypted
+      -facility local7"

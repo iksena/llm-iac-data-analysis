@@ -1,0 +1,1576 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Sketch-to-Image Generation System with SDXL + ControlNet using Custom Container'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: "ml.g5.4xlarge"
+    Description: "SageMaker instance type (needs 64GB+ VRAM for SDXL + ControlNet)"
+    AllowedValues:
+      - ml.g4dn.2xlarge
+      - ml.g5.2xlarge
+      - ml.g5.4xlarge
+      - ml.g5.12xlarge
+
+  AutoStopMinutes:
+    Type: Number
+    Default: 120
+    Description: "Auto-stop SageMaker endpoint after X minutes of inactivity (default: 120)"
+    MinValue: 30
+    MaxValue: 480
+
+Resources:
+  # Auto-stop EventBridge Rule
+  AutoStopRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-auto-stop"
+      Description: "Auto-stop SageMaker endpoint after inactivity"
+      ScheduleExpression: "rate(5 minutes)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AutoStopFunction.Arn
+          Id: "AutoStopTarget"
+
+  # Auto-stop Lambda Permission
+  AutoStopPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AutoStopFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AutoStopRule.Arn
+
+  # Auto-stop Lambda Function
+  AutoStopFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-auto-stop"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          ENDPOINT_NAME: !Sub "${AWS::StackName}-endpoint"
+          AUTO_STOP_MINUTES: !Ref AutoStopMinutes
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime, timedelta, timezone
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          sagemaker = boto3.client('sagemaker')
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+              try:
+                  endpoint_name = os.environ['ENDPOINT_NAME']
+                  auto_stop_minutes = int(os.environ['AUTO_STOP_MINUTES'])
+
+                  # Check if endpoint exists and is running
+                  try:
+                      response = sagemaker.describe_endpoint(EndpointName=endpoint_name)
+                      if response['EndpointStatus'] != 'InService':
+                          return {'statusCode': 200, 'body': 'Endpoint not in service'}
+                  except sagemaker.exceptions.ClientError:
+                      return {'statusCode': 200, 'body': 'Endpoint does not exist'}
+
+                  # Check for recent invocations
+                  end_time = datetime.now(timezone.utc)
+                  start_time = end_time - timedelta(minutes=auto_stop_minutes)
+
+                  try:
+                      metrics_response = cloudwatch.get_metric_statistics(
+                          Namespace='AWS/SageMaker',
+                          MetricName='Invocations',
+                          Dimensions=[
+                              {'Name': 'EndpointName', 'Value': endpoint_name}
+                          ],
+                          StartTime=start_time,
+                          EndTime=end_time,
+                          Period=300,
+                          Statistics=['Sum']
+                      )
+
+                      # Calculate total invocations
+                      total_invocations = sum(point['Sum'] for point in metrics_response['Datapoints'])
+
+                      if total_invocations == 0:
+                          logger.info(f"No invocations in last {auto_stop_minutes} minutes. Stopping endpoint.")
+
+                          # Stop the endpoint
+                          sagemaker.delete_endpoint(EndpointName=endpoint_name)
+
+                          return {
+                              'statusCode': 200,
+                              'body': f'Endpoint stopped due to {auto_stop_minutes} minutes of inactivity'
+                          }
+                      else:
+                          logger.info(f"Found {total_invocations} invocations. Keeping endpoint running.")
+                          return {
+                              'statusCode': 200,
+                              'body': f'Endpoint active with {total_invocations} recent invocations'
+                          }
+
+                  except Exception as e:
+                      logger.error(f"Error checking metrics: {str(e)}")
+                      return {'statusCode': 200, 'body': 'Could not check activity metrics'}
+
+              except Exception as e:
+                  logger.error(f"Error in auto-stop function: {str(e)}")
+                  return {'statusCode': 500, 'body': str(e)}
+
+  # S3 Bucket for Static Website
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-website-${AWS::AccountId}"
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: error.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  # S3 Bucket Policy for Website
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: WebsiteBucket
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: "*"
+            Action: "s3:GetObject"
+            Resource: !Join
+              - ""
+              - - "arn:aws:s3:::"
+                - !Ref WebsiteBucket
+                - "/*"
+
+  # S3 Bucket for Generated Images and Control Images
+  ImagesBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-images-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  # S3 Bucket Policy for Images
+  ImagesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: ImagesBucket
+    Properties:
+      Bucket: !Ref ImagesBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: "*"
+            Action: "s3:GetObject"
+            Resource: !Join
+              - ""
+              - - "arn:aws:s3:::"
+                - !Ref ImagesBucket
+                - "/*"
+
+  # ECR Repository for Custom Container
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${AWS::StackName}-controlnet-container"
+      ImageScanningConfiguration:
+        ScanOnPush: false
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 3 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 3
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            Id: S3Origin
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        Enabled: true
+        DefaultRootObject: index.html
+        Comment: !Sub "${AWS::StackName} Static Website"
+        DefaultCacheBehavior:
+          AllowedMethods: [GET, HEAD]
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+        PriceClass: PriceClass_100
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      Description: "API for sketch-to-image generation with ControlNet"
+
+  # API Gateway Resources
+  ModelResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: model
+
+  StartResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ModelResource
+      PathPart: start
+
+  StopResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ModelResource
+      PathPart: stop
+
+  StatusResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref ModelResource
+      PathPart: status
+
+  GenerateResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: generate
+
+  BuildResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: build
+
+  EmergencyStopResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: emergency-stop
+
+  # SageMaker Execution Role
+  SageMakerExecutionRole:
+    Type: AWS::IAM::Role
+    DependsOn: ImagesBucket
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-SageMakerRole-v3-${AWS::AccountId}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+      Policies:
+        - PolicyName: SageMakerS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ImagesBucket.Arn
+                  - !Sub "${ImagesBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+
+  # CodeBuild Service Role
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                  - ecr:PutImage
+                Resource: "*"
+
+  # CodeBuild Project
+  ContainerBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-container-build"
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_LARGE
+        Image: aws/codebuild/standard:7.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref AWS::AccountId
+          - Name: IMAGE_REPO_NAME
+            Value: !Ref ECRRepository
+          - Name: IMAGE_TAG
+            Value: latest
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                - REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image...
+
+                # Create Dockerfile with timezone and CUDA fixes
+                - |
+                  cat > Dockerfile << 'EOF'
+                  FROM pytorch/pytorch:2.1.0-cuda11.8-cudnn8-runtime
+
+                  # Set timezone non-interactively
+                  ENV DEBIAN_FRONTEND=noninteractive
+                  ENV TZ=UTC
+
+                  # Install system dependencies
+                  RUN apt-get update && apt-get install -y \
+                      git \
+                      wget \
+                      libgl1-mesa-glx \
+                      libglib2.0-0 \
+                      libsm6 \
+                      libxext6 \
+                      libxrender-dev \
+                      libgomp1 \
+                      tzdata \
+                      && ln -fs /usr/share/zoneinfo/$TZ /etc/localtime \
+                      && dpkg-reconfigure -f noninteractive tzdata \
+                      && rm -rf /var/lib/apt/lists/*
+
+                  # Install compatible PyTorch stack first
+                  RUN pip install --no-cache-dir \
+                      torch==2.1.0+cu118 torchvision==0.16.0+cu118 --extra-index-url https://download.pytorch.org/whl/cu118
+
+                  # Install other dependencies
+                  RUN pip install --no-cache-dir \
+                      huggingface_hub==0.19.4 \
+                      diffusers==0.24.0 \
+                      transformers==4.36.0 \
+                      accelerate==0.25.0 \
+                      opencv-python==4.8.1.78 \
+                      pillow==10.1.0 \
+                      numpy==1.24.3 \
+                      boto3==1.34.0 \
+                      flask==3.0.0 \
+                      gunicorn==21.2.0
+
+                  # Create app directory
+                  WORKDIR /opt/ml/code
+
+                  # Copy inference script
+                  COPY inference.py /opt/ml/code/
+                  COPY requirements.txt /opt/ml/code/
+
+                  # Set environment variables
+                  ENV PYTHONUNBUFFERED=TRUE
+                  ENV PYTHONDONTWRITEBYTECODE=TRUE
+                  ENV PATH="/opt/ml/code:${PATH}"
+
+                  # Expose port
+                  EXPOSE 8080
+
+                  # Set the default command
+                  ENTRYPOINT ["python", "inference.py"]
+                  EOF
+
+                # Create inference script
+                - |
+                  cat > inference.py << 'EOF'
+                  import json
+                  import base64
+                  import os
+                  import io
+                  import boto3
+                  import torch
+                  from PIL import Image
+                  import numpy as np
+                  from flask import Flask, request, jsonify
+                  from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel
+                  from diffusers.utils import load_image
+                  import cv2
+
+                  app = Flask(__name__)
+
+                  # Global variables
+                  pipe = None
+                  s3_client = boto3.client('s3')
+
+                  def load_models():
+                      global pipe
+                      print("Loading SDXL ControlNet pipeline...")
+
+                      # Load ControlNet
+                      controlnet = ControlNetModel.from_pretrained(
+                          "diffusers/controlnet-canny-sdxl-1.0",
+                          torch_dtype=torch.float16
+                      )
+
+                      # Load SDXL pipeline with ControlNet
+                      pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+                          "stabilityai/stable-diffusion-xl-base-1.0",
+                          controlnet=controlnet,
+                          torch_dtype=torch.float16,
+                          use_safetensors=True,
+                          variant="fp16"
+                      )
+
+                      pipe = pipe.to("cuda")
+                      pipe.enable_model_cpu_offload()
+
+                      print("Models loaded successfully!")
+
+                  def preprocess_image(image):
+                      """Convert image to Canny edge detection"""
+                      # Convert PIL to numpy
+                      image_array = np.array(image)
+
+                      # Convert to grayscale if needed
+                      if len(image_array.shape) == 3:
+                          gray = cv2.cvtColor(image_array, cv2.COLOR_RGB2GRAY)
+                      else:
+                          gray = image_array
+
+                      # Apply Canny edge detection
+                      edges = cv2.Canny(gray, 100, 200)
+
+                      # Convert back to PIL Image
+                      canny_image = Image.fromarray(edges).convert('RGB')
+                      return canny_image
+
+                  @app.route('/ping', methods=['GET'])
+                  def ping():
+                      return jsonify({'status': 'healthy'})
+
+                  @app.route('/invocations', methods=['POST'])
+                  def invoke():
+                      try:
+                          # Parse request
+                          data = json.loads(request.data)
+
+                          prompt = data.get('inputs', '')
+                          parameters = data.get('parameters', {})
+
+                          # Get sketch from S3
+                          bucket_name = os.environ.get('S3_BUCKET')
+                          sketch_key = parameters.get('sketch_s3_key', 'control/building_sketch.png')
+
+                          if not bucket_name:
+                              return jsonify({'error': 'S3_BUCKET environment variable not set'}), 400
+
+                          # Download sketch from S3
+                          try:
+                              response = s3_client.get_object(Bucket=bucket_name, Key=sketch_key)
+                              sketch_bytes = response['Body'].read()
+                              sketch_image = Image.open(io.BytesIO(sketch_bytes)).convert('RGB')
+                          except Exception as e:
+                              return jsonify({'error': f'Failed to load sketch from S3: {str(e)}'}), 400
+
+                          # Preprocess sketch to Canny edges
+                          control_image = preprocess_image(sketch_image)
+
+                          # Generation parameters
+                          num_inference_steps = parameters.get('num_inference_steps', 30)
+                          guidance_scale = parameters.get('guidance_scale', 7.5)
+                          controlnet_conditioning_scale = parameters.get('controlnet_conditioning_scale', 1.0)
+                          width = parameters.get('width', 1024)
+                          height = parameters.get('height', 1024)
+                          seed = parameters.get('seed', None)
+                          negative_prompt = parameters.get('negative_prompt', '')
+
+                          # Set seed if provided
+                          if seed is not None:
+                              torch.manual_seed(seed)
+
+                          # Generate image
+                          print(f"Generating image with prompt: {prompt[:100]}...")
+
+                          result = pipe(
+                              prompt=prompt,
+                              negative_prompt=negative_prompt,
+                              image=control_image,
+                              width=width,
+                              height=height,
+                              num_inference_steps=num_inference_steps,
+                              guidance_scale=guidance_scale,
+                              controlnet_conditioning_scale=controlnet_conditioning_scale,
+                              generator=torch.Generator(device="cuda").manual_seed(seed) if seed else None
+                          )
+
+                          # Convert to base64
+                          generated_image = result.images[0]
+                          buffered = io.BytesIO()
+                          generated_image.save(buffered, format="PNG")
+                          img_base64 = base64.b64encode(buffered.getvalue()).decode()
+
+                          return jsonify({
+                              'generated_images': [img_base64]
+                          })
+
+                      except Exception as e:
+                          print(f"Error during generation: {str(e)}")
+                          return jsonify({'error': str(e)}), 500
+
+                  if __name__ == '__main__':
+                      # Load models on startup
+                      load_models()
+
+                      # Start Flask server
+                      app.run(host='0.0.0.0', port=8080)
+                  EOF
+
+                # Create requirements.txt
+                - |
+                  cat > requirements.txt << 'EOF'
+                  torch==2.1.0+cu118
+                  torchvision==0.16.0+cu118
+                  huggingface_hub==0.19.4
+                  diffusers==0.24.0
+                  transformers==4.36.0
+                  accelerate==0.25.0
+                  opencv-python==4.8.1.78
+                  pillow==10.1.0
+                  numpy==1.24.3
+                  boto3==1.34.0
+                  flask==3.0.0
+                  gunicorn==21.2.0
+                  EOF
+
+                - docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $REPOSITORY_URI:$IMAGE_TAG
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker image...
+                - docker push $REPOSITORY_URI:$IMAGE_TAG
+      TimeoutInMinutes: 90
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    DependsOn:
+      - ImagesBucket
+      - SageMakerExecutionRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SageMakerAndS3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sagemaker:*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "${ImagesBucket.Arn}/*"
+                  - !GetAtt ImagesBucket.Arn
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt SageMakerExecutionRole.Arn
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt ContainerBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - ecr:DescribeRepositories
+                  - ecr:DescribeImages
+                Resource: !GetAtt ECRRepository.Arn
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+  # Container Builder Lambda Function
+  ContainerBuilderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-container-builder"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ContainerBuildProject
+          ECR_REPOSITORY_URI: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}"
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          import time
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          codebuild = boto3.client('codebuild')
+          ecr = boto3.client('ecr')
+
+          def lambda_handler(event, context):
+              try:
+                  project_name = os.environ['PROJECT_NAME']
+                  ecr_repository_uri = os.environ['ECR_REPOSITORY_URI']
+
+                  # Check if image already exists
+                  try:
+                      repository_name = ecr_repository_uri.split('/')[-1]
+                      response = ecr.describe_images(
+                          repositoryName=repository_name,
+                          imageIds=[{'imageTag': 'latest'}]
+                      )
+                      if response['imageDetails']:
+                          logger.info("Container image already exists")
+                          return create_response(200, {
+                              'status': 'already_built',
+                              'image_uri': f"{ecr_repository_uri}:latest"
+                          })
+                  except ecr.exceptions.ImageNotFoundException:
+                      pass
+                  except Exception as e:
+                      logger.info(f"Error checking image: {str(e)}")
+
+                  # Start build
+                  logger.info(f"Starting CodeBuild project: {project_name}")
+                  build_response = codebuild.start_build(projectName=project_name)
+                  build_id = build_response['build']['id']
+
+                  # Wait for build completion (with timeout)
+                  max_wait_time = 5400  # 90 minutes
+                  wait_interval = 30
+                  elapsed_time = 0
+
+                  while elapsed_time < max_wait_time:
+                      build_status = codebuild.batch_get_builds(ids=[build_id])
+                      status = build_status['builds'][0]['buildStatus']
+
+                      logger.info(f"Build status: {status}")
+
+                      if status == 'SUCCEEDED':
+                          return create_response(200, {
+                              'status': 'built',
+                              'image_uri': f"{ecr_repository_uri}:latest",
+                              'build_id': build_id
+                          })
+                      elif status in ['FAILED', 'FAULT', 'STOPPED', 'TIMED_OUT']:
+                          return create_response(500, {
+                              'error': f'Build failed with status: {status}',
+                              'build_id': build_id
+                          })
+
+                      time.sleep(wait_interval)
+                      elapsed_time += wait_interval
+
+                  return create_response(202, {
+                      'status': 'building',
+                      'build_id': build_id,
+                      'message': 'Build started, check status manually'
+                  })
+
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  return create_response(500, {'error': str(e)})
+
+          def create_response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Content-Type': 'application/json'
+                  },
+                  'body': json.dumps(body)
+              }
+
+  # Model Controller Function
+  ModelControllerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-model-controller"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 256
+      Environment:
+        Variables:
+          SAGEMAKER_ROLE_ARN: !GetAtt SageMakerExecutionRole.Arn
+          MODEL_NAME: !Sub "${AWS::StackName}-sdxl-controlnet-model"
+          ENDPOINT_CONFIG_NAME: !Sub "${AWS::StackName}-endpoint-config"
+          ENDPOINT_NAME: !Sub "${AWS::StackName}-endpoint"
+          INSTANCE_TYPE: !Ref InstanceType
+          IMAGES_BUCKET: !Ref ImagesBucket
+          ECR_REPOSITORY_URI: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}"
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          sagemaker = boto3.client('sagemaker')
+          ecr = boto3.client('ecr')
+
+          def lambda_handler(event, context):
+              try:
+                  logger.info(f"Received event: {json.dumps(event)}")
+
+                  path = event.get('path', '')
+                  if '/start' in path:
+                      return start_model()
+                  elif '/stop' in path:
+                      return stop_model()
+                  else:
+                      return create_response(400, {'error': 'Invalid path'})
+
+              except Exception as e:
+                  logger.error(f"Error: {str(e)}")
+                  return create_response(500, {'error': str(e)})
+
+          def create_response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Content-Type': 'application/json'
+                  },
+                  'body': json.dumps(body)
+              }
+
+          def start_model():
+              model_name = os.environ['MODEL_NAME']
+              endpoint_config_name = os.environ['ENDPOINT_CONFIG_NAME']
+              endpoint_name = os.environ['ENDPOINT_NAME']
+              ecr_repository_uri = os.environ['ECR_REPOSITORY_URI']
+
+              try:
+                  # Check if endpoint already exists
+                  try:
+                      response = sagemaker.describe_endpoint(EndpointName=endpoint_name)
+                      status = response['EndpointStatus']
+                      if status == 'InService':
+                          return create_response(200, {'status': 'already_running'})
+                      elif status in ['Creating', 'Updating']:
+                          return create_response(200, {'status': 'starting'})
+                  except sagemaker.exceptions.ClientError:
+                      pass
+
+                  # Check if custom container image exists
+                  try:
+                      repository_name = ecr_repository_uri.split('/')[-1]
+                      ecr.describe_images(
+                          repositoryName=repository_name,
+                          imageIds=[{'imageTag': 'latest'}]
+                      )
+                  except Exception as e:
+                      return create_response(400, {
+                          'error': 'Custom container not built yet. Please build container first.',
+                          'details': str(e)
+                      })
+
+                  # Create or update model
+                  try:
+                      sagemaker.describe_model(ModelName=model_name)
+                      logger.info("Model already exists")
+                  except sagemaker.exceptions.ClientError:
+                      logger.info("Creating new SDXL + ControlNet model with custom container")
+
+                      sagemaker.create_model(
+                          ModelName=model_name,
+                          PrimaryContainer={
+                              'Image': f"{ecr_repository_uri}:latest",
+                              'Environment': {
+                                  'S3_BUCKET': os.environ['IMAGES_BUCKET'],
+                                  'SAGEMAKER_PROGRAM': 'inference.py',
+                                  'SAGEMAKER_SUBMIT_DIRECTORY': '/opt/ml/code'
+                              }
+                          },
+                          ExecutionRoleArn=os.environ['SAGEMAKER_ROLE_ARN']
+                      )
+
+                  # Create endpoint configuration
+                  try:
+                      sagemaker.describe_endpoint_config(EndpointConfigName=endpoint_config_name)
+                      logger.info("Endpoint config already exists")
+                  except sagemaker.exceptions.ClientError:
+                      logger.info("Creating endpoint configuration")
+                      sagemaker.create_endpoint_config(
+                          EndpointConfigName=endpoint_config_name,
+                          ProductionVariants=[{
+                              'VariantName': 'AllTraffic',
+                              'ModelName': model_name,
+                              'InitialInstanceCount': 1,
+                              'InstanceType': os.environ['INSTANCE_TYPE'],
+                              'InitialVariantWeight': 1.0
+                          }]
+                      )
+
+                  # Create endpoint
+                  logger.info("Creating endpoint")
+                  sagemaker.create_endpoint(
+                      EndpointName=endpoint_name,
+                      EndpointConfigName=endpoint_config_name
+                  )
+
+                  return create_response(200, {'status': 'starting'})
+
+              except Exception as e:
+                  logger.error(f"Error starting model: {str(e)}")
+                  return create_response(500, {'error': str(e)})
+
+          def stop_model():
+              endpoint_name = os.environ['ENDPOINT_NAME']
+
+              try:
+                  sagemaker.delete_endpoint(EndpointName=endpoint_name)
+                  logger.info("Endpoint deletion initiated")
+                  return create_response(200, {'status': 'stopping'})
+              except Exception as e:
+                  logger.error(f"Error stopping model: {str(e)}")
+                  return create_response(500, {'error': str(e)})
+
+  # Image Generator Function
+  ImageGeneratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-image-generator"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      Environment:
+        Variables:
+          ENDPOINT_NAME: !Sub "${AWS::StackName}-endpoint"
+          IMAGES_BUCKET: !Ref ImagesBucket
+          SKETCH_KEY: "control/building_sketch.png"
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import uuid
+          import os
+          import logging
+          from datetime import datetime
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          sagemaker_runtime = boto3.client('sagemaker-runtime')
+          s3 = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              try:
+                  endpoint_name = os.environ['ENDPOINT_NAME']
+                  bucket_name = os.environ['IMAGES_BUCKET']
+                  sketch_key = os.environ['SKETCH_KEY']
+
+                  try:
+                      s3.head_object(Bucket=bucket_name, Key=sketch_key)
+                      logger.info(f"Found control sketch at s3://{bucket_name}/{sketch_key}")
+                  except:
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                              'Access-Control-Allow-Headers': 'Content-Type',
+                              'Content-Type': 'application/json'
+                          },
+                          'body': json.dumps({
+                              'error': 'Control sketch not found. Please upload building_sketch.png to the control/ folder in S3.'
+                          })
+                      }
+
+                  # PRECISE prompt based on your COMPLETE sketch description
+                  prompt = """Modern two-story residential house with exact architectural details:
+
+                  MAIN STRUCTURE: Very boxy modern design, right side elongates out more than left side,
+                  all tile on right extension, white square tile exterior walls on main structure
+
+                  MATERIALS: Outdoor walls made of white square tiles, second story has wood siding,
+                  tiles go around glass windows like a hoodie situation
+
+                  WINDOWS & DOORS: Small window on left of house, floor-to-ceiling glass facing forward
+                  with exactly 3 vertical panes (left, middle, right) on each floor, sliding door with
+                  two panes on left front balcony, solid wood door
+
+                  BALCONIES & RAILINGS: Left front balcony with glass pane railing,
+                  top floor has glass railing throughout
+
+                  ROOF SYSTEM: Flat roof with left side further back, roof part made of tile with glass railing,
+                  smaller third floor on back right of house with wood siding and white boxy roof (smaller footprint)
+
+                  CONNECTED GARAGE: One-floor garage connected to house on right side, boxy addition
+
+                  LANDSCAPING: Rectangular water feature bottom left of image, curved walkways throughout,
+                  small bushes around house, tree on left side of house, trees on top of house,
+                  small bushes on top of house, fence behind house
+
+                  Professional architectural rendering, photorealistic quality, sharp focus"""
+
+                  negative_prompt = """blurry, low quality, distorted, wrong architectural details,
+                  incorrect window count, asymmetrical when should be symmetrical, missing balcony,
+                  wrong materials, no glass railings, missing water feature, straight walkways,
+                  cartoon, sketch style, unrealistic proportions, gothic, classical, ornate details"""
+
+                  payload = {
+                      "inputs": prompt,
+                      "parameters": {
+                          "negative_prompt": negative_prompt,
+                          "num_inference_steps": 40,
+                          "guidance_scale": 8.0,
+                          "controlnet_conditioning_scale": 0.8,
+                          "width": 1024,
+                          "height": 1024,
+                          "seed": 42,
+                          "sketch_s3_key": sketch_key
+                      }
+                  }
+
+                  logger.info(f"Generating image with ControlNet using sketch: {sketch_key}")
+
+                  response = sagemaker_runtime.invoke_endpoint(
+                      EndpointName=endpoint_name,
+                      ContentType='application/json',
+                      Body=json.dumps(payload),
+                      Accept='application/json'
+                  )
+
+                  result = json.loads(response['Body'].read().decode())
+                  logger.info("Received response from SageMaker")
+
+                  image_data = None
+                  if 'generated_images' in result:
+                      image_data = base64.b64decode(result['generated_images'][0])
+                  elif 'images' in result:
+                      image_data = base64.b64decode(result['images'][0])
+                  elif isinstance(result, list) and len(result) > 0:
+                      image_data = base64.b64decode(result[0])
+                  else:
+                      raise ValueError(f"Unexpected response format: {list(result.keys())}")
+
+                  timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                  image_key = f"generated/controlled_architecture_{timestamp}_{uuid.uuid4().hex[:8]}.png"
+
+                  s3.put_object(
+                      Bucket=bucket_name,
+                      Key=image_key,
+                      Body=image_data,
+                      ContentType='image/png',
+                      Metadata={
+                          'generation_type': 'controlnet',
+                          'control_image': sketch_key,
+                          'timestamp': timestamp
+                      }
+                  )
+
+                  logger.info(f"ControlNet image saved to S3: {image_key}")
+
+                  presigned_url = s3.generate_presigned_url(
+                      'get_object',
+                      Params={'Bucket': bucket_name, 'Key': image_key},
+                      ExpiresIn=7200
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({
+                          'image_url': presigned_url,
+                          'key': image_key,
+                          'timestamp': timestamp,
+                          'control_type': 'ControlNet with building sketch',
+                          'sketch_used': sketch_key
+                      })
+                  }
+
+              except Exception as e:
+                  logger.error(f"Error generating image: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  # Status Checker Function
+  StatusCheckerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-status-checker"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          ENDPOINT_NAME: !Sub "${AWS::StackName}-endpoint"
+          IMAGES_BUCKET: !Ref ImagesBucket
+          SKETCH_KEY: "control/building_sketch.png"
+          ECR_REPOSITORY_URI: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}"
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          sagemaker = boto3.client('sagemaker')
+          s3 = boto3.client('s3')
+          ecr = boto3.client('ecr')
+
+          def lambda_handler(event, context):
+              try:
+                  endpoint_name = os.environ['ENDPOINT_NAME']
+                  bucket_name = os.environ['IMAGES_BUCKET']
+                  sketch_key = os.environ['SKETCH_KEY']
+                  ecr_repository_uri = os.environ['ECR_REPOSITORY_URI']
+
+                  # Check container status
+                  container_built = False
+                  try:
+                      repository_name = ecr_repository_uri.split('/')[-1]
+                      response = ecr.describe_images(
+                          repositoryName=repository_name,
+                          imageIds=[{'imageTag': 'latest'}]
+                      )
+                      if response['imageDetails']:
+                          container_built = True
+                  except:
+                      pass
+
+                  # Check endpoint status
+                  try:
+                      response = sagemaker.describe_endpoint(EndpointName=endpoint_name)
+                      status = response['EndpointStatus']
+
+                      status_mapping = {
+                          'InService': 'ready',
+                          'Creating': 'starting',
+                          'Updating': 'starting',
+                          'SystemUpdating': 'starting',
+                          'RollingBack': 'starting',
+                          'Deleting': 'stopping',
+                          'Failed': 'error',
+                          'OutOfService': 'error'
+                      }
+
+                      model_status = status_mapping.get(status, 'unknown')
+
+                      sketch_exists = False
+                      try:
+                          s3.head_object(Bucket=bucket_name, Key=sketch_key)
+                          sketch_exists = True
+                      except:
+                          pass
+
+                      response_data = {
+                          'status': model_status,
+                          'sagemaker_status': status,
+                          'endpoint_name': endpoint_name,
+                          'sketch_uploaded': sketch_exists,
+                          'sketch_location': f's3://{bucket_name}/{sketch_key}' if sketch_exists else 'Not uploaded',
+                          'container_built': container_built
+                      }
+
+                      if status == 'InService':
+                          response_data['ready_time'] = response.get('LastModifiedTime', '').isoformat() if response.get('LastModifiedTime') else None
+                          if not sketch_exists:
+                              response_data['warning'] = 'Model ready but control sketch not uploaded'
+
+                  except sagemaker.exceptions.ClientError as e:
+                      if 'does not exist' in str(e):
+                          model_status = 'offline'
+                          sketch_exists = False
+                          try:
+                              s3.head_object(Bucket=bucket_name, Key=sketch_key)
+                              sketch_exists = True
+                          except:
+                              pass
+                          response_data = {
+                              'status': model_status,
+                              'sketch_uploaded': sketch_exists,
+                              'sketch_location': f's3://{bucket_name}/{sketch_key}' if sketch_exists else 'Not uploaded',
+                              'container_built': container_built
+                          }
+                      else:
+                          logger.error(f"SageMaker error: {str(e)}")
+                          model_status = 'error'
+                          response_data = {
+                              'status': model_status,
+                              'error': str(e),
+                              'container_built': container_built
+                          }
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps(response_data)
+                  }
+
+              except Exception as e:
+                  logger.error(f"Error checking status: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({'status': 'error', 'error': str(e)})
+                  }
+
+  # Emergency Stop Function
+  EmergencyStopFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-emergency-stop"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      MemorySize: 128
+      Environment:
+        Variables:
+          ENDPOINT_NAME: !Sub "${AWS::StackName}-endpoint"
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+          from datetime import datetime
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          sagemaker = boto3.client('sagemaker')
+
+          def lambda_handler(event, context):
+              try:
+                  endpoint_name = os.environ['ENDPOINT_NAME']
+
+                  # Force stop endpoint
+                  try:
+                      sagemaker.delete_endpoint(EndpointName=endpoint_name)
+                      logger.info(f"Emergency stop executed for endpoint: {endpoint_name}")
+
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                              'Access-Control-Allow-Headers': 'Content-Type',
+                              'Content-Type': 'application/json'
+                          },
+                          'body': json.dumps({'message': 'Emergency stop executed successfully'})
+                      }
+
+                  except sagemaker.exceptions.ClientError as e:
+                      if 'does not exist' in str(e):
+                          return {
+                              'statusCode': 200,
+                              'headers': {
+                                  'Access-Control-Allow-Origin': '*',
+                                  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                                  'Access-Control-Allow-Headers': 'Content-Type',
+                                  'Content-Type': 'application/json'
+                              },
+                              'body': json.dumps({'message': 'Endpoint already stopped or does not exist'})
+                          }
+                      else:
+                          raise e
+
+              except Exception as e:
+                  logger.error(f"Error in emergency stop: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+  # API Gateway Methods
+  BuildMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref BuildResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ContainerBuilderFunction.Arn}/invocations"
+
+  StartMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref StartResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ModelControllerFunction.Arn}/invocations"
+
+  StopMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref StopResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ModelControllerFunction.Arn}/invocations"
+
+  StatusMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref StatusResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StatusCheckerFunction.Arn}/invocations"
+
+  GenerateMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref GenerateResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ImageGeneratorFunction.Arn}/invocations"
+
+  EmergencyStopMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref EmergencyStopResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${EmergencyStopFunction.Arn}/invocations"
+
+  # CORS OPTIONS Methods
+  BuildOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref BuildResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  StartOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref StartResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  StopOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref StopResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  StatusOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref StatusResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  GenerateOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref GenerateResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  EmergencyStopOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref EmergencyStopResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Lambda Permissions
+  ContainerBuilderPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ContainerBuilderFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*"
+
+  ModelControllerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ModelControllerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/*"
+
+  ImageGeneratorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ImageGeneratorFunction
+      Action: lambda:InvokeFunction

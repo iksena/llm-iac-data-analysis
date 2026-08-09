@@ -1,0 +1,521 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# This is sample code for demonstration purposes only. Do not deploy to
+# production without your own security review. See NOTICE file for details.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS DevOps Agent - EKS CrashLoopBackOff Test Stack (Auto-discovers Default VPC)'
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: devops-agent-test-cluster
+    Description: Name for the EKS cluster
+
+  NodeInstanceType:
+    Type: String
+    Default: t3.medium
+    Description: EC2 instance type for worker nodes
+
+  NodeGroupDesiredSize:
+    Type: Number
+    Default: 2
+    Description: Desired number of worker nodes
+
+  AgentSpaceId:
+    Type: String
+    Description: DevOps Agent Space ID (from console)
+
+  SlackServiceId:
+    Type: String
+    Default: ''
+    Description: Slack Service ID (UUID) from one-time registration in DevOps Agent console. Leave empty if Slack was configured via console.
+
+  SlackWorkspaceId:
+    Type: String
+    Default: ''
+    Description: Slack Workspace ID (e.g. T01ABCDEF). Leave empty if Slack was configured via console.
+
+  SlackWorkspaceName:
+    Type: String
+    Default: ''
+    Description: Slack Workspace name. Leave empty if Slack was configured via console.
+
+  SlackChannelId:
+    Type: String
+    Default: ''
+    Description: Slack Channel ID for incident notifications (e.g. C01ABCDEF). Leave empty if Slack was configured via console.
+
+  AllowedPublicAccessCidr:
+    Type: String
+    Default: '0.0.0.0/0'
+    Description: CIDR block allowed to access the EKS public endpoint (e.g. your VPN/office IP range like 203.0.113.0/24). Restrict this in production.
+
+Conditions:
+  DeploySlackAssociation: !Not [!Equals [!Ref SlackServiceId, '']]
+
+Resources:
+  # Lambda execution role for VPC discovery
+  VPCDiscoveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: VPCDiscovery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                # ec2:Describe* actions do not support resource-level permissions
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt VPCDiscoveryDLQ.Arn
+
+  VPCDiscoveryDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ClusterName}-vpc-discovery-dlq
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+  # Lambda function to discover default VPC and subnets
+  VPCDiscoveryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt VPCDiscoveryRole.Arn
+      Timeout: 30
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig:
+        TargetArn: !GetAtt VPCDiscoveryDLQ.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  ec2 = boto3.client('ec2')
+
+                  # Get default VPC
+                  vpcs = ec2.describe_vpcs(Filters=[{'Name': 'isDefault', 'Values': ['true']}])
+                  if not vpcs['Vpcs']:
+                      raise Exception('No default VPC found')
+
+                  vpc_id = vpcs['Vpcs'][0]['VpcId']
+
+                  # Get subnets in default VPC (at least 2 in different AZs)
+                  subnets = ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])
+
+                  if len(subnets['Subnets']) < 2:
+                      raise Exception('Need at least 2 subnets in default VPC')
+
+                  # Get subnets from different AZs
+                  az_subnets = {}
+                  for subnet in subnets['Subnets']:
+                      az = subnet['AvailabilityZone']
+                      if az not in az_subnets:
+                          az_subnets[az] = subnet['SubnetId']
+
+                  subnet_ids = list(az_subnets.values())[:2]
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'VpcId': vpc_id,
+                      'Subnet1': subnet_ids[0],
+                      'Subnet2': subnet_ids[1]
+                  })
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  # Custom resource to invoke Lambda
+  VPCDiscovery:
+    Type: Custom::VPCDiscovery
+    Properties:
+      ServiceToken: !GetAtt VPCDiscoveryFunction.Arn
+
+  # EKS Cluster Role
+  EKSClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ClusterName}-cluster-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+
+  # EKS Node Role
+  EKSNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ClusterName}-node-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  # EKS Cluster
+  EKSEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for EKS cluster secrets encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccount
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+
+  EKSCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: '1.32'
+      RoleArn: !GetAtt EKSClusterRole.Arn
+      EncryptionConfig:
+        - Provider:
+            KeyArn: !GetAtt EKSEncryptionKey.Arn
+          Resources:
+            - secrets
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !GetAtt VPCDiscovery.Subnet1
+          - !GetAtt VPCDiscovery.Subnet2
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        PublicAccessCidrs:
+          - !Ref AllowedPublicAccessCidr
+      Tags:
+        - Key: Purpose
+          Value: AWS-DevOpsAgent-Testing
+
+  # EKS Node Group
+  EKSNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: EKSCluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodegroupName: !Sub ${ClusterName}-nodegroup
+      NodeRole: !GetAtt EKSNodeRole.Arn
+      Subnets:
+        - !GetAtt VPCDiscovery.Subnet1
+        - !GetAtt VPCDiscovery.Subnet2
+      ScalingConfig:
+        MinSize: 1
+        MaxSize: 3
+        DesiredSize: !Ref NodeGroupDesiredSize
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      Tags:
+        Purpose: AWS-DevOpsAgent-Testing
+
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ClusterName}-alarm-notifications
+      KmsMasterKeyId: alias/aws/sns
+
+  # Alarm: Pod restart count spike (CrashLoopBackOff indicator)
+  PodRestartAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ClusterName}-CrashLoopBackOff
+      AlarmDescription: >
+        Detects pods restarting frequently, indicating CrashLoopBackOff.
+        Triggers DevOps Agent investigation.
+      Namespace: ContainerInsights
+      MetricName: pod_number_of_container_restarts
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      OKActions:
+        - !Ref AlarmNotificationTopic
+      InsufficientDataActions:
+        - !Ref AlarmNotificationTopic
+      Tags:
+        - Key: Purpose
+          Value: DevOps-Agent-Trigger
+
+  # Alarm: Pod not ready
+  PodNotReadyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ClusterName}-Pod-NotReady
+      AlarmDescription: >
+        Detects pods not in ready state for extended period.
+        Triggers DevOps Agent investigation.
+      Namespace: ContainerInsights
+      MetricName: pod_number_of_container_restarts
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ClusterName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+      OKActions:
+        - !Ref AlarmNotificationTopic
+      InsufficientDataActions:
+        - !Ref AlarmNotificationTopic
+      Tags:
+        - Key: Purpose
+          Value: DevOps-Agent-Trigger
+
+  TriggerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ClusterName}-trigger-dlq
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+  # Lambda role to trigger DevOps Agent
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ClusterName}-trigger-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeDevOpsAgent
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aidevops:InvokeAgent
+                  - aidevops:CreateBacklogTask
+                  - aidevops:GetBacklogTask
+                  - aidevops:ListExecutions
+                Resource: !Sub arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt TriggerDLQ.Arn
+
+  # Lambda to trigger DevOps Agent investigation
+  TriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ClusterName}-trigger-devops-agent
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt TriggerRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      ReservedConcurrentExecutions: 5
+      DeadLetterConfig:
+        TargetArn: !GetAtt TriggerDLQ.Arn
+      KmsKeyArn: !GetAtt EKSEncryptionKey.Arn
+      Environment:
+        Variables:
+          AGENT_SPACE_ID: !Ref AgentSpaceId
+          CLUSTER_NAME: !Ref ClusterName
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import time
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+          from urllib import request as urlrequest
+
+          AGENT_SPACE_ID = os.environ['AGENT_SPACE_ID']
+          CLUSTER_NAME = os.environ['CLUSTER_NAME']
+          REGION = os.environ.get('AWS_REGION', 'us-east-1')
+          BASE_URL = f"https://dp.aidevops.{REGION}.api.aws"
+          creds = boto3.Session().get_credentials()
+
+          def sigv4_request(method, url, data=None):
+              body = json.dumps(data) if data else ''
+              req = AWSRequest(method=method, url=url, data=body, headers={'Content-Type': 'application/json'})
+              SigV4Auth(creds, 'aidevops', REGION).add_auth(req)
+              r = urlrequest.Request(req.url, data=body.encode() if body else None, headers=dict(req.headers), method=method)
+              resp = urlrequest.urlopen(r, timeout=30)
+              return json.loads(resp.read().decode())
+
+          def lambda_handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+              alarm_name, alarm_desc = parse_alarm(event)
+              if not alarm_name:
+                  return {'statusCode': 400, 'body': 'Invalid event'}
+              description = (
+                  f"CloudWatch alarm '{alarm_name}' triggered for EKS cluster '{CLUSTER_NAME}'. {alarm_desc} "
+                  f"1. List pods in devops-agent-test namespace, identify CrashLoopBackOff pods. "
+                  f"2. Check pod events, logs, exit codes, and resource limits. "
+                  f"3. Use search_runbooks MCP tool to find relevant remediation steps. "
+                  f"4. Use get_runbook to fetch the FULL content of the matching runbook. "
+                  f"5. In your response, explicitly cite the remediation instructions from the runbook. "
+                  f"Include the runbook filename as source, quote the specific remediation section that matches the root cause, "
+                  f"and show the exact commands from the runbook verbatim. Do NOT paraphrase or summarize the runbook steps. "
+                  f"6. For each failing pod, use propose_remediation MCP tool with the specific kubectl commands from the runbook. "
+                  f"7. Format your final summary as: Pod Name | Root Cause | Runbook Section | Proposed Commands."
+              )
+              task_url = f"{BASE_URL}/backlog/agent-space/{AGENT_SPACE_ID}/tasks"
+              task = sigv4_request("POST", task_url, {
+                  "taskType": "INVESTIGATION",
+                  "title": f"CrashLoop Alert: {alarm_name}",
+                  "priority": "HIGH",
+                  "description": description,
+                  "clientToken": str(time.time())
+              })
+              task_id = task['task']['taskId']
+              print(f"Created task: {task_id}")
+              exec_url = f"{BASE_URL}/journal/agent-space/{AGENT_SPACE_ID}/executions"
+              sigv4_request("POST", exec_url, {"taskId": task_id})
+              print(f"Started execution for task: {task_id}")
+              return {'statusCode': 200, 'body': json.dumps({'taskId': task_id, 'alarm': alarm_name})}
+
+          def parse_alarm(event):
+              if event.get('source') == 'aws.cloudwatch':
+                  d = event.get('detail', {})
+                  return d.get('alarmName', ''), d.get('configuration', {}).get('description', '')
+              elif 'Records' in event:
+                  for r in event['Records']:
+                      if r.get('EventSource') == 'aws:sns':
+                          m = json.loads(r['Sns']['Message'])
+                          return m.get('AlarmName', ''), m.get('AlarmDescription', '')
+              elif 'alarmName' in event:
+                  return event['alarmName'], event.get('alarmDescription', '')
+              return '', ''
+
+  # Slack integration with DevOps Agent Space
+  SlackAssociation:
+    Type: AWS::DevOpsAgent::Association
+    Condition: DeploySlackAssociation
+    Properties:
+      AgentSpaceId: !Ref AgentSpaceId
+      ServiceId: !Ref SlackServiceId
+      Configuration:
+        Slack:
+          WorkspaceId: !Ref SlackWorkspaceId
+          WorkspaceName: !Ref SlackWorkspaceName
+          TransmissionTarget:
+            IncidentResponseTarget:
+              ChannelId: !Ref SlackChannelId
+
+  # EventBridge rule to catch alarm state changes
+  AlarmEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ClusterName}-alarm-to-devops-agent
+      Description: Routes EKS CloudWatch alarms to DevOps Agent
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          alarmName:
+            - prefix: !Ref ClusterName
+          state:
+            value:
+              - ALARM
+      Targets:
+        - Arn: !GetAtt TriggerFunction.Arn
+          Id: TriggerDevOpsAgent
+
+  # Permission for EventBridge to invoke Lambda
+  EventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AlarmEventRule.Arn
+
+Outputs:
+  ClusterName:
+    Description: EKS Cluster Name
+    Value: !Ref EKSCluster
+
+  ClusterEndpoint:
+    Description: EKS Cluster Endpoint
+    Value: !GetAtt EKSCluster.Endpoint
+
+  VpcId:
+    Description: Default VPC ID used
+    Value: !GetAtt VPCDiscovery.VpcId
+
+  Subnets:
+    Description: Subnets used for EKS
+    Value: !Sub "${VPCDiscovery.Subnet1}, ${VPCDiscovery.Subnet2}"
+
+  UpdateKubeconfigCommand:
+    Description: Command to update kubeconfig
+    Value: !Sub aws eks update-kubeconfig --name ${ClusterName} --region ${AWS::Region}
+
+  PodRestartAlarmName:
+    Description: CrashLoopBackOff alarm name
+    Value: !Ref PodRestartAlarm
+
+  PodNotReadyAlarmName:
+    Description: Pod not ready alarm name
+    Value: !Ref PodNotReadyAlarm
+
+  TriggerFunctionArn:
+    Description: Lambda that triggers DevOps Agent investigation
+    Value: !GetAtt TriggerFunction.Arn
+
+  EventRuleName:
+    Description: EventBridge rule watching for alarm state changes
+    Value: !Ref AlarmEventRule
+
+  SlackAssociationId:
+    Condition: DeploySlackAssociation
+    Description: Slack integration association ID
+    Value: !GetAtt SlackAssociation.AssociationId

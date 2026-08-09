@@ -1,0 +1,364 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CELLO Operator Portal — app layer (M8). Public ALB (HTTPS via ACM) + Route53 record + ECS
+  Fargate service on the shared cello cluster, reusing the directory VPC. The portal reaches the
+  directory ONLY over its internal HTTP API (account-by-email-stub / agents-by-account /
+  agent-write), authenticated by the x-cello-internal-api-key header — never the directory DB.
+  Secrets (DB URL, KMS master key, directory API key) are injected by ARN at task launch.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, production]
+  PortalHostname:
+    Type: String
+    Default: portal.cello.mygentic.ai
+  HostedZoneId:
+    Type: String
+    Default: Z02692523DOH7NW521CL8
+  ImageTag:
+    Type: String
+    Default: latest
+  DirectoryApiUrl:
+    Type: String
+    Default: http://directory-us1.cello.mygentic.ai
+    Description: The directory's public ALB (its /internal/* is header-authenticated). Superseded by DirectoryApiUrls when set.
+  DirectoryApiUrls:
+    Type: String
+    Default: "http://directory-us1.cello.mygentic.ai,http://directory-eu1.cello.mygentic.ai,http://directory-ap1.cello.mygentic.ai"
+    Description: >
+      M10-D11 — ordered comma-separated failover list of directory ALB URLs (primary first).
+      When non-empty, supersedes DirectoryApiUrl. All portal DirectoryClient methods try each
+      node in order on DirectoryUnreachableError; exhaustion fails loud.
+  EmailFrom:
+    Type: String
+    Default: "CELLO <no-reply@mygentic.ai>"
+  DatabaseUrlSecretArn:
+    Type: String
+    Description: Secrets Manager ARN for cello/{env}/portal/database-url (full ARN incl. suffix).
+  KmsMasterKeySecretArn:
+    Type: String
+    Description: Secrets Manager ARN for cello/{env}/portal/kms-master-key (64-hex).
+  DirectoryApiKeySecretArn:
+    Type: String
+    Default: arn:aws:secretsmanager:us-east-1:257394457473:secret:cello/dev/ops-agent/directory-api-key-YTcKGN
+    Description: Reuses the directory internal API key (same value the ops-agent uses).
+  IntakeSeedsSecretArn:
+    Type: String
+    Default: "arn:aws:secretsmanager:us-east-1:257394457473:secret:cello/dev/portal/intake-key-0-GXpcIR"
+    Description: >
+      Secrets Manager ARN for cello/{env}/portal/intake-key-0 — the PORTAL INTAKE seeds, as
+      `key_id:hexseed` pairs comma-separated across live generations. This is the key a submitting
+      daemon seals a trust-signal submission TO, so the DIRECTORY cannot read it; the portal is the
+      only party that can open one. ONE secret holds EVERY live generation on purpose: rotation must
+      retain the previous seed until no undrained row still references it (M10B-D11), because
+      in-flight rows are sealed to whichever generation was published when they were sent. Opening
+      every row with a single current seed turns a routine rotation into the permanent, unattributable
+      destruction of every queued endorsement.
+  SubmissionSeedSecretArn:
+    Type: String
+    Description: >
+      Secrets Manager ARN for cello/{env}/portal/submission-seed — the M10 trust-signal submission
+      signer's Ed25519 seed (its pubkey is enrolled in the directory's authorized_issuers). Required:
+      without it getSubmissionSigner FAILS CLOSED in dev (ABSENT IS NOT FINE) and the WebAuthn handoff
+      mints nothing. No Default — deploy.sh must pass it so a missing value fails at deploy, not silently.
+  GitHubOAuthSecretArn:
+    Type: String
+    Description: >
+      Secrets Manager ARN for cello/{env}/portal/github-oauth — JSON with client_id and
+      client_secret for the GitHub OAuth App (DOD-OAUTH-1 trust signal generation).
+  SubmissionSignerKmsKeyId:
+    Type: String
+    Default: ""
+    Description: >
+      KMS key ID or ARN for the Ed25519 submission signer (cello-dev-submission-signer).
+      Required for all non-local envs — without it GitHub OAuth and WebAuthn minting fail.
+      Use the key ID (not the alias) so the value is stable across alias renames.
+  Cpu:
+    Type: String
+    Default: "512"
+  Memory:
+    Type: String
+    Default: "1024"
+  AlarmTopicArn:
+    Type: String
+    Default: ""
+    Description: Optional SNS topic for the magic-link delivery alarm. Empty = alarm with no action.
+
+Conditions:
+  HasAlarmTopic: !Not [!Equals [!Ref AlarmTopicArn, ""]]
+  HasKmsKeyId: !Not [!Equals [!Ref SubmissionSignerKmsKeyId, ""]]
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/cello-portal-${Environment}"
+      RetentionInDays: 90
+
+  # ─── Magic-link delivery observability ────────────────────────────────────────
+  # Magic-link is the sole auth entry. A SES misconfig (unverified identity, missing
+  # ses:SendEmail, wrong region) makes EVERY sign-in email silently fail while the request still
+  # returns {sent:true} (forced by the no-enumeration invariant — the failure cannot surface
+  # in-band). This metric filter + alarm is the out-of-band loud signal the reviewers required.
+  DeliveryFailureMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref LogGroup
+      FilterPattern: '{ $.event = "portal.auth.magic_link.delivery_failed" }'
+      MetricTransformations:
+        - MetricNamespace: CelloPortal
+          MetricName: !Sub "MagicLinkDeliveryFailures-${Environment}"
+          MetricValue: "1"
+          DefaultValue: 0
+
+  DeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "cello-portal-magic-link-delivery-failures-${Environment}"
+      AlarmDescription: Magic-link email delivery is failing (SES misconfig = silent login outage).
+      Namespace: CelloPortal
+      MetricName: !Sub "MagicLinkDeliveryFailures-${Environment}"
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: !If [HasAlarmTopic, [!Ref AlarmTopicArn], !Ref "AWS::NoValue"]
+
+  # ─── IAM ──────────────────────────────────────────────────────────────────────
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "cello-portal-execution-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: portal-secrets-read
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DatabaseUrlSecretArn
+                  - !Ref KmsMasterKeySecretArn
+                  - !Ref DirectoryApiKeySecretArn
+                  - !Ref SubmissionSeedSecretArn
+                  - !Ref IntakeSeedsSecretArn
+                  - !Ref GitHubOAuthSecretArn
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "cello-portal-task-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: portal-ses-send
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Magic-link delivery. Scoped to the verified mygentic.ai sending identity.
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: "*"
+                Condition:
+                  StringLike:
+                    "ses:FromAddress": "*@mygentic.ai"
+
+  # ─── ECS task + service ───────────────────────────────────────────────────────
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "cello-portal-${Environment}"
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: portal
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/cello-portal:${ImageTag}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3000
+              Protocol: tcp
+          Environment:
+            - Name: CELLO_ENV
+              Value: !Ref Environment
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: PORTAL_BASE_URL
+              Value: !Sub "https://${PortalHostname}"
+            - Name: PORTAL_EMAIL_FROM
+              Value: !Ref EmailFrom
+            - Name: DIRECTORY_API_URL
+              Value: !Ref DirectoryApiUrl
+            - Name: DIRECTORY_API_URLS
+              Value: !Ref DirectoryApiUrls
+            # WebAuthn relying-party config — must match the served host (no scheme/port for the ID;
+            # full origin for the browser check). Required outside CELLO_ENV=local.
+            - Name: WEBAUTHN_RP_ID
+              Value: !Ref PortalHostname
+            - Name: WEBAUTHN_ORIGIN
+              Value: !Sub "https://${PortalHostname}"
+            - !If
+              - HasKmsKeyId
+              - Name: PORTAL_KMS_KEY_ID
+                Value: !Ref SubmissionSignerKmsKeyId
+              - !Ref AWS::NoValue
+          Secrets:
+            - Name: PORTAL_DATABASE_URL
+              ValueFrom: !Ref DatabaseUrlSecretArn
+            - Name: PORTAL_KMS_MASTER_KEY
+              ValueFrom: !Ref KmsMasterKeySecretArn
+            - Name: DIRECTORY_API_KEY
+              ValueFrom: !Ref DirectoryApiKeySecretArn
+            - Name: PORTAL_SUBMISSION_SEED
+              ValueFrom: !Ref SubmissionSeedSecretArn
+            # M10B / DOD-END-INGRESS-1 — without this the drain answers 503 `no_intake_keys` and
+            # every sealed submission stays queued: the portal cannot open what it has no key for.
+            - Name: PORTAL_INTAKE_SEEDS
+              ValueFrom: !Ref IntakeSeedsSecretArn
+            - Name: GITHUB_CLIENT_ID
+              ValueFrom: !Sub "${GitHubOAuthSecretArn}:client_id::"
+            - Name: GITHUB_CLIENT_SECRET
+              ValueFrom: !Sub "${GitHubOAuthSecretArn}:client_secret::"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: portal
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "cello-portal-${Environment}"
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !ImportValue
+          Fn::Sub: "cello-${Environment}-public-subnet-a"
+        - !ImportValue
+          Fn::Sub: "cello-${Environment}-public-subnet-b"
+      SecurityGroups:
+        - !ImportValue
+          Fn::Sub: "cello-${Environment}-portal-alb-sg"
+      Tags:
+        - Key: Project
+          Value: cello
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 3000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !ImportValue
+        Fn::Sub: "cello-${Environment}-vpc-id"
+      HealthCheckPath: /sign-in
+      HealthCheckProtocol: HTTP
+      Matcher:
+        HttpCode: "200"
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !ImportValue
+            Fn::Sub: "cello-${Environment}-portal-cert-arn"
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            StatusCode: HTTP_301
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [HttpsListener, HttpListener]
+    Properties:
+      ServiceName: !Sub "cello-portal-${Environment}"
+      Cluster: !ImportValue
+        Fn::Sub: "cello-${Environment}-cluster-arn"
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      EnableExecuteCommand: true
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      HealthCheckGracePeriodSeconds: 120
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !ImportValue
+              Fn::Sub: "cello-${Environment}-private-subnet-a"
+            - !ImportValue
+              Fn::Sub: "cello-${Environment}-private-subnet-b"
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: "cello-${Environment}-portal-task-sg"
+      LoadBalancers:
+        - ContainerName: portal
+          ContainerPort: 3000
+          TargetGroupArn: !Ref TargetGroup
+      Tags:
+        - Key: Project
+          Value: cello
+
+  PortalDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub "${PortalHostname}."
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Alb.DNSName
+        HostedZoneId: !GetAtt Alb.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
+
+Outputs:
+  PortalUrl:
+    Value: !Sub "https://${PortalHostname}"
+  AlbDnsName:
+    Value: !GetAtt Alb.DNSName

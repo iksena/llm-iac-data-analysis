@@ -1,0 +1,452 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  FlightAware Scheduled Refresh - self-contained microservice.
+  Includes: refresh Lambda (24h schedule), schedule-toggle Lambda,
+  ARC child plan for DR failover, CloudWatch alarm and dashboard.
+  Deploy to both regions; ARC plan + dashboard created in primary only.
+
+Parameters:
+  DocDBEndpoint:
+    Type: String
+    Description: DocumentDB cluster endpoint
+  DocDBSecretArn:
+    Type: String
+    Description: Secrets Manager ARN for DocumentDB credentials
+  FlightAwareSecretArn:
+    Type: String
+    Default: airporthub/flightaware/api-key
+    Description: Secrets Manager secret name for FlightAware API key
+  DocDBDatabase:
+    Type: String
+    Default: airports
+    Description: DocumentDB database name
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for Lambda
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet in AZ 1
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Private subnet in AZ 2
+  DocDBSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: DocumentDB security group ID
+  ScheduleState:
+    Type: String
+    AllowedValues: [ENABLED, DISABLED]
+    Default: ENABLED
+    Description: EventBridge schedule state (ENABLED in primary, DISABLED in passive)
+  PrimaryRegion:
+    Type: String
+    Default: us-east-1
+    Description: Primary region - ARC plan and dashboard only deploy here
+  SecondaryRegion:
+    Type: String
+    Default: us-east-2
+    Description: Secondary region
+  ApprovalRoleArn:
+    Type: String
+    Description: IAM role ARN for ARC manual approval steps
+
+Conditions:
+  IsPrimaryRegion: !Equals [!Ref 'AWS::Region', !Ref PrimaryRegion]
+
+Resources:
+
+  # ============================================================
+  # REFRESH LAMBDA (per-region)
+  # ============================================================
+
+  RefreshLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-refresh-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub '${DocDBSecretArn}*'
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:airporthub/flightaware/*'
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  RefreshLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${AWS::StackName}-refresh-sg'
+      GroupDescription: Security group for Scheduled Refresh Lambda
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 27017
+          ToPort: 27017
+          DestinationSecurityGroupId: !Ref DocDBSecurityGroupId
+          Description: DocumentDB access
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Secrets Manager and FlightAware API
+
+  DocDBIngressFromRefreshLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DocDBSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 27017
+      ToPort: 27017
+      SourceSecurityGroupId: !Ref RefreshLambdaSecurityGroup
+      Description: Allow FlightAware Refresh Lambda to connect to DocumentDB
+
+  RefreshFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-refresh'
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Code: ./
+      MemorySize: 256
+      Timeout: 900
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt RefreshLambdaRole.Arn
+      VpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref RefreshLambdaSecurityGroup
+      Environment:
+        Variables:
+          DOCDB_ENDPOINT: !Ref DocDBEndpoint
+          DOCDB_PORT: '27017'
+          DOCDB_SECRET_ARN: !Ref DocDBSecretArn
+          DOCDB_DATABASE: !Ref DocDBDatabase
+          FA_SECRET_ARN: !Ref FlightAwareSecretArn
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # EVENTBRIDGE SCHEDULE (per-region)
+  # ============================================================
+
+  RefreshScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-schedule'
+      Description: Trigger scheduled flight data refresh every 24 hours
+      ScheduleExpression: 'rate(24 hours)'
+      State: !Ref ScheduleState
+      Targets:
+        - Arn: !GetAtt RefreshFunction.Arn
+          Id: ScheduledRefreshTarget
+
+  RefreshLambdaSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RefreshFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt RefreshScheduleRule.Arn
+
+  # ============================================================
+  # SCHEDULE TOGGLE LAMBDA (per-region)
+  # ============================================================
+
+  ToggleLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-toggle-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EventBridgeToggle
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:EnableRule
+                  - events:DisableRule
+                Resource:
+                  # Rule names use the stack name prefix - deployed as
+                  # flightaware-app-switchover-us-east-1 and flightaware-app-switchover-us-east-2
+                  - !Sub 'arn:aws:events:${PrimaryRegion}:${AWS::AccountId}:rule/flightaware-app-switchover-${PrimaryRegion}-schedule'
+                  - !Sub 'arn:aws:events:${SecondaryRegion}:${AWS::AccountId}:rule/flightaware-app-switchover-${SecondaryRegion}-schedule'
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  ToggleFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-toggle'
+      Runtime: python3.12
+      Handler: schedule_toggle.lambda_function.lambda_handler
+      Code: ./
+      MemorySize: 128
+      Timeout: 30
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt ToggleLambdaRole.Arn
+      Environment:
+        Variables:
+          # Pass rule names so the Lambda doesn't hardcode them
+          PRIMARY_RULE_NAME: !Sub 'flightaware-app-switchover-${PrimaryRegion}-schedule'
+          SECONDARY_RULE_NAME: !Sub 'flightaware-app-switchover-${SecondaryRegion}-schedule'
+          PRIMARY_REGION: !Ref PrimaryRegion
+          SECONDARY_REGION: !Ref SecondaryRegion
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # CLOUDWATCH ALARM (per-region)
+  # ============================================================
+
+  ScheduledRefreshAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-errors'
+      AlarmDescription: FlightAware scheduled refresh Lambda errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RefreshFunction
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # ============================================================
+  # ARC CHILD PLAN (primary region only)
+  # ============================================================
+
+  ChildPlanExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: IsPrimaryRegion
+    Properties:
+      RoleName: flightaware-app-switchover-arc-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: arc-region-switch.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunction
+                Resource:
+                  - !Sub 'arn:aws:lambda:${PrimaryRegion}:${AWS::AccountId}:function:flightaware-app-switchover-${PrimaryRegion}-toggle'
+                  - !Sub 'arn:aws:lambda:${SecondaryRegion}:${AWS::AccountId}:function:flightaware-app-switchover-${SecondaryRegion}-toggle'
+        - PolicyName: ArcRequiredPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:SimulatePrincipalPolicy
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - arc-region-switch:ApprovePlanExecutionStep
+                Resource: '*'
+        - PolicyName: ReportGeneration
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::airporthub-arc-reports-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::airporthub-arc-reports-${AWS::AccountId}/*'
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  ChildSwitchoverPlan:
+    Type: AWS::ARCRegionSwitch::Plan
+    Condition: IsPrimaryRegion
+    Properties:
+      Name: flightaware-app-switchover
+      Description: >
+        FlightAware scheduled refresh failover - toggles the 24h EventBridge
+        schedule from source to activating region during DR switchover.
+      PrimaryRegion: !Ref PrimaryRegion
+      RecoveryApproach: activePassive
+      Regions:
+        - !Ref PrimaryRegion
+        - !Ref SecondaryRegion
+      RecoveryTimeObjectiveMinutes: 15
+      ExecutionRole: !GetAtt ChildPlanExecutionRole.Arn
+
+      ReportConfiguration:
+        ReportOutput:
+          - S3Configuration:
+              BucketPath: !Sub 'airporthub-arc-reports-${AWS::AccountId}'
+              BucketOwner: !Ref 'AWS::AccountId'
+
+      Workflows:
+
+        # --- Activate us-east-2 ---
+        - WorkflowTargetAction: activate
+          WorkflowTargetRegion: !Ref SecondaryRegion
+          WorkflowDescription: Enable scheduled refresh in us-east-2, disable in us-east-1
+          Steps:
+            - Name: toggle-scheduled-refresh
+              Description: Enable EventBridge schedule in activating region, disable in source
+              ExecutionBlockType: CustomActionLambda
+              ExecutionBlockConfiguration:
+                CustomActionLambdaConfig:
+                  Lambdas:
+                    - Arn: !Sub 'arn:aws:lambda:${PrimaryRegion}:${AWS::AccountId}:function:flightaware-app-switchover-${PrimaryRegion}-toggle'
+                    - Arn: !Sub 'arn:aws:lambda:${SecondaryRegion}:${AWS::AccountId}:function:flightaware-app-switchover-${SecondaryRegion}-toggle'
+                  RegionToRun: activatingRegion
+                  RetryIntervalMinutes: 2
+                  TimeoutMinutes: 5
+
+        # --- Activate us-east-1 (failback) ---
+        - WorkflowTargetAction: activate
+          WorkflowTargetRegion: !Ref PrimaryRegion
+          WorkflowDescription: Enable scheduled refresh in us-east-1, disable in us-east-2
+          Steps:
+            - Name: toggle-scheduled-refresh-failback
+              Description: Enable EventBridge schedule in activating region, disable in source
+              ExecutionBlockType: CustomActionLambda
+              ExecutionBlockConfiguration:
+                CustomActionLambdaConfig:
+                  Lambdas:
+                    - Arn: !Sub 'arn:aws:lambda:${PrimaryRegion}:${AWS::AccountId}:function:flightaware-app-switchover-${PrimaryRegion}-toggle'
+                    - Arn: !Sub 'arn:aws:lambda:${SecondaryRegion}:${AWS::AccountId}:function:flightaware-app-switchover-${SecondaryRegion}-toggle'
+                  RegionToRun: activatingRegion
+                  RetryIntervalMinutes: 2
+                  TimeoutMinutes: 5
+
+      Tags:
+        Project: AirportHub
+        resilience-tier: mission-critical
+
+  # ============================================================
+  # CLOUDWATCH DASHBOARD (primary region only)
+  # ============================================================
+
+  ScheduledRefreshDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Condition: IsPrimaryRegion
+    Properties:
+      DashboardName: FlightAware-ScheduledRefresh
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text", "x": 0, "y": 0, "width": 24, "height": 1,
+              "properties": { "markdown": "# FlightAware Scheduled Refresh" }
+            },
+            {
+              "type": "metric", "x": 0, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "Invocations",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "flightaware-app-switchover-${PrimaryRegion}-refresh", {"region": "${PrimaryRegion}", "label": "${PrimaryRegion}", "stat": "Sum"}],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "flightaware-app-switchover-${SecondaryRegion}-refresh", {"region": "${SecondaryRegion}", "label": "${SecondaryRegion}", "stat": "Sum"}]
+                ],
+                "period": 300, "stat": "Sum", "view": "timeSeries", "region": "${PrimaryRegion}"
+              }
+            },
+            {
+              "type": "metric", "x": 8, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "Errors",
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "flightaware-app-switchover-${PrimaryRegion}-refresh", {"region": "${PrimaryRegion}", "label": "${PrimaryRegion}", "stat": "Sum", "color": "#d62728"}],
+                  ["AWS/Lambda", "Errors", "FunctionName", "flightaware-app-switchover-${SecondaryRegion}-refresh", {"region": "${SecondaryRegion}", "label": "${SecondaryRegion}", "stat": "Sum", "color": "#ff7f0e"}]
+                ],
+                "period": 300, "stat": "Sum", "view": "timeSeries", "region": "${PrimaryRegion}"
+              }
+            },
+            {
+              "type": "metric", "x": 16, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "Duration (p50 / p99)",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "flightaware-app-switchover-${PrimaryRegion}-refresh", {"region": "${PrimaryRegion}", "label": "${PrimaryRegion} p50", "stat": "p50"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "flightaware-app-switchover-${PrimaryRegion}-refresh", {"region": "${PrimaryRegion}", "label": "${PrimaryRegion} p99", "stat": "p99"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "flightaware-app-switchover-${SecondaryRegion}-refresh", {"region": "${SecondaryRegion}", "label": "${SecondaryRegion} p50", "stat": "p50"}]
+                ],
+                "period": 300, "stat": "p50", "view": "timeSeries", "region": "${PrimaryRegion}"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  RefreshFunctionArn:
+    Description: Scheduled Refresh Lambda ARN
+    Value: !GetAtt RefreshFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-RefreshFunctionArn'
+  RefreshFunctionName:
+    Description: Refresh Lambda function name
+    Value: !Ref RefreshFunction
+  ToggleFunctionArn:
+    Description: Schedule Toggle Lambda ARN
+    Value: !GetAtt ToggleFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ToggleFunctionArn'
+  ScheduleRuleName:
+    Description: EventBridge schedule rule name
+    Value: !Ref RefreshScheduleRule
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduleRuleName'
+  ChildPlanArn:
+    Condition: IsPrimaryRegion
+    Description: ARC child plan ARN (for parent plan reference)
+    Value: !Ref ChildSwitchoverPlan
+    Export:
+      Name: !Sub '${AWS::StackName}-ChildPlanArn'

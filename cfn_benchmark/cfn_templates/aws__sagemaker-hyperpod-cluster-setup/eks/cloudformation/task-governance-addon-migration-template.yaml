@@ -1,0 +1,527 @@
+Description: 'Task Governance Addon Migration () - Single Stack: Backup, Update Addon, Restore, Cleanup'
+Parameters:
+  Stage:
+    Type: String
+    Default: prod
+    AllowedValues:
+      - gamma
+      - prod
+    Description: Deployment stage (gamma, prod)
+  ResourceNamePrefix:
+    Type: String
+    Default: sagemaker-hyperpod-eks
+    Description: Prefix for all resources created by this template.
+  EKSClusterName:
+    Type: String
+    Description: The name of the EKS cluster.
+  HyperpodClusterId:
+    Type: String
+    AllowedPattern: '[a-z0-9]{12}'
+    ConstraintDescription: HyperpodClusterId must be exactly 12 lowercase alphanumeric characters (the bare cluster ID, not an ARN).
+    Description: >-
+      The SageMaker HyperPod cluster ID, used to name the backup S3 bucket. Must be the bare cluster ID (12 lowercase
+      alphanumeric characters), not a cluster ARN, so the resulting bucket name is S3-compliant.
+  BackupS3Bucket:
+    Type: String
+    Default: ''
+    Description: >-
+      S3 bucket for backing up CRs before migration. Defaults to sagemaker-hyperpod-{HyperpodClusterId}-tg-bucket.
+      Auto-created if it does not exist.
+  CustomResourceS3Bucket:
+    Type: String
+    Default: ''
+    Description: S3 bucket containing Lambda code and templates. Defaults to aws-sagemaker-hyperpod-cluster-setup-{region}-{stage}.
+  FunctionS3Key:
+    Type: String
+    Default: resources/artifacts/task-governance-addon-migration-lambda-function.zip
+    Description: S3 key for the Lambda function zip.
+  LayerS3Key:
+    Type: String
+    Default: resources/artifacts/tiered-cache-lambda-layer.zip
+    Description: S3 key for the Lambda layer zip (kubectl + aws-iam-authenticator).
+  TaskGovernanceAddonName:
+    Type: String
+    Default: amazon-sagemaker-hyperpod-taskgovernance
+    Description: Name of the Task Governance EKS addon.
+  TaskGovernanceAddonVersion:
+    Type: String
+    Description: Target version for the Task Governance addon upgrade.
+  CurrentTaskGovernanceAddonVersion:
+    Type: String
+    Description: >-
+      Current installed version of the Task Governance addon. Used with the target version to look up the CRD migration
+      spec. If current and target have the same major.minor, no CRD schema migration runs.
+Conditions:
+  BackupS3BucketProvided:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: BackupS3Bucket
+          - ''
+  CustomResourceS3BucketProvided:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: CustomResourceS3Bucket
+          - ''
+Resources:
+  MigrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                Resource:
+                  Fn::Sub: arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:cluster/${EKSClusterName}
+              - Effect: Allow
+                Action:
+                  - eks:UpdateAddon
+                  - eks:DescribeAddon
+                Resource:
+                  Fn::Sub: >-
+                    arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:addon/${EKSClusterName}/${TaskGovernanceAddonName}/*
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource:
+                  Fn::Join:
+                    - ''
+                    - - 'arn:'
+                      - Ref: AWS::Partition
+                      - ':s3:::'
+                      - Fn::If:
+                          - BackupS3BucketProvided
+                          - Ref: BackupS3Bucket
+                          - Fn::Sub: sagemaker-hyperpod-${HyperpodClusterId}-tg-bucket
+                      - /task-governance-addon-migration/*
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  Fn::Join:
+                    - ''
+                    - - 'arn:'
+                      - Ref: AWS::Partition
+                      - ':s3:::'
+                      - Fn::If:
+                          - BackupS3BucketProvided
+                          - Ref: BackupS3Bucket
+                          - Fn::Sub: sagemaker-hyperpod-${HyperpodClusterId}-tg-bucket
+                Condition:
+                  StringLike:
+                    s3:prefix:
+                      - task-governance-addon-migration/*
+              - Effect: Allow
+                Action:
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:PutEncryptionConfiguration
+                  - s3:PutBucketPolicy
+                  - s3:PutBucketPublicAccessBlock
+                Resource:
+                  Fn::Join:
+                    - ''
+                    - - 'arn:'
+                      - Ref: AWS::Partition
+                      - ':s3:::'
+                      - Fn::If:
+                          - BackupS3BucketProvided
+                          - Ref: BackupS3Bucket
+                          - Fn::Sub: sagemaker-hyperpod-${HyperpodClusterId}-tg-bucket
+          PolicyName:
+            Fn::Sub: ${ResourceNamePrefix}-TGMigration-Access
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/MigrationRole
+  AccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      AccessPolicies:
+        - AccessScope:
+            Type: cluster
+          PolicyArn:
+            Fn::Sub: arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+      ClusterName:
+        Ref: EKSClusterName
+      KubernetesGroups:
+        - tg-migration-automation
+      PrincipalArn:
+        Fn::GetAtt:
+          - MigrationRole
+          - Arn
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/AccessEntry
+  Layer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      CompatibleArchitectures:
+        - x86_64
+      CompatibleRuntimes:
+        - python3.9
+        - python3.10
+        - python3.11
+        - python3.12
+      Content:
+        S3Bucket:
+          Fn::If:
+            - CustomResourceS3BucketProvided
+            - Ref: CustomResourceS3Bucket
+            - Fn::Sub: aws-sagemaker-hyperpod-cluster-setup-${AWS::Region}-${Stage}
+        S3Key:
+          Ref: LayerS3Key
+      Description: Lambda Layer for kubectl and aws-iam-authenticator
+      LayerName:
+        Fn::Sub: ${ResourceNamePrefix}-tg-migration-layer
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/Layer
+  FunctionBackup:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket:
+          Fn::If:
+            - CustomResourceS3BucketProvided
+            - Ref: CustomResourceS3Bucket
+            - Fn::Sub: aws-sagemaker-hyperpod-cluster-setup-${AWS::Region}-${Stage}
+        S3Key:
+          Ref: FunctionS3Key
+      Environment:
+        Variables:
+          EKS_CLUSTER_NAME:
+            Ref: EKSClusterName
+          BACKUP_S3_BUCKET:
+            Fn::If:
+              - BackupS3BucketProvided
+              - Ref: BackupS3Bucket
+              - Fn::Sub: sagemaker-hyperpod-${HyperpodClusterId}-tg-bucket
+          CURRENT_TASK_GOVERNANCE_ADDON_VERSION:
+            Ref: CurrentTaskGovernanceAddonVersion
+          TASK_GOVERNANCE_ADDON_VERSION:
+            Ref: TaskGovernanceAddonVersion
+          MIGRATION_MODE: backup
+          PATH: /opt/python/bin:/var/lang/bin:/usr/local/bin:/usr/bin/:/bin
+          KUBECONFIG: /tmp/.kube/config
+          LD_LIBRARY_PATH: /opt/python/lib
+      Handler: lambda_function.lambda_handler
+      Layers:
+        - Ref: Layer
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 1
+      Role:
+        Fn::GetAtt:
+          - MigrationRole
+          - Arn
+      Runtime: python3.12
+      Timeout: 900
+    DependsOn:
+      - AccessEntry
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/FunctionBackup
+  LogGroupBackup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Join:
+          - ''
+          - - /aws/lambda/
+            - Ref: FunctionBackup
+      RetentionInDays: 14
+    DependsOn:
+      - FunctionBackup
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/LogGroupBackup
+  InvokeConfigBackup:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName:
+        Ref: FunctionBackup
+      MaximumRetryAttempts: 0
+      Qualifier: $LATEST
+    DependsOn:
+      - FunctionBackup
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/InvokeConfigBackup
+  BackupResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceTimeout: 930
+      ServiceToken:
+        Fn::GetAtt:
+          - FunctionBackup
+          - Arn
+    DependsOn:
+      - FunctionBackup
+      - InvokeConfigBackup
+      - LogGroupBackup
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/BackupResource
+  FunctionUpdate:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket:
+          Fn::If:
+            - CustomResourceS3BucketProvided
+            - Ref: CustomResourceS3Bucket
+            - Fn::Sub: aws-sagemaker-hyperpod-cluster-setup-${AWS::Region}-${Stage}
+        S3Key:
+          Ref: FunctionS3Key
+      Environment:
+        Variables:
+          EKS_CLUSTER_NAME:
+            Ref: EKSClusterName
+          TASK_GOVERNANCE_ADDON_NAME:
+            Ref: TaskGovernanceAddonName
+          TASK_GOVERNANCE_ADDON_VERSION:
+            Ref: TaskGovernanceAddonVersion
+          MIGRATION_MODE: update
+          PATH: /opt/python/bin:/var/lang/bin:/usr/local/bin:/usr/bin/:/bin
+          KUBECONFIG: /tmp/.kube/config
+          LD_LIBRARY_PATH: /opt/python/lib
+      Handler: lambda_function.lambda_handler
+      Layers:
+        - Ref: Layer
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 1
+      Role:
+        Fn::GetAtt:
+          - MigrationRole
+          - Arn
+      Runtime: python3.12
+      Timeout: 900
+    DependsOn:
+      - AccessEntry
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/FunctionUpdate
+  LogGroupUpdate:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Join:
+          - ''
+          - - /aws/lambda/
+            - Ref: FunctionUpdate
+      RetentionInDays: 14
+    DependsOn:
+      - FunctionUpdate
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/LogGroupUpdate
+  InvokeConfigUpdate:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName:
+        Ref: FunctionUpdate
+      MaximumRetryAttempts: 0
+      Qualifier: $LATEST
+    DependsOn:
+      - FunctionUpdate
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/InvokeConfigUpdate
+  UpdateAddonResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceTimeout: 930
+      ServiceToken:
+        Fn::GetAtt:
+          - FunctionUpdate
+          - Arn
+    DependsOn:
+      - BackupResource
+      - FunctionUpdate
+      - InvokeConfigUpdate
+      - LogGroupUpdate
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/UpdateAddonResource
+  FunctionRestore:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket:
+          Fn::If:
+            - CustomResourceS3BucketProvided
+            - Ref: CustomResourceS3Bucket
+            - Fn::Sub: aws-sagemaker-hyperpod-cluster-setup-${AWS::Region}-${Stage}
+        S3Key:
+          Ref: FunctionS3Key
+      Environment:
+        Variables:
+          EKS_CLUSTER_NAME:
+            Ref: EKSClusterName
+          BACKUP_S3_BUCKET:
+            Fn::If:
+              - BackupS3BucketProvided
+              - Ref: BackupS3Bucket
+              - Fn::Sub: sagemaker-hyperpod-${HyperpodClusterId}-tg-bucket
+          CURRENT_TASK_GOVERNANCE_ADDON_VERSION:
+            Ref: CurrentTaskGovernanceAddonVersion
+          TASK_GOVERNANCE_ADDON_VERSION:
+            Ref: TaskGovernanceAddonVersion
+          MIGRATION_MODE: restore
+          PATH: /opt/python/bin:/var/lang/bin:/usr/local/bin:/usr/bin/:/bin
+          KUBECONFIG: /tmp/.kube/config
+          LD_LIBRARY_PATH: /opt/python/lib
+      Handler: lambda_function.lambda_handler
+      Layers:
+        - Ref: Layer
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 1
+      Role:
+        Fn::GetAtt:
+          - MigrationRole
+          - Arn
+      Runtime: python3.12
+      Timeout: 900
+    DependsOn:
+      - AccessEntry
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/FunctionRestore
+  LogGroupRestore:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Join:
+          - ''
+          - - /aws/lambda/
+            - Ref: FunctionRestore
+      RetentionInDays: 14
+    DependsOn:
+      - FunctionRestore
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/LogGroupRestore
+  InvokeConfigRestore:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName:
+        Ref: FunctionRestore
+      MaximumRetryAttempts: 0
+      Qualifier: $LATEST
+    DependsOn:
+      - FunctionRestore
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/InvokeConfigRestore
+  RestoreResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceTimeout: 930
+      ServiceToken:
+        Fn::GetAtt:
+          - FunctionRestore
+          - Arn
+    DependsOn:
+      - FunctionRestore
+      - InvokeConfigRestore
+      - LogGroupRestore
+      - UpdateAddonResource
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/RestoreResource
+  FunctionCleanup:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        S3Bucket:
+          Fn::If:
+            - CustomResourceS3BucketProvided
+            - Ref: CustomResourceS3Bucket
+            - Fn::Sub: aws-sagemaker-hyperpod-cluster-setup-${AWS::Region}-${Stage}
+        S3Key:
+          Ref: FunctionS3Key
+      Environment:
+        Variables:
+          EKS_CLUSTER_NAME:
+            Ref: EKSClusterName
+          BACKUP_S3_BUCKET:
+            Fn::If:
+              - BackupS3BucketProvided
+              - Ref: BackupS3Bucket
+              - Fn::Sub: sagemaker-hyperpod-${HyperpodClusterId}-tg-bucket
+          BUCKET_AUTO_CREATED:
+            Fn::If:
+              - BackupS3BucketProvided
+              - 'false'
+              - 'true'
+          MIGRATION_MODE: cleanup
+          PATH: /opt/python/bin:/var/lang/bin:/usr/local/bin:/usr/bin/:/bin
+          KUBECONFIG: /tmp/.kube/config
+          LD_LIBRARY_PATH: /opt/python/lib
+      Handler: lambda_function.lambda_handler
+      Layers:
+        - Ref: Layer
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 1
+      Role:
+        Fn::GetAtt:
+          - MigrationRole
+          - Arn
+      Runtime: python3.12
+      Timeout: 900
+    DependsOn:
+      - AccessEntry
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/FunctionCleanup
+  LogGroupCleanup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName:
+        Fn::Join:
+          - ''
+          - - /aws/lambda/
+            - Ref: FunctionCleanup
+      RetentionInDays: 14
+    DependsOn:
+      - FunctionCleanup
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/LogGroupCleanup
+  InvokeConfigCleanup:
+    Type: AWS::Lambda::EventInvokeConfig
+    Properties:
+      FunctionName:
+        Ref: FunctionCleanup
+      MaximumRetryAttempts: 0
+      Qualifier: $LATEST
+    DependsOn:
+      - FunctionCleanup
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/InvokeConfigCleanup
+  CleanupResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceTimeout: 930
+      ServiceToken:
+        Fn::GetAtt:
+          - FunctionCleanup
+          - Arn
+    DependsOn:
+      - FunctionCleanup
+      - InvokeConfigCleanup
+      - LogGroupCleanup
+      - RestoreResource
+    Metadata:
+      aws:cdk:path: TaskGovernanceAddonMigrationCfnTemplate/CleanupResource
+Outputs:
+  BackupStatus:
+    Value:
+      Fn::GetAtt:
+        - BackupResource
+        - Status
+  AddonStatus:
+    Value:
+      Fn::GetAtt:
+        - UpdateAddonResource
+        - AddonStatus
+  RestoredCRs:
+    Value:
+      Fn::GetAtt:
+        - RestoreResource
+        - RestoredCRs

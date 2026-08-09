@@ -1,0 +1,405 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: aws-cloudformation-templates/cloudops/synthetics-heartbeat creates an AWS CloudWatch Synthetics canary.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: 'Synthetics Configuration'
+        Parameters:
+          - CanaryName
+          - DomainName
+          - WatchedPagePath
+      - Label:
+          default: 'Notification Configuration'
+        Parameters:
+          - AlarmLevel
+          - SNSForAlertArn
+          - SNSForDeploymentArn
+      - Label:
+          default: 'Tag Configuration'
+        Parameters:
+          - Environment
+          - TagKey
+          - TagValue
+
+Parameters:
+  AlarmLevel:
+    Type: String
+    Default: NOTICE
+    AllowedValues:
+      - NOTICE
+      - WARNING
+    Description: The alarm level of CloudWatch alarms
+  CanaryName:
+    Type: String
+    AllowedPattern: ^[0-9a-z_\-]{1,21}$
+    Description: CloudWatch Synthetics Canary Name [required]
+  DomainName:
+    Type: String
+    AllowedPattern: .+
+    Description: The watched domain name [required]
+  IncidentDurationInSeconds:
+    Type: Number
+    Default: 600
+    MinValue: 0
+    Description: The time to wait until starting an incident [required]
+  IncidentSuccessPercentThreshold:
+    Type: Number
+    Default: 50
+    MinValue: 0
+    MaxValue: 100
+    Description: The threshold of success percent starting an incident [required]
+  WatchedPagePath:
+    Type: String
+    Default: /index.html
+    AllowedPattern: .+
+    Description: The watched page path [required]
+  SNSForAlertArn:
+    Type: String
+    Default: ''
+    Description: The Amazon SNS topic ARN for alert
+  SNSForDeploymentArn:
+    Type: String
+    Default: ''
+    Description: The Amazon SNS topic ARN for deployment information
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - production
+      - test
+      - development
+  TagKey:
+    Type: String
+    Default: createdby
+    AllowedPattern: .+
+  TagValue:
+    Type: String
+    Default: aws-cloudformation-templates
+    AllowedPattern: .+
+
+Conditions:
+  CreateNoticeAlarm: !Not [ !Equals [ !Ref AlarmLevel, WARNING ] ]
+  CreateSNSForAlert: !Equals [ !Ref SNSForAlertArn, '']
+  CreateSNSForDeployment: !Equals [ !Ref SNSForDeploymentArn, '']
+
+Resources:
+  # IAM
+  IAMRoleForSynthetics:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Description: A role required for CloudWatch Synthetics to access S3 and CloudWatch Logs.
+      Policies:
+        - PolicyName: !Sub CloudWatchLogsSynthetics-${CanaryName}-${AWS::Region}
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub arn:aws:s3:::${S3ForSynthetics}
+                  - !Sub arn:aws:s3:::${S3ForSynthetics}/*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/cwsyn-${CanaryName}-*
+              - Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: CloudWatchSynthetics
+      RoleName: !Sub 'SyntheticsRole-${CanaryName}-${AWS::Region}'
+      Tags:
+        - Key: environment
+          Value: !Ref Environment
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+  # CloudWatch Synthetics
+  Synthetics:
+    Type: AWS::Synthetics::Canary
+    Properties:
+      ArtifactS3Location: !Sub s3://${S3ForSynthetics}
+      Code:
+        Handler: pageLoadBlueprint.handler
+        Script: !Sub |
+          const { URL } = require('url');
+          const synthetics = require('Synthetics');
+          const log = require('SyntheticsLogger');
+          const syntheticsConfiguration = synthetics.getConfiguration();
+          const syntheticsLogHelper = require('SyntheticsLogHelper');
+
+          const loadBlueprint = async function () {
+
+              const urls = ['https://${DomainName}${WatchedPagePath}'];
+
+              // Set screenshot option
+              const takeScreenshot = true;
+
+              /* Disabling default step screen shots taken during Synthetics.executeStep() calls
+              * Step will be used to publish metrics on time taken to load dom content but
+              * Screenshots will be taken outside the executeStep to allow for page to completely load with domcontentloaded
+              * You can change it to load, networkidle0, networkidle2 depending on what works best for you.
+              */
+              syntheticsConfiguration.disableStepScreenshots();
+              syntheticsConfiguration.setConfig({
+                continueOnStepFailure: true,
+                includeRequestHeaders: true, // Enable if headers should be displayed in HAR
+                includeResponseHeaders: true, // Enable if headers should be displayed in HAR
+                restrictedHeaders: [], // Value of these headers will be redacted from logs and reports
+                restrictedUrlParameters: [] // Values of these url parameters will be redacted from logs and reports
+
+              });
+
+              let page = await synthetics.getPage();
+
+              for (const url of urls) {
+                  await loadUrl(page, url, takeScreenshot);
+              }
+          };
+
+          // Reset the page in-between
+          const resetPage = async function(page) {
+              try {
+                  await page.goto('about:blank',{waitUntil: ['load', 'networkidle0'], timeout: 30000} );
+              } catch (e) {
+                  synthetics.addExecutionError('Unable to open a blank page. ', e);
+              }
+          }
+
+          const loadUrl = async function (page, url, takeScreenshot) {
+              let stepName = null;
+              let domcontentloaded = false;
+
+              try {
+                  stepName = new URL(url).hostname;
+              } catch (e) {
+                  const errorString = 'Error parsing url: ' + url + '.' + e;
+                  log.error(errorString);
+                  /* If we fail to parse the URL, don't emit a metric with a stepName based on it.
+                    It may not be a legal CloudWatch metric dimension name and we may not have an alarms
+                    setup on the malformed URL stepName.  Instead, fail this step which will
+                    show up in the logs and will fail the overall canary and alarm on the overall canary
+                    success rate.
+                  */
+                  throw e;
+              }
+
+              await synthetics.executeStep(stepName, async function () {
+                  const sanitizedUrl = syntheticsLogHelper.getSanitizedUrl(url);
+
+                  /* You can customize the wait condition here. For instance, using 'networkidle2' or 'networkidle0' to load page completely.
+                    networkidle0: Navigation is successful when the page has had no network requests for half a second. This might never happen if page is constantly loading multiple resources.
+                    networkidle2: Navigation is successful when the page has no more then 2 network requests for half a second.
+                    domcontentloaded: It's fired as soon as the page DOM has been loaded, without waiting for resources to finish loading. If needed add explicit wait with await new Promise(r => setTimeout(r, milliseconds))
+                  */
+                  const response = await page.goto(url, { waitUntil: ['domcontentloaded'], timeout: 30000});
+                  if (response) {
+                      domcontentloaded = true;
+                      const status = response.status();
+                      const statusText = response.statusText();
+
+                      logResponseString = 'Response from url: ' + sanitizedUrl + ' Status: ' + status + ' Status Text: ' + statusText;
+
+                      //If the response status code is not a 2xx success code
+                      if (response.status() < 200 || response.status() > 299) {
+                          throw new Error('Failed to load url: ' + sanitizedUrl + ' ' + response.status() + ' ' + response.statusText());
+                      }
+                  } else {
+                      const logNoResponseString = 'No response returned for url: ' + sanitizedUrl;
+                      log.error(logNoResponseString);
+                      throw new Error(logNoResponseString);
+                  }
+              });
+
+              // Wait for 15 seconds to let page load fully before taking screenshot.
+              if (domcontentloaded && takeScreenshot) {
+                  await new Promise(r => setTimeout(r, 15000));
+                  await synthetics.takeScreenshot(stepName, 'loaded');
+              }
+
+              // Reset page
+              await resetPage(page);
+          };
+
+          exports.handler = async () => {
+              return await loadBlueprint();
+          };
+      DeleteLambdaResourcesOnCanaryDeletion: true
+      ExecutionRoleArn: !GetAtt IAMRoleForSynthetics.Arn
+      FailureRetentionPeriod: 31
+      Name: !Ref CanaryName
+      RuntimeVersion: syn-nodejs-puppeteer-10.0
+      Schedule:
+        IncidentDurationInSeconds: '0'
+        Expression: rate(5 minutes)
+      StartCanaryAfterCreation: true
+      SuccessRetentionPeriod: 31
+      Tags:
+        - Key: environment
+          Value: !Ref Environment
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+  S3ForSynthetics:
+    Type: AWS::S3::Bucket
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      BucketName: !Sub cloudops-${CanaryName}-${AWS::Region}-${AWS::AccountId}
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpirationInDays
+            ExpirationInDays: 60
+            Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: environment
+          Value: !Ref Environment
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+  S3BucketPolicyForSynthetics:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref S3ForSynthetics
+      PolicyDocument:
+        Version: 2012-10-17
+        Id: !Ref S3ForSynthetics
+        Statement:
+          - Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt S3ForSynthetics.Arn
+              - !Join
+                - ''
+                - - !GetAtt S3ForSynthetics.Arn
+                  - /*
+            Condition:
+              NumericLessThan:
+                s3:TlsVersion: 1.2
+              Bool:
+                aws:SecureTransport: true
+  # CloudWatch Alarm
+  CloudWatchIncidentSynthetics:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ActionsEnabled: true
+      AlarmActions:
+        - !If
+          - CreateSNSForAlert
+          - !GetAtt SNSForAlert.Outputs.SNSTopicArn
+          - !Ref SNSForAlertArn
+      AlarmDescription: !Sub 'CloudWatch Synthetics による定期モニタリングで、${DomainName}${WatchedPagePath} への GET の *失敗率が上昇* しています。'
+      AlarmName: !Sub Incident-${CanaryName}-Synthetics-AccessError
+      ComparisonOperator: LessThanThreshold
+      DatapointsToAlarm: 1
+      Dimensions:
+        - Name: CanaryName
+          Value: !Ref CanaryName
+      EvaluationPeriods: 1
+      MetricName: SuccessPercent
+      Namespace: CloudWatchSynthetics
+      OKActions:
+        - !If
+          - CreateSNSForAlert
+          - !GetAtt SNSForAlert.Outputs.SNSTopicArn
+          - !Ref SNSForAlertArn
+      Period: !Ref IncidentDurationInSeconds
+      Statistic: Average
+      Threshold: !Ref IncidentSuccessPercentThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: environment
+          Value: !Ref Environment
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+  CloudWatchAlarmSynthetics:
+    Condition: CreateNoticeAlarm
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ActionsEnabled: true
+      AlarmActions:
+        - !If
+          - CreateSNSForAlert
+          - !GetAtt SNSForAlert.Outputs.SNSTopicArn
+          - !Ref SNSForAlertArn
+      AlarmDescription: !Sub 'CloudWatch Synthetics による定期モニタリングで、${DomainName}${WatchedPagePath} への GET の *失敗率が上昇* しています。このエラーが継続する場合は、 *トラフィックの増大* もしくは *内部処理に異常が発生* している可能性があります。'
+      AlarmName: !Sub Notice-${CanaryName}-Synthetics-AccessError
+      ComparisonOperator: LessThanThreshold
+      DatapointsToAlarm: 1
+      Dimensions:
+        - Name: CanaryName
+          Value: !Ref CanaryName
+      EvaluationPeriods: 1
+      MetricName: SuccessPercent
+      Namespace: CloudWatchSynthetics
+      OKActions:
+        - !If
+          - CreateSNSForAlert
+          - !GetAtt SNSForAlert.Outputs.SNSTopicArn
+          - !Ref SNSForAlertArn
+      Period: 300
+      Statistic: Average
+      Threshold: 90
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: environment
+          Value: !Ref Environment
+        - Key: !Ref TagKey
+          Value: !Ref TagValue
+  # SNS
+  SNSForAlert:
+    Condition: CreateSNSForAlert
+    Type: AWS::Serverless::Application
+    Properties:
+      Location:
+        ApplicationId: arn:aws:serverlessrepo:us-east-1:172664222583:applications/sns-topic
+        SemanticVersion: 2.2.25
+      NotificationARNs:
+        - !If
+          - CreateSNSForDeployment
+          - !GetAtt SNSForDeployment.Outputs.SNSTopicArn
+          - !Ref SNSForDeploymentArn
+      Parameters:
+        TopicName: !Sub Alert-createdby-${AWS::StackName}
+      Tags:
+        environment: !Ref Environment
+        createdby: !Ref TagValue
+  SNSForDeployment:
+    Condition: CreateSNSForDeployment
+    Type: AWS::Serverless::Application
+    Properties:
+      Location:
+        ApplicationId: arn:aws:serverlessrepo:us-east-1:172664222583:applications/sns-topic
+        SemanticVersion: 2.2.25
+      Parameters:
+        TopicName: !Sub Deployment-createdby-${AWS::StackName}
+      Tags:
+        environment: !Ref Environment
+        createdby: !Ref TagValue

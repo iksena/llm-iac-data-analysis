@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  OPTIONAL sibling stack for peer-bundle distribution via S3 presigned URLs.
+  Provisions a private, SSE-encrypted, TLS-only bucket with a short lifecycle
+  so onboarding kits don't linger. The distribute-peer-bundle.sh helper
+  uploads a bundle here and mints a 24h presigned URL to share with the peer.
+
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        # W3045 rejects BucketOwnerEnforced (a security-forward setting) as a
+        # style issue. We deliberately use it — no ACLs at all.
+        - W3045
+
+Parameters:
+  ObjectExpirationDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    Description: Delete each uploaded bundle after this many days. Short by design — a bundle is a one-shot onboarding artifact.
+  NoncurrentVersionExpirationDays:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: How long to retain overwritten versions of a bundle. Kept minimal for hygiene.
+  SignerAccessKeySerial:
+    Type: Number
+    Default: 1
+    Description: Bump this to rotate the presign-signer's access key on the next deploy (an AccessKey resource replaces on Serial change).
+
+Resources:
+  BundlesBucket:
+    Type: AWS::S3::Bucket
+    # Keep the bucket on stack delete so any in-flight presigned URLs still work.
+    # Objects age out via lifecycle; empty the bucket manually before deleting.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Globally-unique deterministic name: no domain leakage, no clashes.
+      BucketName: !Sub "claude-gateway-peer-bundles-${AWS::AccountId}-${AWS::Region}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-current
+            Status: Enabled
+            ExpirationInDays: !Ref ObjectExpirationDays
+          - Id: expire-noncurrent
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: !Ref NoncurrentVersionExpirationDays
+          - Id: abort-multipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-bundles" }
+
+  # Deny plaintext (aws:SecureTransport: false) access. Presigned URLs already
+  # go over HTTPS, but this closes the loop for any direct S3 API caller.
+  BundlesBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref BundlesBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt BundlesBucket.Arn
+              - !Sub "${BundlesBucket.Arn}/*"
+            Condition:
+              Bool: { "aws:SecureTransport": "false" }
+
+  # -------------------------------------------------------------- signer identity
+  # Dedicated IAM user whose long-lived access keys sign the presigned URLs.
+  # Rationale: presigned URLs signed by SSO/assumed-role temp credentials
+  # inherit the session token's expiry (typically ~1h), silently capping the
+  # X-Amz-Expires you requested. A dedicated user with static keys honors the
+  # full 24h TTL the peer expects. Scoped to just this bucket + these actions.
+  SignerUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${AWS::StackName}-signer"
+      Policies:
+        - PolicyName: presign-bundles
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "${BundlesBucket.Arn}/*"
+              # Needed for the CLI's `aws s3 cp` head/list before the upload.
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt BundlesBucket.Arn
+
+  SignerAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref SignerUser
+      Serial: !Ref SignerAccessKeySerial
+
+  # AccessKey secret material is only surfaced *inside* this stack (via GetAtt
+  # SignerAccessKey.SecretAccessKey), NOT as a stack output. Stashed in a
+  # Secrets Manager secret that distribute-peer-bundle.sh reads at runtime.
+  SignerCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-signer-credentials"
+      Description: !Sub "Long-lived access keys for the ${AWS::StackName}-signer IAM user (used to mint 24h presigned URLs)."
+      SecretString: !Sub |
+        {"aws_access_key_id":"${SignerAccessKey}","aws_secret_access_key":"${SignerAccessKey.SecretAccessKey}"}
+
+Outputs:
+  BucketName:
+    Description: S3 bucket for peer-bundle distribution (private, TLS-only).
+    Value: !Ref BundlesBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-bucket-name"
+  BucketArn:
+    Value: !GetAtt BundlesBucket.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-bucket-arn"
+  SignerCredentialsSecretArn:
+    Description: Secrets Manager ARN for the presign-signer's access keys. distribute-peer-bundle.sh reads this to sign URLs with static (24h-honoring) credentials.
+    Value: !Ref SignerCredentialsSecret
+    Export:
+      Name: !Sub "${AWS::StackName}-signer-secret-arn"

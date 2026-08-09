@@ -1,0 +1,1536 @@
+# stacks/apps/augury.yml
+# 300A
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >-
+  Creates an ECS service for the Augury web server, along with target group and
+  listener rule for the shared ALB. Also creates a worker service, queue,
+  Fargate task, and other resources needed for periodic forecast processing.
+
+Parameters:
+  kWebContainerName:
+    Type: String
+    Default: augury-web
+  kWorkerContainerName:
+    Type: String
+    Default: augury-worker
+  kApplicationPort:
+    Type: Number
+    Default: 3000
+  kPostgresPoolSize:
+    Type: Number
+    Default: 10
+  kMetricFilterNamespace:
+    Type: String
+    Default: PRX/Augury
+  #######
+  NestedChangeSetScrubbingResourcesState: { Type: String }
+  AlbFullName: { Type: String }
+  AlbHttpsListenerArn: { Type: String }
+  EcsClusterArn: { Type: String }
+  EnvironmentType: { Type: String }
+  EnvironmentTypeAbbreviation: { Type: String }
+  EnvironmentTypeLowercase: { Type: String }
+  RegionMode: { Type: String }
+  RootStackName: { Type: String }
+  RootStackId: { Type: String }
+  EchoServiceToken: { Type: String }
+  VpcId: { Type: AWS::EC2::VPC::Id }
+  EcrImageTag: { Type: AWS::SSM::Parameter::Value<String> }
+  AlbListenerRulePriorityPrefix: { Type: String }
+  VpcPublicSubnet1Id: { Type: AWS::EC2::Subnet::Id }
+  VpcPublicSubnet2Id: { Type: AWS::EC2::Subnet::Id }
+  VpcPublicSubnet3Id: { Type: AWS::EC2::Subnet::Id }
+  SharedAppRedisEndpointAddress: { Type: String }
+  SharedAppRedisEndpointPort: { Type: String }
+  SharedAuroraPostgresqlEndpoint: { Type: String }
+  SharedAuroraPostgresqlPort: { Type: String }
+  SharedPostgresqlClientSecurityGroupId: { Type: String }
+  SharedClickhouseClientSecurityGroupId: { Type: String }
+  SharedClickhouseEndpoint: { Type: String }
+  SharedClickhousePort: { Type: String }
+  SharedClickhouseAuguryDatabase: { Type: AWS::SSM::Parameter::Value<String> }
+  SharedClickhouseAuguryPassword: { Type: AWS::SSM::Parameter::Value<String>, NoEcho: true }
+  SharedClickhouseAuguryUsername: { Type: AWS::SSM::Parameter::Value<String> }
+  ClickhouseLegacyClientSecurityGroupId: { Type: AWS::EC2::SecurityGroup::Id }
+  CastlePostgresInstanceEndpointAddress: { Type: String }
+  CastlePostgresInstanceEndpointPort: { Type: String }
+  AdFilesHostname: { Type: String }
+  AuguryHostname: { Type: String }
+  FeederHostname: { Type: String }
+  IdHostname: { Type: String }
+  CastleHostname: { Type: String }
+  CmsHostname: { Type: String }
+  DovetailRouterHostname: { Type: String }
+  AdFilesS3BucketArn: { Type: AWS::SSM::Parameter::Value<String> }
+  SlackMessageRelaySnsTopicArn: { Type: String }
+  Aarch64AsgCapacityProviderName: { Type: String }
+  PorterJobExecutionSnsTopicArn: { Type: String }
+
+Conditions:
+  IsProduction: !Equals [!Ref EnvironmentType, Production]
+  IsPrimaryRegion: !Equals [!Ref RegionMode, Primary]
+  HasAuroraEndpoint: !Not [!Equals [!Ref SharedAuroraPostgresqlEndpoint, ""]]
+  EnableWorkers: !And [!Condition HasAuroraEndpoint, !Condition IsPrimaryRegion]
+  EnableNestedChangeSetScrubbingResources: !Equals [!Ref NestedChangeSetScrubbingResourcesState, Enabled]
+
+Resources:
+  NestedChangeSetScrubber: { Type: AWS::SNS::Topic, Condition: EnableNestedChangeSetScrubbingResources }
+
+  Constants:
+    Type: Custom::Echo
+    Properties:
+      ServiceToken: !Ref EchoServiceToken
+      ActualsIngestJobInvocationCountMetricName: !Sub ActualsIngestJobInvocationCountNewCluster${EnvironmentType}
+      TargetingRecordCacheSizeMetricsName: !Sub TargetingRecordCacheSize${EnvironmentType}
+      AdFilesS3BucketName: !Select [5, !Split [":", !Ref AdFilesS3BucketArn]]
+      WorkerLoggedErrorsMetricName: !Sub WorkerLoggedErrors${EnvironmentType}
+      SlowWorkerLoggedErrorsMetricName: !Sub SlowWorkerLoggedErrors${EnvironmentType}
+      WebLoggedErrorsMetricName: !Sub WebLoggedErrors${EnvironmentType}
+
+  HostHeaderListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      Conditions:
+        - Field: host-header
+          Values:
+            - inventory.dovetail.*
+      ListenerArn: !Ref AlbHttpsListenerArn
+      Priority: !Join ["", [!Ref AlbListenerRulePriorityPrefix, "01"]]
+  RedirectHostHeaderListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - RedirectConfig:
+            Host: !Ref AuguryHostname
+            Path: "/#{path}"
+            Port: "#{port}"
+            Protocol: "#{protocol}"
+            Query: "#{query}"
+            StatusCode: "HTTP_301"
+          Type: redirect
+      Conditions:
+        - Field: host-header
+          Values:
+            - augury.*
+      ListenerArn: !Ref AlbHttpsListenerArn
+      Priority: !Join ["", [!Ref AlbListenerRulePriorityPrefix, "03"]]
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 31
+      HealthCheckPath: /health_check
+      HealthCheckTimeoutSeconds: 30
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: load_balancing.algorithm.type
+          Value: "least_outstanding_requests"
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_augury" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      TargetType: instance
+      UnhealthyThresholdCount: 10
+      VpcId: !Ref VpcId
+  TargetGroupHttp5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ERROR [Augury] Web server <${EnvironmentTypeAbbreviation}> RETURNING 5XX ERRORS (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Augury's Rails server is returning 5XX errors from
+        the ECS service to the load balancer.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref AlbFullName
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+      EvaluationPeriods: 1
+      MetricName: HTTPCode_Target_5XX_Count
+      Namespace: AWS/ApplicationELB
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:ops:cloudwatch-log-group-name, Value: !Ref WebTaskLogGroup }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      Threshold: 0
+      TreatMissingData: notBreaching
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+        Version: "2012-10-17"
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Effect: Allow
+                Resource: "*"
+                Sid: AllowSsmChannels
+            Version: "2012-10-17"
+          PolicyName: EcsExec
+        - PolicyDocument:
+            Statement:
+              - Action: sns:Publish
+                Effect: Allow
+                Resource: !Ref PorterJobExecutionSnsTopicArn
+                Sid: AllowPorterJobExecution
+            Version: "2012-10-17"
+          PolicyName: Porter
+        - PolicyDocument:
+            Statement:
+              - Action: sns:Publish
+                Effect: Allow
+                Resource: !Ref SlackMessageRelaySnsTopicArn
+                Sid: AllowSlackMessaging
+            Version: "2012-10-17"
+          PolicyName: Slack
+        - PolicyDocument:
+            Statement:
+              - Action: events:PutEvents
+                Effect: Allow
+                Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default
+                Sid: AllowDefaultEventBusPut
+            Version: "2012-10-17"
+          PolicyName: DefaultEventBus
+        - PolicyDocument:
+            Statement:
+              - Action: sqs:*
+                Effect: Allow
+                Resource:
+                  - !GetAtt SlowWorkerRelaySqsQueue.Arn
+            Version: "2012-10-17"
+          PolicyName: SqsFullApplicationAccess
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - s3:Get*
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                Effect: Allow
+                Resource: !Ref AdFilesS3BucketArn
+                Sid: AllowBucketActions
+              - Action:
+                  - s3:AbortMultipartUpload
+                  - s3:Get*
+                  - s3:ListMultipartUploadParts
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Effect: Allow
+                Resource: !Sub ${AdFilesS3BucketArn}/*
+                Sid: AllowObjectActions
+            Version: "2012-10-17"
+          PolicyName: S3UploadAccess
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - s3:Get*
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                Effect: Allow
+                Resource: !GetAtt ForecastsDataLakeBucket.Arn
+                Sid: AllowDataLakeBucketActions
+              - Action:
+                  - s3:AbortMultipartUpload
+                  - s3:DeleteObject
+                  - s3:Get*
+                  - s3:ListMultipartUploadParts
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Effect: Allow
+                Resource: !Sub ${ForecastsDataLakeBucket.Arn}/*
+                Sid: AllowDataLakeObjectActions
+            Version: "2012-10-17"
+          PolicyName: ForecastsDataLakeBucket
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action: ssm:GetParameters
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/*
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/global/Spire/new-relic-lite-api-key
+                Sid: AllowAppParameterRead
+            Version: "2012-10-17"
+          PolicyName: ContainerSecrets
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+
+  WebEcsService:
+    Type: AWS::ECS::Service
+    Condition: HasAuroraEndpoint # See README
+    Properties:
+      CapacityProviderStrategy:
+        - Base: 0
+          CapacityProvider: !Ref Aarch64AsgCapacityProviderName
+          Weight: 1
+      Cluster: !Ref EcsClusterArn
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      DesiredCount: !If [IsPrimaryRegion, !If [IsProduction, 10, 2], 0]
+      EnableECSManagedTags: true
+      EnableExecuteCommand: true
+      LoadBalancers:
+        - ContainerName: !Ref kWebContainerName
+          ContainerPort: !Ref kApplicationPort
+          TargetGroupArn: !Ref TargetGroup
+      PlacementConstraints:
+        - Type: memberOf
+          Expression: attribute:ecs.cpu-architecture == arm64
+      PlacementStrategies:
+        - Field: instanceId
+          Type: spread
+      PropagateTags: TASK_DEFINITION
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      TaskDefinition: !Ref WebTaskDefinition
+  WorkerEcsService:
+    Type: AWS::ECS::Service
+    Condition: EnableWorkers # See README
+    Properties:
+      CapacityProviderStrategy:
+        - Base: 0
+          CapacityProvider: !Ref Aarch64AsgCapacityProviderName
+          Weight: 1
+      Cluster: !Ref EcsClusterArn
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      DesiredCount: !If [IsProduction, 2, 1]
+      EnableECSManagedTags: true
+      EnableExecuteCommand: true
+      PlacementConstraints:
+        - Type: memberOf
+          Expression: attribute:ecs.cpu-architecture == arm64
+      PropagateTags: TASK_DEFINITION
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      TaskDefinition: !Ref WorkerTaskDefinition
+
+  WebTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+  WebTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Command:
+            - web
+          Cpu: !If [IsProduction, 256, 128]
+          Environment:
+            - Name: APP_NAME
+              Value: augury
+            - Name: APP_ENV
+              Value: !Ref EnvironmentTypeAbbreviation
+            - Name: AUGURY_HOST
+              Value: !Ref AuguryHostname
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+            - Name: CLICKHOUSE_DATABASE
+              Value: !Ref SharedClickhouseAuguryDatabase
+            - Name: CLICKHOUSE_HOST
+              Value: !Ref SharedClickhouseEndpoint
+            - Name: CLICKHOUSE_PASSWORD
+              Value: !Ref SharedClickhouseAuguryPassword
+            - Name: CLICKHOUSE_PORT
+              Value: !Ref SharedClickhousePort
+            - Name: CLICKHOUSE_USER
+              Value: !Ref SharedClickhouseAuguryUsername
+            - Name: PORTER_SNS_TOPIC_ARN
+              Value: !Ref PorterJobExecutionSnsTopicArn
+            - Name: POSTGRES_HOST
+              Value: !Ref SharedAuroraPostgresqlEndpoint
+            - Name: POSTGRES_PORT
+              Value: !Ref SharedAuroraPostgresqlPort
+            - Name: REDIS_HOST
+              Value: !Ref SharedAppRedisEndpointAddress
+            - Name: REDIS_PORT
+              Value: !Ref SharedAppRedisEndpointPort
+            - Name: REDIS_SSL
+              Value: true
+            - Name: UPLOAD_ADFILE_SECRET_ACCESS_KEY
+              Value: !GetAtt S3SigningAccessKey.SecretAccessKey
+            - Name: UPLOAD_ADFILE_ACCESS_KEY_ID
+              Value: !Ref S3SigningAccessKey
+            - Name: UPLOAD_ADFILE_AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: UPLOAD_ADFILE_BUCKET
+              Value: !GetAtt Constants.AdFilesS3BucketName
+            - Name: UPLOAD_ADFILE_BUCKET_DOMAIN
+              Value: !Sub ${Constants.AdFilesS3BucketName}.s3.${AWS::Region}.amazonaws.com
+            - Name: UPLOAD_ADFILE_PUBLIC_ACCESS_HOST
+              Value: !Ref AdFilesHostname
+            - Name: RAILS_SERVE_STATIC_FILES
+              Value: "true"
+            - Name: RAILS_ENV
+              Value: !Ref EnvironmentTypeLowercase
+            - Name: POSTGRES_POOL_SIZE
+              Value: !Ref kPostgresPoolSize
+            - Name: CASTLE_POSTGRES_HOST
+              Value: !Ref CastlePostgresInstanceEndpointAddress
+            - Name: CASTLE_POSTGRES_PORT
+              Value: !Ref CastlePostgresInstanceEndpointPort
+            - Name: CASTLE_HOST
+              Value: !Ref CastleHostname
+            - Name: CMS_HOST
+              Value: !Ref CmsHostname
+            - Name: DOVETAIL_HOST
+              Value: !Ref DovetailRouterHostname
+            - Name: FEEDER_HOST
+              Value: !Ref FeederHostname
+            - Name: ID_HOST
+              Value: !Ref IdHostname
+            - Name: NEW_RELIC_NAME
+              Value: !If [IsProduction, Augury Production, Augury Staging]
+            - Name: BQ_DATASET
+              Value: !If [IsProduction, production, staging]
+            - Name: DATALAKE_URI
+              Value: !Sub s3://${ForecastsDataLakeBucket}
+            - Name: DATALAKE_AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: SLOW_WORKER_RELAY_SQS_URL
+              Value: !Ref SlowWorkerRelaySqsQueue
+            - Name: SLACK_SNS_TOPIC
+              Value: !Ref SlackMessageRelaySnsTopicArn
+            - Name: SLACK_CHANNEL_ID
+              Value: C06E86HT0ER
+          Essential: true
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - ./bin/docker-health-check && exit 0 || exit 1
+            Interval: 10
+            Retries: 3
+            StartPeriod: 60
+            Timeout: 5
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrImageTag}
+          LinuxParameters:
+            InitProcessEnabled: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WebTaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Memory: !If [IsProduction, 6000, 3700]
+          MemoryReservation: !If [IsProduction, 4000, 3500]
+          Name: !Ref kWebContainerName
+          PortMappings:
+            - ContainerPort: !Ref kApplicationPort
+              HostPort: 0
+          Secrets:
+            - Name: SECRET_KEY_BASE
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/secret-key-base
+            - Name: RAILS_MASTER_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/rails-master-key
+            - Name: POSTGRES_DATABASE
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/database-name
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/database-password
+            - Name: POSTGRES_USER
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/database-username
+            - Name: CASTLE_POSTGRES_DATABASE
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/castle-database-name
+            - Name: CASTLE_POSTGRES_USER
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/castle-database-username
+            - Name: CASTLE_POSTGRES_PASSWORD
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/castle-database-password
+            - Name: PRX_CLIENT_ID
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/id-auth-client-id
+            - Name: PRX_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/id-auth-client-secret
+            - Name: AUGURY_ADMIN_ACCOUNTS
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/admin-account-ids
+            - Name: SCHEDULES_TOKEN
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/schedule-token
+            - Name: BIGQUERY_CREDENTIALS
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/bigquery-credentials
+            - Name: ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/ar-encryption-primary-key
+            - Name: ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/ar-encryption-deterministic-key
+            - Name: ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/ar-encryption-key-derivation-salt
+            - Name: NEW_RELIC_KEY
+              ValueFrom: /prx/global/Spire/new-relic-lite-api-key
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      NetworkMode: bridge
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      TaskRoleArn: !GetAtt TaskRole.Arn
+
+  WorkerTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Command:
+            - workfast
+          Cpu: !If [IsProduction, 256, 128]
+          Environment:
+            - Name: APP_NAME
+              Value: augury
+            - Name: APP_ENV
+              Value: !Ref EnvironmentTypeAbbreviation
+            - Name: AUGURY_HOST
+              Value: !Ref AuguryHostname
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+            - Name: CLICKHOUSE_DATABASE
+              Value: !Ref SharedClickhouseAuguryDatabase
+            - Name: CLICKHOUSE_HOST
+              Value: !Ref SharedClickhouseEndpoint
+            - Name: CLICKHOUSE_PASSWORD
+              Value: !Ref SharedClickhouseAuguryPassword
+            - Name: CLICKHOUSE_PORT
+              Value: !Ref SharedClickhousePort
+            - Name: CLICKHOUSE_USER
+              Value: !Ref SharedClickhouseAuguryUsername
+            - Name: PORTER_SNS_TOPIC_ARN
+              Value: !Ref PorterJobExecutionSnsTopicArn
+            - Name: POSTGRES_HOST
+              Value: !Ref SharedAuroraPostgresqlEndpoint
+            - Name: POSTGRES_PORT
+              Value: !Ref SharedAuroraPostgresqlPort
+            - Name: REDIS_HOST
+              Value: !Ref SharedAppRedisEndpointAddress
+            - Name: REDIS_PORT
+              Value: !Ref SharedAppRedisEndpointPort
+            - Name: REDIS_SSL
+              Value: true
+            - Name: UPLOAD_ADFILE_SECRET_ACCESS_KEY
+              Value: !GetAtt S3SigningAccessKey.SecretAccessKey
+            - Name: UPLOAD_ADFILE_ACCESS_KEY_ID
+              Value: !Ref S3SigningAccessKey
+            - Name: UPLOAD_ADFILE_AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: UPLOAD_ADFILE_BUCKET
+              Value: !GetAtt Constants.AdFilesS3BucketName
+            - Name: UPLOAD_ADFILE_BUCKET_DOMAIN
+              Value: !Sub ${Constants.AdFilesS3BucketName}.s3.${AWS::Region}.amazonaws.com
+            - Name: UPLOAD_ADFILE_PUBLIC_ACCESS_HOST
+              Value: !Ref AdFilesHostname
+            - Name: RAILS_SERVE_STATIC_FILES
+              Value: "true"
+            - Name: RAILS_ENV
+              Value: !Ref EnvironmentTypeLowercase
+            - Name: POSTGRES_POOL_SIZE
+              Value: !Ref kPostgresPoolSize
+            - Name: CASTLE_POSTGRES_HOST
+              Value: !Ref CastlePostgresInstanceEndpointAddress
+            - Name: CASTLE_POSTGRES_PORT
+              Value: !Ref CastlePostgresInstanceEndpointPort
+            - Name: CASTLE_HOST
+              Value: !Ref CastleHostname
+            - Name: CMS_HOST
+              Value: !Ref CmsHostname
+            - Name: DOVETAIL_HOST
+              Value: !Ref DovetailRouterHostname
+            - Name: FEEDER_HOST
+              Value: !Ref FeederHostname
+            - Name: ID_HOST
+              Value: !Ref IdHostname
+            - Name: NEW_RELIC_NAME
+              Value: !If [IsProduction, Augury Production, Augury Staging]
+            - Name: BQ_DATASET
+              Value: !If [IsProduction, production, staging]
+            - Name: DATALAKE_URI
+              Value: !Sub s3://${ForecastsDataLakeBucket}
+            - Name: DATALAKE_AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: SLOW_WORKER_RELAY_SQS_URL
+              Value: !Ref SlowWorkerRelaySqsQueue
+            - Name: SLACK_SNS_TOPIC
+              Value: !Ref SlackMessageRelaySnsTopicArn
+            - Name: SLACK_CHANNEL_ID
+              Value: C06E86HT0ER
+          Essential: true
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - ./bin/docker-health-check && exit 0 || exit 1
+            Interval: 10
+            Retries: 3
+            StartPeriod: 60
+            Timeout: 5
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrImageTag}
+          LinuxParameters:
+            InitProcessEnabled: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkerTaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Memory: !If [IsProduction, 4000, 3700]
+          MemoryReservation: !If [IsProduction, 1000, 1000]
+          Name: !Ref kWorkerContainerName
+          PortMappings:
+            - ContainerPort: !Ref kApplicationPort
+              HostPort: 0
+          Secrets:
+            - Name: SECRET_KEY_BASE
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/secret-key-base
+            - Name: RAILS_MASTER_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/rails-master-key
+            - Name: POSTGRES_DATABASE
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/database-name
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/database-password
+            - Name: POSTGRES_USER
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/database-username
+            - Name: CASTLE_POSTGRES_DATABASE
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/castle-database-name
+            - Name: CASTLE_POSTGRES_USER
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/castle-database-username
+            - Name: CASTLE_POSTGRES_PASSWORD
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/castle-database-password
+            - Name: PRX_CLIENT_ID
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/id-auth-client-id
+            - Name: PRX_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/id-auth-client-secret
+            - Name: AUGURY_ADMIN_ACCOUNTS
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/admin-account-ids
+            - Name: SCHEDULES_TOKEN
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/schedule-token
+            - Name: BIGQUERY_CREDENTIALS
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/bigquery-credentials
+            - Name: ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/ar-encryption-primary-key
+            - Name: ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/ar-encryption-deterministic-key
+            - Name: ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/ar-encryption-key-derivation-salt
+            - Name: NEW_RELIC_KEY
+              ValueFrom: /prx/global/Spire/new-relic-lite-api-key
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      NetworkMode: bridge
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      TaskRoleArn: !GetAtt TaskRole.Arn
+
+  ForecastsDataLakeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+
+  S3SigningUser:
+    Type: AWS::IAM::User
+    Properties:
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Augury }
+  S3SigningAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref S3SigningUser
+  S3SigningAccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action:
+              - s3:AbortMultipartUpload
+              - s3:ListMultipartUploadParts
+              - s3:PutObject
+            Effect: Allow
+            Resource:
+              - !Sub ${AdFilesS3BucketArn}/creatives/*
+              - !Sub ${AdFilesS3BucketArn}/upload/*
+        Version: "2012-10-17"
+      PolicyName: ExternalS3BucketAccess
+      Users:
+        - !Ref S3SigningUser
+
+  WorkerTaskLogImpressionsFetchJobMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: |-
+        { $.msg = "*Performed ImpressionsFetchJob*" }
+      LogGroupName: !Ref WorkerTaskLogGroup
+      MetricTransformations:
+        - MetricName: !GetAtt Constants.ActualsIngestJobInvocationCountMetricName
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: "1"
+  ReallocationJobMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: |-
+        { $.msg = "reallocation_job" }
+      LogGroupName: !Ref WorkerTaskLogGroup
+      MetricTransformations:
+        - MetricName: !Sub ReallocationJobElapsed${EnvironmentType}
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: $.elapsed
+  InventoryUpdateJobMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: |-
+        { $.msg = "inventory_update_job" }
+      LogGroupName: !Ref WorkerTaskLogGroup
+      MetricTransformations:
+        - MetricName: !Sub InventoryUpdateJobElapsed${EnvironmentType}
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: $.elapsed
+  WebLoggedErrorsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: |-
+        { ($.level >= 50) && ($.level < 60) }
+      LogGroupName: !Ref WebTaskLogGroup
+      MetricTransformations:
+        - MetricName: !GetAtt Constants.WebLoggedErrorsMetricName
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: "1"
+  WebLoggedErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ERROR [Augury] Web <${EnvironmentTypeAbbreviation}> IS LOGGING ERRORS (${RootStackName} 2)
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Augury's web task has logged an error. Check the logs!
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      MetricName: !GetAtt Constants.WebLoggedErrorsMetricName
+      Namespace: !Ref kMetricFilterNamespace
+      Period: 300
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:ops:cloudwatch-log-group-name, Value: !Ref WebTaskLogGroup }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      Threshold: 0
+      TreatMissingData: notBreaching
+  WorkersLoggedErrorsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: |-
+        { ($.level >= 50) && ($.level < 60) }
+      LogGroupName: !Ref WorkerTaskLogGroup
+      MetricTransformations:
+        - MetricName: !GetAtt Constants.WorkerLoggedErrorsMetricName
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: "1"
+  WorkerLoggedErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ERROR [Augury] Worker <${EnvironmentTypeAbbreviation}> IS LOGGING ERRORS (${RootStackName} 2)
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Augury's worker task has logged an error. Check the logs!
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      MetricName: !GetAtt Constants.WorkerLoggedErrorsMetricName
+      Namespace: !Ref kMetricFilterNamespace
+      Period: 300
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:ops:cloudwatch-log-group-name, Value: !Ref WorkerTaskLogGroup }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      Threshold: 0
+      TreatMissingData: notBreaching
+  SlowWorkerLoggedErrorsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: |-
+        { ($.level >= 50) && ($.level < 60) }
+      LogGroupName: !Ref SlowWorkerTaskLogGroup
+      MetricTransformations:
+        - MetricName: !GetAtt Constants.SlowWorkerLoggedErrorsMetricName
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: "1"
+  SlowWorkerLoggedErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ERROR [Augury] Slow Worker <${EnvironmentTypeAbbreviation}> IS LOGGING ERRORS (${RootStackName} 2)
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Augury's slow worker task has logged an error. Check the logs!
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      MetricName: !GetAtt Constants.SlowWorkerLoggedErrorsMetricName
+      Namespace: !Ref kMetricFilterNamespace
+      Period: 300
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:ops:cloudwatch-log-group-name, Value: !Ref SlowWorkerTaskLogGroup }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      Threshold: 0
+      TreatMissingData: notBreaching
+  TargetingRecordCacheSizeMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: |-
+        { $.type = "inventory.allocation_caching_states" }
+      LogGroupName: !Ref WorkerTaskLogGroup
+      MetricTransformations:
+        - MetricName: !GetAtt Constants.TargetingRecordCacheSizeMetricsName
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: $.max_flight_allocation_cache_entries.acs_entry_count
+  AuguryActualsAreBehindAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableWorkers # See README
+    Properties:
+      AlarmName: !Sub ERROR [Augury] Worker <${EnvironmentTypeAbbreviation}> NOT FETCHING IMPRESSIONS (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Augury's worker task has not logged any impression
+        fetching actvitiy for an unusually long time. This could mean incorrect
+        ads are being served.
+      ComparisonOperator: LessThanThreshold
+      EvaluationPeriods: 3
+      MetricName: !GetAtt Constants.ActualsIngestJobInvocationCountMetricName
+      Namespace: !Ref kMetricFilterNamespace
+      Period: 300
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:ops:cloudwatch-log-group-name, Value: !Ref WorkerTaskLogGroup }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      Threshold: 1
+      TreatMissingData: breaching
+  AuguryExpandedAllocationCacheSizeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ERROR [Augury] Allocation Targeting Record Cache <${EnvironmentTypeAbbreviation}> IS LARGE (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Augury's expanded allocation cache is big for some
+        flight(s). Check the logs and the TruncateExpiredDataJob job.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: 3
+      MetricName: !GetAtt Constants.TargetingRecordCacheSizeMetricsName
+      Namespace: !Ref kMetricFilterNamespace
+      Period: 300
+      Statistic: Maximum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:ops:cloudwatch-log-group-name, Value: !Ref WorkerTaskLogGroup }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      Threshold: 1000
+      TreatMissingData: notBreaching
+  AuguryForecastsAreBehindAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableWorkers # See README
+    Properties:
+      AlarmName: !Sub ERROR [Augury] Worker <${EnvironmentTypeAbbreviation}> NOT FORECASTING INVENTORY (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Augury's worker task has not logged any forecast
+        actvitiy for an unusually long time. Inventory is slowly becoming stale.
+      ComparisonOperator: LessThanThreshold
+      EvaluationPeriods: 4
+      MetricName: !Sub ForecastJobElapsed${EnvironmentType}
+      Namespace: PRX/Augury
+      Period: !If [IsProduction, 900, 5400]
+      Statistic: SampleCount
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:ops:cloudwatch-log-group-name, Value: !Ref WorkerTaskLogGroup }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      Threshold: 1
+      TreatMissingData: breaching
+
+  # Some Augury jobs are marked as "slow", which indicates they should not be
+  # completed in the standard ECS service instance. These jobs are added to a
+  # queue, and run in isolated Fargate tasks. In order to limit concurrency,
+  # the tasks are started by a Lambda function, which watches the queue and
+  # manages the number of running Fargate tasks. The tasks pull messages from
+  # the queue until the queue is empty, at which point they terminate.
+  SlowWorkerTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+  SlowWorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+      ContainerDefinitions:
+        - Command:
+            - workslow
+          Environment:
+            - Name: APP_NAME
+              Value: augury
+            - Name: APP_ENV
+              Value: !Ref EnvironmentTypeAbbreviation
+            - Name: AUGURY_HOST
+              Value: !Ref AuguryHostname
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+            - Name: CLICKHOUSE_DATABASE
+              Value: !Ref SharedClickhouseAuguryDatabase
+            - Name: CLICKHOUSE_HOST
+              Value: !Ref SharedClickhouseEndpoint
+            - Name: CLICKHOUSE_PASSWORD
+              Value: !Ref SharedClickhouseAuguryPassword
+            - Name: CLICKHOUSE_PORT
+              Value: !Ref SharedClickhousePort
+            - Name: CLICKHOUSE_USER
+              Value: !Ref SharedClickhouseAuguryUsername
+            - Name: PORTER_SNS_TOPIC_ARN
+              Value: !Ref PorterJobExecutionSnsTopicArn
+            - Name: POSTGRES_HOST
+              Value: !Ref SharedAuroraPostgresqlEndpoint
+            - Name: POSTGRES_PORT
+              Value: !Ref SharedAuroraPostgresqlPort
+            - Name: REDIS_HOST
+              Value: !Ref SharedAppRedisEndpointAddress
+            - Name: REDIS_PORT
+              Value: !Ref SharedAppRedisEndpointPort
+            - Name: REDIS_SSL
+              Value: true
+            - Name: UPLOAD_ADFILE_SECRET_ACCESS_KEY
+              Value: !GetAtt S3SigningAccessKey.SecretAccessKey
+            - Name: UPLOAD_ADFILE_ACCESS_KEY_ID
+              Value: !Ref S3SigningAccessKey
+            - Name: UPLOAD_ADFILE_AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: UPLOAD_ADFILE_BUCKET
+              Value: !GetAtt Constants.AdFilesS3BucketName
+            - Name: UPLOAD_ADFILE_BUCKET_DOMAIN
+              Value: !Sub ${Constants.AdFilesS3BucketName}.s3.${AWS::Region}.amazonaws.com
+            - Name: UPLOAD_ADFILE_PUBLIC_ACCESS_HOST
+              Value: !Ref AdFilesHostname
+            - Name: RAILS_SERVE_STATIC_FILES
+              Value: "true"
+            - Name: RAILS_ENV
+              Value: !Ref EnvironmentTypeLowercase
+            - Name: POSTGRES_POOL_SIZE
+              Value: !Ref kPostgresPoolSize
+            - Name: CASTLE_POSTGRES_HOST
+              Value: !Ref CastlePostgresInstanceEndpointAddress
+            - Name: CASTLE_POSTGRES_PORT
+              Value: !Ref CastlePostgresInstanceEndpointPort
+            - Name: CASTLE_HOST
+              Value: !Ref CastleHostname
+            - Name: CMS_HOST
+              Value: !Ref CmsHostname
+            - Name: DOVETAIL_HOST
+              Value: !Ref DovetailRouterHostname
+            - Name: FEEDER_HOST
+              Value: !Ref FeederHostname
+            - Name: ID_HOST
+              Value: !Ref IdHostname
+            - Name: NEW_RELIC_NAME
+              Value: !If [IsProduction, Augury Production, Augury Staging]
+            - Name: BQ_DATASET
+              Value: !If [IsProduction, production, staging]
+            - Name: DATALAKE_URI
+              Value: !Sub s3://${ForecastsDataLakeBucket}
+            - Name: DATALAKE_AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: SLACK_SNS_TOPIC
+              Value: !Ref SlackMessageRelaySnsTopicArn
+            - Name: SLACK_CHANNEL_ID
+              Value: C06E86HT0ER
+          Essential: true
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - ./bin/docker-health-check && exit 0 || exit 1
+            Interval: 10
+            Retries: 3
+            StartPeriod: 60
+            Timeout: 5
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrImageTag}
+          LinuxParameters:
+            InitProcessEnabled: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref SlowWorkerTaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: fargate
+          Name: augury-workslow
+          Secrets:
+            - Name: SECRET_KEY_BASE
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/secret-key-base
+            - Name: RAILS_MASTER_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/rails-master-key
+            - Name: POSTGRES_DATABASE
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/database-name
+            - Name: POSTGRES_PASSWORD
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/database-password
+            - Name: POSTGRES_USER
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/database-username
+            - Name: CASTLE_POSTGRES_DATABASE
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/castle-database-name
+            - Name: CASTLE_POSTGRES_USER
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/castle-database-username
+            - Name: CASTLE_POSTGRES_PASSWORD
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/castle-database-password
+            - Name: PRX_CLIENT_ID
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/id-auth-client-id
+            - Name: PRX_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/id-auth-client-secret
+            - Name: AUGURY_ADMIN_ACCOUNTS
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/admin-account-ids
+            - Name: SCHEDULES_TOKEN
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/schedule-token
+            - Name: BIGQUERY_CREDENTIALS
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/bigquery-credentials
+            - Name: ACTIVE_RECORD_ENCRYPTION_PRIMARY_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/ar-encryption-primary-key
+            - Name: ACTIVE_RECORD_ENCRYPTION_DETERMINISTIC_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/ar-encryption-deterministic-key
+            - Name: ACTIVE_RECORD_ENCRYPTION_KEY_DERIVATION_SALT
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Augury/ar-encryption-key-derivation-salt
+            - Name: NEW_RELIC_KEY
+              ValueFrom: /prx/global/Spire/new-relic-lite-api-key
+      Cpu: "4096"
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      Memory: "16384"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      TaskRoleArn: !GetAtt TaskRole.Arn
+
+  SlowWorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allows web/database traffic for FARGATE executions
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - CidrIpv6: ::/0
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - CidrIp: 0.0.0.0/0
+          FromPort: !Ref SharedAuroraPostgresqlPort
+          IpProtocol: tcp
+          ToPort: !Ref SharedAuroraPostgresqlPort
+        - CidrIpv6: ::/0
+          FromPort: !Ref SharedAuroraPostgresqlPort
+          IpProtocol: tcp
+          ToPort: !Ref SharedAuroraPostgresqlPort
+        - CidrIp: 0.0.0.0/0
+          FromPort: !Ref CastlePostgresInstanceEndpointPort # TODO It would be better if these rules were excluded when there is no DB instance
+          IpProtocol: tcp
+          ToPort: !Ref CastlePostgresInstanceEndpointPort
+        - CidrIpv6: ::/0
+          FromPort: !Ref CastlePostgresInstanceEndpointPort
+          IpProtocol: tcp
+          ToPort: !Ref CastlePostgresInstanceEndpointPort
+        - CidrIp: 0.0.0.0/0
+          FromPort: !Ref SharedClickhousePort
+          IpProtocol: tcp
+          ToPort: !Ref SharedClickhousePort
+        - CidrIpv6: ::/0
+          FromPort: !Ref SharedClickhousePort
+          IpProtocol: tcp
+          ToPort: !Ref SharedClickhousePort
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_augury_workslow" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      VpcId: !Ref VpcId
+
+  SlowWorkerRelaySqsQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+  SlowWorkerRelayFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Launches fargate slow queue worker from SQS
+      Environment:
+        Variables:
+          ECS_CLUSTER_ARN: !Ref EcsClusterArn
+          ECS_TASK_DEFINITION_ARN: !Ref SlowWorkerTaskDefinition
+          VPC_SUBNET_1: !Ref VpcPublicSubnet1Id
+          VPC_SUBNET_2: !Ref VpcPublicSubnet2Id
+          VPC_SUBNET_3: !Ref VpcPublicSubnet3Id
+          SECURITY_GROUP_1: !GetAtt SlowWorkerSecurityGroup.GroupId
+          # Using the combined legacy clickhouse + castle security groups for
+          # now to overcome the security group limit.
+          SECURITY_GROUP_4: !Ref ClickhouseLegacyClientSecurityGroupId
+          SECURITY_GROUP_5: !Ref SharedPostgresqlClientSecurityGroupId
+          STARTED_BY: !Ref AWS::StackName
+          ENVIRONMENT_TYPE: !Ref EnvironmentType
+          ROOT_STACK_ID: !Ref RootStackId
+          ROOT_STACK_NAME: !Ref RootStackName
+          STACK_ID: !Ref AWS::StackName
+          STACK_NAME: !Ref AWS::StackId
+      Events:
+        SqsMessages:
+          Type: SQS
+          Properties:
+            BatchSize: 1
+            Queue: !GetAtt SlowWorkerRelaySqsQueue.Arn
+      Handler: index.handler
+      InlineCode: |
+        const { ECS } = require('@aws-sdk/client-ecs');
+        const ecs = new ECS({ apiVersion: '2014-11-13' });
+        const QUEUE_CONCURRENCY = { slow: 4 };
+
+        // ECS listTask parameters
+        const startedBy = (name) => `${process.env.STARTED_BY}-${name}`;
+        const listParams = (name) => {
+          return {
+            cluster: process.env.ECS_CLUSTER_ARN,
+            desiredStatus: 'RUNNING',
+            maxResults: 10,
+            startedBy: startedBy(name),
+          };
+        };
+
+        // ECS runTask parameters
+        const runParams = (name) => {
+          return {
+            cluster: process.env.ECS_CLUSTER_ARN,
+            launchType: 'FARGATE',
+            networkConfiguration: {
+              awsvpcConfiguration: {
+                subnets: [
+                  process.env.VPC_SUBNET_1,
+                  process.env.VPC_SUBNET_2,
+                  process.env.VPC_SUBNET_3,
+                ],
+                assignPublicIp: 'ENABLED',
+                securityGroups: [
+                  process.env.SECURITY_GROUP_1,
+                  process.env.SECURITY_GROUP_2,
+                  process.env.SECURITY_GROUP_3,
+                  process.env.SECURITY_GROUP_4,
+                  process.env.SECURITY_GROUP_5,
+                ],
+              },
+            },
+            overrides: {
+              containerOverrides: [
+                {
+                  name: 'augury-workslow',
+                  environment: [
+                    {
+                      name: 'QUEUE',
+                      value: name,
+                    },
+                  ],
+                },
+              ],
+            },
+            platformVersion: '1.4.0',
+            runtimePlatform: {
+              cpuArchitecture: "ARM64"
+            },
+            startedBy: startedBy(name),
+            taskDefinition: process.env.ECS_TASK_DEFINITION_ARN,
+            tags: [
+              { key: 'prx:meta:tagging-version', value: '2021-04-07' },
+              { key: 'prx:cloudformation:stack-name', value: process.env.STACK_NAME },
+              { key: 'prx:cloudformation:stack-id', value: process.env.STACK_ID },
+              {
+                key: 'prx:cloudformation:root-stack-name',
+                value: process.env.ROOT_STACK_NAME,
+              },
+              {
+                key: 'prx:cloudformation:root-stack-id',
+                value: process.env.ROOT_STACK_ID,
+              },
+              { key: 'prx:ops:environment', value: process.env.ENVIRONMENT_TYPE },
+              { key: 'prx:dev:family', value: 'Dovetail' },
+              { key: 'prx:dev:application', value: 'Augury' },
+            ],
+          };
+        };
+
+        // lightweight json logger
+        function log(level, msg, extra = {}) {
+          console[level](JSON.stringify({ level, msg, ...extra }));
+        }
+
+        exports.handler = async (event) => {
+          const queueName = event?.Records?.shift()?.body || '';
+          if (!QUEUE_CONCURRENCY[queueName]) {
+            return log('warn', `unknown queue ${queueName}`);
+          }
+
+          const listRes = await ecs.listTasks(listParams(queueName));
+          const running = listRes.taskArns.length;
+          if (running < QUEUE_CONCURRENCY[queueName]) {
+            log('info', `launching 1 more ${queueName} worker (${running} running)`);
+            try {
+              const runRes = await ecs.runTask(runParams(queueName));
+              log('debug', 'ran task', runRes);
+            } catch (err) {
+              log('error', 'error running task', err);
+              throw err;
+            }
+          } else {
+            log('info', `already running ${running} ${queueName} workers`);
+          }
+        };
+      MemorySize: 128
+      Policies:
+        - Statement:
+            - Action: ecs:ListTasks
+              Effect: Allow
+              Resource: "*"
+            - Action:
+                - ecs:RunTask
+                - ecs:TagResource
+              Effect: Allow
+              Resource: !Ref SlowWorkerTaskDefinition
+            - Action: iam:PassRole
+              Effect: Allow
+              Resource:
+                - !GetAtt ExecutionRole.Arn
+                - !GetAtt TaskRole.Arn
+          Version: "2012-10-17"
+      ReservedConcurrentExecutions: 1
+      Runtime: nodejs24.x
+      Tags:
+        prx:meta:tagging-version: "2021-04-07"
+        prx:cloudformation:stack-name: !Ref AWS::StackName
+        prx:cloudformation:stack-id: !Ref AWS::StackId
+        prx:ops:environment: !Ref EnvironmentType
+        prx:dev:family: Dovetail
+        prx:dev:application: Augury
+      Timeout: 5
+  SlowWorkerRelayFunctionElevatedErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub WARN [Augury] Slow worker relay function <${EnvironmentTypeAbbreviation}> INVOCATIONS ERRORS (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Augury slow worker relay function is failing, which
+        could be preventing some forecasts, inventory, availability, etc from
+        updating.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SlowWorkerRelayFunction
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Augury }
+      Threshold: 0
+      TreatMissingData: notBreaching
+
+  # Forecast task timings
+  ForecastJobMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: |-
+        { $.msg = "forecast_job" }
+      LogGroupName: !Ref SlowWorkerTaskLogGroup
+      MetricTransformations:
+        - MetricName: !Sub ForecastJobElapsed${EnvironmentType}
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: $.elapsed
+
+  # Forecast Rscript timings
+  ForecastDownloadsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: |-
+        { $.msg = "forecast_downloads" }
+      LogGroupName: !Ref SlowWorkerTaskLogGroup
+      MetricTransformations:
+        - MetricName: !Sub ForecastDownloadsElapsed${EnvironmentType}
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: $.elapsed
+  ForecastGeocountriesMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: |-
+        { $.msg = "forecast_partitions" }
+      LogGroupName: !Ref SlowWorkerTaskLogGroup
+      MetricTransformations:
+        - MetricName: !Sub ForecastPartitionsElapsed${EnvironmentType}
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: $.elapsed
+
+  # CloudWatch Dashboard
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardBody: !Sub
+        - |-
+          {
+            "widgets": [
+              {
+                "height": 6,
+                "width": 24,
+                "y": 0,
+                "x": 0,
+                "type": "metric",
+                "properties": {
+                  "metrics": [
+                    [ "${kMetricFilterNamespace}", "${JobDurationMetricName}", { "label": "Maximum", "stat": "Maximum" } ],
+                    [ "${kMetricFilterNamespace}", "${JobDurationMetricName}", { "stat": "p99", "label": "p99" } ],
+                    [ "${kMetricFilterNamespace}", "${JobDurationMetricName}", { "stat": "p95", "label": "p95" } ],
+                    [ "${kMetricFilterNamespace}", "${JobDurationMetricName}", { "stat": "p90", "label": "p90" } ],
+                    [ "${kMetricFilterNamespace}", "${JobDurationMetricName}", { "label": "p50", "stat": "p50" } ],
+                    [ "${kMetricFilterNamespace}", "${JobDurationMetricName}", { "label": "Average" } ],
+                    [ "${kMetricFilterNamespace}", "${JobDurationMetricName}", { "stat": "Minimum", "label": "Minimum" } ]
+                  ],
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "region": "${AWS::Region}",
+                  "title": "Forecast Job Duration",
+                  "stat": "Average",
+                  "period": 300,
+                  "liveData": true,
+                  "yAxis": {
+                    "left": {
+                      "min": 0
+                    }
+                  }
+                }
+              },
+              {
+                "height": 3,
+                "width": 12,
+                "y": 6,
+                "x": 0,
+                "type": "metric",
+                "properties": {
+                  "metrics": [
+                    [ "${kMetricFilterNamespace}", "${DownloadDurationMetricName}", { "label": "Maximum", "stat": "Maximum" } ],
+                    [ "${kMetricFilterNamespace}", "${DownloadDurationMetricName}", { "stat": "p99", "label": "p99" } ],
+                    [ "${kMetricFilterNamespace}", "${DownloadDurationMetricName}", { "stat": "p95", "label": "p95" } ],
+                    [ "${kMetricFilterNamespace}", "${DownloadDurationMetricName}", { "stat": "p90", "label": "p90" } ],
+                    [ "${kMetricFilterNamespace}", "${DownloadDurationMetricName}", { "label": "p50", "stat": "p50" } ],
+                    [ "${kMetricFilterNamespace}", "${DownloadDurationMetricName}", { "label": "Average" } ],
+                    [ "${kMetricFilterNamespace}", "${DownloadDurationMetricName}", { "stat": "Minimum", "label": "Minimum" } ]
+                  ],
+                  "view": "timeSeries",
+                  "stacked": false,
+                  "region": "${AWS::Region}",
+                  "title": "Forecast Downloads Duration",
+                  "stat": "Average",
+                  "period": 300,
+                  "liveData": true,
+                  "yAxis": {
+                    "left": {
+                      "min": 0
+                    }
+                  }
+                }
+              }
+            ]
+          }
+        - JobDurationMetricName: !Sub ForecastJobElapsed${EnvironmentType}
+          DownloadDurationMetricName: !Sub ForecastDownloadsElapsed${EnvironmentType}
+      DashboardName: !Sub ${RootStackName}-${AWS::Region}-Augury
+
+Outputs:
+  TargetGroupFullName:
+    Value: !GetAtt TargetGroup.TargetGroupFullName

@@ -1,0 +1,1119 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Pricing Assistant - CI/CD Pipeline with Agent Preparation'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-pricing-assistant
+    Description: Name of the project for resource naming
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  GitHubRepo:
+    Type: String
+    Default: aws-samples/sample-pricing-assistant-for-aws
+    Description: GitHub repository in format owner/repo
+
+  GitHubBranch:
+    Type: String
+    Default: main
+    Description: GitHub branch to trigger pipeline
+
+  DomainName:
+    Type: String
+    Default: your-domain.example.com
+    Description: Public domain for the application (CloudFront alias and Cognito relying-party ID)
+
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: Route 53 hosted zone ID for DomainName. Required to create the ALB DNS record.
+
+  ALBCertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate ARN in this region for the ALB HTTPS listener.
+
+  CloudFrontCertificateArn:
+    Type: String
+    Default: ''
+    Description: ACM certificate ARN in us-east-1 for the CloudFront distribution.
+
+  ALBLoadBalancerArn:
+    Type: String
+    Default: ''
+    Description: ARN of the ALB created by the ECS stack (read from its outputs after first deploy).
+
+  BudgetAlertEmail:
+    Type: String
+    Default: your-email@example.com
+    Description: Email for Bedrock cost-cap budget alerts (forecast and actual breach)
+
+  MonthlyBedrockBudgetUSD:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    Description: Monthly Bedrock-spend cap in USD. On breach, deny policy attached
+      to ECS task role until manually detached.
+
+  AuthEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable Cognito auth on the API + WS. Default false to preserve current open-access live-site behavior.
+
+  BootstrapAdminEmail:
+    Type: String
+    Default: admin@example.com
+    Description: Email for the initial admin user created when the cognito stack is first deployed.
+
+  MfaConfiguration:
+    Type: String
+    Default: OPTIONAL
+    AllowedValues: [OFF, OPTIONAL, ON]
+    Description: Initial MFA configuration. Admins can flip OPTIONAL <-> ON in the admin UI at runtime.
+
+  EmailSenderMode:
+    Type: String
+    Default: COGNITO_DEFAULT
+    AllowedValues: [COGNITO_DEFAULT, SES]
+    Description: Cognito email sender. Use COGNITO_DEFAULT to skip SES verification; SES requires SesFromEmail + SesIdentityArn.
+
+  SesFromEmail:
+    Type: String
+    Default: ''
+    Description: SES verified sender (e.g., noreply@example.com). Only used when EmailSenderMode=SES.
+
+  SesIdentityArn:
+    Type: String
+    Default: ''
+    Description: SES verified identity ARN. Only used when EmailSenderMode=SES.
+
+Resources:
+  # CodeStar Connection for GitHub
+  GitHubConnection:
+    Type: AWS::CodeStarConnections::Connection
+    Properties:
+      ConnectionName: !Sub ${ProjectName}-github
+      ProviderType: GitHub
+
+  # S3 Bucket for Pipeline Artifacts
+  PipelineArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Environment}-pipeline-artifacts-${AWS::AccountId}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # CodeBuild Service Role
+  CodeBuildServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub ${PipelineArtifactsBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: '*'
+
+  # CodeBuild Project - Backend
+  BackendBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-backend-build
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image...
+                - cd backend
+                - docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                - cd ..
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker image...
+                - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                - echo Writing image definitions file...
+                - printf '[{"name":"backend","imageUri":"%s"}]' $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG > imagedefinitions.json
+          artifacts:
+            files:
+              - imagedefinitions.json
+
+  # CodeBuild Project - Frontend
+  FrontendBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-frontend-build
+      ServiceRole: !GetAtt CodeBuildServiceRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to Amazon ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+            build:
+              commands:
+                - echo Build started on `date`
+                - echo Building the Docker image...
+                - cd frontend
+                - docker build -t $IMAGE_REPO_NAME:$IMAGE_TAG .
+                - docker tag $IMAGE_REPO_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                - cd ..
+            post_build:
+              commands:
+                - echo Build completed on `date`
+                - echo Pushing the Docker image...
+                - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG
+                - echo Writing image definitions file...
+                - printf '[{"name":"frontend","imageUri":"%s"}]' $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/$IMAGE_REPO_NAME:$IMAGE_TAG > imagedefinitions.json
+          artifacts:
+            files:
+              - imagedefinitions.json
+
+  # CloudFormation Service Role for Infrastructure Updates
+  CloudFormationServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-cloudformation-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudformation.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSCloudFormationFullAccess
+      Policies:
+        - PolicyName: InfrastructureAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - ec2:Create*
+                  - ec2:Delete*
+                  - ec2:Modify*
+                  - ec2:Associate*
+                  - ec2:Disassociate*
+                  - ec2:AuthorizeSecurityGroupIngress
+                  - ec2:AuthorizeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:AllocateAddress
+                  - ec2:ReleaseAddress
+                  - ecs:CreateCluster
+                  - ecs:DeleteCluster
+                  - ecs:Describe*
+                  - ecs:Update*
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DeregisterTaskDefinition
+                  - ecs:CreateService
+                  - ecs:DeleteService
+                  - ecs:TagResource
+                  - ecs:UntagResource
+                  - ecr:CreateRepository
+                  - ecr:DeleteRepository
+                  - ecr:Describe*
+                  - ecr:GetLifecyclePolicy
+                  - ecr:PutLifecyclePolicy
+                  - ecr:PutImageScanningConfiguration
+                  - ecr:TagResource
+                  - elasticloadbalancing:Create*
+                  - elasticloadbalancing:Delete*
+                  - elasticloadbalancing:Describe*
+                  - elasticloadbalancing:Modify*
+                  - elasticloadbalancing:AddTags
+                  - elasticloadbalancing:RemoveTags
+                  - elasticloadbalancing:SetSecurityGroups
+                  - elasticloadbalancing:SetSubnets
+                  - s3:CreateBucket
+                  - s3:DeleteBucket
+                  - s3:Get*
+                  - s3:Put*
+                  - s3:List*
+                  - logs:CreateLogGroup
+                  - logs:DeleteLogGroup
+                  - logs:Describe*
+                  - logs:PutRetentionPolicy
+                  - logs:PutMetricFilter
+                  - logs:DeleteMetricFilter
+                  - logs:TagResource
+                  - cloudwatch:PutDashboard
+                  - cloudwatch:DeleteDashboards
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:Describe*
+                  - sns:CreateTopic
+                  - sns:DeleteTopic
+                  - sns:Subscribe
+                  - sns:Unsubscribe
+                  - sns:Get*
+                  - sns:Set*
+                  - sns:TagResource
+                  - lambda:CreateFunction
+                  - lambda:DeleteFunction
+                  - lambda:UpdateFunctionCode
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:Get*
+                  - lambda:AddPermission
+                  - lambda:RemovePermission
+                  - lambda:TagResource
+                  # Required to drive the BootstrapAdminUser custom resource in the cognito stack.
+                  - lambda:InvokeFunction
+                  - bedrock:Get*
+                  - bedrock:List*
+                  - bedrock:CreateGuardrail
+                  - bedrock:UpdateGuardrail
+                  - bedrock:DeleteGuardrail
+                  - bedrock:CreateGuardrailVersion
+                  - wafv2:Create*
+                  - wafv2:Delete*
+                  - wafv2:Get*
+                  - wafv2:Update*
+                  - wafv2:List*
+                  - wafv2:TagResource
+                  - cloudfront:Create*
+                  - cloudfront:Delete*
+                  - cloudfront:Get*
+                  - cloudfront:Update*
+                  - cloudfront:TagResource
+                  # DynamoDB — used by the PasskeyNicknamesTable in the
+                  # services stack.
+                  - dynamodb:CreateTable
+                  - dynamodb:DeleteTable
+                  - dynamodb:DescribeTable
+                  - dynamodb:UpdateTable
+                  - dynamodb:UpdateContinuousBackups
+                  - dynamodb:DescribeContinuousBackups
+                  - dynamodb:DescribeTimeToLive
+                  - dynamodb:UpdateTimeToLive
+                  - dynamodb:TagResource
+                  - dynamodb:UntagResource
+                  - dynamodb:ListTagsOfResource
+                  - route53:ChangeResourceRecordSets
+                  - route53:GetHostedZone
+                  - route53:ListResourceRecordSets
+                  - acm:RequestCertificate
+                  - acm:DeleteCertificate
+                  - acm:DescribeCertificate
+                  - acm:ListCertificates
+                  - acm:AddTagsToCertificate
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                  # Cognito stack — creating/managing the user pool, client, and groups.
+                  - cognito-idp:CreateUserPool
+                  - cognito-idp:DeleteUserPool
+                  - cognito-idp:DescribeUserPool
+                  - cognito-idp:UpdateUserPool
+                  - cognito-idp:CreateUserPoolClient
+                  - cognito-idp:DeleteUserPoolClient
+                  - cognito-idp:DescribeUserPoolClient
+                  - cognito-idp:UpdateUserPoolClient
+                  - cognito-idp:CreateGroup
+                  - cognito-idp:DeleteGroup
+                  - cognito-idp:GetGroup
+                  - cognito-idp:UpdateGroup
+                  - cognito-idp:SetUserPoolMfaConfig
+                  - cognito-idp:TagResource
+                  - cognito-idp:UntagResource
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:TagRole
+                  - iam:UntagRole
+                  - iam:CreateServiceLinkedRole
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*'
+              # Managed policies for the Bedrock budget stack (deny policy attached
+              # to ECS task role on cap breach).
+              - Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:DeletePolicy
+                  - iam:GetPolicy
+                  - iam:GetPolicyVersion
+                  - iam:ListPolicyVersions
+                  - iam:CreatePolicyVersion
+                  - iam:DeletePolicyVersion
+                  - iam:TagPolicy
+                  - iam:UntagPolicy
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:policy/${ProjectName}-*'
+              # AWS Budgets resources for the Bedrock cost cap stack.
+              - Effect: Allow
+                Action:
+                  - budgets:CreateBudget
+                  - budgets:UpdateBudget
+                  - budgets:DeleteBudget
+                  - budgets:DescribeBudget
+                  - budgets:DescribeBudgets
+                  - budgets:CreateNotification
+                  - budgets:UpdateNotification
+                  - budgets:DeleteNotification
+                  - budgets:DescribeNotificationsForBudget
+                  - budgets:CreateSubscriber
+                  - budgets:UpdateSubscriber
+                  - budgets:DeleteSubscriber
+                  - budgets:DescribeSubscribersForNotification
+                  - budgets:ExecuteBudgetAction
+                  - budgets:CreateBudgetAction
+                  - budgets:UpdateBudgetAction
+                  - budgets:DeleteBudgetAction
+                  - budgets:DescribeBudgetAction
+                  - budgets:DescribeBudgetActionsForBudget
+                Resource: '*'
+
+  # CodePipeline Service Role
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-codepipeline-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !Sub ${PipelineArtifactsBucket.Arn}
+                  - !Sub ${PipelineArtifactsBucket.Arn}/*
+                  - !Sub arn:aws:s3:::${ProjectName}-${Environment}-pipeline-east-${AWS::AccountId}
+                  - !Sub arn:aws:s3:::${ProjectName}-${Environment}-pipeline-east-${AWS::AccountId}/*
+              - Effect: Allow
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+                Resource:
+                  - !GetAtt BackendBuildProject.Arn
+                  - !GetAtt FrontendBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:RegisterTaskDefinition
+                  - ecs:UpdateService
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-*'
+              - Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                Resource: !Ref GitHubConnection
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ValidationLambda.Arn
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:DescribeStackResources
+                  - cloudformation:GetTemplate
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                Resource: '*'
+
+  # CodePipeline
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}-pipeline
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStores:
+        - Region: us-west-2
+          ArtifactStore:
+            Type: S3
+            Location: !Ref PipelineArtifactsBucket
+        - Region: us-east-1
+          ArtifactStore:
+            Type: S3
+            Location: !Sub ${ProjectName}-${Environment}-pipeline-east-${AWS::AccountId}
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: '1'
+              Configuration:
+                ConnectionArn: !Ref GitHubConnection
+                FullRepositoryId: !Ref GitHubRepo
+                BranchName: !Ref GitHubBranch
+                OutputArtifactFormat: CODE_ZIP
+              OutputArtifacts:
+                - Name: SourceOutput
+
+        - Name: CreateChangeSets
+          Actions:
+            - Name: CreateVPCChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-vpc
+                TemplatePath: SourceOutput::infrastructure/01-vpc-networking.yaml
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationServiceRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "ProjectName": "${ProjectName}",
+                    "Environment": "${Environment}"
+                  }
+              InputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+            - Name: CreateECSChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-ecs
+                TemplatePath: SourceOutput::infrastructure/02-ecs-alb.yaml
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationServiceRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "ProjectName": "${ProjectName}",
+                    "Environment": "${Environment}",
+                    "DomainName": "${DomainName}",
+                    "HostedZoneId": "${HostedZoneId}"
+                  }
+              InputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+            - Name: CreateGuardrailsChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-guardrails
+                TemplatePath: SourceOutput::infrastructure/07-bedrock-guardrails.yaml
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationServiceRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "ProjectName": "${ProjectName}",
+                    "Environment": "${Environment}"
+                  }
+              InputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+            - Name: CreateServicesChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-services
+                TemplatePath: SourceOutput::infrastructure/04-ecs-services.yaml
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationServiceRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "ProjectName": "${ProjectName}",
+                    "Environment": "${Environment}",
+                    "AuthEnabled": "${AuthEnabled}",
+                    "DomainName": "${DomainName}"
+                  }
+              InputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+            - Name: CreateMonitoringChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-monitoring
+                TemplatePath: SourceOutput::infrastructure/06-monitoring.yaml
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationServiceRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "ProjectName": "${ProjectName}",
+                    "Environment": "${Environment}",
+                    "AlertEmail": "admin@example.com"
+                  }
+              InputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+            - Name: CreateCloudFrontChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-cloudfront
+                TemplatePath: SourceOutput::infrastructure/08-cloudfront-cdn.yaml
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationServiceRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "ProjectName": "${ProjectName}",
+                    "Environment": "${Environment}",
+                    "DomainName": "${DomainName}",
+                    "HostedZoneId": "${HostedZoneId}",
+                    "ALBCertificateArn": "${ALBCertificateArn}",
+                    "CloudFrontCertificateArn": "${CloudFrontCertificateArn}",
+                    "ALBLoadBalancerArn": "${ALBLoadBalancerArn}"
+                  }
+              InputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+            - Name: CreateWAFChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Region: us-east-1
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-waf
+                TemplatePath: SourceOutput::infrastructure/09-waf-rate-limiting.yaml
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationServiceRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "ProjectName": "${ProjectName}",
+                    "Environment": "${Environment}"
+                  }
+              InputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+            - Name: CreateBudgetChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-budget
+                TemplatePath: SourceOutput::infrastructure/11-bedrock-budget.yaml
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationServiceRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "ProjectName": "${ProjectName}",
+                    "Environment": "${Environment}",
+                    "BudgetAlertEmail": "${BudgetAlertEmail}",
+                    "MonthlyBudgetUSD": "${MonthlyBedrockBudgetUSD}"
+                  }
+              InputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+            - Name: CreateCognitoChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-cognito
+                TemplatePath: SourceOutput::infrastructure/12-cognito.yaml
+                Capabilities: CAPABILITY_NAMED_IAM
+                RoleArn: !GetAtt CloudFormationServiceRole.Arn
+                ParameterOverrides: !Sub |
+                  {
+                    "ProjectName": "${ProjectName}",
+                    "Environment": "${Environment}",
+                    "AppDomainName": "${DomainName}",
+                    "BootstrapAdminEmail": "${BootstrapAdminEmail}",
+                    "MfaConfiguration": "${MfaConfiguration}",
+                    "EmailSenderMode": "${EmailSenderMode}",
+                    "SesFromEmail": "${SesFromEmail}",
+                    "SesIdentityArn": "${SesIdentityArn}"
+                  }
+              InputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+
+        - Name: ExecuteChangeSets
+          Actions:
+            - Name: ExecuteVPCChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-vpc
+              RunOrder: 1
+
+            - Name: ExecuteECSChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-ecs
+              RunOrder: 2
+
+            - Name: ExecuteGuardrailsChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-guardrails
+              RunOrder: 3
+
+            - Name: ExecuteCognitoChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-cognito
+              # Must run before Services — Services imports the user-pool / client IDs
+              # exported by this stack.
+              RunOrder: 4
+
+            - Name: ExecuteServicesChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-services
+              RunOrder: 5
+
+            - Name: ExecuteMonitoringChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-monitoring
+              RunOrder: 7
+
+            - Name: ExecuteCloudFrontChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-cloudfront
+              RunOrder: 8
+
+            - Name: ExecuteWAFChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Region: us-east-1
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-waf
+              RunOrder: 8
+
+            - Name: ExecuteBudgetChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                ChangeSetName: pipeline-changeset
+                StackName: aws-pricing-assistant-budget
+              # Run after services (RunOrder 5) which creates the ECS task role
+              # the budget action targets.
+              RunOrder: 9
+
+        - Name: Build
+          Actions:
+            - Name: BackendBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BackendBuildProject
+                EnvironmentVariables: !Sub |
+                  [
+                    {
+                      "name": "AWS_DEFAULT_REGION",
+                      "value": "${AWS::Region}"
+                    },
+                    {
+                      "name": "AWS_ACCOUNT_ID",
+                      "value": "${AWS::AccountId}"
+                    },
+                    {
+                      "name": "IMAGE_REPO_NAME",
+                      "value": "aws-pricing-assistant-prod-backend"
+                    },
+                    {
+                      "name": "IMAGE_TAG",
+                      "value": "latest"
+                    }
+                  ]
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BackendBuildOutput
+              RunOrder: 1
+
+            - Name: FrontendBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref FrontendBuildProject
+                EnvironmentVariables: !Sub |
+                  [
+                    {
+                      "name": "AWS_DEFAULT_REGION",
+                      "value": "${AWS::Region}"
+                    },
+                    {
+                      "name": "AWS_ACCOUNT_ID",
+                      "value": "${AWS::AccountId}"
+                    },
+                    {
+                      "name": "IMAGE_REPO_NAME",
+                      "value": "aws-pricing-assistant-prod-frontend"
+                    },
+                    {
+                      "name": "IMAGE_TAG",
+                      "value": "latest"
+                    }
+                  ]
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: FrontendBuildOutput
+              RunOrder: 1
+
+        - Name: Deploy
+          Actions:
+            - Name: BackendDeploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: '1'
+              Configuration:
+                ClusterName:
+                  Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ecs-cluster-name
+                ServiceName: !Sub ${ProjectName}-${Environment}-backend
+                FileName: imagedefinitions.json
+              InputArtifacts:
+                - Name: BackendBuildOutput
+              RunOrder: 1
+
+            - Name: FrontendDeploy
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: '1'
+              Configuration:
+                ClusterName:
+                  Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ecs-cluster-name
+                ServiceName: !Sub ${ProjectName}-${Environment}-frontend
+                FileName: imagedefinitions.json
+              InputArtifacts:
+                - Name: FrontendBuildOutput
+              RunOrder: 1
+
+        - Name: Validate
+          Actions:
+            - Name: ValidateDeployment
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: '1'
+              Configuration:
+                FunctionName: !Ref ValidationLambda
+              RunOrder: 1
+
+  # Validation Lambda Function
+  ValidationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-validation
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt ValidationLambdaRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          HEALTH_CHECK_URL: !Sub https://${DomainName}/health
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib3
+          import time
+          import boto3
+
+          codepipeline = boto3.client('codepipeline')
+
+          def handler(event, context):
+              print(f"Validating deployment...")
+
+              # Get job details from CodePipeline
+              job_id = event['CodePipeline.job']['id']
+
+              try:
+                  # Health check endpoint (configured via HEALTH_CHECK_URL env var)
+                  url = os.environ['HEALTH_CHECK_URL']
+                  http = urllib3.PoolManager()
+
+                  # Retry logic for deployment to stabilize
+                  max_retries = 5
+                  for attempt in range(max_retries):
+                      try:
+                          print(f"Attempt {attempt + 1}: Checking {url}")
+                          response = http.request('GET', url, timeout=10)
+
+                          if response.status == 200:
+                              print(f"✅ Health check passed: {response.status}")
+                              # Report success to CodePipeline
+                              codepipeline.put_job_success_result(jobId=job_id)
+                              return {
+                                  'statusCode': 200,
+                                  'body': json.dumps({
+                                      'status': 'success',
+                                      'message': 'Deployment validation successful',
+                                      'url': url,
+                                      'response_code': response.status
+                                  })
+                              }
+                          else:
+                              print(f"❌ Health check failed: {response.status}")
+
+                      except Exception as e:
+                          print(f"❌ Health check error: {str(e)}")
+
+                      if attempt < max_retries - 1:
+                          print(f"Waiting 10 seconds before retry...")
+                          time.sleep(10)
+
+                  # All retries failed - report failure to CodePipeline
+                  error_msg = f"Deployment validation failed after {max_retries} attempts"
+                  codepipeline.put_job_failure_result(
+                      jobId=job_id,
+                      failureDetails={'message': error_msg, 'type': 'JobFailed'}
+                  )
+                  raise Exception(error_msg)
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  # Report failure to CodePipeline
+                  codepipeline.put_job_failure_result(
+                      jobId=job_id,
+                      failureDetails={'message': str(e), 'type': 'JobFailed'}
+                  )
+                  raise
+
+  # Validation Lambda Role
+  ValidationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-validation-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodePipelineAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:PutJobSuccessResult
+                  - codepipeline:PutJobFailureResult
+                Resource: '*'
+
+Outputs:
+  PipelineName:
+    Description: Name of the CodePipeline
+    Value: !Ref Pipeline
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-pipeline-name
+
+  GitHubConnectionArn:
+    Description: ARN of the GitHub connection
+    Value: !Ref GitHubConnection
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-github-connection-arn

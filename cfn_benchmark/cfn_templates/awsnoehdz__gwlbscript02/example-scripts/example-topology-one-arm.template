@@ -1,0 +1,609 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Set up a demonstration topology for using gwlbtun in one-arm mode
+Parameters:
+  LinuxAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: AMI ID to use for GWLB appliances
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  GWLBInstanceType:
+    Type: String
+    Description: Instance type code to use for the GWLB appliances. The default is fine for light testing, for heavier workloads you should consider a c5n instance.
+    Default: t2.micro
+  ApplicationInstanceType:
+    Type: String
+    Description: Instance type code to use for the application.
+    Default: t2.micro
+
+Resources:
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join [ "-", [ !Ref AWS::StackName, "EC2Role" ] ]
+      Description: Role for all EC2 instances to run under to allow SSM and S3
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: AllowIPAssign
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "ec2:AssignPrivateIpAddresses"
+                  - "ec2:UnassignPrivateIpAddresses"
+                  - "ec2:AssignIpv6Addresses"
+                  - "ec2:UnassignIpv6Addresses"
+                Resource: !Sub "arn:aws:ec2:*:${AWS::AccountId}:network-interface/*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonSSMPatchAssociation
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+  EC2RoleInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Join [ "-", [ !Ref AWS::StackName, "EC2Role" ] ]
+      Path: /
+      Roles:
+        - !Ref EC2Role
+
+  GWLBTunVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.10.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "gwlbtun" ] ]
+
+  GWLBTunVPCv6:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      VpcId: !Ref GWLBTunVPC
+      AmazonProvidedIpv6CidrBlock: true
+
+  GWLBTunPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: GWLBTunVPCv6
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '' ]
+      CidrBlock: !Select [0, !Cidr [!GetAtt GWLBTunVPC.CidrBlock, 8, 8]]
+      Ipv6CidrBlock: !Select [0, !Cidr [!Select [0, !GetAtt GWLBTunVPC.Ipv6CidrBlocks], 8, 64]]
+      VpcId: !Ref GWLBTunVPC
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "gwlbtun private" ] ]
+
+  GWLBTunPrivateRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref GWLBTunVPC
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "gwlbtun private" ] ]
+
+  GWLBTunPrivateRTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref GWLBTunPrivateSubnet
+      RouteTableId: !Ref GWLBTunPrivateRT
+
+   # Set up the GWLB
+  GWLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Join [ "-", [ !Ref AWS::StackName, "GWLB" ] ]
+      Type: gateway
+      IpAddressType: dualstack
+      Subnets:
+        - !Ref GWLBTunPrivateSubnet
+
+  GWLBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Join [ "-", [ !Ref AWS::StackName, "Instances" ] ]
+      VpcId: !Ref GWLBTunVPC
+      Protocol: GENEVE
+      Port: 6081
+      HealthCheckProtocol: HTTP
+      HealthCheckPort: 80
+      HealthCheckPath: /
+      HealthCheckEnabled: true
+      TargetType: ip  # TargetType IP allows specifying the specific NIC on the GWLBTun instance to target
+      Targets:
+        - Id: !GetAtt GWLBTunInstanceOneArm.PrivateIp
+
+  GWLBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref GWLB
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GWLBTargetGroup
+
+  GWLBEndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    Properties:
+      GatewayLoadBalancerArns:
+        - !Ref GWLB
+      AcceptanceRequired: false
+
+  GWLBe:
+    Type: AWS::EC2::VPCEndpoint
+    DependsOn:
+      - GWLBEndpointService
+      - GWLBTunInstanceOneArm
+    Properties:
+      VpcId: !Ref ApplicationVPC
+      ServiceName: !Sub "com.amazonaws.vpce.${AWS::Region}.${GWLBEndpointService}"
+      VpcEndpointType: GatewayLoadBalancer
+      SubnetIds:
+        - !Ref ApplicationGWLBeSubnet
+
+  # Build a GWLBTun instance.
+  # The yum installs tc for AL2, iproute-tc for AL2022. One or the other will always fail - this is expected.
+  GWLBTunInstanceOneArm:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LinuxAmiId
+      InstanceType: !Ref GWLBInstanceType
+      IamInstanceProfile: !Join [ "-", [ !Ref AWS::StackName, "EC2Role" ] ]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 9
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          AssociatePublicIpAddress: True
+          SubnetId: !Ref GWLBTunPrivateSubnet
+          GroupSet:
+            - Ref: GWLBTunSG
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash -ex
+          sudo su
+          yum -y groupinstall "Development Tools"
+          yum -y install cmake3
+          yum -y install tc || true
+          yum -y install iproute-tc || true
+          cd /root
+          git clone https://github.com/awsnoehdz/gwlbscript.git
+          cd gwlbscript
+          cmake3 .
+          make
+
+          echo "[Unit]" > /usr/lib/systemd/system/gwlbtun.service
+          echo "Description=AWS GWLB Tunnel Handler" >> /usr/lib/systemd/system/gwlbtun.service
+          echo "" >> /usr/lib/systemd/system/gwlbtun.service
+          echo "[Service]" >> /usr/lib/systemd/system/gwlbtun.service
+          echo "ExecStart=/root/gwlbscript/gwlbtun -c /root/gwlbscript/example-scripts/create-passthrough.sh -p 80" >> /usr/lib/systemd/system/gwlbtun.service
+          echo "Restart=always" >> /usr/lib/systemd/system/gwlbtun.service
+          echo "RestartSec=5s" >> /usr/lib/systemd/system/gwlbtun.service
+
+          systemctl daemon-reload
+          systemctl enable --now --no-block gwlbtun.service
+          systemctl start gwlbtun.service
+          echo
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "GWLBTun" ] ]
+
+  GWLBTunSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref GWLBTunVPC
+      GroupName: !Join [ "-", [ !Ref AWS::StackName, "GWLBTun Security" ] ]
+      GroupDescription: GWLBTun Security
+      SecurityGroupIngress:
+        - CidrIp: !GetAtt GWLBTunVPC.CidrBlock
+          IpProtocol: -1
+
+  # Make an Internet Gateway in our GWLB VPC so it can download our source code and some packages.
+  GWLBTunIG:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "gwlbtun" ] ]
+
+  GWLBTunIGA:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref GWLBTunIG
+      VpcId: !Ref GWLBTunVPC
+
+  GWLBTunIGRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GWLBTunIGA
+    Properties:
+      RouteTableId: !Ref GWLBTunPrivateRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref GWLBTunIG
+
+  # Set up the Application VPC
+  ApplicationVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.20.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "Application VPC" ] ]
+
+  ApplicationVPCv6:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      VpcId: !Ref ApplicationVPC
+      AmazonProvidedIpv6CidrBlock: true
+
+  ApplicationPrivateSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: ApplicationVPCv6
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '' ]
+      CidrBlock: !Select [0, !Cidr [!GetAtt ApplicationVPC.CidrBlock, 8, 8]]
+      Ipv6CidrBlock: !Select [0, !Cidr [!Select [0, !GetAtt ApplicationVPC.Ipv6CidrBlocks], 8, 64]]
+      VpcId: !Ref ApplicationVPC
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "Application private" ] ]
+
+  ApplicationPrivateRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ApplicationVPC
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "Application private" ] ]
+
+  ApplicationPrivateRTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ApplicationPrivateSubnet
+      RouteTableId: !Ref ApplicationPrivateRT
+
+  ApplicationGWLBeSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: ApplicationVPCv6
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '' ]
+      CidrBlock: !Select [ 1, !Cidr [ !GetAtt ApplicationVPC.CidrBlock, 8, 8]]
+      Ipv6CidrBlock: !Select [ 1, !Cidr [ !Select [ 0, !GetAtt ApplicationVPC.Ipv6CidrBlocks ], 8, 64 ] ]
+      VpcId: !Ref ApplicationVPC
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "Application GWLBe" ] ]
+
+  ApplicationGWLBeRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ApplicationVPC
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "Application GWLBe" ] ]
+
+  ApplicationGWLBeRTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ApplicationGWLBeSubnet
+      RouteTableId: !Ref ApplicationGWLBeRT
+
+  ApplicationNATSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: ApplicationVPCv6
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '' ]
+      CidrBlock: !Select [ 2, !Cidr [ !GetAtt ApplicationVPC.CidrBlock, 8, 8]]
+      Ipv6CidrBlock: !Select [ 2, !Cidr [ !Select [ 0, !GetAtt ApplicationVPC.Ipv6CidrBlocks ], 8, 64 ] ]
+      VpcId: !Ref ApplicationVPC
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "Application NAT" ] ]
+
+  ApplicationNATRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ApplicationVPC
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "Application NAT" ] ]
+
+  ApplicationNATRTA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ApplicationNATSubnet
+      RouteTableId: !Ref ApplicationNATRT
+
+  # Make a NAT Gateway in our application VPC for traffic leaving GWLB to go to
+  ApplicationNGEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  ApplicationNG:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      ConnectivityType: public
+      AllocationId: !GetAtt ApplicationNGEIP.AllocationId
+      SubnetId: !Ref ApplicationNATSubnet
+
+  # Make an Internet Gateway in our application VPC and route to it from the public subnet.
+  ApplicationIG:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "Application" ] ]
+
+  ApplicationIGA:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref ApplicationIG
+      VpcId: !Ref ApplicationVPC
+
+  ApplicationIGRT:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ApplicationVPC
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "Internet Gateway" ] ]
+
+  ApplicationIGRTA:
+    Type: AWS::EC2::GatewayRouteTableAssociation
+    Properties:
+      GatewayId: !Ref ApplicationIG
+      RouteTableId: !Ref ApplicationIGRT
+
+  # Route traffic from our applications to the GWLB endpoint
+  ApplicationPrivateGWLBRouteOutv4:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ApplicationPrivateRT
+      VpcEndpointId: !Ref GWLBe
+      DestinationCidrBlock: 0.0.0.0/0
+
+  ApplicationPrivateGWLBRouteOutv6:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref ApplicationPrivateRT
+      VpcEndpointId: !Ref GWLBe
+      DestinationIpv6CidrBlock: ::/0
+
+  # Route the return from GWLB to the NAT Gateway for non-local v4 and the IG for non-local v6
+  ApplicationGWLBtoNATRouteOutv4:
+    Type: AWS::EC2::Route
+    DependsOn: ApplicationIGA
+    Properties:
+      RouteTableId: !Ref ApplicationGWLBeRT
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref ApplicationNG
+
+  ApplicationGWLBtoNATRouteOutv6:
+    Type: AWS::EC2::Route
+    DependsOn: ApplicationIGA
+    Properties:
+      RouteTableId: !Ref ApplicationGWLBeRT
+      DestinationIpv6CidrBlock: ::/0
+      GatewayId: !Ref ApplicationIG
+
+  # Route traffic out from the NAT GW to the IGW
+  ApplicationNATtoIGWRouteOut:
+    Type: AWS::EC2::Route
+    DependsOn: ApplicationIGA
+    Properties:
+      RouteTableId: !Ref ApplicationNATRT
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref ApplicationIG
+
+  # Route traffic coming in back to our GWLBe
+  ApplicationNATtoGWLBeRouteInv4:
+    Type: AWS::EC2::Route
+    DependsOn: ApplicationIGA
+    Properties:
+      RouteTableId: !Ref ApplicationNATRT
+      DestinationCidrBlock: !GetAtt ApplicationPrivateSubnet.CidrBlock
+      VpcEndpointId: !Ref GWLBe
+
+  ApplicationNATtoGWLBeRouteInv6:
+    Type: AWS::EC2::Route
+    DependsOn: ApplicationIGRTA
+    Properties:
+      RouteTableId: !Ref ApplicationIGRT
+      DestinationIpv6CidrBlock: !Select [0, !GetAtt ApplicationPrivateSubnet.Ipv6CidrBlocks]
+      VpcEndpointId: !Ref GWLBe
+
+  # Finally, create a test application instance
+  ApplicationInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LinuxAmiId
+      InstanceType: !Ref ApplicationInstanceType
+      IamInstanceProfile: !Join [ "-", [ !Ref AWS::StackName, "EC2Role" ] ]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 8
+      NetworkInterfaces:
+        - DeviceIndex: 0
+          SubnetId: !Ref ApplicationPrivateSubnet
+          Ipv6AddressCount: 1
+      Tags:
+        - Key: Name
+          Value: !Join [ "-", [ !Ref AWS::StackName, "Application" ] ]
+
+  # Do the fixes to our endpoint to allow IPv6 to work, until IPv6 support is added to CF.
+  LambdaGWLBeIPv6FixRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-LambdaGWLBeIPv6Fix"
+      Description: Role for Cloudformation lambda script GWLBeIPv6Fix
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [ lambda.amazonaws.com ] }
+            Action: [ 'sts:AssumeRole' ]
+      Policies:
+        - PolicyName: AllowModifyVPCEndpoint
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - ec2:ModifyVpcEndpoint
+                Resource: !Sub "arn:aws:ec2:*:${AWS::AccountId}:vpc-endpoint/*"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Pass in the endpoint ID as GWLBeId. The version of botocore in lambda is too old to recognize the IpAddressType
+  # parameter, thus the install of a newer version at the start.
+  LambdaGWLBeIPv6Fix:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-GWLBeIPv6Fix"
+      Handler: index.handler
+      Role: !GetAtt LambdaGWLBeIPv6FixRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import sys
+          from pip._internal import main
+
+          main(['install', '-I', '-q', 'boto3', '--target', '/tmp/', '--no-cache-dir', '--disable-pip-version-check'])
+          sys.path.insert(0,'/tmp/')
+
+          import boto3
+          import cfnresponse
+          import threading
+          import logging
+          import botocore
+          import time
+
+          def timeout(event, context):
+            logging.error('Execution is about to time out, sending failure response to CloudFormation')
+            cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, reason="Execution timeout")
+
+          def handler(event, context):
+            timer = threading.Timer((context.get_remaining_time_in_millis() / 1000.00) - 0.5, timeout, args=[event, context])
+            timer.start()
+            try:
+              if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                ec2 = boto3.client('ec2')
+                res = ec2.modify_vpc_endpoint(VpcEndpointId=event['ResourceProperties']['GWLBeId'], IpAddressType='dualstack')
+                if 'Return' in res and res['Return'] == True:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, res, event['ResourceProperties']['GWLBeId'])
+                else:
+                  logging.error(f"modify_vpc_endpoint returned something other than True: {res}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, res)
+              else:
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            except Exception as e:
+                logging.error('Exception: %s' % e, exc_info=True)
+                logging.error(f"Data from request:\nevent={event}\ncontext={context}")
+                cfnresponse.send(event, context, cfnresponse.FAILED, {"e": f'{e}'})
+                raise e
+      Runtime: python3.9
+
+  GWLBeIPv6:
+    Type: Custom::GWLBIPV6
+    DependsOn:
+      - GWLBESIPv6
+    Properties:
+      ServiceToken: !GetAtt LambdaGWLBeIPv6Fix.Arn
+      GWLBeId: !Ref GWLBe
+
+  LambdaGWLBESIPv6FixRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-LambdaGWLBESIPv6Fix"
+      Description: Role for Cloudformation lambda script GWLBESIPv6Fix
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [ lambda.amazonaws.com ] }
+            Action: [ 'sts:AssumeRole' ]
+      Policies:
+        - PolicyName: AllowModifyVPCEndpoint
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - ec2:ModifyVpcEndpointServiceConfiguration
+                Resource: !Sub "arn:aws:ec2:*:${AWS::AccountId}:vpc-endpoint-service/*"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  LambdaGWLBESIPv6Fix:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-GWLBESIPv6Fix"
+      Handler: index.handler
+      Role: !GetAtt LambdaGWLBESIPv6FixRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import sys
+          from pip._internal import main
+
+          main(['install', '-I', '-q', 'boto3', '--target', '/tmp/', '--no-cache-dir', '--disable-pip-version-check'])
+          sys.path.insert(0,'/tmp/')
+
+          import boto3
+          import cfnresponse
+          import threading
+          import logging
+          import botocore
+          import time
+
+          def timeout(event, context):
+            logging.error('Execution is about to time out, sending failure response to CloudFormation')
+            cfnresponse.send(event, context, cfnresponse.FAILED, {}, None, reason="Execution timeout")
+
+          def handler(event, context):
+            timer = threading.Timer((context.get_remaining_time_in_millis() / 1000.00) - 0.5, timeout, args=[event, context])
+            timer.start()
+            try:
+              if event['RequestType'] == 'Create' or event['RequestType'] == 'Update':
+                ec2 = boto3.client('ec2')
+                res = ec2.modify_vpc_endpoint_service_configuration(ServiceId=event['ResourceProperties']['GWLBES'], AddSupportedIpAddressTypes=['ipv6'])
+                if 'Return' in res and res['Return'] == True:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, res, event['ResourceProperties']['GWLBES'])
+                else:
+                  logging.error(f"modify_vpc_endpoint returned something other than True: {res}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, res)
+              else:
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            except Exception as e:
+                logging.error('Exception: %s' % e, exc_info=True)
+                logging.error(f"Data from request:\nevent={event}\ncontext={context}")
+                cfnresponse.send(event, context, cfnresponse.FAILED, {"e": f'{e}'})
+                raise e
+      Runtime: python3.9
+
+  GWLBESIPv6:
+    Type: Custom::GWLBIPV6
+    Properties:
+      ServiceToken: !GetAtt LambdaGWLBESIPv6Fix.Arn
+      GWLBES: !Ref GWLBEndpointService
+
+Outputs:
+  GWLBES:
+    Description: ID of the GWLB endpoint service
+    Value: !Sub "com.amazonaws.vpce.${AWS::Region}.${GWLBEndpointService}"
+    Export:
+      Name: !Sub "${AWS::StackName}-EndpointService"

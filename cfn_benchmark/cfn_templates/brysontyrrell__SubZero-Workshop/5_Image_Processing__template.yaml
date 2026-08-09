@@ -1,0 +1,391 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+
+  AppName:
+    Type: String
+    AllowedPattern: '^[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?$'
+    MaxLength: 63
+
+  RegionalCertificateArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/regional_certificate_arn
+
+  HostedZoneId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/hosted_zone_id
+
+  UserPoolArn:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /workshop/cognito_pool_arn
+
+  DeploymentRegions:
+    Type: CommaDelimitedList
+
+Conditions:
+  IsPrimaryRegion:
+    Fn::Equals:
+      - !Ref AWS::Region
+      - !Select [0, !Ref DeploymentRegions]
+
+Globals:
+  Function:
+    Runtime: python3.8
+    Handler: index.lambda_handler
+    Tracing: PassThrough
+    Environment:
+      Variables:
+        BUCKET_NAME: !Ref ImageStore
+        TABLE_NAME: !Ref ImageDatabase
+    Layers:
+      - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:python38-aws-xray-sdk:1
+
+Resources:
+
+  UploadQueue:
+    Type: AWS::SQS::Queue
+
+  UploadQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref UploadQueue
+      PolicyDocument:
+        Statement:
+          - Action: sqs:SendMessage
+            Effect: Allow
+            Resource: !GetAtt UploadQueue.Arn
+            Principal:
+              AWS: "*"
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-*"
+
+  ImageStore:
+    Type: AWS::S3::Bucket
+    DependsOn:
+      UploadQueuePolicy
+    Properties:
+      LifecycleConfiguration:
+        Rules:
+          - Prefix: waiting-room/
+            ExpirationInDays: 1
+            Status: Enabled
+      NotificationConfiguration:
+        QueueConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Queue: !GetAtt UploadQueue.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: waiting-room/
+
+  ImageDatabase:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AppName}-image-database"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+# API Resources
+
+  WorkshopApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      OpenApiVersion: '3.0.2'
+      EndpointConfiguration: REGIONAL
+      TracingEnabled: true
+      BinaryMediaTypes:
+        - 'application/octet-stream'
+        - 'image/*'
+        - 'multipart/form-data'
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !Ref UserPoolArn
+            AuthorizationScopes:
+              - "workshop-api/allow"
+
+  Upload:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/post_image
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref ImageStore
+      Events:
+        PostImage:
+          Type: Api
+          Properties:
+            Path: /api/images
+            Method: post
+            RestApiId: !Ref WorkshopApi
+
+  List:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/get_images
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ImageDatabase
+      Events:
+        GetImages:
+          Type: Api
+          Properties:
+            Path: /api/images
+            Method: get
+            RestApiId: !Ref WorkshopApi
+
+  Download:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/get_image_by_sha
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref ImageDatabase
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:ListBucket
+              Resource: !Sub 'arn:aws:s3:::${AWS::StackName}-*'
+      Events:
+        GetImages:
+          Type: Api
+          Properties:
+            Path: /api/images/{sha}
+            Method: get
+            RestApiId: !Ref WorkshopApi
+
+# Route 53 Domain Resources
+
+  ApiCustomDomain:
+    Type: AWS::ApiGateway::DomainName
+    Properties:
+      DomainName: !Sub "${AppName}.workshop.dev.jamfnimbus.cloud"
+      RegionalCertificateArn: !Ref RegionalCertificateArn
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiBasePath:
+    Type: AWS::ApiGateway::BasePathMapping
+    Properties:
+      DomainName: !Ref ApiCustomDomain
+      RestApiId: !Ref WorkshopApi
+      Stage: Prod
+    DependsOn:
+      - WorkshopApi
+      - WorkshopApiProdStage
+      - ApiCustomDomain
+
+  RegionalRoute53Record:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      Name: !Sub "${AppName}.workshop.dev.jamfnimbus.cloud"
+      SetIdentifier: !Sub '${AppName}-${AWS::Region}'
+      AliasTarget:
+        DNSName: !GetAtt ApiCustomDomain.RegionalDomainName
+        HostedZoneId: !GetAtt ApiCustomDomain.RegionalHostedZoneId
+      HostedZoneId: !Ref HostedZoneId
+      Region: !Ref AWS::Region
+      Type: A
+
+# State Machine
+
+  ImageQueuePoller:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/image_queue_poller
+      Tracing: Active
+      Environment:
+        Variables:
+          STEP_FUNCTION_ARN: !Ref StateMachine
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ImageStore
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt StateMachine.Name
+      Events:
+        NewObjects:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt UploadQueue.Arn
+            BatchSize: 10
+            Enabled: true
+
+  ImageResize:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./src/image_resize
+      MemorySize: 512
+      Timeout: 5
+      Tracing: Active
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:python38-pillow:1
+      Policies:
+        - S3CrudPolicy:
+            BucketName: !Ref ImageStore
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionString: !Sub |
+        {
+          "StartAt": "Write Image Hash",
+          "States": {
+
+            "Write Image Hash": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "ResultPath": null,
+              "Parameters": {
+                "TableName": "${ImageDatabase}",
+                "Item": {
+                  "pk": {"S": "IMAGE"},
+                  "sk": {"S.$": "$.sha256-hash"},
+                  "mimetype": {"S.$": "$.mimetype"},
+                  "origin_bucket": {"S.$": "$.origin-bucket"},
+                  "origin_region": {"S.$": "$.origin-region"}
+                },
+                "ConditionExpression": "attribute_not_exists(sk)"
+              },
+              "Catch": [
+                {
+                  "ErrorEquals": ["DynamoDB.ConditionalCheckFailedException"],
+                  "ResultPath": null,
+                  "Next": "Link Client to Image"
+                }
+              ],
+              "Next": "Parallel Image Resizing"
+            },
+
+            "Parallel Image Resizing": {
+              "Type": "Parallel",
+              "ResultPath": null,
+              "Branches": [
+                {
+                  "StartAt": "Unsized",
+                  "States": {
+                    "Unsized": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${ImageResize.Arn}",
+                        "Payload": {
+                          "image_size": 0,
+                          "bucket.$": "$.bucket",
+                          "key.$": "$.key",
+                          "sha256.$": "$.sha256-hash",
+                          "mimetype.$": "$.mimetype"
+                        }
+                      },
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "Size 2048",
+                  "States": {
+                    "Size 2048": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${ImageResize.Arn}",
+                        "Payload": {
+                          "image_size": 2048,
+                          "bucket.$": "$.bucket",
+                          "key.$": "$.key",
+                          "sha256.$": "$.sha256-hash",
+                          "mimetype.$": "$.mimetype"
+                        }
+                      },
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "Size 1024",
+                  "States": {
+                    "Size 1024": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${ImageResize.Arn}",
+                        "Payload": {
+                          "image_size": 1024,
+                          "bucket.$": "$.bucket",
+                          "key.$": "$.key",
+                          "sha256.$": "$.sha256-hash",
+                          "mimetype.$": "$.mimetype"
+                        }
+                      },
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "Next": "Link Client to Image"
+            },
+
+            "Link Client to Image": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:putItem",
+              "Parameters": {
+                "TableName": "${ImageDatabase}",
+                "Item": {
+                  "pk": {"S.$": "$.uploading-client"},
+                  "sk": {"S.$": "$.composite"},
+                  "sha256": {"S.$": "$.sha256-hash"},
+                  "filename": {"S.$": "$.filename"}
+                }
+              },
+              "End": true
+            }
+
+          }
+        }
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - !Sub 'states.${AWS::Region}.amazonaws.com'
+            Action: sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt ImageDatabase.Arn
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ImageResize.Arn

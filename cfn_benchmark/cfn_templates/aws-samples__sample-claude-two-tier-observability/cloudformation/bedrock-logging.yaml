@@ -1,0 +1,610 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Bedrock Model Invocation Logging — captures full request/response (including
+  tool_use and tool_result blocks) to S3 and CloudWatch Logs. This is the
+  server-side foundation of the 2-tier observability architecture.
+
+Parameters:
+  OrgName:
+    Type: String
+    Default: my-org
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [30, 60, 90, 180, 365]
+    Description: CloudWatch Logs retention period.
+
+  S3ExpirationDays:
+    Type: Number
+    Default: 365
+    Description: S3 object expiration in days for invocation logs.
+
+  EnableCloudWatchLogs:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Also send invocation logs to CloudWatch Logs (enables GenAI observability dashboards).
+
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ''
+    Description: ARN of IAM Permissions Boundary (required for accounts with restrictive SCPs).
+
+  UserAttributeTableName:
+    Type: String
+    Default: ''
+    Description: DynamoDB table name for cached Cognito user attributes (from cognito-stack).
+
+  UserAttributeTableArn:
+    Type: String
+    Default: ''
+    Description: DynamoDB table ARN for IAM policy (from cognito-stack).
+
+Conditions:
+  EnableCWLogs: !Equals [!Ref EnableCloudWatchLogs, 'true']
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, '']]
+  HasUserAttributeTable: !Not [!Equals [!Ref UserAttributeTableName, '']]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # S3 Bucket for Bedrock Invocation Logs
+  # ---------------------------------------------------------------------------
+  # KMS key for encrypting invocation logs (contains sensitive prompt/response data)
+  InvocationLogKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'Encryption key for Claude Code invocation logs (${OrgName})'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Account root: admin + usage actions (enables IAM-based KMS grants)
+          - Sid: AllowAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action:
+              - kms:Create*
+              - kms:Describe*
+              - kms:Enable*
+              - kms:List*
+              - kms:Put*
+              - kms:Update*
+              - kms:Revoke*
+              - kms:Disable*
+              - kms:Get*
+              - kms:Delete*
+              - kms:TagResource
+              - kms:UntagResource
+              - kms:ScheduleKeyDeletion
+              - kms:CancelKeyDeletion
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+            Resource: '*'
+          - Sid: AllowBedrockLogging
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+            Resource: '*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          # Lambda KMS access granted via IAM policy on InvocationProcessorRole
+          # (account root statement above enables IAM-based KMS grants)
+      Tags:
+        - Key: Project
+          Value: claude-code
+
+  InvocationLogKMSAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/claude-code-invocation-logs-${OrgName}'
+      TargetKeyId: !Ref InvocationLogKMSKey
+
+  # checkov:skip=CKV_AWS_18:Access-log bucket cannot log to itself — this IS the access-log destination
+  AccessLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name required for deploy.sh cross-stack references"
+          - id: W35
+            reason: "Access-log bucket cannot log to itself — this IS the access-log destination"
+    Properties:
+      BucketName: !Sub 'claude-code-invocation-access-logs-${OrgName}-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireAccessLogs
+            Status: Enabled
+            ExpirationInDays: 365
+      Tags:
+        - Key: Project
+          Value: claude-code
+        - Key: Component
+          Value: access-logging
+
+  AccessLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: S3ServerAccessLogsPolicy
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${AccessLogBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+
+  InvocationLogBucket:
+    Type: AWS::S3::Bucket
+    # DependsOn ensures Lambda permission exists before S3 validates notification config
+    DependsOn: InvocationProcessorS3Permission
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name required for deploy.sh cross-stack references"
+    Properties:
+      BucketName: !Sub 'claude-code-invocation-logs-${OrgName}-${Environment}-${AWS::AccountId}'
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogBucket
+        LogFilePrefix: invocation-logs/
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !GetAtt InvocationLogKMSKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: IntelligentTiering
+            Status: Enabled
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 30
+          - Id: Expiration
+            Status: Enabled
+            ExpirationInDays: !Ref S3ExpirationDays
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: 'bedrock-logs/'
+            Function: !GetAtt InvocationProcessorFunction.Arn
+      Tags:
+        - Key: Project
+          Value: claude-code
+        - Key: Component
+          Value: invocation-logging
+
+  InvocationLogBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref InvocationLogBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonHTTPS
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt InvocationLogBucket.Arn
+              - !Sub '${InvocationLogBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+          - Sid: AllowBedrockLogging
+            Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub '${InvocationLogBucket.Arn}/bedrock-logs/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+          - Sid: DenyDeleteAuditLogs
+            Effect: Deny
+            Principal: '*'
+            Action:
+              - 's3:DeleteObject'
+              - 's3:DeleteObjectVersion'
+            Resource: !Sub '${InvocationLogBucket.Arn}/bedrock-logs/*'
+            Condition:
+              StringNotEquals:
+                'aws:PrincipalArn': !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Log Group for Bedrock Invocation Logs
+  # ---------------------------------------------------------------------------
+  # checkov:skip=CKV_AWS_158:Sample uses default encryption — production deployments should add KMS
+  InvocationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: EnableCWLogs
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Sample uses default encryption — production deployments should add KMS"
+    Properties:
+      LogGroupName: !Sub '/aws/bedrock/invocation-logs/${OrgName}'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: claude-code
+
+  # ---------------------------------------------------------------------------
+  # IAM Role for Bedrock to write to CloudWatch Logs
+  # ---------------------------------------------------------------------------
+  BedrockLoggingRole:
+    Type: AWS::IAM::Role
+    Condition: EnableCWLogs
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name required for deploy.sh cross-stack references"
+    Properties:
+      RoleName: !Sub 'bedrock-invocation-logging-${OrgName}-${Environment}'
+      PermissionsBoundary: !If
+        - HasPermissionsBoundary
+        - !Ref PermissionsBoundaryArn
+        - !Ref AWS::NoValue
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref AWS::AccountId
+      Policies:
+        - PolicyName: CloudWatchLogsWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !If
+                  - EnableCWLogs
+                  - !Sub '${InvocationLogGroup.Arn}:*'
+                  - !Ref AWS::NoValue
+
+  # ---------------------------------------------------------------------------
+  # Custom Resource: Enable Bedrock Model Invocation Logging
+  # ---------------------------------------------------------------------------
+  # checkov:skip=CKV_AWS_117:Lambdas call AWS APIs only — VPC adds NAT Gateway cost with no benefit
+  # checkov:skip=CKV_AWS_116:Synchronous invocation — DLQ not applicable
+  # checkov:skip=CKV_AWS_173:Environment variables contain config (table names, ARNs), not secrets
+  EnableLoggingFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda calls AWS APIs only — VPC adds cost with no benefit"
+          - id: W92
+            reason: "Custom resource Lambda — runs once at deploy time, concurrency limit not needed"
+          - id: W58
+            reason: "Lambda has CloudWatch Logs access via AWSLambdaBasicExecutionRole"
+    Properties:
+      FunctionName: !Sub 'claude-code-enable-bedrock-logging-${OrgName}'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      ReservedConcurrentExecutions: 5
+      Role: !GetAtt EnableLoggingRole.Arn
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              if event["RequestType"] == "Delete":
+                  try:
+                      boto3.client("bedrock").delete_model_invocation_logging_configuration()
+                  except Exception:
+                      pass
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              try:
+                  client = boto3.client("bedrock")
+                  props = event["ResourceProperties"]
+
+                  config = {
+                      "s3Config": {
+                          "bucketName": props["S3BucketName"],
+                          "keyPrefix": "bedrock-logs/"
+                      },
+                      "textDataDeliveryEnabled": True,
+                      "imageDataDeliveryEnabled": False,
+                      "embeddingDataDeliveryEnabled": False,
+                      "videoDataDeliveryEnabled": False,
+                  }
+
+                  if props.get("CloudWatchLogGroupName"):
+                      config["cloudWatchConfig"] = {
+                          "logGroupName": props["CloudWatchLogGroupName"],
+                          "roleArn": props["CloudWatchRoleArn"],
+                          "largeDataDeliveryS3Config": {
+                              "bucketName": props["S3BucketName"],
+                              "keyPrefix": "bedrock-logs/large-data/"
+                          }
+                      }
+
+                  client.put_model_invocation_logging_configuration(loggingConfig=config)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      "Status": "Logging enabled"
+                  })
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      "Error": str(e)
+                  })
+
+  EnableLoggingRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Bedrock logging APIs are account-level — resource-level ARNs not supported"
+    Properties:
+      PermissionsBoundary: !If
+        - HasPermissionsBoundary
+        - !Ref PermissionsBoundaryArn
+        - !Ref AWS::NoValue
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockLoggingConfig
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Bedrock logging APIs are account-level; resource-level ARNs not supported
+              - Effect: Allow
+                Action:
+                  - bedrock:PutModelInvocationLoggingConfiguration
+                  - bedrock:DeleteModelInvocationLoggingConfiguration
+                  - bedrock:GetModelInvocationLoggingConfiguration
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !If
+                  - EnableCWLogs
+                  - !GetAtt BedrockLoggingRole.Arn
+                  - !Ref AWS::NoValue
+
+  EnableLoggingCustomResource:
+    Type: Custom::EnableBedrockLogging
+    DependsOn:
+      - InvocationLogBucketPolicy
+    Properties:
+      ServiceToken: !GetAtt EnableLoggingFunction.Arn
+      S3BucketName: !Ref InvocationLogBucket
+      CloudWatchLogGroupName: !If
+        - EnableCWLogs
+        - !Ref InvocationLogGroup
+        - ''
+      CloudWatchRoleArn: !If
+        - EnableCWLogs
+        - !GetAtt BedrockLoggingRole.Arn
+        - ''
+
+  # ---------------------------------------------------------------------------
+  # Invocation Log Processor Lambda (parses tool_use/tool_result, sessions)
+  # ---------------------------------------------------------------------------
+  # checkov:skip=CKV_AWS_117:Lambdas call AWS APIs only — VPC adds NAT Gateway cost with no benefit
+  # checkov:skip=CKV_AWS_116:Synchronous invocation — DLQ not applicable
+  # checkov:skip=CKV_AWS_173:Environment variables contain config (table names, ARNs), not secrets
+  InvocationProcessorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda calls AWS APIs only — VPC adds cost with no benefit"
+          - id: W92
+            reason: "ReservedConcurrentExecutions set on function"
+    Properties:
+      FunctionName: !Sub 'claude-code-invocation-processor-${OrgName}-${Environment}'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 512
+      ReservedConcurrentExecutions: 50
+      Role: !GetAtt InvocationProcessorRole.Arn
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Sub 'claude-code-invocation-logs-${OrgName}-${Environment}-${AWS::AccountId}'
+          PROCESSED_PREFIX: 'processed/'
+          ORG_NAME: !Ref OrgName
+          CW_LOG_GROUP: !Sub '/aws/claude-code/invocation-metrics/${OrgName}'
+          USER_ATTR_TABLE: !If
+            - HasUserAttributeTable
+            - !Ref UserAttributeTableName
+            - ''
+      Code:
+        # Inline stub — full implementation in lambda/invocation_processor/index.py
+        # Deploy with: aws lambda update-function-code --function-name ... --zip-file ...
+        ZipFile: |
+          # Stub — replaced at deploy time by lambda/invocation_processor/index.py
+          def handler(event, context):
+              print("Deploy the full processor from lambda/invocation_processor/")
+              return {"statusCode": 200}
+
+  InvocationProcessorRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name required for deploy.sh cross-stack references"
+    Properties:
+      RoleName: !Sub 'claude-code-invocation-processor-role-${OrgName}-${Environment}'
+      PermissionsBoundary: !If
+        - HasPermissionsBoundary
+        - !Ref PermissionsBoundaryArn
+        - !Ref AWS::NoValue
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::claude-code-invocation-logs-${OrgName}-${Environment}-${AWS::AccountId}/bedrock-logs/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::claude-code-invocation-logs-${OrgName}-${Environment}-${AWS::AccountId}/processed/*'
+        - PolicyName: CloudWatchWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/claude-code/invocation-metrics/${OrgName}:*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/claude-code-invocation-processor-${OrgName}-${Environment}:*'
+        - PolicyName: KMSDecrypt
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt InvocationLogKMSKey.Arn
+        - !If
+          - HasUserAttributeTable
+          - PolicyName: DynamoDBRead
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - dynamodb:GetItem
+                  Resource: !Ref UserAttributeTableArn
+          - !Ref 'AWS::NoValue'
+
+  InvocationProcessorS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt InvocationProcessorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub 'arn:aws:s3:::claude-code-invocation-logs-${OrgName}-${Environment}-${AWS::AccountId}'
+      SourceAccount: !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------------------
+  # Processed data log group (for EMF metrics from processor)
+  # ---------------------------------------------------------------------------
+  # checkov:skip=CKV_AWS_158:Sample uses default encryption — production deployments should add KMS
+  ProcessedMetricsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Sample uses default encryption — production deployments should add KMS"
+    Properties:
+      LogGroupName: !Sub '/aws/claude-code/invocation-metrics/${OrgName}'
+      RetentionInDays: !Ref LogRetentionDays
+
+Outputs:
+  InvocationLogBucketName:
+    Description: S3 bucket receiving Bedrock invocation logs
+    Value: !Ref InvocationLogBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-InvocationBucket'
+
+  InvocationLogBucketArn:
+    Description: S3 bucket ARN
+    Value: !GetAtt InvocationLogBucket.Arn
+
+  InvocationLogGroupName:
+    Condition: EnableCWLogs
+    Description: CloudWatch log group for Bedrock invocation logs
+    Value: !Ref InvocationLogGroup
+
+  ProcessorFunctionArn:
+    Description: ARN of the invocation log processor Lambda
+    Value: !GetAtt InvocationProcessorFunction.Arn
+
+  ProcessorFunctionName:
+    Description: Name of the invocation log processor Lambda
+    Value: !Ref InvocationProcessorFunction
+
+  InvocationLogKMSKeyArn:
+    Description: KMS key ARN for invocation log encryption
+    Value: !GetAtt InvocationLogKMSKey.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KMSKeyArn'

@@ -1,0 +1,293 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: Benching stack with S3 bucket of test objects, bucket-filler custom resource, archive control Lambda and orchestration Step Function
+
+# This stack is the benchmarking infrastructure. Contributors adding a new
+# contender Lambda do NOT need to edit this file — see templates/contenders.yml
+# for the contender registration markers and the README for the contribution flow.
+
+Parameters:
+  ProjectName:
+    Type: String
+  FilesPrefix:
+    Type: String
+    Default: files
+    Description: Key prefix under which the test objects (and the contender archives, under archives/) live
+  TestFileCount:
+    Type: Number
+    Default: 3000
+    Description: The number of test files to fill the bucket with
+  TestFileSize:
+    Type: Number
+    Default: 5
+    Description: The average size of test files, in MB
+  RunsPerContender:
+    Type: Number
+    Default: 10
+    Description: Number of times each contender Lambda is invoked in parallel per benchmark run; the reported duration_ms is the mean across all runs
+  MaxRunTimeMs:
+    Type: Number
+    Default: 300000
+    Description: Performance budget in milliseconds. A contender fails if mean(duration_ms) + stddev(duration_ms) >= this value (it must archive consistently under this budget).
+
+Resources:
+  #############
+  # S3 Bucket #
+  #############
+  Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${AWS::AccountId}-${AWS::Region}
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: AbortMultipart
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          - Id: ReapSegmentTemps
+            Status: Enabled
+            Prefix: seg-temps/
+            ExpirationInDays: 1
+  # Custom resource reusing the bucket emptier Lambda from the CI stack.
+  # Fn::ImportValue reads a value exported by another stack (cross-stack reference).
+  BucketEmptier:
+    Type: Custom::BucketEmptier
+    Properties:
+      ServiceToken:
+        {
+          Fn::ImportValue: !Sub "CustomResource:${ProjectName}:S3BucketEmptier",
+        }
+      BucketName: !Ref Bucket
+
+  ###############################
+  # Fill-bucket custom resource #
+  ###############################
+  FillBucketFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-fill-bucket
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: s3-put-test-objects
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: TestObjects
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}/${FilesPrefix}/*
+              - Sid: ListTestObjects
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+      Path: /
+  FillBucketFunctionRoleBasicPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      Roles:
+        - !Ref FillBucketFunctionRole
+      PolicyName: basic-lambda
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !GetAtt FillBucketFunctionLogGroup.Arn
+  FillBucketFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-fill-bucket
+      CodeUri: ../benching/fill-bucket
+      Runtime: provided.al2023
+      MemorySize: 768
+      Timeout: 600
+      Handler: rust.handler
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          RUST_LOG: info # debug,hyper=info,h2=info,tracing=info,aws_config=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,rustls=info
+      Role: !GetAtt FillBucketFunctionRole.Arn
+  FillBucketFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${FillBucketFunction}
+      RetentionInDays: 90
+  FillBucket:
+    Type: Custom::FillBucket
+    DependsOn:
+      - FillBucketFunctionRoleBasicPolicy
+    Properties:
+      ServiceToken: !GetAtt FillBucketFunction.Arn
+      ServiceTimeout: 600
+      BucketName: !Ref Bucket
+      KeyPrefix: !Ref FilesPrefix
+      ObjectCount: !Ref TestFileCount
+      ObjectSizeMb: !Ref TestFileSize
+
+  ##########################
+  # Control Lambda (archive validator)
+  ##########################
+  ControlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-control
+      CodeUri: ../benching/control-lambda
+      Runtime: provided.al2023
+      MemorySize: 1024
+      Timeout: 600
+      Handler: rust.handler
+      Architectures:
+        - arm64
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref Bucket
+          FILES_PREFIX: !Ref FilesPrefix
+          RUST_LOG: info # debug,hyper=info,h2=info,tracing=info,aws_config=info,aws_smithy_runtime=info,aws_smithy_runtime_api=info,rustls=info
+      Policies:
+        - Version: 2012-10-17
+          Statement:
+            - Sid: ListBucketForPrefix
+              Effect: Allow
+              Action:
+                - s3:ListBucket
+              Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}
+              Condition:
+                StringLike:
+                  s3:prefix:
+                    - !Sub ${FilesPrefix}/*
+            - Sid: GetTestObjects
+              Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}/${FilesPrefix}/*
+            - Sid: GetArchives
+              Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}/archives/*
+            - Sid: DenyLogGroupCreation
+              Effect: Deny
+              Action: logs:CreateLogGroup
+              Resource: "*"
+  ControlFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${ControlFunction}
+      RetentionInDays: 90
+
+  ###################
+  # Benching Step Function
+  ###################
+  BenchingStateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/vendedlogs/states/${ProjectName}-benching
+      RetentionInDays: 90
+  BenchingStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-sfn-benching
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-and-cleanup
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: InvokeContenders
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-*
+              - Sid: GetContenderConfig
+                Effect: Allow
+                Action:
+                  - lambda:GetFunctionConfiguration
+                Resource:
+                  - !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-*
+              - Sid: InvokeControl
+                Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt ControlFunction.Arn
+              - Sid: DeleteArchives
+                Effect: Allow
+                Action:
+                  - s3:DeleteObject
+                Resource: !Sub arn:${AWS::Partition}:s3:::${Bucket}/archives/*
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: "*"
+      Path: /
+  BenchingStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub ${ProjectName}-benching
+      DefinitionUri: ./benching.asl.json
+      DefinitionSubstitutions:
+        ProjectName: !Ref ProjectName
+        ControlFunctionArn: !GetAtt ControlFunction.Arn
+        BucketName: !Ref Bucket
+        FilesPrefix: !Ref FilesPrefix
+        TestFileCount: !Ref TestFileCount
+        RunsPerContender: !Ref RunsPerContender
+        MaxRunTimeMs: !Ref MaxRunTimeMs
+      Role: !GetAtt BenchingStateMachineRole.Arn
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt BenchingStateMachineLogGroup.Arn
+
+Outputs:
+  BucketName:
+    Description: Name of the bucket containing the test objects for benching archive creation
+    Value: !Ref Bucket
+  BenchingStateMachineArn:
+    Description: ARN of the Step Function that runs the benchmark over a list of contender Lambda ARNs
+    Value: !Ref BenchingStateMachine

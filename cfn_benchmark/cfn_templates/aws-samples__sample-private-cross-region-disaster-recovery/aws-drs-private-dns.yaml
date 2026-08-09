@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  **WARNING** This template creates Route 53 private hosted zones, IAM roles, Lambda functions (with custom resource logic), and
+  related resources. You will be billed for the AWS resources used if you create a stack from this template.
+
+Parameters:
+  # Regions fetched from SSM Parameter Store
+  PrimaryRegion:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: "/dr/primary/region"
+    Description: "DRS source (Primary) region (from SSM)"
+  RecoveryRegion:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: "/dr/recovery/region"
+    Description: "DRS target (Recovery) region (from SSM)"
+
+  # DR-region VPC IDs—pass these from your DR stack’s Outputs
+  RecoveryVpcId:
+    Type: String
+    Description: "Recovery VPC ID"
+  RecoveryStagingVpcId:
+    Type: String
+    Description: "Recovery Staging VPC ID"
+
+Resources:
+  ## Private zone for drs.<PrimaryRegion>.amazonaws.com
+  ## associated into both Recovery VPCs
+  DrsPrimaryHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Sub drs.${PrimaryRegion}.amazonaws.com
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub drs.${PrimaryRegion}.amazonaws.com
+      VPCs:
+        - VPCId: !Ref RecoveryVpcId
+          VPCRegion: !Ref RecoveryRegion
+        - VPCId: !Ref RecoveryStagingVpcId
+          VPCRegion: !Ref RecoveryRegion
+
+  ## Private zone for drs.<RecoveryRegion>.amazonaws.com
+  ## associated into both Primary VPCs (imported from Outputs)
+  DrsRecoveryHostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Sub drs.${RecoveryRegion}.amazonaws.com
+      HostedZoneTags:
+        - Key: Name
+          Value: !Sub drs.${RecoveryRegion}.amazonaws.com
+      VPCs:
+        - VPCId: !ImportValue SourceVpcId
+          VPCRegion: !Ref PrimaryRegion
+        - VPCId: !ImportValue SourceStagingVpcId
+          VPCRegion: !Ref PrimaryRegion
+
+  ## IAM Role for Lambda
+  CreateDrsDnsRecordsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: [ lambda.amazonaws.com ] }
+            Action: [ sts:AssumeRole ]
+      Path: /
+      Policies:
+        - PolicyName: drs-create-records-lambda-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+              # Allow changes in both hosted zones
+              - Effect: Allow
+                Action:
+                  - route53:ChangeResourceRecordSets
+                Resource:
+                  - !Sub arn:${AWS::Partition}:route53:::hostedzone/${DrsPrimaryHostedZone}
+                  - !Sub arn:${AWS::Partition}:route53:::hostedzone/${DrsRecoveryHostedZone}
+              # Describe VPC endpoints
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcEndpoints
+                Resource: "*"
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "DescribeVpcEndpoints uses wildcard read permission"
+
+  ## Lambda to create alias records
+  CreateDrsDnsRecordsFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "This Lambda only talks to public Route53/EC2 APIs"
+          - id: W92
+            reason: "We don’t expect any hot-loop bursts here"
+    Properties:
+      Description: "Create Route53 alias records for DRS interface endpoints"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt CreateDrsDnsRecordsRole.Arn
+      MemorySize: 128
+      Timeout: 30
+      Environment:
+        Variables:
+          PRIMARY_REGION: !Ref PrimaryRegion
+          RECOVERY_REGION: !Ref RecoveryRegion
+          PRIMARY_HOSTED_ZONE_ID: !Ref DrsPrimaryHostedZone
+          RECOVERY_HOSTED_ZONE_ID: !Ref DrsRecoveryHostedZone
+          PRIMARY_STAGING_VPC_ID: !ImportValue SourceStagingVpcId
+          RECOVERY_STAGING_VPC_ID: !Ref RecoveryStagingVpcId
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          import urllib3
+
+          # ─── vendored cfnresponse.send ────────────────────────────────────────────────
+          http = urllib3.PoolManager()
+
+          def send_response(event, context, response_status, response_data):
+              response_body = {
+                  "Status": response_status,
+                  "Reason":  f"See CloudWatch Log Stream: {context.log_stream_name}",
+                  "PhysicalResourceId": event.get("PhysicalResourceId", context.log_stream_name),
+                  "StackId":    event["StackId"],
+                  "RequestId":  event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": response_data
+              }
+              json_body = json.dumps(response_body).encode("utf-8")
+              headers = {"content-type":"","content-length":str(len(json_body))}
+              http.request("PUT", event["ResponseURL"], body=json_body, headers=headers)
+
+          # ─── clients ──────────────────────────────────────────────────────────────────
+          r53   = boto3.client("route53")
+          ec2_p = boto3.client("ec2", region_name=os.environ["PRIMARY_REGION"])
+          ec2_r = boto3.client("ec2", region_name=os.environ["RECOVERY_REGION"])
+
+          def lambda_handler(event, context):
+              try:
+                  vps_p = ec2_p.describe_vpc_endpoints(
+                      Filters=[
+                          {"Name":"service-name","Values":[f"com.amazonaws.{os.environ['PRIMARY_REGION']}.drs"]},
+                          {"Name":"vpc-id","Values":[os.environ["PRIMARY_STAGING_VPC_ID"]]},
+                      ]
+                  )["VpcEndpoints"][0]["DnsEntries"][0]
+
+                  vps_r = ec2_r.describe_vpc_endpoints(
+                      Filters=[
+                          {"Name":"service-name","Values":[f"com.amazonaws.{os.environ['RECOVERY_REGION']}.drs"]},
+                          {"Name":"vpc-id","Values":[os.environ["RECOVERY_STAGING_VPC_ID"]]},
+                      ]
+                  )["VpcEndpoints"][0]["DnsEntries"][0]
+
+                  if event["RequestType"] in ("Create", "Update"):
+                      action = "UPSERT"
+                  else:
+                      action = "DELETE"
+
+                  for zone, entry, region in [
+                      (os.environ["PRIMARY_HOSTED_ZONE_ID"],  vps_p, os.environ["PRIMARY_REGION"]),
+                      (os.environ["RECOVERY_HOSTED_ZONE_ID"], vps_r, os.environ["RECOVERY_REGION"])
+                  ]:
+                      r53.change_resource_record_sets(
+                          HostedZoneId=zone,
+                          ChangeBatch={
+                              "Comment": "Alias for DRS endpoint",
+                              "Changes": [{
+                                  "Action": action,
+                                  "ResourceRecordSet": {
+                                      "Name": f"drs.{region}.amazonaws.com",
+                                      "Type": "A",
+                                      "AliasTarget": {
+                                          "HostedZoneId":          entry["HostedZoneId"],
+                                          "DNSName":               entry["DnsName"],
+                                          "EvaluateTargetHealth":  True
+                                      }
+                                  }
+                              }]
+                          }
+                      )
+
+                  send_response(event, context, "SUCCESS", {})
+              except Exception as e:
+                  print("Error:", e)
+                  send_response(event, context, "FAILED", {"Message": str(e)})
+
+  ## CustomResource to trigger Lambda on Create/Update/Delete
+  DrsDnsRecordsCustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - CreateDrsDnsRecordsRole
+      - DrsPrimaryHostedZone
+      - DrsRecoveryHostedZone
+    Properties:
+      ServiceToken: !GetAtt CreateDrsDnsRecordsFunction.Arn

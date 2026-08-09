@@ -1,0 +1,355 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy a service on AWS Fargate, hosted in a private subnet, but accessible via a private NLB for outbound proxying
+Parameters:
+  InternetPrivateSubnetIdA:
+    Type: String
+    Description: Private Subnet Id A
+  InternetPrivateSubnetIdB:
+    Type: String
+    Description: Private Subnet Id B
+  InternetPrivateSubnetIdC:
+    Type: String
+    Description: Private Subnet Id C
+  InternetVPCId:
+    Type: String
+    Description: VPC ID
+  EndpointVPCId:
+    Type: String
+    Description: Endpoint VPC ID
+  ProductionVPCId:
+    Type: String
+    Description: Endpoint VPC ID
+  SharedVPCId:
+    Type: String
+    Description: Endpoint VPC ID
+  Subnets:
+    Type: String
+    Description: A comma delimited list of subnet IDs to deploy each interface endpoint into, e.g. subnetId1,subnetId2,subnetId3
+  LogGroupRetentionInDays:
+    Type: String
+    Description: The number of days to retain logs
+    Default: 90
+  ContainerImage:
+    Type: String
+    Description: The container to use. This can be a dockerhub name (e.g. datadog/squid) or a full ECR path.
+    #Default: chriskingwork/docker-squid:latest
+    Default: datadog/squid:latest
+  ProjectName:
+    Type: String
+    Description: Project Name to be used for naming and tagging
+
+Resources:
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogGroupRetentionInDays
+
+  OutboundProxiesSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Interface Endpoints"
+      VpcId: !Ref InternetVPCId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 3128
+        ToPort: 3128
+        CidrIp: 10.0.0.0/8
+      - IpProtocol: tcp
+        FromPort: 3128
+        ToPort: 3128
+        CidrIp: 172.16.0.0/12
+      - IpProtocol: tcp
+        FromPort: 3128
+        ToPort: 3128
+        CidrIp: 192.168.0.0/16
+
+  ECSRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Sid: ''
+          Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: KmsReadOnly
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - ecr:GetAuthorizationToken
+            - ecr:BatchCheckLayerAvailability
+            - ecr:GetDownloadUrlForLayer
+            - ecr:BatchGetImage
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+      Path: /
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+
+  OutBoundProxyDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities:
+        - "FARGATE"
+      Cpu: "1024"
+      Memory: "2048"
+      NetworkMode: awsvpc
+      #ExecutionRoleArn: !GetAtt ECSRole.Arn
+      ContainerDefinitions:
+        -
+          Name: "outbound-proxy"
+          Image: !Ref ContainerImage
+          PortMappings:
+            -
+              ContainerPort: 3128
+              #LogConfiguration:
+              #  LogDriver: awslogs
+              #  Options:
+              #    #awslogs-group: !Join [ '', [ '/ecs/', !Ref ECSLogGroup ] ]
+              #    awslogs-group: !Ref ECSLogGroup
+              #    awslogs-region: !Ref 'AWS::Region'
+              #    awslogs-stream-prefix: ecs
+
+  OutboundProxyNLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Subnets:
+        - !Ref InternetPrivateSubnetIdA
+        - !Ref InternetPrivateSubnetIdB
+        - !Ref InternetPrivateSubnetIdC
+      Type: network
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckProtocol: TCP
+      HealthyThresholdCount: 2
+      TargetType: ip
+      Port: 3128
+      Protocol: TCP
+      UnhealthyThresholdCount: 2
+      VpcId: !Ref InternetVPCId
+
+  OutboundProxyListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref OutboundProxyNLB
+      Port: 3128
+      Protocol: TCP
+
+  ServiceAutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: service-autoscaling
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - application-autoscaling:*
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:PutMetricAlarm
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                Resource: '*'
+
+  DefaultServiceScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: 3
+      MaxCapacity: 10
+      ResourceId: !Sub
+        - service/${EcsClusterName}/${EcsDefaultServiceName}
+        - EcsClusterName: !Ref ECSCluster
+          EcsDefaultServiceName: !GetAtt OutboundProxyService.Name
+      RoleARN: !GetAtt ServiceAutoScalingRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  DefaultServiceScaleOutPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ScaleOutPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref DefaultServiceScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 60
+        MetricAggregationType: Average
+        StepAdjustments:
+          - ScalingAdjustment: 1
+            MetricIntervalLowerBound: 0
+
+  DefaultServiceScaleInPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: ScaleInPolicy
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref DefaultServiceScalingTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 60
+        MetricAggregationType: Average
+        StepAdjustments:
+          - ScalingAdjustment: -1
+            MetricIntervalUpperBound: 0
+
+  DefaultServiceScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      EvaluationPeriods: 2
+      Statistic: Average
+      TreatMissingData: notBreaching
+      Threshold: 50
+      AlarmDescription: Alarm to add capacity if CPU is high
+      Period: 60
+      AlarmActions:
+        - !Ref DefaultServiceScaleOutPolicy
+      Namespace: AWS/ECS
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt OutboundProxyService.Name
+      ComparisonOperator: GreaterThanThreshold
+      MetricName: CPUUtilization
+
+  DefaultServiceScaleInAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      EvaluationPeriods: 2
+      Statistic: Average
+      TreatMissingData: notBreaching
+      Threshold: 25
+      AlarmDescription: Alarm to reduce capacity if container CPU is low
+      Period: 300
+      AlarmActions:
+        - !Ref DefaultServiceScaleInPolicy
+      Namespace: AWS/ECS
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt OutboundProxyService.Name
+      ComparisonOperator: LessThanThreshold
+      MetricName: CPUUtilization
+
+  OutboundProxyService:
+    DependsOn:
+      - OutboundProxyListener
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !Ref ECSCluster
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      DesiredCount: 3
+      LaunchType: FARGATE
+      TaskDefinition: !Ref OutBoundProxyDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref InternetPrivateSubnetIdA
+            - !Ref InternetPrivateSubnetIdB
+            - !Ref InternetPrivateSubnetIdC
+          SecurityGroups:
+            - !Ref OutboundProxiesSecurityGroup
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+      - ContainerName: outbound-proxy
+        ContainerPort: 3128
+        TargetGroupArn: !Ref TargetGroup
+
+  VPCIdInterfaceEndpointsSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: "Interface Endpoints"
+      VpcId: !Ref EndpointVPCId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 3128
+        ToPort: 3128
+        CidrIp: 10.0.0.0/8
+      - IpProtocol: tcp
+        FromPort: 3128
+        ToPort: 3128
+        CidrIp: 172.16.0.0/12
+      - IpProtocol: tcp
+        FromPort: 3128
+        ToPort: 3128
+        CidrIp: 192.168.0.0/16
+
+  OutboundProxyEndpointService:
+    Type: "AWS::EC2::VPCEndpointService"
+    Properties:
+      NetworkLoadBalancerArns:
+        - !Ref OutboundProxyNLB
+      AcceptanceRequired: false
+
+  OutboundProxyEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref EndpointVPCId
+      ServiceName: !Sub 'com.amazonaws.vpce.${AWS::Region}.${OutboundProxyEndpointService}'
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: false
+      SubnetIds: !Split [ ',', !Ref Subnets ]
+      SecurityGroupIds:
+        - !Ref VPCIdInterfaceEndpointsSecurityGroup
+
+  OutboundProxyDNS:
+    Type: "AWS::Route53::HostedZone"
+    Properties:
+      HostedZoneConfig:
+        Comment: "A hosted zone for ECS Telemetry VPC endpoints"
+      Name: !Join [ '', [ !Select [ 1, !Split [ ':', !Select [ 0, !GetAtt OutboundProxyEndpoint.DnsEntries ] ] ], '.' ] ]
+      VPCs:
+        -
+          VPCId: !Ref InternetVPCId
+          VPCRegion: !Ref "AWS::Region"
+        -
+          VPCId: !Ref SharedVPCId
+          VPCRegion: !Ref "AWS::Region"
+        -
+          VPCId: !Ref ProductionVPCId
+          VPCRegion: !Ref "AWS::Region"
+      HostedZoneTags:
+        -
+          Key: Name
+          Value: !Ref ProjectName
+
+  OutboundProxyRecord:
+    DependsOn: OutboundProxyDNS
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Join [ '', [ !Select [ 1, !Split [ ':', !Select [ 0, !GetAtt OutboundProxyEndpoint.DnsEntries ] ] ], '.' ] ]
+      Comment: DNS for ECS
+      Name: !Select [ 1, !Split [ ':', !Select [ 0, !GetAtt OutboundProxyEndpoint.DnsEntries ] ] ]
+      AliasTarget:
+        DNSName: !Join [ '', [ !Select [ 1, !Split [ ':', !Select [ 0, !GetAtt OutboundProxyEndpoint.DnsEntries ] ] ], '.' ] ]
+        EvaluateTargetHealth: false
+        HostedZoneId: !Select [ 0, !Split [ ':', !Select [ 0, !GetAtt OutboundProxyEndpoint.DnsEntries ] ] ]
+      Type: A
+
+Outputs:
+  proxyEndpointAddress:
+    Value: !Select [ 1, !Split [ ':', !Select [ 0, !GetAtt OutboundProxyEndpoint.DnsEntries ] ] ]
+    Description: The DNS address to allow outbound proxy access for servers

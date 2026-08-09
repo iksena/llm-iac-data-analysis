@@ -1,0 +1,709 @@
+# stacks/custom-resources.yml
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Provides services to be used as CloudFormation custom resources
+
+Parameters:
+  EnvironmentType: { Type: String }
+  EnvironmentTypeAbbreviation: { Type: String }
+  StorageStackName: { Type: String }
+  RootStackName: { Type: String }
+  RootStackId: { Type: String }
+  NestedChangeSetScrubbingResourcesState: { Type: String }
+
+Conditions:
+  EnableNestedChangeSetScrubbingResources: !Equals [!Ref NestedChangeSetScrubbingResourcesState, Enabled]
+
+Resources:
+  NestedChangeSetScrubber: { Type: AWS::SNS::Topic, Condition: EnableNestedChangeSetScrubbingResources }
+
+  AmazonSesSmtpCredentialsGeneratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Architectures: [arm64]
+      Description: >-
+        Generates SES SMTP credentials for a given IAM access key and secret
+      Handler: index.lambda_handler
+      InlineCode: |
+        import cfnresponse
+        import hmac
+        import hashlib
+        import base64
+
+        # These values are required to calculate the signature. Do not change them.
+        DATE = "11111111"
+        SERVICE = "ses"
+        MESSAGE = "SendRawEmail"
+        TERMINAL = "aws4_request"
+        VERSION = 0x04
+
+        def sign(key, msg):
+            return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+        def calculate_key(secret_access_key, region):
+            signature = sign(("AWS4" + secret_access_key).encode("utf-8"), DATE)
+            signature = sign(signature, region)
+            signature = sign(signature, SERVICE)
+            signature = sign(signature, TERMINAL)
+            signature = sign(signature, MESSAGE)
+            signature_and_version = bytes([VERSION]) + signature
+            smtp_password = base64.b64encode(signature_and_version)
+            return smtp_password.decode("utf-8")
+
+        # Ref: https://docs.aws.amazon.com/ses/latest/DeveloperGuide/smtp-credentials.html
+        def lambda_handler(event, context):
+            props = event["ResourceProperties"]
+
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+              "UserName": props["AccessKeyId"],
+              "Password": calculate_key(props["SecretAccessKey"], props["Region"])
+            })
+      MemorySize: 128
+      Runtime: python3.14
+      Tags:
+        prx:meta:tagging-version: "2021-04-07"
+        prx:cloudformation:stack-name: !Ref AWS::StackName
+        prx:cloudformation:stack-id: !Ref AWS::StackId
+        prx:cloudformation:root-stack-name: !Ref RootStackName
+        prx:cloudformation:root-stack-id: !Ref RootStackId
+        prx:ops:environment: !Ref EnvironmentType
+        prx:dev:application: Infrastructure
+      Timeout: 4
+  AmazonSesSmtpCredentialsGeneratorFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AmazonSesSmtpCredentialsGeneratorFunction}
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Infrastructure }
+  AmazonSesSmtpCredentialsGeneratorFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ERROR [Infrastructure] SES Cred. Generator <${EnvironmentTypeAbbreviation}> FUNCTION ERRORS (${RootStackName})
+      AlarmDescription: !Sub |-
+        ${EnvironmentType} stack custom resource function for generating SES
+        SMTP credentials is failing. This could mean that a stack update is
+        stalled, waiting for an HTTP callback from the function.
+
+        Be careful rolling back the stack; if the function fails again during
+        rollback it may become even more stuck. Making the callback request
+        manually may be possible, by looking at the function logs.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AmazonSesSmtpCredentialsGeneratorFunction
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Infrastructure }
+      Threshold: 0
+      TreatMissingData: notBreaching
+
+  AvailabilityZoneSelectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Architectures: [arm64]
+      Description: >-
+        Provides information about the availability zones that can and should
+        be used for the current region, including a list of zone names, and the
+        count of allowed zones
+      Handler: index.lambda_handler
+      InlineCode: |
+        import cfnresponse
+        import boto3
+        import traceback
+
+        ec2 = boto3.client("ec2")
+
+        # All regions should have at least two AZs after accounting for
+        # disallowed AZs. If a region would otherwise be left with only a
+        # single AZ, all AZs for that region should be disallowed.
+        DISALLOWED_AZS = ["use1-az3"]
+
+        def azFilter(az):
+            return az["ZoneId"] not in DISALLOWED_AZS
+
+        def lambda_handler(event, context):
+            try:
+                print(event)
+
+                if event["RequestType"] == "Create" or event["RequestType"] == "Update":
+                    azs = ec2.describe_availability_zones()["AvailabilityZones"]
+                    azs.sort(key=lambda a: a["ZoneName"])
+                    allowed = list(filter(azFilter, azs))
+                    names = list(map(lambda a: a["ZoneName"], allowed))
+
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                        "ZoneNames": names + names + names,
+                        "Count": len(names)
+                    })
+                else:
+                    cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+            except Exception as e:
+                print("Function failed due to exception.")
+                print(e)
+                traceback.print_exc()
+                cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      MemorySize: 128
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Action: ec2:DescribeAvailabilityZones
+              Effect: Allow
+              Resource: "*"
+      Runtime: python3.14
+      Tags:
+        prx:meta:tagging-version: "2021-04-07"
+        prx:cloudformation:stack-name: !Ref AWS::StackName
+        prx:cloudformation:stack-id: !Ref AWS::StackId
+        prx:cloudformation:root-stack-name: !Ref RootStackName
+        prx:cloudformation:root-stack-id: !Ref RootStackId
+        prx:ops:environment: !Ref EnvironmentType
+        prx:dev:application: Infrastructure
+      Timeout: 60
+  AvailabilityZoneSelectorFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AvailabilityZoneSelectorFunction}
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Infrastructure }
+  AvailabilityZoneSelectorFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ERROR [Infrastructure] AZ Selector <${EnvironmentTypeAbbreviation}> FUNCTION ERRORS (${RootStackName})
+      AlarmDescription: !Sub |-
+        ${EnvironmentType} stack custom resource function for selecting
+        availability zones is failing. This could mean that a stack update is
+        stalled, waiting for an HTTP callback from the function.
+
+        Be careful rolling back the stack; if the function fails again during
+        rollback it may become even more stuck. Making the callback request
+        manually may be possible, by looking at the function logs.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AvailabilityZoneSelectorFunction
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Infrastructure }
+      Threshold: 0
+      TreatMissingData: notBreaching
+
+  EchoFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Architectures: [arm64]
+      Description: >-
+        Returns any resource properties as outputs. This can be useful when a
+        derived value needs to be used several times within a template, but is
+        not available via Fn::Ref or Fn::GetAtt from any other resource.
+      Handler: index.lambda_handler
+      InlineCode: |
+        import cfnresponse
+        import traceback
+
+        def lambda_handler(event, context):
+            try:
+                print(event)
+
+                props = event["ResourceProperties"]
+                props.pop("ServiceToken", None)
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, props)
+
+            except Exception as e:
+                print("Function failed due to exception.")
+                print(e)
+                traceback.print_exc()
+                cfnresponse.send(event, context, cfnresponse.FAILED, {})
+      MemorySize: 128
+      Runtime: python3.14
+      Tags:
+        prx:meta:tagging-version: "2021-04-07"
+        prx:cloudformation:stack-name: !Ref AWS::StackName
+        prx:cloudformation:stack-id: !Ref AWS::StackId
+        prx:cloudformation:root-stack-name: !Ref RootStackName
+        prx:cloudformation:root-stack-id: !Ref RootStackId
+        prx:ops:environment: !Ref EnvironmentType
+        prx:dev:application: Infrastructure
+      Timeout: 4
+  EchoFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${EchoFunction}
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Infrastructure }
+  EchoFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ERROR [Infrastructure] Echo <${EnvironmentTypeAbbreviation}> FUNCTION ERRORS (${RootStackName})
+      AlarmDescription: !Sub |-
+        ${EnvironmentType} stack custom resource echo function is failing. This
+        could mean that a stack update is stalled, waiting for an HTTP callback
+        from the function.
+
+        Be careful rolling back the stack; if the function fails again during
+        rollback it may become even more stuck. Making the callback request
+        manually may be possible, by looking at the function logs.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EchoFunction
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Infrastructure }
+      Threshold: 0
+      TreatMissingData: notBreaching
+
+  Ec2ResourceTaggerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Architectures: [arm64]
+      Description: >-
+        Manages resource tags for EC2 resources, primarily to allow tagging of
+        resources like VPC Endpoints, for which CloudFormation doesn't support
+        tagging natively.
+      Handler: index.handler
+      InlineCode: |
+        const response = require('cfn-response');
+        const { ConfiguredRetryStrategy } = require('@aws-sdk/util-retry');
+        const {
+          EC2Client,
+          CreateTagsCommand,
+          DeleteTagsCommand,
+        } = require('@aws-sdk/client-ec2');
+
+        const ec2 = new EC2Client({
+          apiVersion: '2016-11-15',
+          retryStrategy: new ConfiguredRetryStrategy(6, 1100),
+        });
+
+        exports.handler = async (event, context) => {
+          console.log(event);
+
+          try {
+            const tags = event.ResourceProperties.Tags;
+            const id = event.ResourceProperties.ResourceId;
+
+            if (!tags || !tags.length || !id) {
+              console.error('ResourceId and Tags properties must be defined');
+              await response.send(event, context, response.FAILED, {});
+            }
+
+            if (event.RequestType === 'Create') {
+              // Create all tags on the custom resource
+              await ec2.send(
+                new CreateTagsCommand({
+                  Resources: [id],
+                  Tags: tags,
+                }),
+              );
+            } else if (event.RequestType === 'Update') {
+              // Remove tags that were present in the old resource properties, but are
+              // no longer present
+              const previousTags = event.OldResourceProperties.Tags;
+              const currentTagKeys = tags.map((t) => t.Key);
+
+              const staleTags = previousTags.filter(
+                (p) => !currentTagKeys.includes(p.Key),
+              );
+
+              if (staleTags.length) {
+                await ec2.send(
+                  new DeleteTagsCommand({
+                    Resources: [id],
+                    Tags: staleTags,
+                  }),
+                );
+              }
+
+              // Create/update all values present in the current resource properties
+              await ec2.send(
+                new CreateTagsCommand({
+                  Resources: [id],
+                  Tags: tags,
+                }),
+              );
+            } else if (event.RequestType === 'Delete') {
+              // Remove all tags on the custom resource
+              await ec2.send(
+                new DeleteTagsCommand({
+                  Resources: [id],
+                  Tags: tags,
+                }),
+              );
+            }
+
+            await response.send(event, context, response.SUCCESS, {});
+          } catch (error) {
+            console.error(error);
+            await response.send(event, context, response.FAILED, {});
+          }
+        };
+      MemorySize: 128
+      Policies:
+        - Statement:
+            - Action:
+                - ec2:CreateTags
+                - ec2:DeleteTags
+              Effect: Allow
+              Resource: "*"
+          Version: "2012-10-17"
+      Runtime: nodejs24.x
+      Tags:
+        prx:meta:tagging-version: "2021-04-07"
+        prx:cloudformation:stack-name: !Ref AWS::StackName
+        prx:cloudformation:stack-id: !Ref AWS::StackId
+        prx:cloudformation:root-stack-name: !Ref RootStackName
+        prx:cloudformation:root-stack-id: !Ref RootStackId
+        prx:ops:environment: !Ref EnvironmentType
+        prx:dev:application: Infrastructure
+      Timeout: 60
+  Ec2ResourceTaggerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Ec2ResourceTaggerFunction}
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Infrastructure }
+  Ec2ResourceTaggerFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ERROR [Infrastructure] EC2 Tagger <${EnvironmentTypeAbbreviation}> FUNCTION ERRORS (${RootStackName})
+      AlarmDescription: !Sub |-
+        ${EnvironmentType} stack custom resource function for tagging
+        EC2 resources is failing. This could mean that a stack update is
+        stalled, waiting for an HTTP callback from the function.
+
+        Be careful rolling back the stack; if the function fails again during
+        rollback it may become even more stuck. Making the callback request
+        manually may be possible, by looking at the function logs.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref Ec2ResourceTaggerFunction
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Infrastructure }
+      Threshold: 0
+      TreatMissingData: notBreaching
+
+  HashStringFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Architectures: [arm64]
+      Description: >-
+        Create a hash of an input string of a specified length
+      Handler: index.handler
+      InlineCode: |
+        const response = require('cfn-response');
+        const { createHash } = require('node:crypto');
+
+        exports.handler = async (event, context) => {
+          console.log(event);
+
+          try {
+            const inp = event.ResourceProperties.InputString;
+            const len = +event.ResourceProperties.Length;
+
+            if (!inp || !len || +len > 32) {
+              console.error('InputString and Length properties must be defined');
+              await response.send(event, context, response.FAILED, {});
+            }
+
+            const hash = createHash('sha256');
+            hash.update(inp);
+            const hex = hash.digest('hex');
+
+            await response.send(event, context, response.SUCCESS, {
+              Hash: hex.substring(0, len),
+            });
+          } catch (error) {
+            console.error(error);
+            await response.send(event, context, response.FAILED, {});
+          }
+        };
+      MemorySize: 128
+      Runtime: nodejs24.x
+      Tags:
+        prx:meta:tagging-version: "2021-04-07"
+        prx:cloudformation:stack-name: !Ref AWS::StackName
+        prx:cloudformation:stack-id: !Ref AWS::StackId
+        prx:cloudformation:root-stack-name: !Ref RootStackName
+        prx:cloudformation:root-stack-id: !Ref RootStackId
+        prx:ops:environment: !Ref EnvironmentType
+        prx:dev:application: Infrastructure
+      Timeout: 8
+  HashStringFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${HashStringFunction}
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Infrastructure }
+  HashStringFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ERROR [Infrastructure] Hash String <${EnvironmentTypeAbbreviation}> FUNCTION ERRORS (${RootStackName})
+      AlarmDescription: !Sub |-
+        ${EnvironmentType} stack custom resource function for creating hash
+        strings is failing. This could mean that a stack update is
+        stalled, waiting for an HTTP callback from the function.
+
+        Be careful rolling back the stack; if the function fails again during
+        rollback it may become even more stuck. Making the callback request
+        manually may be possible, by looking at the function logs.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref HashStringFunction
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Infrastructure }
+      Threshold: 0
+      TreatMissingData: notBreaching
+
+  TransferServerIpFinderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Architectures: [arm64]
+      Description: >-
+        Provides the IP addresses associated with a AWS Transfer Family server
+      Handler: index.handler
+      InlineCode: |
+        const response = require('cfn-response');
+        const {
+          TransferClient,
+          DescribeServerCommand,
+        } = require('@aws-sdk/client-transfer');
+        const {
+          EC2Client,
+          DescribeVpcEndpointsCommand,
+          DescribeNetworkInterfacesCommand,
+        } = require('@aws-sdk/client-ec2');
+        const { ConfiguredRetryStrategy } = require('@aws-sdk/util-retry');
+
+        const transfer = new TransferClient({
+          apiVersion: '2018-11-05',
+          retryStrategy: new ConfiguredRetryStrategy(6, 1100),
+        });
+
+        const ec2 = new EC2Client({
+          apiVersion: '2016-11-15',
+          retryStrategy: new ConfiguredRetryStrategy(6, 1100),
+        });
+
+        exports.handler = async (event, context) => {
+          console.log(event);
+
+          try {
+            const serverId = event.ResourceProperties.ServerId;
+
+            const serverDesc = await transfer.send(
+              new DescribeServerCommand({ ServerId: serverId }),
+            );
+            const vpcEndpointId = serverDesc.Server.EndpointDetails.VpcEndpointId;
+
+            const vpcEndpointDesc = await ec2.send(
+              new DescribeVpcEndpointsCommand({
+                VpcEndpointIds: [vpcEndpointId],
+              }),
+            );
+            const networkInterfaceIds =
+              vpcEndpointDesc.VpcEndpoints[0].NetworkInterfaceIds;
+
+            const networkInterfacesDesc = await ec2.send(
+              new DescribeNetworkInterfacesCommand({
+                NetworkInterfaceIds: networkInterfaceIds,
+              }),
+            );
+
+            const privateIpAddresses = networkInterfacesDesc.NetworkInterfaces.map(
+              (i) => i.PrivateIpAddress,
+            );
+
+            await response.send(event, context, response.SUCCESS, {
+              PrivateIpAddresses: privateIpAddresses,
+            });
+          } catch (error) {
+            console.error(error);
+            await response.send(event, context, response.FAILED, {});
+          }
+        };
+      MemorySize: 128
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Action:
+                - ec2:DescribeNetworkInterfaces
+                - ec2:DescribeVpcEndpoints
+                - transfer:DescribeServer
+              Effect: Allow
+              Resource: "*"
+      Runtime: nodejs24.x
+      Tags:
+        prx:meta:tagging-version: "2021-04-07"
+        prx:cloudformation:stack-name: !Ref AWS::StackName
+        prx:cloudformation:stack-id: !Ref AWS::StackId
+        prx:cloudformation:root-stack-name: !Ref RootStackName
+        prx:cloudformation:root-stack-id: !Ref RootStackId
+        prx:ops:environment: !Ref EnvironmentType
+        prx:dev:application: Infrastructure
+      Timeout: 60
+  TransferServerIpFinderFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${TransferServerIpFinderFunction}
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Infrastructure }
+  TransferServerIpFinderFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ERROR [Infrastructure] IP Finder <${EnvironmentTypeAbbreviation}> FUNCTION ERRORS (${RootStackName})
+      AlarmDescription: !Sub |-
+        ${EnvironmentType} stack custom resource function for finding transfer
+        server IPs is failing. This could mean that a stack update is
+        stalled, waiting for an HTTP callback from the function.
+
+        Be careful rolling back the stack; if the function fails again during
+        rollback it may become even more stuck. Making the callback request
+        manually may be possible, by looking at the function logs.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TransferServerIpFinderFunction
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Infrastructure }
+      Threshold: 0
+      TreatMissingData: notBreaching
+
+Outputs:
+  AmazonSesSmtpCredentialsGeneratorServiceToken:
+    Description: Service token for the SES SMTP credentials generator
+    Value: !GetAtt AmazonSesSmtpCredentialsGeneratorFunction.Arn
+  AvailabilityZoneSelectorServiceToken:
+    Description: Service token for the availability zone selector
+    Value: !GetAtt AvailabilityZoneSelectorFunction.Arn
+  EchoServiceToken:
+    Description: Service token for echo
+    Value: !GetAtt EchoFunction.Arn
+  Ec2ResourceTaggerServiceToken:
+    Description: Service token for EC2 Resource tagger
+    Value: !GetAtt Ec2ResourceTaggerFunction.Arn
+  HashStringServiceToken:
+    Description: Service token for hash string generator
+    Value: !GetAtt HashStringFunction.Arn
+  TransferServerIpFinderServiceToken:
+    Description: Service token for transfer server IP finder
+    Value: !GetAtt TransferServerIpFinderFunction.Arn

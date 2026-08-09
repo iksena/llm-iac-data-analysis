@@ -1,0 +1,941 @@
+# Copyright 2021-2023 Chris Farris <chrisf@primeharbor.com>
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Run Prowler across the entire org, and index findings in Elastic Search
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+
+  pBucketName:
+    Description: Name of the bucket to hold the prowler results
+    Type: String
+
+  pTableName:
+    Description: Name of the DDB table to track the prowler results
+    Type: String
+    Default: prowler-findings
+
+  pAuditRoleName:
+    Description: Default name of the AssumeRole to assume into accounts
+    Type: String
+    Default: security-audit
+
+  pPayerAccountId:
+    Description: Account ID of the AWS Organizations Management Account
+    Type: String
+
+  pTemplateURL:
+    Description: URL to the Transformed Template this stack was deployed with (for promotion to another environment)
+    Type: String
+
+  pScheduleExpression:
+    Description: CloudWatch ScheduleExpression for when the task is run
+    Type: String
+    Default: cron(0 12 * * ? *)
+
+  pRuleState:
+    Type: String
+    Description: Enable or disable the CloudWatch Event to run the ECS Task
+    Default: DISABLED
+    AllowedValues:
+      - DISABLED
+      - ENABLED
+
+  pSecurityHub:
+    Type: String
+    Description: Enable or disable pushing Prowler Findings to Security Hub
+    Default: DISABLED
+    AllowedValues:
+      - DISABLED
+      - ENABLED
+
+  pProwlerMetricNamespace:
+    Type: String
+    Description: Name of the CloudWatch Metrics Namespace to create Log metric filters
+    Default: prowler
+
+  pLogGroupName:
+    Type: String
+    Description: Name of LogGroup where Prowler Container will write logs
+    Default: prowler
+
+  pProwlerSlackSecret:
+    Description: FullName of secret that has a SLACK_API_TOKEN and SLACK_CHANNEL_ID to push updates to slack. See https://docs.prowler.cloud/en/latest/tutorials/integrations/
+    Type: String
+    Default: "NONE"
+
+  pFindingAlertSlackSecret:
+    Description: FullName of secret that has a SLACK_API_TOKEN and SLACK_CHANNEL_ID to send high-value new alerts to Slack
+    Type: String
+    Default: "NONE"
+
+  pAlertTopicArn:
+    Description: Topic To send Alarm Actions to
+    Type: String
+    Default: NONE
+
+  #
+  # Fargate Related Params
+  #
+  pServiceName:
+    Type: String
+    Default: "prowler"
+    Description: A name for the service
+
+  pContainerCpu:
+    Type: Number
+    Default: 1024
+    Description: How much CPU to give the container. 1024 is 1 CPU
+
+  pContainerMemory:
+    Type: Number
+    Default: 2048
+    Description: How much memory in megabytes to give the container
+
+  pImageRepo:
+    Type: String
+    Description: The url of a docker image that contains the application process that will handle the traffic for this service
+
+  pImageVersion:
+    Description: Version Identifer of Container to Deploy
+    Type: String
+
+  pContainerSubnet:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet to use for the Fargate containers
+
+  pContainerVPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to use for the Fargate containers
+
+  pLambdaSize:
+    Description: Memory/CPU Size of the Lambda
+    Type: String
+    Default: 4096
+
+Conditions:
+  cProwlerSlackSecret: !Not [!Equals [ !Ref pProwlerSlackSecret, "NONE" ]]
+  cDeployAlertLambda: !Not [!Equals [ !Ref pFindingAlertSlackSecret, "NONE" ]]
+  cAlarmActions: !Not [!Equals [ !Ref pAlertTopicArn, "NONE" ]]
+
+Globals:
+  Function:
+    Runtime: python3.11
+    MemorySize: !Ref pLambdaSize
+    Environment:
+      Variables:
+          ROLE_SESSION_NAME: !Ref AWS::StackName
+          BUCKET: !Ref pBucketName
+          ROLE_NAME: !Ref pAuditRoleName
+          LOG_LEVEL: 'INFO'
+
+Resources:
+
+  #
+  # Results Bucket
+  #
+  ProwlerBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: RetainExceptOnCreate
+    DependsOn:
+      - ProwlerBucketNotificationTopicPolicy
+      - ProwlerBucketProcessedFindingsNotificationTopicPolicy
+    Properties:
+      # AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      BucketName: !Ref pBucketName
+      # Additional Configuration options to come back and revisit.
+      # LifecycleConfiguration: <- I don't think we'd ever want to expire resources, but maybe over time?
+      # LoggingConfiguration: <- Probably unnecessary, but if someone needs it for compliance
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Topic: !Ref OutputNotificationTopic
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "prowler4-output/json-ocsf/"
+                  - Name: suffix
+                    Value: ".json"
+          - Event: 's3:ObjectCreated:*'
+            Topic: !Ref ProcessedAWSFindingsNotificationTopic
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "prowler4-output/json-ocsf-processed/"
+                  - Name: suffix
+                    Value: ".json"
+          - Event: 's3:ObjectCreated:*'
+            Topic: !Ref GCPOutputNotificationTopic
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: "prowler-gcp-output/"
+                  - Name: suffix
+                    Value: ".ocsf.json"
+      OwnershipControls:
+        Rules:
+        - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: True
+        BlockPublicPolicy: True
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True  # This rule also prohibits Cross-Account bucket access
+
+  OutputNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub "Destination of PutObject calls from ${pBucketName}/prowler4-output/json-ocsf/"
+      TopicName: !Sub "${pBucketName}-AWS-S3Events"
+
+  ProwlerBucketNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref OutputNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: AllowProwlerBucket
+        Statement:
+        - Sid: AllowProwlerBucketPublish
+          Effect: Allow
+          Principal:
+            Service: "s3.amazonaws.com"
+          Action:
+          - SNS:Publish
+          Resource:
+          - !Ref OutputNotificationTopic
+          Condition:
+            ArnLike:
+              aws:SourceArn: !Sub "arn:aws:s3:*:*:${pBucketName}"
+            StringEquals:
+              aws:SourceAccount: !Ref AWS::AccountId
+
+  ProcessedAWSFindingsNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub "Destination of PutObject calls from ${pBucketName}/prowler4-output/json-ocsf-processed/"
+      TopicName: !Sub "${pBucketName}-AWS-Processed-S3Events"
+
+  ProwlerBucketProcessedFindingsNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref ProcessedAWSFindingsNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: AllowProwlerBucket
+        Statement:
+        - Sid: AllowProwlerBucketPublish
+          Effect: Allow
+          Principal:
+            Service: "s3.amazonaws.com"
+          Action:
+          - SNS:Publish
+          Resource:
+          - !Ref ProcessedAWSFindingsNotificationTopic
+          Condition:
+            ArnLike:
+              aws:SourceArn: !Sub "arn:aws:s3:*:*:${pBucketName}"
+            StringEquals:
+              aws:SourceAccount: !Ref AWS::AccountId
+
+  GCPOutputNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub "Destination of PutObject calls from ${pBucketName}/prowler-gcp-output/"
+      TopicName: !Sub "${pBucketName}-GCP-S3Events"
+
+  ProwlerBucketGCPNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref GCPOutputNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: AllowProwlerBucket
+        Statement:
+        - Sid: AllowProwlerBucketPublish
+          Effect: Allow
+          Principal:
+            Service: "s3.amazonaws.com"
+          Action:
+          - SNS:Publish
+          Resource:
+          - !Ref GCPOutputNotificationTopic
+          Condition:
+            ArnLike:
+              aws:SourceArn: !Sub "arn:aws:s3:*:*:${pBucketName}"
+            StringEquals:
+              aws:SourceAccount: !Ref AWS::AccountId
+
+  #
+  # ECS Resources
+  #
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+
+  ProwlerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Ref 'pServiceName'
+      Cpu: !Ref 'pContainerCpu'
+      Memory: !Ref 'pContainerMemory'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !Ref ECSTaskExecutionRole
+      TaskRoleArn: !Ref ContainerRole
+      RuntimePlatform:
+          CpuArchitecture: ARM64
+          OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: !Ref 'pServiceName'
+          Cpu: !Ref 'pContainerCpu'
+          Memory: !Ref 'pContainerMemory'
+          Image: !Sub "${pImageRepo}:${pImageVersion}"
+          LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref ContainerLogGroup
+                awslogs-region: !Ref AWS::Region
+                awslogs-create-group: true
+                awslogs-stream-prefix: !Sub "${pServiceName}-${pImageVersion}"
+          Secrets:
+            !If
+            - cProwlerSlackSecret
+            -
+              - Name: SLACK_API_TOKEN
+                ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${pProwlerSlackSecret}:SLACK_API_TOKEN::"
+              - Name: SLACK_CHANNEL_ID
+                ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${pProwlerSlackSecret}:SLACK_CHANNEL_ID::"
+            - !Ref AWS::NoValue
+          Environment:
+            - Name: ROLENAME
+              Value: !Ref pAuditRoleName
+            - Name: PAYER_ID
+              Value: !Ref pPayerAccountId
+            - Name: OUTPUT_BUCKET
+              Value: !Ref pBucketName
+            - Name: SECURITY_HUB
+              Value: !Ref pSecurityHub
+
+  ContainerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - ecs.amazonaws.com
+              - ecs-tasks.amazonaws.com
+          Action: ['sts:AssumeRole']
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSOrganizationsReadOnlyAccess
+      Policies:
+      - PolicyName: ecs-service
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              # Rules which allow ECS to attach network interfaces to instances
+              # on your behalf in order for awsvpc networking mode to work right
+              - 'ec2:AttachNetworkInterface'
+              - 'ec2:CreateNetworkInterface'
+              - 'ec2:CreateNetworkInterfacePermission'
+              - 'ec2:DeleteNetworkInterface'
+              - 'ec2:DeleteNetworkInterfacePermission'
+              - 'ec2:Describe*'
+              - 'ec2:DetachNetworkInterface'
+              # Rules which allow ECS to update load balancers on your behalf
+              # with the information sabout how to send traffic to your containers
+              - 'elasticloadbalancing:DeregisterInstancesFromLoadBalancer'
+              - 'elasticloadbalancing:DeregisterTargets'
+              - 'elasticloadbalancing:Describe*'
+              - 'elasticloadbalancing:RegisterInstancesWithLoadBalancer'
+              - 'elasticloadbalancing:RegisterTargets'
+              # Allow the ECS tasks to upload logs to CloudWatch
+              - 'logs:CreateLogStream'
+              - 'logs:CreateLogGroup'
+              - 'logs:PutLogEvents'
+            Resource: '*'
+      - PolicyName: ProwlerPermissions
+        PolicyDocument:
+          Statement:
+          - Sid: WriteResultsToS3
+            Action: s3:*
+            Effect: Allow
+            Resource:
+              - !Sub 'arn:aws:s3:::${pBucketName}/*'
+              - !Sub 'arn:aws:s3:::${pBucketName}'
+          - Sid: AssumeAuditRole
+            Effect: "Allow"
+            Action:
+            - sts:AssumeRole
+            Resource: !Sub "arn:aws:iam::*:role/${pAuditRoleName}"
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - ecs-tasks.amazonaws.com
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: AmazonECSTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                # Allow the ECS Tasks to download images from ECR
+                - 'ecr:GetAuthorizationToken'
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:BatchGetImage'
+                # Allow the ECS tasks to upload logs to CloudWatch
+                - 'logs:CreateLogStream'
+                - 'logs:CreateLogGroup'
+                - 'logs:PutLogEvents'
+              Resource: '*'
+        - PolicyName: AccessSlackSecret
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                - ssm:GetParameters
+                - secretsmanager:GetSecretValue
+                - kms:Decrypt
+              Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${pProwlerSlackSecret}*"
+
+  ECSEventRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+              - events.amazonaws.com
+          Action: ['sts:AssumeRole']
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceEventsRole
+
+  ContainerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "Container Security Group for ${AWS::StackName}"
+      # GroupName: String
+      VpcId: !Ref pContainerVPCId
+
+  #
+  # Run the Task
+  #
+  RunTaskRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Execute the Prowler container task
+      Name: !Sub ${AWS::StackName}-run-prowler-task
+      # RoleArn: String
+      ScheduleExpression: !Ref pScheduleExpression
+      State: !Ref pRuleState
+      Targets:
+        - Arn: !GetAtt ECSCluster.Arn
+          RoleArn: !GetAtt ECSEventRole.Arn
+          Id: Id345
+          EcsParameters:
+            TaskDefinitionArn: !Ref ProwlerTaskDefinition
+            TaskCount: 1
+            LaunchType: FARGATE
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                Subnets:
+                - !Ref pContainerSubnet
+                SecurityGroups:
+                - !Ref ContainerSecurityGroup
+                AssignPublicIp: ENABLED
+            PlatformVersion: LATEST
+            EnableECSManagedTags: false
+            EnableExecuteCommand: false
+
+  #
+  # Lambda Functions
+  #
+  DecoratorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: S3Access
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Action:
+            - s3:PutObject
+            - s3:GetObject
+            Effect: Allow
+            Resource:
+              - !Sub 'arn:aws:s3:::${pBucketName}/*'
+              - !Sub 'arn:aws:s3:::${pBucketName}'
+      - PolicyName: LambdaLogging
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Resource: '*'
+            Action:
+            - logs:*
+            Effect: Allow
+      - PolicyName: GetMessages
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Resource:
+            - !GetAtt S3EventDecoratorQueue.Arn
+            Action:
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+            Effect: Allow
+      - PolicyName: DDBFindingTracking
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Resource:
+            - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProwlerFindingsTrackingTable}"
+            - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProwlerFindingsTrackingTable}/index/*"
+            Action:
+            - dynamodb:Query
+            - dynamodb:PutItem
+            - dynamodb:BatchWriteItem
+            - dynamodb:UpdateItem
+            Effect: Allow
+          - Resource:
+            - !GetAtt ProwlerFindingsTrackingTableKey.Arn
+            Action:
+            - kms:*
+            Effect: Allow
+
+  DecorateFindingsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-decorator"
+      Description: Decorate prowler findings with additional tracking data from DDB
+      Handler: decorate_prowler_findings.handler
+      Role: !GetAtt DecoratorLambdaRole.Arn
+      CodeUri: ../lambda
+      Timeout: 900
+      Events:
+        SQSIngest:
+          Type: SQS
+          Properties:
+            BatchSize: 1
+            Enabled: True
+            Queue: !GetAtt S3EventDecoratorQueue.Arn
+      Environment:
+        Variables:
+          TRACKING_TABLE_NAME: !Ref ProwlerFindingsTrackingTable
+          OUTPUT_BUCKET: !Ref ProwlerBucket
+
+  FindingsAlertRole:
+    Type: AWS::IAM::Role
+    Condition: cDeployAlertLambda
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: LambdaLogging
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Resource: '*'
+            Action:
+            - logs:*
+            Effect: Allow
+      - PolicyName: DDBStreamRead
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:DescribeStream
+                - dynamodb:GetRecords
+                - dynamodb:GetShardIterator
+                - dynamodb:ListStreams
+              Resource:
+                - !GetAtt ProwlerFindingsTrackingTable.StreamArn
+      - PolicyName: DDBKMSDecrypt
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource:
+                - !GetAtt ProwlerFindingsTrackingTableKey.Arn
+      - PolicyName: AccessSlackSecret
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action:
+              - ssm:GetParameters
+              - secretsmanager:GetSecretValue
+              - kms:Decrypt
+            Resource:
+              - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${pFindingAlertSlackSecret}-*"
+      - PolicyName: S3ConfigFileAccess
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Action:
+            - s3:GetObject
+            Effect: Allow
+            Resource:
+              - !Sub 'arn:aws:s3:::${pBucketName}/*.yaml'
+
+  FindingsAlertFunction:
+    Type: AWS::Serverless::Function
+    Condition: cDeployAlertLambda
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-findings-alert"
+      Description: Send alerts about new findings
+      Handler: alert_prowler_findings.handler
+      Role: !GetAtt FindingsAlertRole.Arn
+      CodeUri: ../lambda
+      Timeout: 60
+      Environment:
+        Variables:
+          SLACK_SECRET: !Ref pFindingAlertSlackSecret
+          CONFIG_BUCKET: !Ref ProwlerBucket
+
+  DynamoDBStreamToFindingsAlertLambda:
+    Condition: cDeployAlertLambda
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      StartingPosition: LATEST
+      EventSourceArn: !GetAtt ProwlerFindingsTrackingTable.StreamArn
+      FunctionName: !GetAtt FindingsAlertFunction.Arn
+
+  #
+  # Decorator S3 -> SNS -> SQS -> Lambda Plumbing
+  #
+  S3EventDecoratorQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      # Any messages older than an hour are probably out-of-date
+      MessageRetentionPeriod: 36000
+      ReceiveMessageWaitTimeSeconds: 10
+      VisibilityTimeout: 1050
+
+  S3EventDecoratorQueueSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !GetAtt S3EventDecoratorQueue.Arn
+      Protocol: sqs
+      TopicArn: !Ref OutputNotificationTopic # topic for "prowler4-output/json-ocsf/" events
+
+  S3EventDecoratorQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref S3EventDecoratorQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Id: AllowS3
+        Statement:
+        - Sid: AllowS3EventNotification
+          Effect: Allow
+          Principal:
+            AWS: '*'
+          Action:
+          - SQS:SendMessage
+          Resource: !GetAtt S3EventDecoratorQueue.Arn
+          Condition:
+            ArnLike:
+              aws:SourceArn: !Sub "arn:aws:s3:*:*:${pBucketName}"
+        - Sid: Allow-SNS-SendMessage
+          Effect: Allow
+          Principal: "*"
+          Action:
+          - sqs:SendMessage
+          Resource: !GetAtt S3EventDecoratorQueue.Arn
+          Condition:
+            ArnEquals:
+              aws:SourceArn:
+                - !Ref OutputNotificationTopic
+
+  S3EventDecoratorQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      ActionsEnabled: True
+      AlarmDescription: "Alert when decorator Queue doesn't properly drain"
+      AlarmName: !Sub "${AWS::StackName}-DecoratorFileProcessQueue"
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt S3EventDecoratorQueue.QueueName
+      EvaluationPeriods: 1
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 300
+      Statistic: Average
+      Threshold: 3
+      TreatMissingData: missing
+      AlarmActions:
+        - !If
+          - cAlarmActions
+          - !Ref pAlertTopicArn
+          - !Ref AWS::NoValue
+
+  FindingsAlertFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: cDeployAlertLambda
+    Properties:
+      AlarmName: !Sub ${FindingsAlertFunction}-LambdaErrors
+      AlarmDescription: "Alarm if lambda errors out"
+      Namespace: "AWS/Lambda"
+      MetricName: "Errors"
+      Dimensions:
+      - Name: "FunctionName"
+        Value: !Ref FindingsAlertFunction
+      Statistic: "Sum"
+      ComparisonOperator: "GreaterThanThreshold"
+      Threshold: 0
+      EvaluationPeriods: 1
+      Period: 60
+      TreatMissingData: "ignore"
+      AlarmActions:
+        - !If
+          - cAlarmActions
+          - !Ref pAlertTopicArn
+          - !Ref AWS::NoValue
+
+  #
+  # DynamoDB resources
+  #
+  ProwlerFindingsTrackingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Ref pTableName
+      AttributeDefinitions:
+        - AttributeName: finding_info_uid
+          AttributeType: S
+        - AttributeName: cloud_account_uid
+          AttributeType: S
+        - AttributeName: metadata_event_code
+          AttributeType: S
+      KeySchema:
+        - AttributeName: finding_info_uid
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      GlobalSecondaryIndexes:
+        - IndexName: "CloudAccountIndex"
+          KeySchema:
+            - AttributeName: cloud_account_uid
+              KeyType: "HASH"
+            - AttributeName: metadata_event_code
+              KeyType: "RANGE"
+          Projection:
+            ProjectionType: "ALL"
+        - IndexName: "EventCodeIndex"
+          KeySchema:
+            - AttributeName: metadata_event_code
+              KeyType: "HASH"
+          Projection:
+            ProjectionType: "ALL"
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref ProwlerFindingsTrackingTableKey
+    DeletionPolicy: RetainExceptOnCreate
+
+  ProwlerFindingsTrackingTableKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: "KMS key to encrypt findings DynamoDB table"
+      KeyPolicy:
+        Id: DynamoDB
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - "kms:*"
+            Resource: "*"
+          - Sid: DynamoDB Permissions
+            Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - "kms:GenerateDataKey"
+              - "kms:Decrypt"
+            Resource: "*"
+
+  ProwlerFindingsTrackingTableKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${pTableName}-dynamodb-key"
+      TargetKeyId: !Ref ProwlerFindingsTrackingTableKey
+
+  #
+  # Alarms
+  #
+  DecorateFindingsFunctionErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${DecorateFindingsFunction}-LambdaErrors
+      AlarmDescription: "Alarm if lambda errors out"
+      Namespace: "AWS/Lambda"
+      MetricName: "Errors"
+      Dimensions:
+      - Name: "FunctionName"
+        Value: !Ref DecorateFindingsFunction
+      Statistic: "Sum"
+      ComparisonOperator: "GreaterThanThreshold"
+      Threshold: 0
+      EvaluationPeriods: 1
+      Period: 60
+      TreatMissingData: "ignore"
+      AlarmActions:
+        - !If
+          - cAlarmActions
+          - !Ref pAlertTopicArn
+          - !Ref AWS::NoValue
+
+  ContainerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Ref pLogGroupName
+      RetentionInDays: 30
+
+  # ProwlerDurationMetricFilter:
+  #   Type: AWS::Logs::MetricFilter
+  #   Properties:
+  #     LogGroupName: !Ref ContainerLogGroup
+  #     FilterPattern: '[timestamp, logLevel, message = "Prowler Exited for", accountId = Number, "with error code", errorCode = Number, "after", durationSeconds = Number, "seconds"]'
+  #     MetricTransformations:
+  #       - MetricValue: "durationSeconds"
+  #         MetricNamespace: !Ref pProwlerMetricNamespace
+  #         MetricName: "ProwlerDuration"
+
+  SuccessfulProwlerRunMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    DependsOn:
+      - ContainerLogGroup
+    Properties:
+      LogGroupName: !Ref ContainerLogGroup
+      FilterPattern: '"Prowler Exited" "with error code 0"'
+      MetricTransformations:
+      - MetricNamespace: !Ref pProwlerMetricNamespace
+        MetricName: successful_prowler_runs
+        MetricValue: '1'
+
+  FailedProwlerRunMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    DependsOn:
+      - ContainerLogGroup
+    Properties:
+      LogGroupName: !Ref ContainerLogGroup
+      FilterPattern: '"Prowler Exited" -"with error code 0"'
+      MetricTransformations:
+      - MetricNamespace: !Ref pProwlerMetricNamespace
+        MetricName: failed_prowler_runs
+        MetricValue: '1'
+
+  FailedProwlerAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: FailedProwlerRun
+      AlarmDescription: Alarms Prowler exits non-0 for an account.
+      MetricName: failed_prowler_runs
+      Namespace: !Ref pProwlerMetricNamespace
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '300'
+      Statistic: Sum
+      Threshold: '1'
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !If
+          - cAlarmActions
+          - !Ref pAlertTopicArn
+          - !Ref AWS::NoValue
+
+Outputs:
+  TemplateURL:
+    Description: URL to the Transformed Template this stack was deployed with (for promotion to another environment)
+    Value: !Ref pTemplateURL
+
+  ECSClusterArn:
+    Value: !GetAtt ECSCluster.Arn
+
+  ECSClusterName:
+    Value: !Ref ECSCluster
+
+  ContainerSecurityGroup:
+    Value: !Ref ContainerSecurityGroup
+
+  ECSEventRoleArn:
+    Value: !GetAtt ECSEventRole.Arn
+
+  ECSTaskExecutionRoleArn:
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+
+  ProwlerContainerTaskId:
+    Value: !Ref ProwlerTaskDefinition
+
+  ProwlerBucket:
+    Value: !Ref ProwlerBucket
+
+  ProwlerBucketEventTopicArn:
+    Value: !Ref OutputNotificationTopic
+
+  ProwlerBucketProcessedEventTopicArn:
+    Value: !Ref ProcessedAWSFindingsNotificationTopic
+
+  ProwlerBucketGCPEventTopicArn:
+    Value: !Ref GCPOutputNotificationTopic

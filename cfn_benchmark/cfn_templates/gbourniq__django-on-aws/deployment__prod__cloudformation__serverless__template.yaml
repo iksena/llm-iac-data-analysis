@@ -1,0 +1,386 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Metadata:
+  License: Apache-2.0
+Description: |
+  This CloudFormation template defines serverless resources:
+  - SNS Topic for AutoScaling and CodeDeploy to send notifications
+  - SQS Queue to send user-defined notifications to Slack via Lambda
+  - Lambda functions to send Slack notifications from SNS and SQS triggers
+  - CloudWatch Event Rule with CodeDeploy source to push custom metrics for deployment state change
+
+Parameters:
+  CodeDeployDimensionName:
+    Description: Dimension Name for the Custom Metric API to push the codedeploy deployment state to
+    Type: String
+  CodeDeployMetricName:
+    Description: Metric Name for the Custom Metric API to push the codedeploy deployment state to
+    Type: String
+  SlackWebhookUrl:
+    NoEcho: 'true'
+    Description: Slack WebHook Url to forward ASG/CodeDeploy events SNS notifications to Slack
+    Type: String
+
+Resources:
+
+  # CloudWatch Event Rules
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: EventRule triggered by CodeDeploy deployment state changes
+      EventPattern:
+        source: [aws.codedeploy]
+        detail-type: ["CodeDeploy Deployment State-change Notification"]
+        detail:
+          state: [FAILURE, SUCCESS]
+      State: "ENABLED"
+      Targets:
+        - Arn: !GetAtt LambdaPushMetricCodeDeployDeploymentState.Arn
+          Id: "TargetFunctionV1"
+
+  # Lambda functions
+  LambdaPushMetricCodeDeployDeploymentState:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Push custom metrics for CodeDeploy deployment event state changes
+      FunctionName: !Join ['-', [!Ref AWS::StackName, lambda-codedeploy]]
+      Handler: codedeploy_lambda_handler.handler
+      Role: !GetAtt LambdaServiceRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Runtime: python3.6
+      Code: src/
+      Environment:
+        Variables:
+          CODEDEPLOY_METRIC_NAME: !Ref CodeDeployMetricName
+          CODEDEPLOY_DIMENSION_NAME: !Ref CodeDeployDimensionName
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaPushMetricCodeDeployDeploymentState
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt EventRule.Arn
+  LambdaForwardSNSToSlack:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Forward messages from Amazon SNS to Slack.
+      FunctionName: !Join ['-', [!Ref AWS::StackName, lambda-sns]]
+      Handler: sns_lambda_handler.handler
+      Role: !GetAtt LambdaServiceRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Runtime: python3.6
+      Code: src/
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+  SnsLambdaFunctionInvokePermission:
+    # Allow SNS service to send messages to the LambdaForwardSNSToSlack Lambda function
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LambdaForwardSNSToSlack
+      Principal: sns.amazonaws.com
+  LambdaForwardSQSToSlack:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Forward messages from Amazon SQS to Slack.
+      FunctionName: !Join ['-', [!Ref AWS::StackName, lambda-sqs]]
+      Handler: sqs_lambda_handler.handler
+      Role: !GetAtt LambdaServiceRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Runtime: python3.6
+      Code: src/
+      Environment:
+        Variables:
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+  SqsLambdaFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      Enabled: true
+      EventSourceArn: !GetAtt SQSQueue.Arn
+      FunctionName: !GetAtt LambdaForwardSQSToSlack.Arn
+  CustomResourceLambdaFunctionForSES:
+          Type: AWS::Lambda::Function
+          Properties:
+              Handler: index.handler
+              Role: !GetAtt LambdaServiceRole.Arn
+              Runtime: python3.7
+              # Add the below next time stack is created - atm getting Modifying service token is not allowed.
+              # Description: Lambda to create and update AWS SES Template Custom Resource
+              # FunctionName: !Join ['-', [!Ref AWS::StackName, lambda-ses]]
+              # Timeout: 30
+              # MemorySize: 128
+              Code:
+                  ZipFile: |
+                      import boto3
+                      import os
+                      import json
+                      import cfnresponse
+                      import pprint
+
+                      def handler(event, context):
+                          responseData = {}
+                          try:
+                              ses_client = boto3.client('ses')
+                              template = {
+                                  'TemplateName': event['ResourceProperties']['TemplateName'],
+                                  'SubjectPart': event['ResourceProperties']['SubjectPart'],
+                                  'TextPart': event['ResourceProperties']['TextPart'],
+                                  'HtmlPart': event['ResourceProperties']['HtmlPart']
+                              }
+                              if event['RequestType'] == "Create":
+                                  pprint.pprint(ses_client.create_template(Template=template))
+                              elif event['RequestType'] == "Update":
+                                try:
+                                  pprint.pprint(ses_client.create_template(Template=template))
+                                except ses_client.exceptions.AlreadyExistsException:
+                                  # Template already exists, update it instead
+                                  pprint.pprint(ses_client.update_template(Template=template))
+                              elif event['RequestType'] == "Delete":
+                                  pprint.pprint(ses_client.delete_template(
+                                      TemplateName=event['ResourceProperties']['TemplateName']
+                                  ))
+                              cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "GenericPhysicalResourceId")
+                          except:
+                              cfnresponse.send(event, context, cfnresponse.FAILED, responseData, "GenericPhysicalResourceId")
+
+  # SNS
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: cfn-info
+      TopicName: !Join ['-', [!Ref AWS::StackName, CloudFormationNotifications]]
+      Subscription:
+        - Protocol: lambda
+          Endpoint: !GetAtt LambdaForwardSNSToSlack.Arn
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref SNSTopic]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: sns:Publish
+            Resource: !Ref SNSTopic
+            Principal:
+              AWS: '*'
+            Condition:
+              ArnLike:
+                AWS:SourceArn: !Sub 'arn:aws:*:*:${AWS::AccountId}:*'
+
+  # SQS
+  SQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      DelaySeconds: 0
+      VisibilityTimeout: 120
+
+  # IAM
+  LambdaServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['-', [!Ref AWS::StackName, LambdaServiceRole]]
+      Path: /
+      AssumeRolePolicyDocument:
+        # Allow Lambda service to assume the role
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: [sts:AssumeRole]
+            Principal:
+              Service: [lambda.amazonaws.com]
+      Policies:
+        # Policy for Lambda to push logs to CloudWatch
+        - PolicyName: !Join ['-', [!Ref AWS::StackName, LambdaCWLogsPolicy]]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: arn:aws:logs:*:*:*
+        # Policy for Lambda to interact with the SQS Queue
+        - PolicyName: !Join ['-', [!Ref AWS::StackName, LambdaSqsPolicy]]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:ChangeMessageVisibility
+                Resource: !GetAtt SQSQueue.Arn
+        # Policy for Lambda to push custom metrics to CW
+        - PolicyName: !Join ['-', [!Ref AWS::StackName, LambdaToPutMetricsToCWPolicy]]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [cloudwatch:PutMetricData]
+                Resource: ['*']
+        # Policy for Lambda custom resource to manage the SES templates
+        - PolicyName: !Join ['-', [!Ref AWS::StackName, LambdaToManageSESTemplatePolicy]]
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: ['*']
+              - Effect: Allow
+                Action:
+                  - ses:CreateTemplate
+                  - ses:GetTemplate
+                  - ses:UpdateTemplate
+                  - ses:DeleteTemplate
+                Resource: ['*']
+
+  # Lambda Custom Resource as SES is not supported yet in eu-west-2
+  SESTemplate:
+    Type: Custom::Template
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunctionForSES.Arn
+      TemplateName: "ItemCreatedOrModifiedNotification"
+      SubjectPart: "{{ subject }}"
+      TextPart: |
+          {{username}}, une nouvelle recette a été {{ action }} par le Chef Tari. Viens vite decouvrir tous les secrets du {{ item_name }}, en exclusivité sur {{ base_url }} !
+
+          - The Tari Newletter Team.
+      HtmlPart: |
+        <!doctype html>
+        <html lang="en">
+
+          <head>
+            <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+            <meta name="viewport" content="width=device-width, initial-scale=1"/>
+            <!-- Loading css from tinyMCE app -->
+            <link href="{{ base_url }}/staticfiles/tinymce/css/prism.css" rel="stylesheet">
+            <!-- Minified customised CSS, compiled Materialize SSAS using Koala -->
+            <link href="{{ base_url }}/staticfiles/css/materialize.css" type="text/css" rel="stylesheet" media="screen,projection"/>
+            <!-- Additional CSS files -->
+            <link href="{{ base_url }}/staticfiles/css/googleapis.css" type="text/css" rel="stylesheet">
+            <link href="{{ base_url }}/staticfiles/css/style.css" type="text/css" rel="stylesheet" media="screen,projection"/>
+            <link rel="shortcut icon" href="{{ base_url }}/staticfiles/favicon.ico">
+            <link rel="apple-touch-icon" href="{{ base_url }}/staticfiles/apple-touch-icon.png">
+            <style>
+              spanblack {
+                background-color: #212121;
+              }
+              img {
+                max-width: 100%;
+                height: auto;
+                width: auto\9; /* ie8 */
+              }
+              logo-img {
+                width: 24px,
+                height: 24px
+              }
+            </style>
+          </head>
+
+          <body>
+
+            <div class="container">
+              <div class="section">
+                <div class="row">
+                  <div class="col s12 center">
+                    <div class="nav-wrapper container">
+                      <a id="logo-container" href="{{ base_url }}/" class="brand-logo center">
+                        <img class="responsive-img" src="{{ base_url }}/staticfiles/Logo.png">
+                      </a>
+                    </div>
+                  </div>
+                </div>
+                <div class="row">
+                  <div class="col s12 center">
+                    <p class="left-align light">{{ username }}, une nouvelle recette a été {{ action }} par le Chef Tari. Viens vite decouvrir tous les secrets du {{ item_name }}, en exclusivité sur <a href="{{ base_url }}/"><u>{{ base_url }}</u></a> !</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="container">
+              <div class="row center">
+                  <div class="col s12 m6 l4">
+                    <a href="{{ item_page_url }}", style="color:#000">
+                      <div class="card hoverable center">
+                        <div class="card-image waves-effect waves-block waves-light">
+                          <img class="activator" src="{{ item_image_url }}">
+                        </div>
+                        <div class="card-content">
+                          <span class="card-title activator grey-text text-darken-4">Voir la recette<i class="material-icons right">chevron_right</i></span>
+                        </div>
+                      </div>
+                    </a>
+                  </div>
+              </div>
+            </div>
+
+            <div class="container">
+              <div class="icon-block">
+                <h4 class="header center grey-text text-darken-3"></a>Bon Appétit 👩🏻‍🍳</h4>
+              </div>
+              <br><br>
+            </div>
+
+            <footer id="my-footer" class="page-footer grey" style="position:sticky;bottom:0;left:0;width:100%;">
+              <div class="container">
+                <div class="row">
+                  <div class="col l9 s12">
+                    <h5 class="white-text"><a class="btn-floating grey darken-2 pulse"><i class="large material-icons">kitchen</i></a>&nbsp;&nbsp; Tari Newsletter</h5>
+                    <p class="grey-text text-lighten-4">
+                      Cet e-mail a été envoyé à l'adresse <a style="color:#FFFFFF;" href="{{ email }}">{{ email }}</a>, car vous êtes abonné(e) à la Tari Newsletter. Si vous souhaitez modifier vos informations ou vous désabonner, <a style="color:#FFFFFF;" href="{{ base_url }}/contact/"><u>cliquez ici</u></a>.
+                      <br>
+                      This email was sent to <a style="color:#FFFFFF;" href="{{ email }}">{{ email }}</a> as you are subscribed to the Tari Newsletter. You can update your preferences or unsubscribe from this list <a style="color:#FFFFFF;" href="{{ base_url }}/contact/"><u>here</u></a>.
+                    </p>
+                    <p class="grey-text text-lighten-4">
+                      <small> © Tari Kitchen 2022 </small>
+                      <br>
+                      <small> © 98 Turnpike House Goswell Road - EC1V 7PE Londres - Royaume-Uni </small>
+                    </p>
+                  </div>
+                  <div class="col l3 s12 center">
+                    <h5 class="white-text">Nous contacter</h5>
+                    <br>
+                    <div class="col l3 s3">
+                      <a class="white-text" href="{{ base_url }}/contact/"><img style="object-fit:contain; width:24px; height:24px" src="{{ base_url }}/staticfiles/logo-facebook.png"></a>
+                    </div>
+                    <div class="col l3 s3">
+                      <a class="white-text" href="{{ base_url }}/contact/"><img style="object-fit:contain; width:24px; height:24px" src="{{ base_url }}/staticfiles/logo-twitter.png"></a>
+                    </div>
+                    <div class="col l3 s3">
+                      <a class="white-text" href="{{ base_url }}/contact/"><img style="object-fit:contain; width:24px; height:24px" src="{{ base_url }}/staticfiles/logo-instagram.png"></a>
+                    </div>
+                    <div class="col l3 s3">
+                      <a class="white-text" href="{{ base_url }}/contact/"><img style="object-fit:contain; width:24px; height:24px" src="{{ base_url }}/staticfiles/logo-youtube.png"></a>
+                    </div>
+                      <br><br>
+                      <ul>
+                        <p class="grey-text text-lighten-4"><small><a style="color:#FFFFFF;" href="{{ base_url }}/"><u>Voir en ligne</u></a></small></p>
+                        <p class="grey-text text-lighten-4"><small><a style="color:#FFFFFF;" href="{{ base_url }}/admin/"><u>Mettre à jour vos préférences</u></a></small></p>
+                        <p class="grey-text text-lighten-4"><small><a style="color:#FFFFFF;" href="{{ base_url }}/contact/"><u>Vous désabonner</u></a></small></p>
+                      </ul>
+                    </div>
+                </div>
+              </div>
+            </footer>
+
+          </body>
+
+        </html>
+
+Outputs:
+  SNSTopicArn:
+    Value: !Ref SNSTopic
+  SQSQueueArn:
+    Value: !GetAtt SQSQueue.Arn
+  SQSQueueUrl:
+    Value: !Ref SQSQueue

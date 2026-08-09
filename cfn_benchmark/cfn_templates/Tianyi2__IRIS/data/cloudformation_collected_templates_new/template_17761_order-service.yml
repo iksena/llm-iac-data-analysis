@@ -1,0 +1,374 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: AWS SaaS Factory Bootcamp Order Service
+Parameters:
+  WorkshopBucket:
+    Description: The S3 bucket with bootcamp resources
+    Type: String
+  AssetsBucketPrefix:
+    Description: S3 folder containing workshop assets. Leave blank if you did not put the assets in a subfolder.
+    Type: String
+    Default: ''
+  ArtifactBucket:
+    Description: The S3 bucket for CodeBuild to store built artifacts
+    Type: String
+  CodeBuildRoleArn:
+    Description: The CodeBuild IAM role ARN
+    Type: String
+  CodePipelineRoleArn:
+    Description: The CodePipeline IAM role ARN
+    Type: String
+  CodePipelineEventRoleArn:
+    Description: The CloudWatch Event IAM role ARN
+    Type: String
+  LambdaCodeBuildStartBuildArn:
+    Description: The Lambda function ARN to start a CodeBuild project
+    Type: String
+  LambdaClearEcrImagesArn:
+    Description: The Lambda function ARN to delete the ECR images
+    Type: String
+  VPC:
+    Description: The SaaS Bootcamp VPC
+    Type: String
+  ALBListener:
+    Description: The HTTP listener on the load balancer for ECS
+    Type: String
+  ECSCluster:
+    Description: ECS Cluster to run the ECS service in
+    Type: String
+  ServiceUrl:
+    Description: API Gateway endpoint URL in front of the microservices
+    Type: String
+  ECSSecurityGroup:
+    Description: Security Group for ECS
+    Type: String
+  SubnetPrivateA:
+    Description: Subnet for ECS service to place tasks in
+    Type: String
+  SubnetPrivateB:
+    Description: Subnet for ECS service to place tasks in
+    Type: String
+Resources:
+  OrderDynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+      - AttributeName: tenant_id
+        AttributeType: S
+      - AttributeName: order_id
+        AttributeType: S
+      KeySchema:
+      - AttributeName: tenant_id
+        KeyType: HASH
+      - AttributeName: order_id
+        KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TableName: OrderBootcamp
+  ECSRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: saas-bootcamp/order-manager
+  InvokeClearEcrRepoImages:
+    Type: Custom::CustomResource
+    Properties:
+      ServiceToken: !Ref LambdaClearEcrImagesArn
+      Repository: !Ref ECSRepository
+  CodeBuildLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/codebuild/saas-bootcamp-order-svc
+      RetentionInDays: 7
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: saas-bootcamp-order-svc
+      Tags:
+        - Key: Name
+          Value: saas-bootcamp-order-svc
+      ServiceRole: !Ref CodeBuildRoleArn
+      TimeoutInMinutes: 10
+      Artifacts:
+        Type: S3
+        Location: !Ref ArtifactBucket
+        Path: '/'
+        Name: order-manager
+        Packaging: ZIP
+      Cache:
+        Type: S3
+        Location: !Sub ${WorkshopBucket}/${AssetsBucketPrefix}codebuild-cache
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: REPOSITORY_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECSRepository}
+          - Name: SOURCE_BUCKET
+            Value: !Ref WorkshopBucket
+          - Name: SOURCE_BUCKET_PREFIX
+            Value: !Ref AssetsBucketPrefix
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - aws s3 cp --recursive s3://$SOURCE_BUCKET/${SOURCE_BUCKET_PREFIX}source/order-manager ./order-manager
+                - aws s3 cp --recursive s3://$SOURCE_BUCKET/${SOURCE_BUCKET_PREFIX}source/shared-modules ./order-manager/shared-modules
+                - aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $REPOSITORY_URI
+            build:
+              commands:
+                - cd order-manager
+                - docker image build -t saas-bootcamp/order-manager -f Dockerfile .
+                - docker tag saas-bootcamp/order-manager:latest ${REPOSITORY_URI}:latest
+                - cd ../
+            post_build:
+              commands:
+                - docker push "${REPOSITORY_URI}:latest"
+                - printf '[{"name":"order-manager","imageUri":"%s"}]' "${REPOSITORY_URI}:latest" > imagedefinitions.json
+          artifacts:
+            files: imagedefinitions.json
+            discard-paths: yes
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    DependsOn: ECSService
+    Properties:
+      Name: saas-bootcamp-order-svc
+      RoleArn: !Ref CodePipelineRoleArn
+      ArtifactStore:
+        Location: !Ref ArtifactBucket
+        Type: S3
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: 1
+              Configuration:
+                S3Bucket: !Ref ArtifactBucket
+                S3ObjectKey: order-manager
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: imgdef
+        - Name: Deploy
+          Actions:
+            - Name: PreDeployAction
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: 1
+              RunOrder: 1
+              Configuration:
+                FunctionName: saas-bootcamp-update-ecs
+                UserParameters: !Sub '{"cluster":"${ECSCluster}","service":"${ECSService}","desiredCount":1}'
+            - Name: DeployAction
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: ECS
+                Version: 1
+              RunOrder: 2
+              Configuration:
+                ClusterName: !Ref ECSCluster
+                ServiceName: saas-bootcamp-order-svc
+                FileName: imagedefinitions.json
+              InputArtifacts:
+                - Name: imgdef
+  CodePipelineEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          reason:
+            - CopyObject
+            - PutObject
+            - CompleteMultipartUpload
+          bucket:
+            name:
+              - !Ref ArtifactBucket
+          object:
+            key:
+              - prefix: order-manager
+      State: ENABLED
+      Targets:
+        - Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${CodePipeline}
+          RoleArn: !Ref CodePipelineEventRoleArn
+          Id: saas-bootcamp-order-svc
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    DependsOn: ECSLogGroup
+    Properties:
+      RoleName: !Sub saas-bootcamp-order-svc-exec-role-${AWS::Region}
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: saas-bootcamp-order-svc-exec-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ECSRepository}
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*:log-stream:*
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:DescribeLogStreams
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/saas-bootcamp-order-svc
+      RetentionInDays: 7
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub saas-bootcamp-order-svc-task-role-${AWS::Region}
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: saas-bootcamp-order-svc-task-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:DescribeTable
+                  - dynamodb:CreateTable
+                Resource: !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/OrderBootcamp
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: saas-bootcamp-order-svc
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RequiresCompatibilities:
+        - FARGATE
+      Memory: 1024
+      Cpu: 512
+      NetworkMode: awsvpc
+      ContainerDefinitions:
+        - Name: order-manager
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECSRepository}:latest
+          PortMappings:
+            - ContainerPort: 3005
+          StopTimeout: 2
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+              # Shared config module sets the account id that the User Manager needs when creating IAM polices
+            - Name: AWS_ACCOUNT_ID
+              Value: !Ref AWS::AccountId
+            - Name: SERVICE_URL
+              Value: !Ref ServiceUrl
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: saas-bootcamp-order-svc
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /order/health
+      HealthCheckIntervalSeconds: 5
+      HealthCheckTimeoutSeconds: 2
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 5
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VPC
+  ALBRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref ALBTargetGroup
+          Type: forward
+      Conditions:
+        - Field: path-pattern
+          Values: ['/order*']
+      ListenerArn: !Ref ALBListener
+      Priority: 5
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBRule
+    Properties:
+      ServiceName: saas-bootcamp-order-svc
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+          Subnets:
+            - !Ref SubnetPrivateA
+            - !Ref SubnetPrivateB
+      LoadBalancers:
+        - ContainerName: order-manager
+          ContainerPort: 3005
+          TargetGroupArn: !Ref ALBTargetGroup
+  InvokeLambdaCodeBuildStartBuild:
+    Type: Custom::CustomResource
+    DependsOn:
+      - CodeBuildProject
+      - CodePipeline
+      - CodePipelineEventRule
+    Properties:
+      ServiceToken: !Ref LambdaCodeBuildStartBuildArn
+      Project: saas-bootcamp-order-svc
+...

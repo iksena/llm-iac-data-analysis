@@ -1,0 +1,821 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Claude Apps Gateway (standalone) - self-hosted control plane for Claude Code on
+  Amazon Bedrock. Runs the native `claude gateway` binary on ECS Fargate behind an
+  IPv4-only internal ALB, backed by RDS PostgreSQL, with OIDC sign-in against any
+  OIDC IdP. Deploys with no dependency on any other stack. Telemetry forwarding
+  to an existing OTLP collector is optional.
+
+Metadata:
+  # OidcIssuer/OidcClientId/AllowedEmailDomains/GroupsClaim are inputs to the
+  # config rendered by deploy.sh (envsubst) and arrive as GatewayConfigContent;
+  # they are intentionally surfaced as stack parameters for documentation and
+  # for callers that render the config from stack inputs, so they aren't Ref'd
+  # directly inside this template.
+  cfn-lint:
+    config:
+      ignore_checks:
+        - W2001
+        # W1030: CertificateArn defaults to "" (managed mode) and is only used in
+        # the BYO branch of the listener's !If, where it IS a valid ARN. The
+        # linter can't see that guard, so it flags the empty-string default.
+        - W1030
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Gateway image and identity" }
+        Parameters:
+          - GatewayImageUri
+          - OidcIssuer
+          - OidcClientId
+          - OidcClientSecretArn
+          - AllowedEmailDomains
+          - GroupsClaim
+      - Label: { default: "Network and DNS" }
+        Parameters:
+          - VpcCidr
+          - DomainName
+          - PublicHostedZoneId
+          - GatewayHostname
+          - PrivateHostedZoneName
+          - CertificateArn
+          - ClientCidr
+          - AlbIdleTimeoutSeconds
+      - Label: { default: "Bedrock and telemetry" }
+        Parameters:
+          - BedrockRegion
+          - CollectorEndpoint
+      - Label: { default: "Config" }
+        Parameters:
+          - GatewayConfigContent
+      - Label: { default: "Spend caps (optional)" }
+        Parameters:
+          - EnableSpendCaps
+          - AdminWriteKeyArn
+
+Parameters:
+  GatewayImageUri:
+    Type: String
+    Description: ECR image URI for the gateway (output of build-and-push.sh), e.g. <acct>.dkr.ecr.<region>.amazonaws.com/claude-apps-gateway:2.1.196
+
+  OidcIssuer:
+    Type: String
+    Description: OIDC issuer URL serving /.well-known/openid-configuration. Cognito = https://cognito-idp.<region>.amazonaws.com/<poolId>
+
+  OidcClientId:
+    Type: String
+    Description: Confidential OIDC web client id whose redirect URI is https://<GatewayHostname>/oauth/callback
+
+  OidcClientSecretArn:
+    Type: String
+    Description: Secrets Manager ARN holding the OIDC client secret (raw string value)
+
+  AllowedEmailDomains:
+    Type: CommaDelimitedList
+    Default: ""
+    Description: Email domains permitted to sign in (rejects id_tokens outside your org). Comma-separated, e.g. example.com
+
+  GroupsClaim:
+    Type: String
+    Default: "cognito:groups"
+    Description: IdP groups claim. Cognito=cognito:groups, Okta/custom=groups, Entra may use roles.
+
+  BedrockRegion:
+    Type: String
+    Default: "us-east-1"
+    Description: >-
+      AWS region for the Bedrock upstream endpoint. deploy.sh passes your active
+      AWS_REGION here; override for cross-region inference. Ensure the Claude
+      models you use have access enabled in this region.
+
+  DBInstanceClass:
+    Type: String
+    Default: "db.t4g.micro"
+    Description: >-
+      RDS instance class. The default holds only a few KB of sign-in state and is
+      plenty; size up if you enable spend limits with heavy traffic. Graviton
+      (t4g) classes aren't offered in every region — override if yours lacks them.
+
+  DBEngineVersion:
+    Type: String
+    Default: "16.14"
+    Description: >-
+      RDS PostgreSQL engine version. RDS deprecates minor versions over time, so a
+      pinned value can eventually fail to create — override with a currently
+      supported version if a deploy fails on this (aws rds describe-db-engine-versions
+      --engine postgres).
+
+  AlbIdleTimeoutSeconds:
+    Type: Number
+    Default: 4000
+    MinValue: 1
+    MaxValue: 4000
+    Description: >-
+      ALB connection idle timeout. Claude Code holds one streaming connection open
+      per turn; during extended thinking no bytes cross the ALB, and the AWS default
+      of 60s closes the connection mid-response ("Connection closed mid-response").
+      Set to the ALB max (4000s) so long think/plan turns survive.
+
+  CollectorEndpoint:
+    Type: String
+    Default: ""
+    Description: OPTIONAL OTLP/HTTP collector endpoint to forward telemetry to. Leave empty for no telemetry (no dependency on the observability stack).
+
+  VpcCidr:
+    Type: String
+    Default: "10.20.0.0/16"
+    Description: CIDR for the gateway's self-contained VPC.
+
+  # --- TLS / DNS: choose ONE of two modes ---
+  # (A) MANAGED (recommended): set PublicHostedZoneId + DomainName, leave CertificateArn empty.
+  #     The stack creates a DNS-validated PUBLIC ACM cert and a public alias A-record to the
+  #     internal ALB. Browser-trusted — no self-signed CA, no NODE_EXTRA_CA_CERTS, no keychain.
+  # (B) BYO / self-signed (fallback): set CertificateArn (+ GatewayHostname + PrivateHostedZoneName).
+  #     The stack creates a private hosted zone + record. Clients must trust the CA out-of-band.
+  DomainName:
+    Type: String
+    Default: ""
+    Description: (Managed mode) Public FQDN developers connect to, e.g. claude-gateway.example.com. Must be within PublicHostedZoneId's zone. Its A-record aliases the INTERNAL ALB, so it resolves to private IPs (reachable over VPN) — /login stays satisfied.
+
+  PublicHostedZoneId:
+    Type: String
+    Default: ""
+    Description: (Managed mode) Public Route53 hosted zone id that is authoritative for DomainName. Used for DNS-validated ACM issuance AND the public alias record. MUST be a public zone (a private zone makes ACM validation hang).
+
+  GatewayHostname:
+    Type: String
+    Default: ""
+    Description: (BYO/self-signed mode) Private DNS name developers connect to, e.g. claude-gateway.internal.example.com (must be within PrivateHostedZoneName and resolve to private IPs only). Leave empty in managed mode.
+
+  PrivateHostedZoneName:
+    Type: String
+    Default: ""
+    Description: (BYO/self-signed mode) Private hosted zone to create/associate with the VPC, e.g. internal.example.com. Leave empty in managed mode.
+
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: (BYO/self-signed mode) ACM certificate ARN for GatewayHostname. Leave EMPTY to use managed mode (PublicHostedZoneId + DomainName). If set, it takes precedence and no cert is created.
+
+  ClientCidr:
+    Type: String
+    Default: "10.30.0.0/16"
+    Description: CIDR of remote clients allowed to reach the internal ALB on 443. Set to your existing connectivity's client range (corporate VPN pool, Direct Connect / Site-to-Site CIDR, Transit Gateway attachment, or the reference Client VPN client CIDR). See network-access/README.md.
+
+  GatewayConfigContent:
+    Type: String
+    Description: Rendered gateway.yaml content (non-secret; secrets stay as ${VAR} placeholders expanded at boot). Must be < 4096 chars.
+
+  # --- resilience and scale ---
+  MinTasks:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Minimum number of gateway tasks. Default 2 spreads across AZs for HA. Use 1 only for a cost-minimal demo.
+
+  MaxTasks:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    Description: Maximum gateway tasks the autoscaler may run.
+
+  TaskCpu:
+    Type: String
+    Default: "1024"
+    AllowedValues: ["512", "1024", "2048", "4096"]
+    Description: Fargate task CPU units.
+
+  TaskMemory:
+    Type: String
+    Default: "2048"
+    Description: Fargate task memory (MiB); must be valid for the chosen CPU.
+
+  TargetRequestsPerTask:
+    Type: Number
+    Default: 200
+    Description: Target average ALB requests/minute per task for request-count autoscaling.
+
+  MultiAzDatabase:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Run RDS Multi-AZ for database failover. Recommended true for production (esp. with spend limits).
+
+  # --- spend caps (optional; hard per-user/group/org budgets enforced server-side) ---
+  EnableSpendCaps:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >-
+      Enable hard spend caps. When true, the rendered config carries an admin block
+      and the task injects the GATEWAY_ADMIN_WRITE_KEY secret so the gateway serves
+      the Admin API and returns 429 to over-cap developers. Set caps via the API
+      after deploy. Default false keeps the gateway cost-tracking-only (no enforcement).
+
+  AdminWriteKeyArn:
+    Type: String
+    Default: ""
+    Description: >-
+      (Spend caps) Secrets Manager ARN holding the admin write key (the x-api-key for
+      POST/DELETE on /v1/organizations/spend_limits). Required when EnableSpendCaps=true.
+      Leave empty when caps are off.
+
+Conditions:
+  HasTelemetry: !Not [!Equals [!Ref CollectorEndpoint, ""]]
+  HasSpendCaps: !Equals [!Ref EnableSpendCaps, "true"]
+  IsMultiAz: !Equals [!Ref MultiAzDatabase, "true"]
+  # Managed public-cert mode: public zone + domain given, and no BYO cert.
+  HasCertificateArn: !Not [!Equals [!Ref CertificateArn, ""]]
+  ManagedCertMode: !And
+    - !Not [!Equals [!Ref PublicHostedZoneId, ""]]
+    - !Not [!Equals [!Ref DomainName, ""]]
+    - !Not [!Condition HasCertificateArn]
+  # BYO/self-signed mode keeps the private hosted zone + private A-record.
+  CreatePrivateZone: !Not [!Condition ManagedCertMode]
+
+Resources:
+  # ----------------------------------------------------------------- networking
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-vpc" }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-igw" }
+
+  IgwAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-public-1" }
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-public-2" }
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private-1" }
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 8]]
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private-2" }
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-public-rt" }
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IgwAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet1
+
+  PublicSubnet2RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnet2
+
+  # Regional NAT gateway (launched Nov 2025): a single VPC-level NAT that
+  # automatically expands/contracts across AZs based on workload presence, so
+  # egress is highly available by default with no per-AZ NAT, no public subnet to
+  # host it, and one route entry shared across AZs. Automatic mode lets AWS manage
+  # the EIPs (no AllocationId). Higher port/IP limits than zonal NATs too.
+  #
+  # PORTABILITY: AvailabilityMode: regional is a recent feature and is not yet in
+  # every region/partition (e.g. some GovCloud/China/older regions). If a deploy
+  # fails creating this resource, switch to a zonal NAT: drop AvailabilityMode,
+  # add an EIP (AllocationId) + a public subnet, and one NAT per AZ.
+  RegionalNat:
+    Type: AWS::EC2::NatGateway
+    DependsOn: IgwAttachment
+    Properties:
+      AvailabilityMode: regional
+      ConnectivityType: public
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-rnat" }
+
+  # One private route table shared by both AZ subnets — the regional NAT's single
+  # ID is valid across every AZ.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-private-rt" }
+
+  PrivateDefaultRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref RegionalNat
+
+  PrivateSubnet1RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet1
+
+  PrivateSubnet2RtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      SubnetId: !Ref PrivateSubnet2
+
+  # ------------------------------------------------------------- security groups
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName} internal ALB - 443 from remote clients and within-VPC"
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - Description: HTTPS from remote client CIDR (VPN/DX/TGW/peering)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref ClientCidr
+        - Description: HTTPS from within the VPC
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref VpcCidr
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-alb-sg" }
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName} gateway task - 8080 from ALB only"
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-task-sg" }
+
+  TaskIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref TaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: Gateway port from ALB
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "${AWS::StackName} RDS - 5432 from gateway task only"
+      VpcId: !Ref Vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-db-sg" }
+
+  DbIngressFromTask:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DbSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref TaskSecurityGroup
+      Description: Postgres from gateway task
+
+  # --------------------------------------------- TLS cert (managed mode only)
+  # DNS-validated PUBLIC ACM cert. ACM writes the _<token> validation CNAME into
+  # the public zone automatically (DomainValidationOptions.HostedZoneId). Created
+  # in-stack so it's in this stack's region (ALB requires a same-region cert).
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: ManagedCertMode
+    Properties:
+      DomainName: !Ref DomainName
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref PublicHostedZoneId
+      ValidationMethod: DNS
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-certificate" }
+
+  # ------------------------------------------------------- public DNS (managed)
+  # Alias A-record in the PUBLIC zone pointing at the INTERNAL ALB — it resolves
+  # to the ALB's private IPs (reachable over VPN), so /login's private-IP check
+  # passes while the cert is publicly trusted. EvaluateTargetHealth: false — an
+  # internal ALB's health isn't visible to external Route53 health evaluation.
+  PublicDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: ManagedCertMode
+    Properties:
+      HostedZoneId: !Ref PublicHostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
+
+  # ----------------------------------------- private DNS (BYO/self-signed mode)
+  PrivateHostedZone:
+    Type: AWS::Route53::HostedZone
+    Condition: CreatePrivateZone
+    Properties:
+      Name: !Ref PrivateHostedZoneName
+      VPCs:
+        - VPCId: !Ref Vpc
+          VPCRegion: !Ref AWS::Region
+      HostedZoneConfig:
+        Comment: !Sub "${AWS::StackName} private zone for the gateway"
+
+  GatewayDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: CreatePrivateZone
+    Properties:
+      HostedZoneId: !Ref PrivateHostedZone
+      Name: !Ref GatewayHostname
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: true
+
+  # ----------------------------------------------------------------------- ALB
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      # No hardcoded Name: CFN create-before-delete on replacement would hit
+      # AlreadyExists. Auto-named; discover via the AlbDnsName output.
+      Scheme: internal
+      Type: application
+      # IPv4 only. Dual-stack internal ALBs return public-range AAAA records,
+      # which makes Claude Code's /login reject the gateway as non-private.
+      IpAddressType: ipv4
+      # Streamed responses keep one connection open across extended thinking, when
+      # no bytes cross the ALB. The AWS default idle timeout (60s) closes those
+      # mid-response; raise it so long think/plan turns aren't truncated.
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: !Ref AlbIdleTimeoutSeconds
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Tags:
+        - { Key: Name, Value: !Sub "${AWS::StackName}-alb" }
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref Vpc
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip
+      # Liveness probe: /healthz stays green through a Postgres blip so signed-in
+      # developers keep working. (/readyz would drain all replicas at once.)
+      HealthCheckPath: /healthz
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: "30" }
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        # Managed mode → the ACM cert this stack creates; else the BYO ARN.
+        - CertificateArn: !If [ManagedCertMode, !Ref Certificate, !Ref CertificateArn]
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ---------------------------------------------------------------------- RDS
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${AWS::StackName} gateway db subnets"
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-db"
+      Description: !Sub "${AWS::StackName} gateway Postgres credentials"
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"gateway"}'
+        GenerateStringKey: "password"
+        PasswordLength: 32
+        # Exclude every character that has structural meaning in a postgres://
+        # DSN or would need percent-encoding. The entrypoint percent-encodes the
+        # password too (defense in depth), but excluding these keeps the DSN
+        # human-readable and avoids any ambiguity. Notably includes # and % —
+        # omitting them let RDS mint passwords that broke the DSN with
+        # "cannot be parsed as a URL".
+        ExcludeCharacters: '"@/\:? #%&+=[]{}|^~`<>(),;'
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    # Showcase DB holds only short-lived auth/device-grant state (no spend tables
+    # unless spend limits are enabled), so we don't snapshot on delete. For a
+    # production deployment with spend limits, switch both to Snapshot.
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: postgres
+      EngineVersion: !Ref DBEngineVersion
+      AllocatedStorage: "20"
+      StorageType: gp3
+      StorageEncrypted: true
+      DBName: gateway
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DbSecret}::username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbSecret}::password}}"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DbSecurityGroup
+      MultiAZ: !If [IsMultiAz, true, false]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+
+  GatewayJwtSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-jwt"
+      Description: !Sub "${AWS::StackName} gateway session JWT signing secret"
+      GenerateSecretString:
+        PasswordLength: 44
+        ExcludePunctuation: true
+
+  # ------------------------------------------------------------------- IAM roles
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - PolicyName: read-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DbSecret
+                  - !Ref GatewayJwtSecret
+                  - !Ref OidcClientSecretArn
+                  # Admin write key (spend caps) — only when enabled, else NoValue so
+                  # the list doesn't carry an empty ARN.
+                  - !If [HasSpendCaps, !Ref AdminWriteKeyArn, !Ref "AWS::NoValue"]
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: bedrock-invoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # bedrock: namespace only (bedrock-runtime: does not exist in IAM).
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/anthropic.*"
+              # Required for the gateway's /v1/models catalog reconciliation.
+              - Effect: Allow
+                Action:
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetInferenceProfile
+                Resource: "*"
+
+  # ----------------------------------------------------------------------- ECS
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+      ClusterSettings:
+        - { Name: containerInsights, Value: enabled }
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}-gateway"
+      RetentionInDays: 30
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-gateway"
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: gateway
+          Image: !Ref GatewayImageUri
+          Essential: true
+          PortMappings:
+            - { ContainerPort: 8080, Protocol: tcp }
+          Environment:
+            - { Name: AWS_REGION, Value: !Ref BedrockRegion }
+            - { Name: GATEWAY_PG_HOST, Value: !GetAtt Database.Endpoint.Address }
+            - { Name: GATEWAY_PG_PORT, Value: !GetAtt Database.Endpoint.Port }
+            - { Name: GATEWAY_PG_DB, Value: gateway }
+            - { Name: GATEWAY_PG_USER, Value: gateway }
+            - { Name: GATEWAY_PG_SSLMODE, Value: require }
+            # The rendered config is NON-secret (real secrets stay as ${VAR}
+            # placeholders the gateway expands at boot), so it rides as a plain env
+            # var. Keeping it IN the task definition means any config change (e.g.
+            # telemetry on/off/endpoint, model list) changes the task-def revision,
+            # so ECS cycles tasks automatically. If this were an SSM secret instead,
+            # editing the SSM value would NOT change the task-def and the running
+            # tasks would silently keep the old config until a manual
+            # `aws ecs update-service --force-new-deployment` (see stack-ordering.md).
+            - { Name: GATEWAY_CONFIG_CONTENT, Value: !Ref GatewayConfigContent }
+          Secrets:
+            - Name: OIDC_CLIENT_SECRET
+              ValueFrom: !Ref OidcClientSecretArn
+            - Name: GATEWAY_JWT_SECRET
+              ValueFrom: !Ref GatewayJwtSecret
+            - Name: GATEWAY_PG_PASSWORD
+              ValueFrom: !Sub "${DbSecret}:password::"
+            # Spend caps: inject the admin write key only when enabled. The rendered
+            # config references ${GATEWAY_ADMIN_WRITE_KEY} in its admin block; when caps
+            # are off the config has no admin block and this secret isn't injected.
+            - !If
+              - HasSpendCaps
+              - Name: GATEWAY_ADMIN_WRITE_KEY
+                ValueFrom: !Ref AdminWriteKeyArn
+              - !Ref AWS::NoValue
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: gateway
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: HttpsListener
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      # Fargate spreads tasks across the AZs of the configured subnets.
+      DesiredCount: !Ref MinTasks
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        # Auto-roll back a bad deploy instead of leaving the service degraded.
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+      LoadBalancers:
+        - ContainerName: gateway
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: 90
+
+  # ----------------------------------------------------------- service autoscaling
+  # Inference requests don't touch Postgres (bearer tokens validate locally), so
+  # the gateway scales horizontally on the stateless Fargate tier. Two target-
+  # tracking policies grow/shrink the task count between MinTasks and MaxTasks.
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub "service/${Cluster}/${Service.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: !Ref MinTasks
+      MaxCapacity: !Ref MaxTasks
+      RoleARN: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-cpu-target"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: 60.0
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 60
+
+  RequestScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-request-target"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub
+            - "${LbFullName}/${TgFullName}"
+            - LbFullName: !GetAtt LoadBalancer.LoadBalancerFullName
+              TgFullName: !GetAtt TargetGroup.TargetGroupFullName
+        TargetValue: !Ref TargetRequestsPerTask
+        ScaleInCooldown: 120
+        ScaleOutCooldown: 60
+
+Outputs:
+  GatewayUrl:
+    Description: URL developers point Claude Code at (forceLoginGatewayUrl).
+    Value: !If [ManagedCertMode, !Sub "https://${DomainName}", !Sub "https://${GatewayHostname}"]
+  AlbDnsName:
+    Description: Internal ALB DNS name (target of the private A-record).
+    Value: !GetAtt LoadBalancer.DNSName
+  VpcId:
+    Value: !Ref Vpc
+  PrivateSubnets:
+    Description: Private subnets (attach your network access here — e.g. Client VPN association, TGW/VPC-peering routes).
+    Value: !Join [",", [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+  VpcCidr:
+    Description: Gateway VPC CIDR (route this from your network; authorization-rule / route target).
+    Value: !Ref VpcCidr
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  TelemetryEnabled:
+    Value: !If [HasTelemetry, "true", "false"]

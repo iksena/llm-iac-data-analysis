@@ -1,0 +1,322 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: FSx for ONTAP EMS Webhook - REST API Gateway with Lambda integration for ONTAP EMS event reception
+
+# DEPLOYMENT NOTE:
+# This template creates named IAM roles (RoleName property), so deployment
+# requires --capabilities CAPABILITY_NAMED_IAM (not just CAPABILITY_IAM).
+# Example:
+#   aws cloudformation deploy \
+#     --template-file ems-webhook-apigw.yaml \
+#     --stack-name fsxn-ems-webhook \
+#     --capabilities CAPABILITY_NAMED_IAM
+
+Parameters:
+  LambdaFunctionArn:
+    Type: String
+    Description: ARN of the Lambda function to receive EMS Webhook events
+    AllowedPattern: 'arn:aws:lambda:[a-z0-9-]+:\d{12}:function:.+'
+
+  StageName:
+    Type: String
+    Default: prod
+    Description: API Gateway deployment stage name
+    MaxLength: 32
+
+  ThrottlingRateLimit:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 10000
+    Description: API Gateway throttling rate limit (requests per second)
+
+  ThrottlingBurstLimit:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    MaxValue: 5000
+    Description: API Gateway throttling burst limit
+
+  WebhookAuthMode:
+    Type: String
+    Default: NONE
+    AllowedValues: [NONE, API_KEY, IAM, SHARED_SECRET]
+    Description: >
+      Authorization mode for the EMS webhook endpoint.
+      NONE: No auth (quickstart/PoC only — NOT for production).
+      API_KEY: Requires x-api-key header (create usage plan separately).
+      IAM: Requires AWS IAM SigV4 signed requests.
+      SHARED_SECRET: Lambda authorizer validates Bearer token against
+        a secret stored in Secrets Manager (recommended for production
+        when ONTAP cannot sign requests with SigV4).
+      For production, use SHARED_SECRET, API_KEY, or IAM.
+
+  WebhookSecretArn:
+    Type: String
+    Default: ''
+    Description: >
+      ARN of the Secrets Manager secret containing the webhook shared secret.
+      Required when WebhookAuthMode is SHARED_SECRET.
+      Secret format: {"webhook_secret": "<your-token>"}
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues:
+      - 1
+      - 3
+      - 5
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+      - 120
+      - 150
+      - 180
+      - 365
+    Description: CloudWatch Logs retention period in days
+
+Conditions:
+  UseApiKey: !Equals [!Ref WebhookAuthMode, API_KEY]
+  UseSharedSecret: !Equals [!Ref WebhookAuthMode, SHARED_SECRET]
+  HasWebhookSecret: !Not [!Equals [!Ref WebhookSecretArn, '']]
+
+Resources:
+  # Dead Letter Queue for async invocation failures
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-ems-dlq'
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Project
+          Value: fsxn-observability
+        - Key: Component
+          Value: ems-webhook
+
+  # CloudWatch Logs log group for API Gateway access logs
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${AWS::StackName}-ems-access'
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: fsxn-observability
+        - Key: Component
+          Value: ems-webhook
+
+  # IAM Role for API Gateway to invoke Lambda
+  ApiGatewayExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-apigw-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !Ref LambdaFunctionArn
+                  - !If
+                    - UseSharedSecret
+                    - !GetAtt AuthorizerFunction.Arn
+                    - !Ref 'AWS::NoValue'
+
+  # --- Lambda Authorizer (SHARED_SECRET mode) ---
+
+  AuthorizerLambdaRole:
+    Type: AWS::IAM::Role
+    Condition: UseSharedSecret
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-authorizer-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref WebhookSecretArn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-authorizer:*'
+
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Condition: UseSharedSecret
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-authorizer'
+      Runtime: python3.12
+      Handler: shared_secret_authorizer.lambda_handler
+      Code:
+        ZipFile: |
+          # Inline placeholder — deploy actual code via:
+          #   aws lambda update-function-code --function-name <name> \
+          #     --zip-file fileb://shared_secret_authorizer.zip
+          def lambda_handler(event, context):
+              raise Exception("Unauthorized")
+      Role: !GetAtt AuthorizerLambdaRole.Arn
+      MemorySize: 128
+      Timeout: 10
+      Environment:
+        Variables:
+          WEBHOOK_SECRET_ARN: !Ref WebhookSecretArn
+
+  AuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: UseSharedSecret
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-authorizer'
+      RetentionInDays: !Ref LogRetentionDays
+
+  WebhookAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Condition: UseSharedSecret
+    Properties:
+      Name: !Sub '${AWS::StackName}-shared-secret'
+      RestApiId: !Ref EmsWebhookApi
+      Type: REQUEST
+      AuthorizerUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations'
+      AuthorizerCredentials: !GetAtt ApiGatewayExecutionRole.Arn
+      IdentitySource: method.request.header.Authorization
+      AuthorizerResultTtlInSeconds: 300
+
+  # --- REST API Gateway ---
+
+  # REST API Gateway
+  EmsWebhookApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${AWS::StackName}-ems-webhook'
+      Description: REST API for receiving ONTAP EMS Webhook events
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # /ems resource
+  EmsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref EmsWebhookApi
+      ParentId: !GetAtt EmsWebhookApi.RootResourceId
+      PathPart: ems
+
+  # POST method on /ems with AWS_PROXY integration
+  EmsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EmsWebhookApi
+      ResourceId: !Ref EmsResource
+      HttpMethod: POST
+      AuthorizationType: !If [UseSharedSecret, CUSTOM, !Ref WebhookAuthMode]
+      AuthorizerId: !If [UseSharedSecret, !Ref WebhookAuthorizer, !Ref 'AWS::NoValue']
+      ApiKeyRequired: !If [UseApiKey, true, false]
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaFunctionArn}/invocations'
+        Credentials: !GetAtt ApiGatewayExecutionRole.Arn
+
+  # Mock integration for non-POST methods returning 405
+  EmsAnyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref EmsWebhookApi
+      ResourceId: !Ref EmsResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 405}'
+        IntegrationResponses:
+          - StatusCode: '405'
+            ResponseTemplates:
+              application/json: '{"message": "Method Not Allowed"}'
+      MethodResponses:
+        - StatusCode: '405'
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway Deployment
+  EmsApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - EmsPostMethod
+      - EmsAnyMethod
+    Properties:
+      RestApiId: !Ref EmsWebhookApi
+
+  # API Gateway Stage with access logging and throttling
+  EmsApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref EmsWebhookApi
+      DeploymentId: !Ref EmsApiDeployment
+      StageName: !Ref StageName
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","responseLatency":"$context.responseLatency"}'
+      MethodSettings:
+        - ResourcePath: /*
+          HttpMethod: '*'
+          ThrottlingRateLimit: !Ref ThrottlingRateLimit
+          ThrottlingBurstLimit: !Ref ThrottlingBurstLimit
+
+  # Lambda permission for API Gateway invocation
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunctionArn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${EmsWebhookApi}/*'
+
+Outputs:
+  ApiEndpointUrl:
+    Description: Full invocation URL for the EMS Webhook endpoint
+    Value: !Sub 'https://${EmsWebhookApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/ems'
+
+  ApiGatewayId:
+    Description: REST API Gateway ID
+    Value: !Ref EmsWebhookApi
+
+  DeadLetterQueueArn:
+    Description: ARN of the Dead Letter Queue
+    Value: !GetAtt DeadLetterQueue.Arn
+
+  LambdaLogGroupName:
+    Description: >-
+      Note: This output provides the access log group name. The Lambda log group
+      is managed by the Lambda function itself (typically /aws/lambda/<function-name>).
+      Use the Lambda function name to derive the log group.
+    Value: !Ref ApiAccessLogGroup
+
+  AccessLogGroupName:
+    Description: CloudWatch Logs log group for API Gateway access logs
+    Value: !Ref ApiAccessLogGroup

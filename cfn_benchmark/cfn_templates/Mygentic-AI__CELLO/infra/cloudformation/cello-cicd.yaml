@@ -1,0 +1,1255 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CELLO CI/CD - GitHub webhook Lambda, pipeline-filter Lambda, EventBridge bus,
+  and per-package CodePipelines. Deployed in us-east-1 only.
+  Completely independent of cello-agent CI/CD infrastructure (SI-003).
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, production]
+    Description: Deployment environment
+  GitHubRepo:
+    Type: String
+    Default: "Mygentic-AI/CELLO"
+    Description: GitHub repository (owner/repo)
+  GitHubBranch:
+    Type: String
+    Default: "main"
+    Description: Branch to monitor
+  GitHubConnectionArn:
+    Type: String
+    Description: CodeStar connection ARN for GitHub
+  # DEPLOY-005 AC-009: staging directory ALB DNS name — read from cello-ecs-directory
+  # stack output at deploy time; never hardcoded. deploy.sh populates this from
+  # read_output "cello-ecs-directory-{env}" "AlbDnsName".
+  StagingDirectoryUrl:
+    Type: String
+    Default: ""
+    Description: >
+      DNS name of the staging directory ALB. LEAVE EMPTY to have the smoke runner resolve
+      it from AWS at run time, which is what infra/CLAUDE.md requires of ALB DNS names and
+      what stops this going stale when the load balancer is replaced. Set it only for a
+      deliberate one-off override. The old default was the literal "PLACEHOLDER", which is
+      a perfectly valid hostname to try to fetch and fails as a network error rather than
+      as a configuration one.
+  # M7-CICD-001 AC-015: webhook secret for cello-client GitHub webhook validation.
+  # No Default — deploy.sh must supply the value at deploy time. An empty or
+  # placeholder secret would silently accept requests with empty signatures.
+  CelloClientWebhookSecret:
+    Type: String
+    NoEcho: true
+    Description: >
+      GitHub webhook HMAC secret for the cello-client repository. Used by the
+      webhook receiver Lambda to validate X-Hub-Signature-256 on cello-client
+      push events. Must be supplied at deploy time — no default.
+  # M7-CICD-001: If the GitHub OIDC provider already exists in the account,
+  # pass its ARN here to skip creation (avoids EntityAlreadyExists failure).
+  ExistingGitHubOidcProviderArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of an existing GitHub Actions OIDC provider in this account. If
+      provided, the stack reuses it instead of creating a new one. Leave empty
+      to create a new provider.
+
+Conditions:
+  CreateOidcProvider: !Equals [!Ref ExistingGitHubOidcProviderArn, ""]
+
+Resources:
+  # EventBridge bus for GitHub events
+  GitHubEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "cello-github-events-${Environment}"
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 artifacts bucket for CodePipeline
+  ArtifactsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      # CI/CD infrastructure is shared across all environments (one deployment).
+      # The bucket name is fixed per AC-001: cello-codepipeline-artifacts-us-east-1.
+      # This template is deployed once in us-east-1 — not per-environment.
+      BucketName: !Sub "cello-codepipeline-artifacts-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+          # M7-CICD-001 AC-010: candidate tarballs expire after 7 days.
+          # Each cello-client push produces ~300 KB; 7-day TTL prevents unbounded growth.
+          - Id: ExpireCandidates
+            Status: Enabled
+            Prefix: candidates/
+            ExpirationInDays: 7
+      Tags:
+        - Key: Project
+          Value: cello
+
+  # IAM role for webhook Lambda
+  WebhookLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "cello-webhook-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EventBridgePut
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt GitHubEventBus.Arn
+        - PolicyName: SecretsManagerHmac
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cello/${Environment}/pipeline/github-hmac-secret*"
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:cello/${Environment}/pipeline/cello-client-webhook-secret*"
+      Tags:
+        - Key: Project
+          Value: cello
+
+  # Webhook receiver Lambda
+  WebhookLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-github-webhook-receiver-${Environment}"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt WebhookLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Environment:
+        Variables:
+          EVENT_BUS_NAME: !Ref GitHubEventBus
+          HMAC_SECRET_ID: !Sub "cello/${Environment}/pipeline/github-hmac-secret"
+      Code:
+        ZipFile: |
+          """
+          GitHub webhook receiver - validates HMAC signature, forwards to EventBridge.
+          Actual implementation deployed via CI; this is the bootstrap placeholder.
+          """
+          def handler(event, context):
+              return {"statusCode": 200, "body": "placeholder"}
+      Tags:
+        - Key: Project
+          Value: cello
+
+  # Webhook Lambda URL (public HTTPS endpoint for GitHub)
+  WebhookLambdaUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      AuthType: NONE
+      TargetFunctionArn: !GetAtt WebhookLambda.Arn
+
+  WebhookLambdaUrlPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt WebhookLambda.Arn
+      Action: lambda:InvokeFunctionUrl
+      Principal: "*"
+      FunctionUrlAuthType: NONE
+
+  # IAM role for pipeline-filter Lambda
+  PipelineFilterLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "cello-pipeline-filter-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: StartPipelines
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                # SI-003: Explicit named pipeline ARNs — no wildcard resource.
+                # Wildcard access (cello-*-pipeline) would allow triggering
+                # unrelated pipelines. Every new pipeline requires an explicit
+                # entry here.
+                Resource:
+                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:cello-connect-pipeline"
+                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:cello-directory-pipeline"
+                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:cello-relay-pipeline"
+                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:cello-e2e-tests-pipeline"
+                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:cello-operations-agent-pipeline"
+      Tags:
+        - Key: Project
+          Value: cello
+
+  # Pipeline filter Lambda
+  PipelineFilterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-pipeline-filter-${Environment}"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt PipelineFilterLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          """
+          Pipeline filter - inspects commit paths, triggers matching CodePipelines.
+          Actual implementation deployed via CI; this is the bootstrap placeholder.
+          """
+          def handler(event, context):
+              return {"statusCode": 200, "body": "placeholder"}
+      Tags:
+        - Key: Project
+          Value: cello
+
+  # EventBridge rule: forward GitHub push events to pipeline-filter Lambda
+  PipelineFilterRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "cello-github-push-to-filter-${Environment}"
+      EventBusName: !Ref GitHubEventBus
+      EventPattern:
+        source:
+          - "cello.github"
+        detail-type:
+          - "push"
+      Targets:
+        - Id: PipelineFilterTarget
+          Arn: !GetAtt PipelineFilterLambda.Arn
+
+  PipelineFilterLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PipelineFilterLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PipelineFilterRule.Arn
+
+  # ── M7-CICD-001: GitHub OIDC provider and role for cello-client CI ────────
+  # The OIDC provider allows GitHub Actions to assume an IAM role without
+  # long-lived credentials. The role is restricted to:
+  #   - repo: Mygentic-AI/cello-client
+  #   - branch: refs/heads/main
+  # Permissions: StartPipelineExecution on cello-e2e-tests-pipeline ONLY (SI-001),
+  # and s3:PutObject scoped to candidates/${github.sha}/* (SI-003).
+
+  GitHubOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Condition: CreateOidcProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      ThumbprintList:
+        # GitHub Actions OIDC thumbprint (stable across rotations since 2023)
+        - "6938fd4d98bab03faadb97b34396831e3780aea1"
+      Tags:
+        - Key: Project
+          Value: cello
+
+  GitHubOidcRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "cello-github-oidc-cello-client-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !If
+                - CreateOidcProvider
+                - !Ref GitHubOidcProvider
+                - !Ref ExistingGitHubOidcProviderArn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+              StringLike:
+                # AC-008: restrict to cello-client repo, main branch and version tags.
+                # Main branch pushes trigger the continuous e2e gate; tag pushes
+                # trigger the release e2e gate (e2e-gate-tag job in ci.yml).
+                "token.actions.githubusercontent.com:sub":
+                  - "repo:Mygentic-AI/cello-client:ref:refs/heads/main"
+                  - "repo:Mygentic-AI/cello-client:ref:refs/tags/*"
+      Policies:
+        # AC-009 / SI-001: ONLY cello-e2e-tests-pipeline. No directory, relay,
+        # connect, or operations-agent pipeline access.
+        - PolicyName: StartE2ePipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codepipeline:StartPipelineExecution
+                  - codepipeline:GetPipelineExecution
+                  - codepipeline:ListActionExecutions
+                Resource:
+                  - !Sub "arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:cello-e2e-tests-pipeline"
+        # SI-003: s3:PutObject scoped to candidates/${github.sha}/* only.
+        # The IAM condition uses the OIDC sub claim to extract the commit SHA
+        # context, but since OIDC sub is repo:branch format (not sha), we scope
+        # to the full candidates/ prefix. The GitHub Actions workflow itself
+        # writes only to candidates/$GITHUB_SHA/ — the S3 key structure provides
+        # the per-commit isolation.
+        - PolicyName: UploadCandidateTarball
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource:
+                  - !Sub "${ArtifactsBucket.Arn}/candidates/*"
+      Tags:
+        - Key: Project
+          Value: cello
+
+  # M7-CICD-001 AC-015: Secrets Manager secret for the cello-client webhook HMAC.
+  # The webhook receiver Lambda validates X-Hub-Signature-256 on cello-client
+  # push events using this secret. Stored in Secrets Manager (not SSM) because
+  # CloudFormation SSM::Parameter SecureString support is unreliable, and the
+  # webhook Lambda role already has secretsmanager:GetSecretValue permission.
+  CelloClientWebhookSecretStore:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "cello/${Environment}/pipeline/cello-client-webhook-secret"
+      Description: "GitHub webhook HMAC secret for cello-client repository"
+      SecretString: !Ref CelloClientWebhookSecret
+      Tags:
+        - Key: Project
+          Value: cello
+
+  # IAM roles for CodeBuild and CodePipeline
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "cello-codebuild-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The smoke runner resolves the staging ALB's DNS name at run time
+              # instead of trusting a value baked in at deploy time — see the
+              # SmokeTestBuild comment. Describe-only, no mutation.
+              - Effect: Allow
+                Action: elasticloadbalancing:DescribeLoadBalancers
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/cello-*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "${ArtifactsBucket.Arn}/*"
+                  - !GetAtt ArtifactsBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::cello-audit-logs-${Environment}-${AWS::Region}/*"
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub "arn:aws:s3:::cello-audit-logs-${Environment}-${AWS::Region}"
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource:
+                  - !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/cello-directory"
+                  - !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/cello-relay"
+                  - !Sub "arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/cello-operations-agent"
+              # ── ECS deploy permissions (DEPLOY-003 + DEPLOY-005) ─────────────────
+              # Required for buildspec docker build → ECR push → ECS rolling deploy.
+              # RegisterTaskDefinition + UpdateService + DescribeServices/TaskDefinition
+              # allow the buildspec to register a new task revision and deploy it.
+              # iam:PassRole is required so CodeBuild can pass the ECS task execution
+              # role (AmazonECSTaskExecutionRolePolicy) to the new task definition.
+              # DEPLOY-005: adds cross-region ECS deploy (us-east-1, eu-central-1,
+              # ap-northeast-1) in the ProductionDeploy stage. Resource: "*" covers
+              # all clusters and services across all regions under this account.
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:RegisterTaskDefinition
+                  - ecs:UpdateService
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  # us-east-1 uses original non-region-scoped names (can't rename due to live exports)
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-directory-execution-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-directory-task-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-relay-execution-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-relay-task-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-ops-agent-execution-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-ops-agent-task-role"
+                  # Non-primary regions use region-scoped names (FEDERATION-E2E-001 fix)
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-eu-central-1-directory-execution-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-eu-central-1-directory-task-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-eu-central-1-relay-execution-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-eu-central-1-relay-task-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-eu-central-1-ops-agent-execution-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-eu-central-1-ops-agent-task-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-ap-northeast-1-directory-execution-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-ap-northeast-1-directory-task-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-ap-northeast-1-relay-execution-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-ap-northeast-1-relay-task-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-ap-northeast-1-ops-agent-execution-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/cello-${Environment}-ap-northeast-1-ops-agent-task-role"
+              # ── CloudWatch Logs read for ops-agent smoke test (OPS-AGENT-005B) ───────
+              # SmokeTestOperationsAgentBuild polls /ecs/cello-operations-agent-{env}
+              # for the ops_agent.started event to verify successful startup.
+              - Effect: Allow
+                Action:
+                  - logs:FilterLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/ecs/cello-operations-agent-${Environment}:*"
+              # ── CloudFormation read-only for ALB URL (DEPLOY-005 AC-009) ───────────
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/cello-ecs-directory-${Environment}/*"
+              # ── SSM for IMAGE_URI passing between pipeline stages ─────────────────
+              # Build stage writes IMAGE_URI to SSM; StagingDeploy/ProductionDeploy read it.
+              # Scoped to /cello/{env}/pipeline/* — no access to node keys or credentials.
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:us-east-1:${AWS::AccountId}:parameter/cello/${Environment}/pipeline/*"
+      Tags:
+        - Key: Project
+          Value: cello
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "cello-codepipeline-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodePipelinePermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !GetAtt ArtifactsBucket.Arn
+                  - !Sub "${ArtifactsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !Sub "arn:aws:codebuild:${AWS::Region}:${AWS::AccountId}:project/cello-*"
+              - Effect: Allow
+                Action:
+                  - codestar-connections:UseConnection
+                Resource: !Ref GitHubConnectionArn
+      Tags:
+        - Key: Project
+          Value: cello
+
+  # CodeBuild projects and CodePipelines — cello-client packages (crypto, transport,
+  # protocol-types, client) moved to cello-client repo post-REPOSPLIT-002; their
+  # pipelines are removed. GitHub Actions in cello-client handles build/test/publish.
+  AdapterClaudeCodeBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cello-connect-build
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: packages/adapter-claude-code/buildspec.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  DirectoryBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cello-directory-build
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: packages/directory/buildspec.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: CELLO_AUDIT_BUCKET
+            Value: cello-audit-logs-dev-us-east-1
+          - Name: CELLO_ENV
+            Value: !Ref Environment
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  RelayBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cello-relay-build
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: packages/relay/buildspec.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: CELLO_ENV
+            Value: !Ref Environment
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  E2eTestsBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cello-e2e-tests-build
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: packages/e2e-tests/buildspec.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  # ── Operations Agent CodeBuild project (AC-002b, OPS-AGENT-005A) ─────────────
+  # Triggered by changes to packages/operations-agent/ via pipeline-filter Lambda.
+  # Build→StagingDeploy→SmokeTest→ProductionDeploy pipeline.
+  # The buildspec.yml is a placeholder (OPS-AGENT-005A); OPS-AGENT-005B wires real build.
+
+  OperationsAgentBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cello-operations-agent-build
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: packages/operations-agent/buildspec.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        # PrivilegedMode required: buildspec.yml runs `docker build` and `docker push`.
+        # Without this, CodeBuild cannot connect to the Docker daemon.
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: CELLO_ENV
+            Value: !Ref Environment
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  StagingDeployOperationsAgentBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cello-staging-deploy-operations-agent-build
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: infra/buildspecs/staging-deploy-operations-agent.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: CELLO_ENV
+            Value: !Ref Environment
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  # ── DEPLOY-005: Staging deploy, smoke test, and production deploy CodeBuild projects ──
+
+  # StagingDeployBuild: deploys the built image to the staging ECS service (dev = staging in Phase 1).
+  # This is a separate CodeBuild project from DirectoryBuild to isolate deploy logic from test logic.
+  # Emits: pipeline.staging.deployed (INFO), pipeline.staging.deploy.failed (ERROR)
+  # No VpcConfig — runs outside the VPC, calls ECS API.
+  StagingDeployDirectoryBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cello-staging-deploy-directory-build
+      # P — Pseudocode:
+      # 1. Read STAGING_IMAGE_URI from SSM (written by Build stage)
+      # 2. Run: aws ecs describe-task-definition cello-directory-{env} → clone → swap image URI
+      # 3. Register new task revision
+      # 4. Run: aws ecs update-service --cluster cello-{env} --service cello-directory-{env}
+      # 5. Poll rolloutState every 15s until COMPLETED or FAILED (up to 15 minutes)
+      # 6. On success: emit pipeline.staging.deployed {pipeline, commitSha, imageDigest, durationMs}
+      # 7. On failure: emit pipeline.staging.deploy.failed {pipeline, commitSha, reason}; exit 1
+      #
+      # CODEPIPELINE source: buildspec lives in repo so it updates on git push.
+      # IMAGE_URI is read from SSM Parameter Store at runtime (not from source artifact).
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: infra/buildspecs/staging-deploy-directory.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: CELLO_ENV
+            Value: !Ref Environment
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  StagingDeployRelayBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cello-staging-deploy-relay-build
+      # CODEPIPELINE source: buildspec lives in repo so it updates on git push.
+      # IMAGE_URI is read from SSM Parameter Store at runtime (not from source artifact).
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: infra/buildspecs/staging-deploy-relay.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: CELLO_ENV
+            Value: !Ref Environment
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  # SmokeTestBuild: runs the 8-scenario smoke test suite against the staging ALB.
+  # AC-006: NO VpcConfig — connects to staging via public ALB URL only.
+  # STAGING_DIRECTORY_URL is injected by CodePipeline at action invocation (AC-009).
+  # SI-002: receives SourceOutput artifact from the Build stage — no new build occurs.
+  # Emits: pipeline.staging.smoke_test.passed (INFO), pipeline.staging.smoke_test.failed (ERROR)
+  SmokeTestBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cello-smoke-test-build
+      # P — Pseudocode:
+      # 1. Read STAGING_DIRECTORY_URL from env (injected by CodePipeline, not hardcoded)
+      # 2. Install Node 24 + pnpm
+      # 3. Run: pnpm --filter @cello-protocol/e2e-tests run typecheck (compile smoke/run-smoke-tests.ts)
+      # 4. Run: node packages/e2e-tests/dist/smoke/run-smoke-tests.js
+      # 5. Smoke runner emits pipeline.staging.smoke_test.passed or pipeline.staging.smoke_test.failed
+      # 6. Exit code from runner propagates to CodeBuild (non-zero = pipeline fails)
+      # CODEPIPELINE source: buildspec lives in repo so it updates on git push.
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: infra/buildspecs/smoke-test.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        # AC-006: NO VpcConfig on this project — smoke test connects via public ALB URL
+        #
+        # AC-009 said this "is never a hardcoded .elb.amazonaws.com string", and that
+        # was true and operationally meaningless. It is a STAGE-1 BAKED VALUE in the
+        # sense infra/CLAUDE.md warns about: deploy.sh resolves it once, CloudFormation
+        # freezes it into the project, and updating the source changes nothing until
+        # deploy.sh runs again. The ALB was replaced and the cicd stack was not
+        # redeployed, so this held `cello-dir-dev-1341968405...` — a host that no longer
+        # resolves. EVERY directory deploy then failed at SmokeTest with `fetch failed`,
+        # ProductionDeploy never ran, and eu-central-1 and ap-northeast-1 could not
+        # receive a directory deploy AT ALL. Two of three sovereign regions, unreachable
+        # by CI, reported as a scenario failure rather than a configuration one.
+        #
+        # An EMPTY value now means "resolve it from AWS at run time", which is what
+        # infra/CLAUDE.md has always said to do with ALB DNS names. A stale cicd stack
+        # then self-heals instead of pointing the gate at a dead host. A non-empty value
+        # still wins, for a deliberate one-off override.
+        EnvironmentVariables:
+          - Name: STAGING_DIRECTORY_URL
+            Value: !Ref StagingDirectoryUrl
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      # AC-006: explicitly no VpcConfig — do not add one
+
+  # SmokeTestOperationsAgentBuild: verifies GET /health returns 200 with status=ok
+  # on the staging ops-agent ECS task after StagingDeploy completes.
+  # AC-007 (OPS-AGENT-005B): smoke test gate before production deploy.
+  SmokeTestOperationsAgentBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cello-smoke-test-operations-agent-build
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: infra/buildspecs/smoke-test-operations-agent.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: CELLO_ENV
+            Value: !Ref Environment
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  # ProductionDeployBuild: deploys the same image digest to production ECS services.
+  # SI-002: receives the image URI from Build stage — same digest, no new build.
+  # AC-007: sequential deploy — us-east-1 first, then eu-central-1, then ap-northeast-1.
+  # Each region polls rolloutState before the next region starts (RunOrder in pipeline).
+  # Emits: pipeline.production.deployed (INFO), pipeline.production.deploy.failed (ERROR)
+  ProductionDeployBuild:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: cello-production-deploy-build
+      # P — Pseudocode:
+      # 1. Receive DEPLOY_REGION (us-east-1 | eu-central-1 | ap-northeast-1) from env
+      # 2. Receive PROD_IMAGE_URI from env (same digest from Build stage — SI-002)
+      # 3. Receive SERVICE_NAME (cello-directory | cello-relay) from env
+      # 4. export START_MS
+      # 5. Clone task def, swap image, register new revision
+      # 6. aws ecs update-service --region $DEPLOY_REGION
+      # 7. Poll rolloutState every 15s until COMPLETED or FAILED (up to 15 minutes)
+      # 8. On success: emit pipeline.production.deployed {pipeline, region, commitSha, imageDigest, durationMs}
+      # 9. On failure: emit pipeline.production.deploy.failed {pipeline, region, commitSha, reason}; exit 1
+      # CODEPIPELINE source: buildspec lives in repo so it updates on git push.
+      # IMAGE_URI is read from SSM Parameter Store at runtime (SI-002: same digest).
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: infra/buildspecs/production-deploy.yml
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        Type: LINUX_CONTAINER
+        Image: aws/codebuild/standard:7.0
+        ComputeType: BUILD_GENERAL1_SMALL
+        EnvironmentVariables:
+          - Name: CELLO_ENV
+            Value: !Ref Environment
+          # DEPLOY_REGION and SERVICE_NAME have no meaningful defaults — they are always
+          # overridden by CodePipeline action EnvironmentVariables at runtime.
+          # Setting them to OVERRIDE_AT_RUNTIME makes this intent explicit and prevents
+          # accidental runs against a hardcoded us-east-1 or cello-directory target.
+          - Name: DEPLOY_REGION
+            Value: "OVERRIDE_AT_RUNTIME"
+          - Name: SERVICE_NAME
+            Value: "OVERRIDE_AT_RUNTIME"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  # CodePipelines — crypto, protocol-types, transport, client pipelines removed post-REPOSPLIT-002.
+  # Those packages now live in cello-client repo; GitHub Actions handles build/test/publish there.
+  AdapterClaudeCodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      PipelineType: V2
+      Name: cello-connect-pipeline
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Ref GitHubRepo
+                BranchName: !Ref GitHubBranch
+                DetectChanges: "false"
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref AdapterClaudeCodeBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+
+  DirectoryPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      PipelineType: V2
+      Name: cello-directory-pipeline
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Ref GitHubRepo
+                BranchName: !Ref GitHubBranch
+                DetectChanges: "false"
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref DirectoryBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        # DEPLOY-005 Stage 3: Deploy built image to staging ECS (dev = staging in Phase 1)
+        # AC-001: staging deploy uses same image digest from Build stage
+        # AC-005: pipeline halts here if staging deploy fails (smoke test never runs)
+        - Name: StagingDeploy
+          Actions:
+            - Name: StagingDeployAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref StagingDeployDirectoryBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: StagingDeployDirectoryOutput
+        # DEPLOY-005 Stage 4: Smoke test against staging ALB
+        # AC-002: 8-scenario smoke suite runs as separate process (no VPC, no direct DB access)
+        # AC-004/SI-001: production deploy stage will not run if this stage fails
+        # AC-009: STAGING_DIRECTORY_URL is set at the CodeBuild project level from the
+        # StagingDirectoryUrl CloudFormation parameter (deploy.sh reads cello-ecs-directory-{env}
+        # stack output AlbDnsName and passes it as StagingDirectoryUrl at deploy time).
+        # No pipeline-level override is needed — the project env var is already correct.
+        - Name: SmokeTest
+          Actions:
+            - Name: SmokeTestAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref SmokeTestBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: SmokeTestOutput
+        # DEPLOY-005 Stage 5: Production deploy — sequential multi-region (AC-003, AC-007)
+        # SI-001: this stage only runs if SmokeTest stage completed with passing status
+        # SI-002: same image URI from SSM (same digest, no new build)
+        # RunOrder ensures sequencing within stage: us-east-1(1) → eu-central-1(2) → ap-northeast-1(3)
+        - Name: ProductionDeploy
+          Actions:
+            - Name: ProductionDeployUsEast1
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              RunOrder: 1
+              Configuration:
+                ProjectName: !Ref ProductionDeployBuild
+                EnvironmentVariables: >
+                  [{"name":"DEPLOY_REGION","value":"us-east-1","type":"PLAINTEXT"},
+                   {"name":"SERVICE_NAME","value":"cello-directory","type":"PLAINTEXT"}]
+              InputArtifacts:
+                - Name: SourceOutput
+            - Name: ProductionDeployEuCentral1
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              RunOrder: 2
+              Configuration:
+                ProjectName: !Ref ProductionDeployBuild
+                EnvironmentVariables: >
+                  [{"name":"DEPLOY_REGION","value":"eu-central-1","type":"PLAINTEXT"},
+                   {"name":"SERVICE_NAME","value":"cello-directory","type":"PLAINTEXT"}]
+              InputArtifacts:
+                - Name: SourceOutput
+            - Name: ProductionDeployApNortheast1
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              RunOrder: 3
+              Configuration:
+                ProjectName: !Ref ProductionDeployBuild
+                EnvironmentVariables: >
+                  [{"name":"DEPLOY_REGION","value":"ap-northeast-1","type":"PLAINTEXT"},
+                   {"name":"SERVICE_NAME","value":"cello-directory","type":"PLAINTEXT"}]
+              InputArtifacts:
+                - Name: SourceOutput
+
+  RelayPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      PipelineType: V2
+      Name: cello-relay-pipeline
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Ref GitHubRepo
+                BranchName: !Ref GitHubBranch
+                DetectChanges: "false"
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref RelayBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        # DEPLOY-005: relay pipeline staging deploy + smoke test + production deploy
+        - Name: StagingDeploy
+          Actions:
+            - Name: StagingDeployAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref StagingDeployRelayBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: StagingDeployRelayOutput
+        # Relay smoke test: verifies relay health endpoint at port 4000 behind ALB.
+        # M6B-007: relay ALB is now externally reachable on port 4002 (WebSocket).
+        # STAGING_DIRECTORY_URL is set at the CodeBuild project level from the StagingDirectoryUrl
+        # CloudFormation parameter — no pipeline-level override needed.
+        - Name: SmokeTest
+          Actions:
+            - Name: SmokeTestAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref SmokeTestBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: SmokeTestOutput
+        - Name: ProductionDeploy
+          Actions:
+            - Name: ProductionDeployUsEast1
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              RunOrder: 1
+              Configuration:
+                ProjectName: !Ref ProductionDeployBuild
+                EnvironmentVariables: >
+                  [{"name":"DEPLOY_REGION","value":"us-east-1","type":"PLAINTEXT"},
+                   {"name":"SERVICE_NAME","value":"cello-relay","type":"PLAINTEXT"}]
+              InputArtifacts:
+                - Name: SourceOutput
+            - Name: ProductionDeployEuCentral1
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              RunOrder: 2
+              Configuration:
+                ProjectName: !Ref ProductionDeployBuild
+                EnvironmentVariables: >
+                  [{"name":"DEPLOY_REGION","value":"eu-central-1","type":"PLAINTEXT"},
+                   {"name":"SERVICE_NAME","value":"cello-relay","type":"PLAINTEXT"}]
+              InputArtifacts:
+                - Name: SourceOutput
+            - Name: ProductionDeployApNortheast1
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              RunOrder: 3
+              Configuration:
+                ProjectName: !Ref ProductionDeployBuild
+                EnvironmentVariables: >
+                  [{"name":"DEPLOY_REGION","value":"ap-northeast-1","type":"PLAINTEXT"},
+                   {"name":"SERVICE_NAME","value":"cello-relay","type":"PLAINTEXT"}]
+              InputArtifacts:
+                - Name: SourceOutput
+
+  E2eTestsPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      PipelineType: V2
+      Name: cello-e2e-tests-pipeline
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+      # M7-CICD-001: Pipeline variable for cross-repo gate. When cello-client
+      # CI starts this pipeline, it passes the candidate commit SHA. When the
+      # pipeline-filter Lambda starts it (native trustless-cello push), the
+      # variable defaults to empty → buildspec takes the registry install path.
+      Variables:
+        - Name: CELLO_CANDIDATE_SHA
+          DefaultValue: ""
+          Description: "Git SHA of candidate connect tarball (cross-repo gate)"
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Ref GitHubRepo
+                BranchName: !Ref GitHubBranch
+                DetectChanges: "false"
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref E2eTestsBuild
+                EnvironmentVariables: '[{"name":"CELLO_CANDIDATE_SHA","value":"#{variables.CELLO_CANDIDATE_SHA}","type":"PLAINTEXT"}]'
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+
+  # ── Operations Agent pipeline (AC-002b, OPS-AGENT-005A) ──────────────────────
+  # Triggered by changes to packages/operations-agent/.
+  # Build → StagingDeploy → SmokeTest → ProductionDeploy.
+  # The StagingDeploy buildspec (staging-deploy-operations-agent.yml) is a placeholder
+  # until OPS-AGENT-005B wires the real deploy logic.
+  # ProductionDeploy reuses the existing ProductionDeployBuild project with
+  # SERVICE_NAME=cello-operations-agent override.
+
+  OperationsAgentPipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      PipelineType: V2
+      Name: cello-operations-agent-pipeline
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactsBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeStarSourceConnection
+                Version: "1"
+              Configuration:
+                ConnectionArn: !Ref GitHubConnectionArn
+                FullRepositoryId: !Ref GitHubRepo
+                BranchName: !Ref GitHubBranch
+                DetectChanges: "false"
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref OperationsAgentBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+        - Name: StagingDeploy
+          Actions:
+            - Name: StagingDeployAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref StagingDeployOperationsAgentBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: StagingDeployOpsAgentOutput
+        # SmokeTest: verifies GET /health returns 200 on the staging ops-agent task.
+        # AC-007 (OPS-AGENT-005B): real ops-agent smoke test, not the directory suite.
+        - Name: SmokeTest
+          Actions:
+            - Name: SmokeTestAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref SmokeTestOperationsAgentBuild
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: SmokeTestOutput
+        # Ops-agent is single-region (us-east-1 only) — Telegram long-polling
+        # requires exactly-one-instance globally, not per-region.
+        - Name: ProductionDeploy
+          Actions:
+            - Name: ProductionDeployUsEast1
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              RunOrder: 1
+              Configuration:
+                ProjectName: !Ref ProductionDeployBuild
+                EnvironmentVariables: >
+                  [{"name":"DEPLOY_REGION","value":"us-east-1","type":"PLAINTEXT"},
+                   {"name":"SERVICE_NAME","value":"cello-operations-agent","type":"PLAINTEXT"}]
+              InputArtifacts:
+                - Name: SourceOutput
+
+Outputs:
+  WebhookLambdaArn:
+    Value: !GetAtt WebhookLambda.Arn
+    Export:
+      Name: !Sub "cello-${Environment}-webhook-lambda-arn"
+
+  WebhookUrl:
+    Value: !GetAtt WebhookLambdaUrl.FunctionUrl
+    Export:
+      Name: !Sub "cello-${Environment}-webhook-url"
+
+  PipelineFilterLambdaArn:
+    Value: !GetAtt PipelineFilterLambda.Arn
+    Export:
+      Name: !Sub "cello-${Environment}-pipeline-filter-lambda-arn"
+
+  ArtifactsBucketName:
+    Value: !Ref ArtifactsBucket
+    Export:
+      Name: !Sub "cello-${Environment}-artifacts-bucket"
+
+  # M7-CICD-001: GitHub OIDC role ARN for cello-client CI workflow
+  GitHubOidcRoleArn:
+    Value: !GetAtt GitHubOidcRole.Arn
+    Export:
+      Name: !Sub "cello-${Environment}-github-oidc-role-arn"

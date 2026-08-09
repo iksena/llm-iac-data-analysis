@@ -1,0 +1,206 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  ExaSense Phase 1-2 verification - Spot GPU instance for 3D reconstruction testing.
+  Uses g5.xlarge (A10G 24GB) with Deep Learning AMI. Auto-terminates after job completion.
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair for SSH access
+
+  MaxSpotPrice:
+    Type: String
+    Default: "0.60"
+    Description: Maximum spot price (USD/hr). On-demand g5.xlarge is ~$1.01/hr.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the instance
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet for the instance
+
+  GithubRepo:
+    Type: String
+    Default: ""
+    Description: (Optional) GitHub repo URL to clone the project
+
+  AutoTerminateMinutes:
+    Type: Number
+    Default: 120
+    Description: Auto-terminate instance after N minutes (safety net)
+
+Resources:
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ExaSense GPU verification instance
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: exasense-verify-sg
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: exasense-verify-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+      Policies:
+        - PolicyName: SelfTerminate
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ec2:TerminateInstances
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "ec2:ResourceTag/Project": "exasense-verify"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+  SpotInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: g5.xlarge
+      # Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04)
+      # This AMI has CUDA drivers pre-installed. Check region availability.
+      ImageId: !FindInMap [RegionAMI, !Ref "AWS::Region", AMI]
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      InstanceMarketOptions:
+        MarketType: spot
+        SpotOptions:
+          MaxPrice: !Ref MaxSpotPrice
+          SpotInstanceType: one-time
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 100
+            VolumeType: gp3
+            Iops: 3000
+            Throughput: 250
+      Tags:
+        - Key: Name
+          Value: exasense-verify-gpu
+        - Key: Project
+          Value: exasense-verify
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          exec > /var/log/exasense-setup.log 2>&1
+
+          # Safety: auto-terminate after ${AutoTerminateMinutes} minutes
+          INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+          REGION=$(curl -s http://169.254.169.254/latest/meta-data/placement/region)
+          nohup bash -c "sleep $((${AutoTerminateMinutes} * 60)) && aws ec2 terminate-instances --instance-ids $INSTANCE_ID --region $REGION" &
+
+          # Wait for NVIDIA drivers
+          for i in $(seq 1 30); do
+            nvidia-smi && break || sleep 10
+          done
+
+          # Install system deps
+          apt-get update
+          apt-get install -y git curl unzip
+
+          # Install uv
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="/root/.local/bin:$PATH"
+
+          # Install COLMAP
+          apt-get install -y colmap || {
+            echo "COLMAP not in apt, installing from conda..."
+            conda install -y -c conda-forge colmap
+          }
+
+          # Clone project
+          cd /home/ubuntu
+          if [ -n "${GithubRepo}" ]; then
+            git clone "${GithubRepo}" exasense
+          else
+            mkdir -p exasense
+            # TODO: Pull from S3 or other source
+          fi
+
+          cd exasense
+
+          # Install dependencies
+          uv sync --extra dev
+          uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+          uv pip install open3d transformers accelerate
+
+          # Run verification
+          uv run python scripts/verification/verify_phase1_2.py \
+            --dataset synthetic --all \
+            2>&1 | tee /home/ubuntu/verification.log
+
+          # Upload results to S3 (if bucket configured)
+          # aws s3 cp data/verification/ s3://exasense-results/verification/ --recursive
+
+          echo "=== Verification complete ==="
+          echo "Results in /home/ubuntu/exasense/data/verification/"
+
+  # Fallback: auto-terminate via CloudWatch alarm if instance runs too long
+  AutoTerminateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: exasense-verify-auto-terminate
+      AlarmDescription: Terminate GPU instance after extended runtime
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref SpotInstance
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: !Sub "${AutoTerminateMinutes}"
+      Threshold: 0
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Sub "arn:aws:automate:${AWS::Region}:ec2:terminate"
+
+Mappings:
+  # Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04) - Feb 2026
+  # Update AMI IDs for your region: aws ec2 describe-images --filters "Name=name,Values=Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 22.04)*" --query 'Images | sort_by(@, &CreationDate) | [-1].ImageId'
+  RegionAMI:
+    us-east-1:
+      AMI: ami-0a0c8eece9b430dc4
+    us-west-2:
+      AMI: ami-0a0c8eece9b430dc4
+    ap-northeast-1:
+      AMI: ami-0a0c8eece9b430dc4
+    ap-northeast-3:
+      AMI: ami-0a0c8eece9b430dc4
+
+Outputs:
+  InstanceId:
+    Value: !Ref SpotInstance
+  PublicIP:
+    Value: !GetAtt SpotInstance.PublicIp
+  SSHCommand:
+    Value: !Sub "ssh -i ${KeyPairName}.pem ubuntu@${SpotInstance.PublicIp}"
+  LogCommand:
+    Value: !Sub "ssh -i ${KeyPairName}.pem ubuntu@${SpotInstance.PublicIp} 'tail -f /var/log/exasense-setup.log'"

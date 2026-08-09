@@ -1,0 +1,695 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Address Splitter - main stack (CloudFront+S3 frontend, HTTP API+Lambda, Cognito JWT auth, DynamoDB, Bedrock, Amazon Location)
+
+Parameters:
+  AppName:
+    Type: String
+    Default: address-splitter
+  Stage:
+    Type: String
+    Default: dev
+  AllowedOrigins:
+    Type: String
+    Default: '*'
+    Description: CORS allowed origins (use * for dev)
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+  ResultsRetentionDays:
+    Type: Number
+    Default: 30
+  CognitoDomainPrefix:
+    Type: String
+    Default: danielpradilla-address-splitter
+  EnableGeonamesOffline:
+    Type: String
+    AllowedValues: ['true','false']
+    Default: 'true'
+  EnableLibpostal:
+    Type: String
+    AllowedValues: ['true','false']
+    Default: 'true'
+  EnableAwsServices:
+    Type: String
+    AllowedValues: ['true','false']
+    Default: 'true'
+  GeonamesDataS3Uri:
+    Type: String
+    Default: ''
+    Description: Optional S3 URI (s3://bucket/prefix) where raw GeoNames files are stored
+
+  LambdaImageUri:
+    Type: String
+    Description: ECR image URI for the API Lambda (container image)
+
+  LocationDataSource:
+    Type: String
+    Default: Here
+    AllowedValues: [Here, Esri]
+  LoqateSecretId:
+    Type: String
+    Default: ''
+    Description: Optional Secrets Manager secret id/name/ARN containing JSON key LOQATE_API_KEY
+
+Conditions:
+  UseGeonamesOffline: !Equals [!Ref EnableGeonamesOffline, 'true']
+  UseAwsServices: !Equals [!Ref EnableAwsServices, 'true']
+  HasLoqateSecret: !Not [!Equals [!Ref LoqateSecretId, '']]
+
+Resources:
+  # -----------------
+  # Frontend hosting
+  # -----------------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub '${AppName}-${Stage}-oai'
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontRead
+            Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+
+  ResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${AppName}-${Stage}-security-headers'
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Preload: true
+            Override: true
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: s3-frontend
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOAI}'
+        DefaultCacheBehavior:
+          TargetOriginId: s3-frontend
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD, OPTIONS]
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  # -----------------
+  # Cognito (email/password; admin-created users)
+  # -----------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      UserPoolName: !Sub '${AppName}-${Stage}'
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 10
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub '${AppName}-${Stage}-spa'
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      SupportedIdentityProviders: [COGNITO]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      CallbackURLs:
+        - !Sub 'https://${CloudFrontDistribution.DomainName}/'
+      LogoutURLs:
+        - !Sub 'https://${CloudFrontDistribution.DomainName}/'
+      # Longer-lived sessions via refresh token
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        RefreshToken: days
+      ExplicitAuthFlows:
+        # Enables CLI standalone Option A via initiate-auth
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Domain: !Ref CognitoDomainPrefix
+      UserPoolId: !Ref UserPool
+
+  # -----------------
+  # DynamoDB
+  # -----------------
+  SubmissionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AppName}-${Stage}-submissions'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  UserSettingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AppName}-${Stage}-user-settings'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_sub
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_sub
+          KeyType: HASH
+
+  BatchJobsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AppName}-${Stage}-batch-jobs'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  BatchInputBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: BatchFunctionPermission
+    Properties:
+      BucketName: !Sub '${AppName}-${Stage}-batch-input-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: input/
+            Function: !GetAtt BatchFunction.Arn
+
+  GeonamesCitiesTable:
+    Type: AWS::DynamoDB::Table
+    Condition: UseGeonamesOffline
+    Properties:
+      TableName: !Sub '${AppName}-${Stage}-geonames-cities'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+
+  GeonamesLookupTable:
+    Type: AWS::DynamoDB::Table
+    Condition: UseGeonamesOffline
+    Properties:
+      TableName: !Sub '${AppName}-${Stage}-geonames'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: GSI2PK
+          AttributeType: S
+        - AttributeName: GSI2SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: GSI2
+          KeySchema:
+            - AttributeName: GSI2PK
+              KeyType: HASH
+            - AttributeName: GSI2SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # -----------------
+  # Amazon Location (pipeline #3)
+  # -----------------
+  PlaceIndex:
+    Type: AWS::Location::PlaceIndex
+    Condition: UseAwsServices
+    Properties:
+      DataSource: !Ref LocationDataSource
+      IndexName: !Sub '${AppName}-${Stage}-place-index'
+      PricingPlan: RequestBasedUsage
+
+  # -----------------
+  # Lambda + HTTP API
+  # -----------------
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AddressSplitterApi
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt SubmissionsTable.Arn
+                  - !Sub '${SubmissionsTable.Arn}/index/*'
+                  - !GetAtt UserSettingsTable.Arn
+                  - !GetAtt BatchJobsTable.Arn
+                  - !Sub '${BatchJobsTable.Arn}/index/*'
+                  - !If [UseGeonamesOffline, !GetAtt GeonamesLookupTable.Arn, !Ref AWS::NoValue]
+                  - !If [UseGeonamesOffline, !Sub '${GeonamesLookupTable.Arn}/index/*', !Ref AWS::NoValue]
+                  - !If [UseGeonamesOffline, !GetAtt GeonamesCitiesTable.Arn, !Ref AWS::NoValue]
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:ListFoundationModels
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetInferenceProfile
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - geo:SearchPlaceIndexForText
+                Resource: '*'
+              # Some Bedrock models/inference profiles require AWS Marketplace subscription checks
+              - Effect: Allow
+                Action:
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Subscribe
+                Resource: '*'
+
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      # NOTE: Do not set FunctionName. Switching from Zip->Image requires replacement and
+      # CloudFormation cannot replace a custom-named function in-place.
+      PackageType: Image
+      Code:
+        ImageUri: !Ref LambdaImageUri
+      Role: !GetAtt ApiFunctionRole.Arn
+      Timeout: 180
+      MemorySize: 7168
+      Environment:
+        Variables:
+          APP_NAME: !Ref AppName
+          STAGE: !Ref Stage
+          AWS_REGION_NAME: !Ref AWS::Region
+          ALLOWED_ORIGINS: !Ref AllowedOrigins
+          RESULTS_RETENTION_DAYS: !Ref ResultsRetentionDays
+          SUBMISSIONS_TABLE: !Ref SubmissionsTable
+          USER_SETTINGS_TABLE: !Ref UserSettingsTable
+          BATCH_JOBS_TABLE: !Ref BatchJobsTable
+          GEONAMES_TABLE: !If [UseGeonamesOffline, !Ref GeonamesLookupTable, '']
+          GEONAMES_CITIES_TABLE: !If [UseGeonamesOffline, !Ref GeonamesCitiesTable, '']
+          PLACE_INDEX_NAME: !If [UseAwsServices, !Ref PlaceIndex, '']
+          LOQATE_API_KEY: !If
+            - HasLoqateSecret
+            - !Sub '{{resolve:secretsmanager:${LoqateSecretId}:SecretString:LOQATE_API_KEY}}'
+            - ''
+      # Code defined above via container image (ImageUri)
+
+  BatchFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AddressSplitterBatch
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetObjectTagging
+                Resource:
+                  - !Sub 'arn:aws:s3:::${AppName}-${Stage}-batch-input-${AWS::AccountId}-${AWS::Region}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt BatchJobsTable.Arn
+                  - !Sub '${BatchJobsTable.Arn}/index/*'
+                  - !If [UseGeonamesOffline, !GetAtt GeonamesLookupTable.Arn, !Ref AWS::NoValue]
+                  - !If [UseGeonamesOffline, !Sub '${GeonamesLookupTable.Arn}/index/*', !Ref AWS::NoValue]
+                  - !If [UseGeonamesOffline, !GetAtt GeonamesCitiesTable.Arn, !Ref AWS::NoValue]
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - geo:SearchPlaceIndexForText
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - aws-marketplace:ViewSubscriptions
+                  - aws-marketplace:Subscribe
+                Resource: '*'
+
+  BatchFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      PackageType: Image
+      Code:
+        ImageUri: !Ref LambdaImageUri
+      ImageConfig:
+        Command: ["batch_handler.handler"]
+      Role: !GetAtt BatchFunctionRole.Arn
+      Timeout: 900
+      MemorySize: 7168
+      Environment:
+        Variables:
+          APP_NAME: !Ref AppName
+          STAGE: !Ref Stage
+          AWS_REGION_NAME: !Ref AWS::Region
+          RESULTS_RETENTION_DAYS: !Ref ResultsRetentionDays
+          BATCH_JOBS_TABLE: !Ref BatchJobsTable
+          GEONAMES_TABLE: !If [UseGeonamesOffline, !Ref GeonamesLookupTable, '']
+          GEONAMES_CITIES_TABLE: !If [UseGeonamesOffline, !Ref GeonamesCitiesTable, '']
+          PLACE_INDEX_NAME: !If [UseAwsServices, !Ref PlaceIndex, '']
+          BATCH_OUTPUT_PREFIX: batch-output
+          BATCH_PIPELINES: bedrock_geonames,libpostal_geonames,aws_services,loqate
+          LOQATE_API_KEY: !If
+            - HasLoqateSecret
+            - !Sub '{{resolve:secretsmanager:${LoqateSecretId}:SecretString:LOQATE_API_KEY}}'
+            - ''
+
+  BatchFunctionPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref BatchFunction
+      Principal: s3.amazonaws.com
+
+  ApiFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Description: !Sub 'Image ${LambdaImageUri}'
+
+  ApiFunctionAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: live
+      FunctionName: !Ref ApiFunction
+      FunctionVersion: !GetAtt ApiFunctionVersion.Version
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AppName}-${Stage}-http-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: [!Ref AllowedOrigins]
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, POST, PUT, OPTIONS]
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      AuthorizerType: JWT
+      IdentitySource:
+        - '$request.header.Authorization'
+      Name: !Sub '${AppName}-${Stage}-jwt'
+      JwtConfiguration:
+        Audience:
+          - !Ref UserPoolClient
+        Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+
+  ApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Ref ApiFunctionAlias
+      PayloadFormatVersion: '2.0'
+
+  RouteHealth:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /health'
+      Target: !Sub 'integrations/${ApiIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  RouteModels:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /models'
+      Target: !Sub 'integrations/${ApiIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  RoutePromptGet:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /prompt'
+      Target: !Sub 'integrations/${ApiIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  RoutePromptPut:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'PUT /prompt'
+      Target: !Sub 'integrations/${ApiIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  RouteSplit:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /split'
+      Target: !Sub 'integrations/${ApiIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  RouteRecent:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /recent'
+      Target: !Sub 'integrations/${ApiIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  RouteSubmissionGet:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /submission/{id}'
+      Target: !Sub 'integrations/${ApiIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  RouteSubmissionPreferred:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'PUT /submission/{id}/preferred'
+      Target: !Sub 'integrations/${ApiIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  RouteBatchJobs:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /batch-jobs'
+      Target: !Sub 'integrations/${ApiIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  RouteBatchJobGet:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'GET /batch-jobs/{id}'
+      Target: !Sub 'integrations/${ApiIntegration}'
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  ApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiFunctionAlias
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/*'
+
+  # NOTE: We intentionally do NOT create the Lambda log group explicitly.
+  # Lambda will auto-create it on first invocation. Retention can be set later.
+
+Outputs:
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  CloudFrontDistributionId:
+    Value: !Ref CloudFrontDistribution
+  CloudFrontUrl:
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}/'
+  ApiBaseUrl:
+    Value: !GetAtt HttpApi.ApiEndpoint
+  CognitoUserPoolId:
+    Value: !Ref UserPool
+  CognitoAppClientId:
+    Value: !Ref UserPoolClient
+  CognitoDomain:
+    Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+  PlaceIndexName:
+    Condition: UseAwsServices
+    Value: !Ref PlaceIndex
+  BatchInputBucketName:
+    Value: !Ref BatchInputBucket

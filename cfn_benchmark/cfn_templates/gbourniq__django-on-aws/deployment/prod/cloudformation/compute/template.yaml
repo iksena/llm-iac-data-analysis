@@ -1,0 +1,589 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Metadata:
+  License: Apache-2.0
+Description: |
+  This CloudFormation template defines the compute resources:
+  - AutoScaling Group with Scheduled Actions and Scaling Policies
+  - Launch Configuration to configure and provision EC2s at launch time
+  - EC2 Instance Role to determine how EC2s can interact with other AWS services
+  - CodeDeploy and Role to deploy new application versions to running EC2 instances
+
+Parameters:
+  ASGCPUTargetValue:
+    Description: Average CPU Target for each instance (eg. 60%)
+    Type: Number
+    MinValue: 20
+    MaxValue: 80
+  ASGDesiredCapacity:
+    Description: Desired number of instances at stack creation
+    Type: String
+  ASGSubnetsString:
+    Description: List of subnets the auto scaling group of EC2s will be spread across
+    Type: String
+  ASGScheduledActionUpTimeHour:
+    Type: String
+    Description: Scale up time, for eg. '8' will cause the ASG to scale up at 8AM GMT.
+    AllowedValues: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12',
+                    '13', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '24']
+  ASGScheduledActionDownTimeHour:
+    Type: String
+    Description: Scale down time, for eg. '23' will cause the ASG to scale down at 11PM GMT.
+    AllowedValues: ['1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12',
+                    '13', '14', '15', '16', '17', '18', '19', '20', '21', '22', '23', '24']
+  EC2SecurityGroupId:
+    Type: String
+  EC2InstanceType:
+    Type: String
+    AllowedValues: [t1.micro, t2.nano, t2.micro, t2.small]
+    ConstraintDescription: must be a valid EC2 instance type.
+  EC2AmiId:
+    Description: AMI ID
+    Type: AWS::EC2::Image::Id
+  ElasticacheRedisEndpoint:
+    Type: String
+  EC2VolumeSize:
+    Type: Number
+    MinValue: 8
+    MaxValue: 20
+  RDSPostgresEndpoint:
+    Type: String
+  SSMParamNameRdsPostgresPassword:
+    NoEcho: true
+    Description: SSM Parameter Name for the RDS password SecureString.
+    Type: String
+  S3BucketArnCodeDeployArtifacts:
+    Description: S3 Bucket Arn for EC2 to pull CodeDeploy Artifacts
+    Type: String
+  S3BucketArnStaticFiles:
+    Description: S3 Bucket Arn for EC2 to put Webapp resources and static files
+    Type: String
+  S3BucketNameStaticFiles:
+    Description: S3 Bucket Name to store as an EC2 environment variable
+    Type: String
+  SNSTopicArn:
+    Description: SNS Topic Arn for ASG and CodeDeploy to send event notifications. This is also used by the Django webapp.
+    Type: String
+  SESIdentityArn:
+    Description: SES Identity Arn for email notifications to registered users when new content is added. Used by the Django webapp.
+    Type: String
+  SQSQueueArn:
+    Description: SQS Queue Arn used to forward messages to Lambda for user-defined Slack notifications
+    Type: String
+  SQSQueueUrl:
+    Description: SQS Queue Url used to forward messages to Lambda for user-defined Slack notifications
+    Type: String
+  TargetGroupArn:
+    Description: Target Group Arn
+    Type: String
+  TargetGroupName:
+    Description: Target Group Name
+    Type: String
+  WebsiteDomain:
+    Description: Website domain, eg. my.domain.com, used by Django S3 storage backend
+    Type: String
+
+Resources:
+  # Auto Scaling Group
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier: !Split [',', !Ref ASGSubnetsString]
+      LaunchConfigurationName: !Ref LaunchConfig
+      DesiredCapacity: !Ref ASGDesiredCapacity
+      MaxSize: '5'
+      # If MinInstancesInService set to 1, then MinSize must be >= 2 since
+      # CodeDeploy would require at least 1 healthy instance for rolling updates
+      MinSize: '1'
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      TargetGroupARNs: [!Ref TargetGroupArn]
+      MetricsCollection:
+        - Granularity: 1Minute
+          Metrics: [GroupMinSize, GroupMaxSize, GroupDesiredCapacity]
+      NotificationConfigurations:
+        - TopicARN: !Ref SNSTopicArn
+          NotificationTypes:
+            - autoscaling:EC2_INSTANCE_LAUNCH
+            - autoscaling:EC2_INSTANCE_LAUNCH_ERROR
+            - autoscaling:EC2_INSTANCE_TERMINATE
+            - autoscaling:EC2_INSTANCE_TERMINATE_ERROR
+            - autoscaling:TEST_NOTIFICATION
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref ASGDesiredCapacity
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        # if MinInstancesInService = 1 and FLEET_PERCENT = 50, then we need at least 2 instances running
+        MinInstancesInService: 0
+        MaxBatchSize: 1
+        PauseTime: PT10M
+        WaitOnResourceSignals: true
+        SuspendProcesses: [ScheduledActions]
+      AutoScalingScheduledAction:
+        # Prevent Scheduled Actions from modifying min/max/desired for CloudFormation
+        IgnoreUnmodifiedGroupSizeProperties: true
+
+  # Scheduled Actions
+  ScheduledActionUp:
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      DesiredCapacity: 1
+      MaxSize: 5
+      # If MinInstancesInService set to 1 and FLEET_PERCENT = 50, then MinSize must be >= 2 since
+      # CodeDeploy would require at least 1 healthy instance for rolling updates
+      MinSize: 1
+      Recurrence: !Join [' ', ['0', !Ref ASGScheduledActionUpTimeHour, '*', '*', '*',]]
+  ScheduledActionDown:
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      DesiredCapacity: 0
+      MaxSize: 2
+      MinSize: 0
+      Recurrence: !Join [' ', ['0', !Ref ASGScheduledActionDownTimeHour, '*', '*', '*',]]
+
+  # Scaling Policy
+  WebServerCPUTargetTrackingScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      Cooldown: '60'
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref ASGCPUTargetValue
+
+  # IAM
+  RootInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [!Ref EC2InstanceRole]
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Join ['-', [!Ref AWS::StackName, AWSEC2InstanceRole]]
+      AssumeRolePolicyDocument:
+        # Allow EC2 and CodeDeploy services to assume the role
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ec2.amazonaws.com, codedeploy.amazonaws.com]
+            Action: [sts:AssumeRole]
+      ManagedPolicyArns:
+        # SSM Session Manager to SSH from the AWS Console
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        # Policy for EC2 (CodeDeploy agent) to download artifacts from S3
+        - PolicyName: !Join ['-', [!Ref AWS::StackName, EC2ToGetObjectsFromS3]]
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:Get*, s3:List*]
+                Resource: !Join ['', [!Ref S3BucketArnCodeDeployArtifacts, '/*']]
+        # Policy for EC2 to put static files to the S3 bucket
+        - PolicyName: !Join ['-', [!Ref AWS::StackName, EC2ToPutObjectsToS3]]
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [s3:*] # [s3:ListBucket*, s3:PutObject*, s3:PutBucketPublicAccessBlock, s3:DeleteObject]
+                Resource:
+                  - !Join ['', [!Ref S3BucketArnStaticFiles, '/*']]
+                  - !Join ['', [!Ref S3BucketArnStaticFiles]]
+        # Policy for EC2 to interact with the CloudWatch service
+        - PolicyName: !Join ['-', [!Ref AWS::StackName, EC2CWAgentPolicy]]
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action: [ssm:GetParameter]
+                Resource: arn:aws:ssm:*:*:parameter/AmazonCloudWatch-*
+                Effect: Allow
+              - Action:
+                  - cloudwatch:PutMetricData
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeTags
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                  - logs:CreateLogStream
+                  - logs:CreateLogGroup
+                Resource: '*'
+                Effect: Allow
+        # Policy for EC2 to send messages to the SQS queue
+        - PolicyName: !Join ['-', [!Ref AWS::StackName, EC2SendMessageToSQS]]
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action: [sqs:SendMessage, sqs:SendMessageBatch]
+                Resource: !Ref SQSQueueArn
+                Effect: Allow
+        # Policy for EC2 to send messages to the SNS Topic
+        - PolicyName: !Join ['-', [!Ref AWS::StackName, EC2SendMessageToSNS]]
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [sns:Publish]
+                Resource: !Ref SNSTopicArn
+        # Policy for EC2 to reach SES to verify email identities and send emails
+        - PolicyName: !Join ['-', [!Ref AWS::StackName, EC2SendEmailsViaSES]]
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ses:SendBulkTemplatedEmail, ses:VerifyEmailIdentity]
+                Resource: '*'
+        # Policy for EC2 to send an SSM command
+        - PolicyName: !Join ['-', [!Ref AWS::StackName, EC2ToRunSSMCommands]]
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ssm:SendCommand]
+                Resource: arn:aws:ec2:*:*:instance/*
+              - Effect: Allow
+                Action: [ssm:SendCommand]
+                Resource: arn:aws:ssm:*::document/AWS-ConfigureDocker
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        # Allow CodeDeploy service to assume the role
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [codedeploy.amazonaws.com]
+            Action: [sts:AssumeRole]
+      Policies:
+        # Policy for CodeDeploy to interact with the AutoScaling service
+        - PolicyName: allow-autoscaling
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:*
+                  - autoscaling:*
+                  - elasticloadbalancing:*
+                  - sns:*
+                Resource: "*"
+
+  # Launch Configuration
+  LaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      ImageId: !Ref EC2AmiId
+      IamInstanceProfile: !Ref RootInstanceProfile
+      SecurityGroups: [!Ref EC2SecurityGroupId]
+      InstanceType: !Ref EC2InstanceType
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp2
+            VolumeSize: !Ref EC2VolumeSize
+            DeleteOnTermination: true
+            Encrypted: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+
+          # Set environment variables for cfn-init scripts
+          export INSTANCE_ID=$(curl http://169.254.169.254/latest/meta-data/instance-id)
+          export ELASTICACHE_REDIS_HOST=${ElasticacheRedisEndpoint}
+          export ELASTICACHE_REDIS_PORT=6379
+          export RDS_POSTGRES_HOST=${RDSPostgresEndpoint}
+          export RDS_POSTGRES_PASSWORD=$(aws ssm get-parameter --name ${SSMParamNameRdsPostgresPassword} --with-decryption --query "Parameter.Value" --output text --region ${AWS::Region})
+
+          # Run cfn-init scripts defined under the AWS::CloudFormation::Init section
+          yum install -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v \
+            --stack ${AWS::StackId} \
+            --resource LaunchConfig \
+            --configsets InstallAndRun \
+            --region ${AWS::Region}
+
+          # Write to index.html
+          INSTANCE_ID=$(curl http://169.254.169.254/latest/meta-data/instance-id)
+          EC2_AVAIL_ZONE=$(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone)
+          echo "Hello from $(hostname -f) ($INSTANCE_ID) in AZ $EC2_AVAIL_ZONE" >> /var/www/html/index.html
+          echo "Healthy" > /var/www/html/health.html
+
+          # Set instance environment variables
+          echo "export AWS_REGION=${AWS::Region}" >> /root/.bashrc
+          echo "export STACK_NAME=${AWS::StackName}" >> /root/.bashrc
+          echo "export ELASTICACHE_REDIS_HOST=${ElasticacheRedisEndpoint}" >> /root/.bashrc
+          echo "export ELASTICACHE_REDIS_PORT=6379" >> /root/.bashrc
+          echo "export RDS_POSTGRES_HOST=${RDSPostgresEndpoint}" >> /root/.bashrc
+          echo "export RDS_POSTGRES_PASSWORD=$(aws ssm get-parameter --name ${SSMParamNameRdsPostgresPassword} --with-decryption --query "Parameter.Value" --output text --region ${AWS::Region})" >> /root/.bashrc
+          echo "export STATICFILES_BUCKET=${S3BucketNameStaticFiles}" >> /root/.bashrc
+          echo "export DJANGO_APP_SNS_TOPIC_ARN=${SNSTopicArn}" >> /root/.bashrc
+          echo "export DJANGO_APP_SES_IDENTITY_ARN=${SESIdentityArn}" >> /root/.bashrc
+          echo "export WEBAPP_DOMAIN=${WebsiteDomain}" >> /root/.bashrc
+          echo "export DOCKER_LOGS_LOG_GROUP_NAME=${DockerLogGroup}" >> /root/.bashrc
+
+          # Send used-defined message to Slack via the SQS queue and Lambda
+          aws sqs send-message --queue-url ${SQSQueueUrl} --message-body "Cfn init successful🙌" --region ${AWS::Region}
+
+          # Send signal back to CloudFormation
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource AutoScalingGroup --region ${AWS::Region}
+    Metadata:
+      Comment: Configure instance and install sample application
+      AWS::CloudFormation::Init:
+        configSets:
+          InstallAndRun:
+            - InstallCloudWatchAgent
+            - InstallPackages
+            - InstallDockerWithSSMRunCommand
+            - ConfigureCfnHup
+            - InstallTemporaryApacheServer
+            - CheckRdsPostgresConnection
+            - CheckEslatiCacheConnection
+            - InstallCodeDeployAgent
+        InstallCloudWatchAgent:
+          files:
+            /opt/aws/cw-logs-config.json:
+              content: |
+                {
+                  "agent": {
+                    "metrics_collection_interval": 60,
+                    "run_as_user": "root"
+                  },
+                  "logs": {
+                    "logs_collected": {
+                      "files": {
+                        "collect_list": [
+                          {
+                            "file_path": "/var/log/cloud-init-output.log",
+                            "log_group_name": "cloud-init-output.log",
+                            "log_stream_name": "{instance_id}"
+                          },
+                          {
+                            "file_path": "/var/log/cfn-init.log",
+                            "log_group_name": "cfn-init.log",
+                            "log_stream_name": "{instance_id}"
+                          },
+                          {
+                            "file_path": "/opt/codedeploy-agent/deployment-root/deployment-logs/codedeploy-agent-deployments.log",
+                            "log_group_name": "codedeploy-agent-deployments.log",
+                            "log_stream_name": "{instance_id}"
+                          },
+                          {
+                            "file_path": "/var/lib/docker/volumes/app-logs/_data/info.log",
+                            "log_group_name": "django-application.log",
+                            "log_stream_name": "{instance_id}"
+                          }
+                        ]
+                      }
+                    }
+                  },
+                  "metrics": {
+                    "append_dimensions": {
+                      "AutoScalingGroupName": "${aws:AutoScalingGroupName}",
+                      "ImageId": "${aws:ImageId}",
+                      "InstanceId": "${aws:InstanceId}",
+                      "InstanceType": "${aws:InstanceType}"
+                    },
+                    "metrics_collected": {
+                      "collectd": {
+                        "metrics_aggregation_interval": 60
+                      },
+                      "disk": {
+                        "measurement": [
+                          "used_percent"
+                        ],
+                        "metrics_collection_interval": 60,
+                        "resources": [
+                          "*"
+                        ]
+                      },
+                      "mem": {
+                        "measurement": [
+                          "mem_used_percent"
+                        ],
+                        "metrics_collection_interval": 60
+                      },
+                      "statsd": {
+                        "metrics_aggregation_interval": 60,
+                        "metrics_collection_interval": 10,
+                        "service_address": ":8125"
+                      }
+                    }
+                  }
+                }
+              mode: '000400'
+              owner: root
+              group: root
+          commands:
+            01_install_cw_agent:
+              command: |
+                wget https://s3.amazonaws.com/amazoncloudwatch-agent/amazon_linux/amd64/latest/amazon-cloudwatch-agent.rpm \
+                && sudo rpm -U ./amazon-cloudwatch-agent.rpm
+            02_create_missing_files:
+              command: |
+                sudo mkdir -p /usr/share/collectd \
+                && sudo touch /usr/share/collectd/types.db
+            03_run_cw_agent:
+              command: |
+                sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+                  -a fetch-config \
+                  -m ec2 \
+                  -c file:/opt/aws/cw-logs-config.json -s
+        InstallPackages:
+          packages:
+            yum:
+              jq: []
+        InstallDockerWithSSMRunCommand:
+          commands:
+            00_ssm_run_command_configure_docker:
+              command: !Sub |
+                aws ssm send-command \
+                  --document-name "AWS-ConfigureDocker" \
+                  --document-version "1" \
+                  --targets Key=InstanceIds,Values=$INSTANCE_ID \
+                  --parameters action=Install \
+                  --timeout-seconds 600 \
+                  --max-concurrency "50" \
+                  --max-errors "0" \
+                  --cloud-watch-output-config CloudWatchOutputEnabled=false \
+                  --region ${AWS::Region}
+        ConfigureCfnHup:
+          files:
+            # The cfn-hup.conf file stores the stack name and the AWS credentials that the cfn-hup daemon targets.
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                # The interval used to check for changes to the resource metadata in minutes. Default is 15
+                interval=2
+              mode: '000400'
+              owner: root
+              group: root
+            # The user actions that the cfn-hup daemon calls periodically are defined in the hooks.conf config file.
+            # To support composition of several applications deploying change notification hooks, cfn-hup supports a
+            # directory named hooks.d that is located in the hooks configuration directory to place additional hooks.
+            # The additional hooks files must use the same layout as the hooks.conf file.
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.LaunchConfig.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchConfig --region ${AWS::Region}
+              mode: "000400"
+              owner: root
+              group: root
+          services:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files: [/etc/cfn/cfn-hup.conf, /etc/cfn/hooks.d/cfn-auto-reloader.conf]
+        InstallCodeDeployAgent:
+          packages:
+            yum:
+              ruby: []
+          files:
+            /home/ec2-user/install:
+              source: !Join ['', [https://aws-codedeploy-, !Ref AWS::Region, .s3.amazonaws.com/latest/install]]
+              mode: '000755'
+          commands:
+            00-install-agent:
+              command: sudo ./install auto
+              cwd: /home/ec2-user/
+            01-check-agent-status:
+              command: sudo service codedeploy-agent status
+        CheckRdsPostgresConnection:
+          packages:
+            yum:
+              postgresql: []
+          commands:
+            00-check-postgres:
+              command: psql -d "postgresql://postgres:$RDS_POSTGRES_PASSWORD@$RDS_POSTGRES_HOST/portfoliodb" -c "select now()"
+        CheckEslatiCacheConnection:
+          packages:
+            yum:
+              gcc: []
+          commands:
+            # https://docs.aws.amazon.com/AmazonElastiCache/latest/red-ug/GettingStarted.ConnectToCacheNode.html
+            00_wget_redis_cli:
+              command: "wget http://download.redis.io/redis-stable.tar.gz"
+            01_untar_redis_cli:
+              command: "tar xzf redis-stable.tar.gz"
+            02_clean_tree:
+              command: "cd redis-stable && make distclean"
+            03_compile_redis_cli:
+              command: "cd redis-stable && make"
+            04_ping_elasticache_redis_server:
+              command: "cd redis-stable/src && ./redis-cli -c -h $ELASTICACHE_REDIS_HOST -p $ELASTICACHE_REDIS_PORT ping"
+        InstallTemporaryApacheServer:
+          packages:
+            yum:
+              httpd: []
+          files:
+            /var/www/html/index.html:
+              content: '<h1>Congratulations, you have successfully launched the AWS CloudFormation sample.</h1>'
+              mode: '000644'
+              owner: root
+              group: root
+          services:
+            sysvinit:
+              httpd:
+                enabled: 'true'
+                ensureRunning: 'true'
+
+  # CodeDeploy
+  CodeDeployApplication:
+    Type: AWS::CodeDeploy::Application
+  CodeDeployDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      DeploymentGroupName: !Ref AWS::StackName
+      ApplicationName: !Ref CodeDeployApplication
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events: [DEPLOYMENT_FAILURE]
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: !Ref WebappDeploymentConfig
+      # CodeDeploy automatically deploys revisions to when new instances are created
+      AutoScalingGroups: [!Ref AutoScalingGroup]
+      DeploymentStyle:
+        DeploymentOption: WITH_TRAFFIC_CONTROL
+        DeploymentType: IN_PLACE
+      LoadBalancerInfo:
+        # Prevents internet traffic from being routed to an instance that's not ready
+        # by de-registering (BlockTraffic) and re-registering instances (AllowTraffic) from the target groupt
+        TargetGroupInfoList: [Name: !Ref TargetGroupName]
+      TriggerConfigurations:
+        - TriggerName: MyTarget
+          TriggerEvents: [DeploymentStart, DeploymentSuccess, DeploymentStop, DeploymentFailure, DeploymentRollback]
+          TriggerTargetArn: !Ref SNSTopicArn
+  WebappDeploymentConfig:
+    Type: AWS::CodeDeploy::DeploymentConfig
+    Properties:
+      MinimumHealthyHosts:
+        Type: FLEET_PERCENT
+        # If MinInstancesInService set to 1 and FLEET_PERCENT = 50, then MinSize must be >= 2 since
+        # CodeDeploy would require at least 1 healthy instance for rolling updates
+        Value: 0
+
+  DockerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join ['-', [!Ref AWS::StackName, DockerLogs]]
+      RetentionInDays: 7
+
+Outputs:
+  AutoScalingGroupName:
+    Value: !Ref AutoScalingGroup
+  CodeDeployApplicationName:
+    Value: !Ref CodeDeployApplication
+  CodeDeployDeploymentGroupName:
+    Value: !Ref CodeDeployDeploymentGroup
+  DockerLogGroupName:
+    Value: !Ref DockerLogGroup

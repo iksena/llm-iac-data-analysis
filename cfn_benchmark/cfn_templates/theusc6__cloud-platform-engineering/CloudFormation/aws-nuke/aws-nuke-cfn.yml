@@ -1,0 +1,354 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CloudFormation Template for AWS-Nuke
+
+Parameters:
+  pVpcId:
+    Description: VPC to give the security group
+    Type: AWS::EC2::VPC::Id
+  pSubnetIds:
+    Description: Subnets to give the event rule
+    Type: List<AWS::EC2::Subnet::Id>
+
+Resources:
+  s3NukeConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub myorg-nuke-config-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName:
+          !Sub myorg-securityhub-s3.9accesslogging-${AWS::AccountId}-${AWS::Region}
+        LogFilePrefix:
+          !Sub "myorg-nuke-config-${AWS::AccountId}-${AWS::Region}/"
+      LifecycleConfiguration:
+        Rules:
+          - Id: myorg-securityhub-s3.13-default-lifecycle-policy
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 30
+            ExpiredObjectDeleteMarker: true
+            Transitions:
+              - StorageClass: INTELLIGENT_TIERING
+                TransitionInDays: 0
+            NoncurrentVersionTransitions:
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 30
+            NoncurrentVersionExpiration:
+              NewerNoncurrentVersions: 1
+              NoncurrentDays: 180
+
+  s3NukeConfigBucketPolicy:
+    Type: 'AWS::S3::BucketPolicy'
+    Properties:
+      Bucket: !Ref s3NukeConfigBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "RequireSSLOnly"
+            Effect: "Deny"
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::myorg-nuke-config-${AWS::AccountId}-${AWS::Region}/*"
+              - !Sub "arn:aws:s3:::myorg-nuke-config-${AWS::AccountId}-${AWS::Region}"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  ec2FargateSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allows access to fargate
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          Description: Allow all outbound traffic by default
+          IpProtocol: "-1"
+      VpcId: !Ref pVpcId
+      GroupName: nuke-sg
+
+  logsNukeGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /nuke
+      RetentionInDays: 365
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  iamEcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: nuke-ecs-fargate-execution-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+        Version: 2012-10-17
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt logsNukeGroup.Arn
+          PolicyName: ecs-fargate-nuke-execution-policy
+
+  iamEcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: nuke-ecs-fargate-task-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+        Version: 2012-10-17
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action: "*"
+                Resource: "*"
+          PolicyName: ecs-fargate-nuke-task-policy
+
+  iamEventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: nuke-event-role
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+        Version: 2012-10-17
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                Resource: !Ref ecsTaskDefinition
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !GetAtt ecsCluster.Arn
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt iamEcsTaskRole.Arn
+                  - !GetAtt iamEcsExecutionRole.Arn
+          PolicyName: events-policy
+
+  ecsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: nuke-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: "Project"
+          Value: "aws-nuke"
+
+  ecsTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Command:
+            - /bin/bash
+            - -c
+            - |-
+              yum install awscli jq wget tar sudo -y
+
+              wget -c https://github.com/rebuy-de/aws-nuke/releases/download/v2.25.0/aws-nuke-v2.25.0-linux-amd64.tar.gz
+              tar -xvf aws-nuke-v2.25.0-linux-amd64.tar.gz
+              mv aws-nuke-v2.25.0-linux-amd64 aws-nuke
+              sudo mv aws-nuke /usr/local/bin/aws-nuke
+
+              AWS_CREDS=$(curl 169.254.170.2$AWS_CONTAINER_CREDENTIALS_RELATIVE_URI)
+              AWS_ACCESS_KEY_ID=$(echo $AWS_CREDS | jq .AccessKeyId)
+              AWS_SECRET_ACCESS_KEY=$(echo $AWS_CREDS | jq .SecretAccessKey)
+              AWS_SESSION_TOKEN=$(echo $AWS_CREDS | jq .Token)
+              AWS_DEFAULT_REGION=${DEFAULT_REGION}
+
+              aws s3 cp s3://"$BUCKET"/nuke-config.yml nuke-config.yml
+              aws-nuke -c nuke-config.yml --force --no-dry-run
+            # aws-nuke -c nuke-config.yml --force
+          Environment:
+            - Name: BUCKET
+              Value: !Ref s3NukeConfigBucket
+            - Name: DEFAULT_REGION
+              Value: !Ref AWS::Region
+          Essential: true
+          Image: public.ecr.aws/docker/library/amazonlinux:latest
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref logsNukeGroup
+              awslogs-stream-prefix: nuke
+              awslogs-region: us-west-2
+          Name: nuke-container
+          #ReadonlyRootFilesystem: true
+          Privileged: false
+      Cpu: 256
+      ExecutionRoleArn: !GetAtt iamEcsExecutionRole.Arn
+      Family: nuke
+      Memory: 1024
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      TaskRoleArn: !GetAtt iamEcsTaskRole.Arn
+
+  ebScheduler:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: nuke-task-scheduler
+      ScheduleExpression: cron(0 14 ? * MON *) # Automation is to run each Monday at 6 AM PST
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ecsCluster.Arn
+          Id: nuke-task
+          RoleArn: !GetAtt iamEventsRole.Arn
+          EcsParameters:
+            TaskDefinitionArn: !Ref ecsTaskDefinition
+            TaskCount: 1
+            LaunchType: FARGATE
+            NetworkConfiguration:
+              AwsVpcConfiguration:
+                AssignPublicIp: DISABLED
+                SecurityGroups:
+                  - !Ref ec2FargateSg
+                Subnets: !Ref pSubnetIds
+            PlatformVersion: LATEST
+          Input: "{}"
+  # Below are the network resources to establish baseline aws-nuke functionality for ECS Tasks
+  # VPC
+  giaNukeInfrastructureVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.128/25
+      Tags:
+        - Key: Name
+          Value: myorg-nuke-infrastructure-vpc
+
+  # Internet Gateway
+  giaNukeInfrastructureIgw01:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: myorg-nuke-infrastructure-igw-01
+
+  # Internet Gateway Attachment to the VPC
+  attachGatewayToVpc:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref giaNukeInfrastructureVPC
+      InternetGatewayId: !Ref giaNukeInfrastructureIgw01
+
+  # Public Subnet
+  giaNukeInfrastructureSubnetPublic01:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref giaNukeInfrastructureVPC
+      CidrBlock: 10.0.0.128/26
+      AvailabilityZone: us-west-2a
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: myorg-nuke-infrastructure-subnet-public01-us-west-2a
+
+  # Private Subnet
+  giaNukeInfrastructureSubnetPrivate01:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref giaNukeInfrastructureVPC
+      CidrBlock: 10.0.0.192/26
+      AvailabilityZone: us-west-2b
+      Tags:
+        - Key: Name
+          Value: myorg-nuke-infrastructure-subnet-private01-us-west-2b
+
+  # Public Route Table
+  giaNukeInfrastructurePublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref giaNukeInfrastructureVPC
+      Tags:
+        - Key: Name
+          Value: myorg-nuke-infrastructure-public-route-table
+
+  # Route for Public Route Table to Internet Gateway
+  publicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: attachGatewayToVpc
+    Properties:
+      RouteTableId: !Ref giaNukeInfrastructurePublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref giaNukeInfrastructureIgw01
+
+  # Private Route Table
+  giaNukeInfrastructurePrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref giaNukeInfrastructureVPC
+      Tags:
+        - Key: Name
+          Value: myorg-nuke-infrastructure-private-route-table
+
+  # NAT Gateway
+  giaNukeInfrastructureNatGw01:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt ElasticIP.AllocationId
+      SubnetId: !Ref giaNukeInfrastructureSubnetPublic01
+      Tags:
+        - Key: Name
+          Value: myorg-nuke-infrastructure-nat-gw-01
+
+  # EIP for NAT Gateway
+  ElasticIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  # Route for Private Route Table to NAT Gateway
+  privateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref giaNukeInfrastructurePrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref giaNukeInfrastructureNatGw01
+
+  # Associate Public Subnet with Public Route Table
+  subnetPublicRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref giaNukeInfrastructureSubnetPublic01
+      RouteTableId: !Ref giaNukeInfrastructurePublicRouteTable
+
+  # Associate Private Subnet with Private Route Table
+  subnetPrivateRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref giaNukeInfrastructureSubnetPrivate01
+      RouteTableId: !Ref giaNukeInfrastructurePrivateRouteTable
+
+Outputs:
+  oBucketName:
+    Description: Bucket name to output for put item
+    Value: !Ref s3NukeConfigBucket

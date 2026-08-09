@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: API Gateway for Board Game Fiesta
+Parameters:
+  Environment:
+    Type: String
+  LambdaS3Bucket:
+    Type: String
+  LambdaS3Key:
+    Type: String
+  DynamoDbStackName:
+    Type: String
+  CognitoStackName:
+    Type: String
+  AutomaStackName:
+    Type: String
+  WebSocketStackName:
+    Type: String
+Conditions:
+  IsProduction: !Equals [ !Ref Environment, 'prod' ]
+Resources:
+  PayPalSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}-PayPalSecret'
+      SecretString: '{"clientId":"","clientSecret":""}' # To be filled later manually
+
+  ApiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - Fn::ImportValue: !Sub '${DynamoDbStackName}-ReadWritePolicyArn'
+        - Fn::ImportValue: !Sub '${AutomaStackName}-ScheduleOnlyPolicyArn'
+        - Fn::ImportValue: !Sub '${WebSocketStackName}-SendMessagePolicyArn'
+      Policies:
+        - PolicyName: UpdateCognitoUser
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminSetUserPassword
+                  - cognito-idp:AdminUpdateUserAttributes
+                Resource:
+                  Fn::ImportValue: !Sub '${CognitoStackName}-UserPoolArn'
+        - PolicyName: SendEmail
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                Resource: !Sub 'arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/*'
+      Path: "/"
+
+  HttpApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: io.quarkus.amazon.lambda.runtime.QuarkusStreamHandler::handleRequest
+      MemorySize: 1024
+      Role: !GetAtt ApiRole.Arn
+      Runtime: java11
+      Timeout: 30
+      Environment:
+        Variables:
+          QUARKUS_PROFILE: !Sub '${Environment}'
+          QUARKUS_HTTP_CORS_ORIGINS:
+            Fn::If:
+              - IsProduction
+              - 'https://boardgamefiesta.com,https://www.boardgamefiesta.com,http://localhost:4200'
+              - !Sub 'https://${Environment}.boardgamefiesta.com,https://www-${Environment}.boardgamefiesta.com,http://localhost:4200'
+          QUARKUS_OIDC_AUTH_SERVER_URL:
+            Fn::ImportValue: !Sub '${CognitoStackName}-UserPoolUrl'
+          QUARKUS_OIDC_CLIENT_ID:
+            Fn::ImportValue: !Sub '${CognitoStackName}-WebAppClientId'
+          BGF_DYNAMODB_TABLE_NAME:
+            Fn::ImportValue: !Sub '${DynamoDbStackName}-TableName'
+          BGF_SQS_QUEUE_URL:
+            Fn::ImportValue: !Sub '${AutomaStackName}-AutomaSqsQueueUrl'
+          BGF_WS_CONNECTIONS_ENDPOINT:
+            Fn::ImportValue: !Sub '${WebSocketStackName}-WsApiEndpoint'
+          PAYPAL_CLIENT_ID: !Sub '{{resolve:secretsmanager:${PayPalSecret}:SecretString:clientId}}'
+          PAYPAL_CLIENT_SECRET: !Sub '{{resolve:secretsmanager:${PayPalSecret}:SecretString:clientSecret}}'
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      DisableExecuteApiEndpoint: true
+      Name: !Sub 'boardgamefiesta-${Environment}-http-api'
+      Description: 'Board Game Fiesta HTTP API'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowCredentials: true
+        AllowHeaders:
+          - Content-Type
+          - X-Amz-Date
+          - Authorization
+          - X-Api-Key
+          - X-Amz-Security-Token
+        AllowMethods:
+          - GET
+          - POST
+          - OPTIONS
+        AllowOrigins:
+          - !If [ IsProduction, 'https://boardgamefiesta.com', !Sub 'https://${Environment}.boardgamefiesta.com' ]
+          - 'http://localhost:4200'
+
+  HttpDefaultIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HttpApiFunction.Arn}/invocations'
+      PayloadFormatVersion: 2.0
+
+  HttpDefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: '$default'
+      AuthorizationType: NONE
+      Target: !Sub 'integrations/${HttpDefaultIntegration}'
+
+  HttpApiDomainName:
+    Type: AWS::ApiGatewayV2::DomainName
+    Properties:
+      DomainName: !If [ IsProduction, 'api.boardgamefiesta.com', !Sub 'api-${Environment}.boardgamefiesta.com' ]
+      DomainNameConfigurations:
+        - CertificateArn: 'arn:aws:acm:eu-west-1:598172618529:certificate/3a61edbf-a6b3-4090-bbfd-2298ac3ad7aa'
+
+  RecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: 'boardgamefiesta.com.'
+      Name: !Ref HttpApiDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt HttpApiDomainName.RegionalDomainName
+        HostedZoneId: !GetAtt HttpApiDomainName.RegionalHostedZoneId
+
+  HttpApiFunctionInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt HttpApiFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/$default'
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+
+  HttpApiDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - HttpDefaultRoute
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: !Ref HttpApiStage
+
+  HttpApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Properties:
+      ApiId: !Ref HttpApi
+      ApiMappingKey: ''
+      DomainName: !Ref HttpApiDomainName
+      Stage: !Ref HttpApiStage
+
+Outputs:
+  HttpApiId:
+    Value: !Ref HttpApi
+    Export:
+      Name: !Sub '${AWS::StackName}-HttpApiId'
+  HttpApiDomainName:
+    Value: !Ref HttpApiDomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-HttpApiDomainName'

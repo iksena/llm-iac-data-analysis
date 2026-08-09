@@ -1,0 +1,317 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Pricing Assistant - Cognito User Pool with passkey support, optional MFA, and admin-managed users'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-pricing-assistant
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  AppDomainName:
+    Type: String
+    Default: your-domain.example.com
+    Description: Public domain of the app — used as the WebAuthn relying-party ID and email link base
+
+  BootstrapAdminEmail:
+    Type: String
+    Default: admin@example.com
+    Description: Email address of the initial admin user. A Cognito-generated temporary password is emailed on first deploy.
+
+  MfaConfiguration:
+    Type: String
+    Default: OPTIONAL
+    AllowedValues: [OFF, OPTIONAL, ON]
+    Description: OPTIONAL = users may enroll TOTP. ON = MFA required for all users (admin can flip at runtime via SetUserPoolMfaConfig).
+
+  EmailSenderMode:
+    Type: String
+    Default: COGNITO_DEFAULT
+    AllowedValues: [COGNITO_DEFAULT, SES]
+    Description: COGNITO_DEFAULT uses Cognito's built-in sender (no SES verification needed). SES uses the FromEmail / SesArn parameters below.
+
+  SesFromEmail:
+    Type: String
+    Default: ''
+    Description: Required when EmailSenderMode=SES. e.g., noreply@example.com
+
+  SesIdentityArn:
+    Type: String
+    Default: ''
+    Description: Required when EmailSenderMode=SES. ARN of the SES verified identity (domain or email).
+
+Conditions:
+  UseSesForEmail: !Equals [!Ref EmailSenderMode, SES]
+
+Resources:
+  # =========================================================================
+  # User Pool
+  # =========================================================================
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${ProjectName}-${Environment}-users
+      # Admin-managed only — self-signup is disabled. Admins create users in the UI.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+        InviteMessageTemplate:
+          EmailSubject: !Sub 'Your ${ProjectName} account'
+          EmailMessage: !Sub |
+            <p>You have been invited to <strong>${ProjectName}</strong>.</p>
+            <p>Sign in at <a href="https://${AppDomainName}">https://${AppDomainName}</a> with:</p>
+            <ul>
+              <li>Email: <strong>{username}</strong></li>
+              <li>Temporary password: <strong>{####}</strong></li>
+            </ul>
+            <p>You will be required to set a new password on first sign-in. After signing in, you can register a passkey for passwordless future sign-ins.</p>
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          TemporaryPasswordValidityDays: 7
+        SignInPolicy:
+          # First-factor options surfaced through the USER_AUTH (choice-based)
+          # auth flow. WEB_AUTHN here is what makes Cognito accept the
+          # passkey-as-first-factor sign-in driven by Amplify v6.
+          # PASSWORD keeps the existing email+password path working.
+          AllowedFirstAuthFactors:
+            - PASSWORD
+            - WEB_AUTHN
+      MfaConfiguration: !Ref MfaConfiguration
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      UserPoolAddOns:
+        AdvancedSecurityMode: AUDIT
+      # WebAuthn / passkey configuration owned natively by CloudFormation —
+      # the AWS::Cognito::UserPool schema gained WebAuthnRelyingPartyID and
+      # WebAuthnUserVerification properties (note the all-caps "ID"). The
+      # bootstrap Lambda used to set these via SetUserPoolMfaConfig, but
+      # that's fragile: CFN doesn't know to re-invoke the custom resource
+      # on every stack update, and a rollback can leave the pool with an
+      # empty WebAuthnConfiguration. Owning these in the resource declaration
+      # lets CFN converge to the correct state on every update.
+      WebAuthnRelyingPartyID: !Ref AppDomainName
+      WebAuthnUserVerification: preferred
+      # SES integration is optional — Cognito's default sender works without
+      # SES verification but is rate-limited and shows a Cognito subdomain.
+      EmailConfiguration: !If
+        - UseSesForEmail
+        - EmailSendingAccount: DEVELOPER
+          From: !Ref SesFromEmail
+          SourceArn: !Ref SesIdentityArn
+        - EmailSendingAccount: COGNITO_DEFAULT
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+        - Name: name
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+
+  # =========================================================================
+  # App Client (public SPA — no client secret)
+  # =========================================================================
+  AppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${ProjectName}-${Environment}-spa
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      RefreshTokenValidity: 30
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+      ExplicitAuthFlows:
+        # ALLOW_USER_AUTH is required for the choice-based (USER_AUTH) flow
+        # that drives passkeys. Cognito refuses WebAuthn challenges unless
+        # this flow is explicitly enabled on the App Client. The list of
+        # available first factors (PASSWORD, WEB_AUTHN, ...) is configured
+        # at the user-pool level via Policies.SignInPolicy above.
+        - ALLOW_USER_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      ReadAttributes:
+        - email
+        - email_verified
+        - name
+      WriteAttributes:
+        - email
+        - name
+
+  # =========================================================================
+  # Admin group — JWT 'cognito:groups' claim used to gate /api/admin/*
+  # =========================================================================
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: Admins
+      Description: Administrators — can manage users and toggle MFA enforcement.
+      Precedence: 1
+
+  # =========================================================================
+  # Bootstrap admin user — created via custom resource on first deploy.
+  # Idempotent: skips if a user with the same email already exists.
+  # =========================================================================
+  BootstrapAdminFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Environment}-bootstrap-admin
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt BootstrapAdminRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3, json, urllib.request, urllib.error
+
+          cognito = boto3.client('cognito-idp')
+
+          def send(event, status, reason=''):
+              body = json.dumps({
+                  'Status': status, 'Reason': reason,
+                  'PhysicalResourceId': event.get('PhysicalResourceId', 'bootstrap-admin'),
+                  'StackId': event['StackId'], 'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'], 'Data': {}
+              }).encode('utf-8')
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT')
+              req.add_header('content-type', '')
+              req.add_header('content-length', str(len(body)))
+              urllib.request.urlopen(req).read()
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      send(event, 'SUCCESS')
+                      return
+
+                  pool_id = event['ResourceProperties']['UserPoolId']
+                  email = event['ResourceProperties']['Email']
+                  group = event['ResourceProperties']['GroupName']
+                  mfa_config = event['ResourceProperties']['MfaConfiguration']
+
+                  # Idempotency: check if user already exists
+                  try:
+                      cognito.admin_get_user(UserPoolId=pool_id, Username=email)
+                      print(f'User {email} already exists, ensuring group membership only')
+                  except cognito.exceptions.UserNotFoundException:
+                      cognito.admin_create_user(
+                          UserPoolId=pool_id,
+                          Username=email,
+                          UserAttributes=[
+                              {'Name': 'email', 'Value': email},
+                              {'Name': 'email_verified', 'Value': 'true'},
+                          ],
+                          DesiredDeliveryMediums=['EMAIL'],
+                      )
+                      print(f'Created bootstrap admin user {email}')
+
+                  cognito.admin_add_user_to_group(
+                      UserPoolId=pool_id, Username=email, GroupName=group,
+                  )
+
+                  # MFA configuration owned by the Lambda; WebAuthn is owned
+                  # natively by the AWS::Cognito::UserPool resource above
+                  # (WebAuthnRelyingPartyID / WebAuthnUserVerification).
+                  # SetUserPoolMfaConfig requires us to pass the existing
+                  # WebAuthnConfiguration if we want to preserve it — we
+                  # read it back from the pool first to avoid clobbering
+                  # the CFN-owned values.
+                  current = cognito.get_user_pool_mfa_config(UserPoolId=pool_id)
+                  mfa_kwargs = {
+                      'UserPoolId': pool_id,
+                      'MfaConfiguration': mfa_config,
+                      'SoftwareTokenMfaConfiguration': {'Enabled': mfa_config != 'OFF'},
+                  }
+                  webauthn = current.get('WebAuthnConfiguration')
+                  if webauthn:
+                      mfa_kwargs['WebAuthnConfiguration'] = webauthn
+                  cognito.set_user_pool_mfa_config(**mfa_kwargs)
+                  print(f'Set MFA config: mfa={mfa_config}; preserved WebAuthn: {bool(webauthn)}')
+                  send(event, 'SUCCESS')
+              except Exception as e:
+                  print(f'Error: {e}')
+                  send(event, 'FAILED', str(e))
+
+  BootstrapAdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-bootstrap-admin-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CognitoAdmin
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminAddUserToGroup
+                  - cognito-idp:SetUserPoolMfaConfig
+                  - cognito-idp:GetUserPoolMfaConfig
+                Resource: !GetAtt UserPool.Arn
+
+  BootstrapAdminUser:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt BootstrapAdminFunction.Arn
+      UserPoolId: !Ref UserPool
+      Email: !Ref BootstrapAdminEmail
+      GroupName: !Ref AdminGroup
+      MfaConfiguration: !Ref MfaConfiguration
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-cognito-user-pool-id
+
+  UserPoolArn:
+    Value: !GetAtt UserPool.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-cognito-user-pool-arn
+
+  AppClientId:
+    Value: !Ref AppClient
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-cognito-client-id
+
+  Region:
+    Value: !Ref AWS::Region
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-cognito-region
+
+  AdminGroupName:
+    Value: !Ref AdminGroup
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-cognito-admin-group

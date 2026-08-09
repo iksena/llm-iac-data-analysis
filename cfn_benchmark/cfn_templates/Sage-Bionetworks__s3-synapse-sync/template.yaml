@@ -1,0 +1,278 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Lambda function code to index files in S3 buckets by creating filehandles
+  on Synapse, triggered by file changes to S3."
+
+Parameters:
+  BucketVariables:
+    Description: 'String mapping buckets to Synapse project IDs'
+    Type: String
+  KmsDecryptPolicyArn:
+    Description: 'The KMS key policy ARN to access the Synapse service user secrets'
+    Type: String
+  BucketNamePrefix:
+    Description: 'Prefix of buckets accessed by the lambda'
+    Type: String
+  DockerImage:
+    Description: Name of Docker image
+    Type: String
+  CIDR:
+    Description: Allow inbound traffic to the cluster from this CIDR range
+    Type: String
+    Default: '10.0.0.0/8'
+    MinLength: '9'
+    MaxLength: '18'
+    AllowedPattern: "(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})\\.(\\d{1,3})/(\\d{1,2})"
+    ConstraintDescription: must be a valid CIDR range of the form x.x.x.x/x.
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets for Autoscaling Group. Please select at least 2.
+  VpcID:
+    Type: AWS::EC2::VPC::Id
+    Description: The vpc within which to place EC2 AutoScaling Group
+  AMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Description: Use an Image from SSM Parameter Store
+    Default: /aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id
+
+Resources:
+  S3BucketAccess:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+            - logs:*
+          Resource: arn:aws:logs:*:*:*
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:PutObjectAcl
+          Resource: !Sub "arn:aws:s3:::${BucketNamePrefix}/*"
+        - Effect: Allow
+          Action:
+            - s3:ListBucket
+          Resource: !Sub "arn:aws:s3:::${BucketNamePrefix}"
+
+  SSMParameterStore:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+           - ssm:DescribeParameters
+          Resource: "*"
+        - Effect: Allow
+          Action:
+            - ssm:GetParameters
+            - ssm:GetParameter
+          Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/HTAN/SynapseSync/*"
+
+  BatchSubmitJob:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Action:
+            - batch:SubmitJob
+          Resource:
+            - !Ref Job
+            - !Ref JobQueue
+
+  Function:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: s3_synapse_sync/
+      Handler: lambda_function.lambda_handler
+      Runtime: python3.13
+      Role: !GetAtt FunctionRole.Arn
+      Environment:
+        Variables:
+          BUCKET_VARIABLES: !Ref BucketVariables
+          JOB_QUEUE: !Ref JobQueue
+          JOB_DEFINITION: !Ref Job
+      Timeout: 900
+      MemorySize: 320
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref SSMParameterStore
+        - !Ref S3BucketAccess
+        - !Ref KmsDecryptPolicyArn
+        - !Ref BatchSubmitJob
+
+  ComputeEnvironment:
+    Type: "AWS::Batch::ComputeEnvironment"
+    Properties:
+      Type: MANAGED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeResources:
+        MaxvCpus: 128
+        SecurityGroupIds:
+          - !Ref SecurityGroup
+        Type: EC2
+        Subnets: !Ref Subnets
+        ImageId: !Ref AMI
+        MinvCpus: 0
+        InstanceRole: !Ref ECSInstanceProfile
+        InstanceTypes:
+          - d3.xlarge
+        LaunchTemplate:
+          LaunchTemplateId: !Ref ComputeLaunchTemplate
+          Version: !GetAtt ComputeLaunchTemplate.LatestVersionNumber
+        DesiredvCpus: 4
+      State: ENABLED
+
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+      Path: "/"
+
+  ComputeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName:  '/dev/sdb'
+            VirtualName: ephemeral0
+        UserData:
+          Fn::Base64: |
+            Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+            MIME-Version: 1.0
+
+            --==BOUNDARY==
+            Content-Type: text/x-shellscript; charset="us-ascii"
+
+            #!/bin/bash
+            mkfs -t xfs /dev/nvme1n1
+            mkdir /data
+            mount /dev/nvme1n1 /data
+            service docker restart
+
+            --==BOUNDARY==--
+
+  JobQueue:
+    Type: "AWS::Batch::JobQueue"
+    Properties:
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref ComputeEnvironment
+      State: ENABLED
+      Priority: 1
+
+  Job:
+    Type: "AWS::Batch::JobDefinition"
+    Properties:
+      Type: container
+      ContainerProperties:
+        Memory: 4096
+        Privileged: false
+        JobRoleArn: !Ref JobRole
+        ReadonlyRootFilesystem: false
+        Vcpus: 1
+        Image: !Ref DockerImage
+        MountPoints:
+          - ContainerPath: "/data"
+            ReadOnly: false
+            SourceVolume: data
+        Volumes:
+          - Name: data
+            Host:
+              SourcePath: "/data"
+      RetryStrategy:
+        Attempts: 3
+
+  JobRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Action: "sts:AssumeRole"
+            Effect: "Allow"
+            Principal:
+              Service: "ecs-tasks.amazonaws.com"
+      ManagedPolicyArns:
+        - !Ref S3BucketAccess
+
+  ECSInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref ECSRole
+
+  ECSRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          -
+            Action: "sts:AssumeRole"
+            Effect: "Allow"
+            Principal:
+              Service: "ec2.amazonaws.com"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - !Ref S3BucketAccess
+
+  SecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      VpcId: !Ref VpcID
+      GroupDescription: "Inbound security group for SSH on Batch EC2 instance"
+      SecurityGroupIngress:
+        - IpProtocol: "tcp"
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref CIDR
+
+Outputs:
+  FunctionArn:
+    Description: "Lambda Function ARN"
+    Value: !GetAtt Function.Arn
+  FunctionRoleArn:
+    Description: "Lambda function role ARN"
+    Value: !GetAtt FunctionRole.Arn
+  ComputeEnvironmentArn:
+    Description: "Compute Environment ARN"
+    Value: !Ref ComputeEnvironment
+  JobQueueArn:
+    Description: "Job Queue ARN"
+    Value: !Ref JobQueue
+  JobArn:
+    Description: "Job Definition ARN"
+    Value: !Ref Job

@@ -1,0 +1,231 @@
+################################################################################
+#
+# MIT No Attribution
+#
+# Copyright Chariot Solutions
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+################################################################################
+
+AWSTemplateFormatVersion:               "2010-09-09"
+Description:                            "Creates an OpenSearch cluster and a Lambda function that will write CloudTrail events into it"
+
+Parameters:
+
+  LambdaName:
+    Description:                        "Name for the Lambda function and associated resources"
+    Type:                               "String"
+    Default:                            "CloudTrail_to_OpenSearch"
+
+  CloudTrailBucket:
+    Description:                        "The S3 bucket that holds CloudTrail events"
+    Type:                               "String"
+
+  CloudTrailPrefix:
+    Description:                        "The path in that bucket for new CloudTrail event files, with trailing slash"
+    Type:                               "String"
+    Default:                            ""
+
+  OpenSearchDomainName:
+    Description:                        "Name for the OpenSearch cluster (must be DNS-legal)"
+    Type:                               "String"
+    Default:                            "cloudtrail-events"
+
+  OpenSearchInstanceType:
+    Description:                        "Type of instance used for OpenSearch cluster; default is useful for small environment"
+    Type:                               "String"
+    Default:                            "t3.small.search"
+
+  OpenSearchStorageType:
+    Description:                        "Type of the OpenSearch storage volume (allowed types depend on instance type)"
+    Type:                               "String"
+    Default:                            "gp3"
+
+  OpenSearchStorageSize:
+    Description:                        "Size of the OpenSearch storage volume, in GB (allowed sizes depend on instance type)"
+    Type:                               "Number"
+    Default:                            64
+
+  AllowedIPs:
+    Description:                        "IP addresses that are allowed to access OpenSearch/Kibana (leave blank for none)"
+    Type:                               "CommaDelimitedList"
+    Default:                            ""
+
+Resources:
+
+  ##
+  ## OpenSearch cluster
+  ##
+
+  OpenSearchDomain:
+    Type:                               "AWS::OpenSearchService::Domain"
+    UpdatePolicy:
+      EnableVersionUpgrade:             true
+    Properties:
+      DomainName:                       !Ref OpenSearchDomainName
+      EngineVersion:                    "OpenSearch_2.13"
+      ClusterConfig:
+        InstanceType:                   !Ref OpenSearchInstanceType
+        InstanceCount:                  1
+        DedicatedMasterEnabled:         false
+        ZoneAwarenessEnabled:           false
+      EBSOptions:
+        EBSEnabled:                     true
+        VolumeType:                     !Ref OpenSearchStorageType
+        VolumeSize:                     !Ref OpenSearchStorageSize
+      SnapshotOptions:
+        AutomatedSnapshotStartHour:     8
+      AdvancedOptions:                  {
+                                        "rest.action.multi.allow_explicit_index": "true"
+                                        }
+      AccessPolicies:
+        Version:                        "2012-10-17"
+        Statement:
+          - Effect:                     "Allow"
+            Principal:                  { "AWS": !Sub "${AWS::AccountId}" }
+            Action:                     "es:*"
+            Resource:                   !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchDomainName}/*"
+          - Effect:                     "Allow"
+            Principal:                  { "AWS": "*" }
+            Action:                     "es:*"
+            Resource:                   !Sub "arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchDomainName}/*"
+            Condition:
+              IpAddress:
+                aws:SourceIp:           !Ref AllowedIPs
+
+  ##
+  ## SQS Queues
+  ##
+
+  NotificationQueue:
+    Type:                               "AWS::SQS::Queue"
+    Properties:
+      QueueName:                        !Sub "${LambdaName}-Notifications"
+      VisibilityTimeout:                3600    # one hour, a multiple of max Lambda execution time
+      RedrivePolicy:
+        maxReceiveCount:                8       # this should be enough to cover cluster upgrades
+        deadLetterTargetArn:            !GetAtt DeadLetterQueue.Arn
+
+  NotificationQueuePolicy:
+    Type:                               "AWS::SQS::QueuePolicy"
+    Properties:
+      Queues:
+        -                               !Ref NotificationQueue
+      PolicyDocument:
+        Version:                        "2012-10-17"
+        Statement:
+          - Effect:                     "Allow"
+            Action:                     "sqs:SendMessage"
+            Resource:                   !GetAtt NotificationQueue.Arn
+            Principal:
+              Service:                  [ "s3.amazonaws.com" ]
+
+  DeadLetterQueue:
+    Type:                               "AWS::SQS::Queue"
+    Properties:
+      QueueName:                        !Sub "${LambdaName}-DLQ"
+      MessageRetentionPeriod:           1209600  # two weeks (maximum allowed)
+
+  ##
+  ## Lambda Function
+  ##
+
+  LambdaLogGroup:
+    Type:                               "AWS::Logs::LogGroup"
+    DeletionPolicy:                     "Delete"
+    Properties:
+      LogGroupName:                     !Sub "/aws/lambda/${LambdaName}"
+      RetentionInDays:                  7
+
+  LambdaRole:
+    Type:                               "AWS::IAM::Role"
+    Properties:
+      Path:                             "/lambda/"
+      RoleName:                         !Sub "${LambdaName}-ExecutionRole-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version:                        "2012-10-17"
+        Statement:
+          Effect:                       "Allow"
+          Principal:
+            Service:                    "lambda.amazonaws.com"
+          Action:                       "sts:AssumeRole"
+      ManagedPolicyArns:
+        -                               "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName:                   "ReadFromSQS"
+          PolicyDocument:
+            Version:                    "2012-10-17"
+            Statement:
+              - Effect:                 "Allow"
+                Action:
+                  -                     "sqs:ReceiveMessage"
+                  -                     "sqs:DeleteMessage"
+                  -                     "sqs:GetQueueAttributes"
+                Resource:               !GetAtt NotificationQueue.Arn
+        - PolicyName:                   "ReadFromLogBucket"
+          PolicyDocument:
+            Version:                    "2012-10-17"
+            Statement:
+              Effect:                   "Allow"
+              Action:
+                -                       "s3:GetObject"
+              Resource:                 [ !Sub "arn:aws:s3:::${CloudTrailBucket}/${CloudTrailPrefix}*" ]
+        - PolicyName:                   "WriteToDestination"
+          PolicyDocument:
+            Version:                    "2012-10-17"
+            Statement:
+              Effect:                   "Allow"
+              Action:                   [ "es:ESHttpGet", "es:ESHttpPost", "es:ESHttpPut" ]
+              Resource:                 [ !Sub "${OpenSearchDomain.Arn}/*" ]
+
+  LambdaFunction:
+    Type:                               "AWS::Lambda::Function"
+    Properties:
+      FunctionName:                     !Ref LambdaName
+      Description:                      "Reacts to CloudTrail files being stored on S3 by uploading them to OpenSearch"
+      Role:                             !GetAtt LambdaRole.Arn
+      Runtime:                          "python3.12"
+      Handler:                          "cloudtrail_to_elasticsearch.lambda_handler.handle"
+      Code:
+        ZipFile:                        "# this is an invalid file, used as a placeholder in the CloudFormation script"
+      MemorySize:                       512
+      Timeout:                          60
+      Environment:
+        Variables:
+          ES_HOSTNAME:                  !GetAtt OpenSearchDomain.DomainEndpoint
+
+  LambdaTrigger:
+    Type:                               "AWS::Lambda::EventSourceMapping"
+    Properties:
+      EventSourceArn:                   !GetAtt NotificationQueue.Arn
+      FunctionName:                     !GetAtt LambdaFunction.Arn
+      BatchSize:                        10
+      MaximumBatchingWindowInSeconds:   90
+      ScalingConfig:
+        MaximumConcurrency:             2
+
+Outputs:
+
+  NotificationQueueArn:
+    Description:                        "The ARN of the notification queue (to create bucket notification)"
+    Value:                              !GetAtt NotificationQueue.Arn
+
+  OpenSearchArn:
+    Description:                        "The ARN of the OpenSearch cluster"
+    Value:                              !GetAtt OpenSearchDomain.Arn
+
+  OpenSearchHostname:
+    Description:                        "The hostname of the OpenSearch cluster"
+    Value:                              !GetAtt OpenSearchDomain.DomainEndpoint

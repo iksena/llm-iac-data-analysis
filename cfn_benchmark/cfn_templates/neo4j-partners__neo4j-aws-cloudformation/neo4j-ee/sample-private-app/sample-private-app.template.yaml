@@ -1,0 +1,298 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Neo4j sample private Lambda app. Deploys a Python Lambda inside the VPC of a
+  Neo4j EE stack (DeploymentMode=Private), exposes it via an IAM-auth Function
+  URL, and wires Bolt egress to the NLB and HTTPS egress to VPC interface
+  endpoints. Replaces the prior CDK implementation; see LAMBDA_PAINS.md.
+
+Parameters:
+  SsmPrefix:
+    Type: String
+    AllowedPattern: '^/[A-Za-z0-9._/-]+$'
+    Description: SSM parameter prefix used by the parent EE stack (e.g. /neo4j-ee/<stack>).
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC the Lambda runs in.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets for the Lambda ENIs.
+  ExternalSgId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Neo4j external SG (fronting NLB on 7687).
+  VpcEndpointSgId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: SG attached to the VPC interface endpoints the Lambda calls on 443.
+  PasswordSecretArn:
+    Type: String
+    Description: ARN of the Neo4j password secret.
+  BoltTlsEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: When true, Lambda uses neo4j+ssc scheme.
+  Neo4jStackName:
+    Type: String
+    Description: CloudFormation stack name of the parent Neo4j EE stack (used for logging/env).
+  Neo4jStackId:
+    Type: String
+    Description: Full CloudFormation stack ARN of the parent Neo4j EE stack. The EE ASG propagates this as tag "StackID" to each cluster instance; the resilience Lambda filters and IAM scopes on it.
+  LambdaS3Bucket:
+    Type: String
+    Description: S3 bucket holding the packaged Lambda zip.
+  LambdaS3Key:
+    Type: String
+    Description: S3 key for the Lambda zip.
+  LambdaS3ObjectVersion:
+    Type: String
+    Default: ''
+    Description: Optional S3 object version for the Lambda zip (forces redeploy on change).
+
+Conditions:
+  HasObjectVersion: !Not [!Equals [!Ref LambdaS3ObjectVersion, '']]
+  BoltTlsEnabledCond: !Equals [!Ref BoltTlsEnabled, 'true']
+
+Resources:
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Egress-only SG for Neo4j demo Lambda
+      VpcId: !Ref VpcId
+      SecurityGroupEgress: []
+
+  LambdaEgressToNeo4jBolt:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 7687
+      ToPort: 7687
+      DestinationSecurityGroupId: !Ref ExternalSgId
+      Description: Bolt to Neo4j NLB
+
+  LambdaEgressToVpcEndpoints:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref VpcEndpointSgId
+      Description: HTTPS to VPC interface endpoints
+
+  Neo4jExternalIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ExternalSgId
+      IpProtocol: tcp
+      FromPort: 7687
+      ToPort: 7687
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Allow Lambda SG Bolt to NLB
+
+  VpcEndpointIngressFromLambda:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VpcEndpointSgId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Description: Allow Lambda SG HTTPS to VPC interface endpoints
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: Neo4jDemoInline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref PasswordSecretArn
+
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}'
+      RetentionInDays: 30
+
+  # FunctionName and FunctionLogGroup.LogGroupName both derive from ${AWS::StackName}.
+  # Lambda function-name rules are stricter than CloudFormation stack-name rules; keep
+  # stack names to the neo4j-sample-private-app-<ee-stack> pattern to stay within both.
+  Function:
+    Type: AWS::Lambda::Function
+    DependsOn: FunctionLogGroup
+    Properties:
+      FunctionName: !Ref AWS::StackName
+      Runtime: python3.13
+      Handler: handler.lambda_handler
+      Role: !GetAtt FunctionRole.Arn
+      MemorySize: 512
+      Timeout: 30
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref FunctionLogGroup
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Environment:
+        Variables:
+          NEO4J_SSM_NLB_PATH: !Sub '${SsmPrefix}/nlb-dns'
+          NEO4J_SECRET_ARN: !Ref PasswordSecretArn
+          NEO4J_BOLT_TLS: !If [BoltTlsEnabledCond, 'true', !Ref 'AWS::NoValue']
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+        S3ObjectVersion: !If [HasObjectVersion, !Ref LambdaS3ObjectVersion, !Ref 'AWS::NoValue']
+
+  FunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt Function.Arn
+      AuthType: AWS_IAM
+
+  FunctionUrlSsmParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/neo4j-sample-private-app/${AWS::StackName}/function-url'
+      Type: String
+      Value: !GetAtt FunctionUrl.FunctionUrl
+      Description: Function URL of the Neo4j sample private app Lambda.
+
+  # The EE stack provisions ssm/ssmmessages/logs/secretsmanager VPC endpoints but
+  # not an ec2 endpoint. The resilience Lambda calls ec2:DescribeInstances, so
+  # this stack adds that endpoint, reusing the EE stack's endpoint SG.
+  Ec2VpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      VpcEndpointType: Interface
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.ec2'
+      PrivateDnsEnabled: true
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref VpcEndpointSgId
+
+  ResilienceFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: Neo4jResilienceInline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SsmPrefix}/*'
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref PasswordSecretArn
+              - Effect: Allow
+                Action: ec2:DescribeInstances
+                Resource: '*'
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}::document/AWS-RunShellScript'
+              - Effect: Allow
+                Action: ssm:SendCommand
+                Resource: !Sub 'arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                Condition:
+                  StringEquals:
+                    aws:ResourceTag/StackID: !Ref Neo4jStackId
+              - Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                Resource: '*'
+
+  ResilienceFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-resilience'
+      RetentionInDays: 30
+
+  ResilienceFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ResilienceFunctionLogGroup
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-resilience'
+      Runtime: python3.13
+      Handler: handler.resilience_handler
+      Role: !GetAtt ResilienceFunctionRole.Arn
+      MemorySize: 512
+      Timeout: 300
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref ResilienceFunctionLogGroup
+        LogFormat: JSON
+        ApplicationLogLevel: INFO
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+      Environment:
+        Variables:
+          NEO4J_SSM_NLB_PATH: !Sub '${SsmPrefix}/nlb-dns'
+          NEO4J_SECRET_ARN: !Ref PasswordSecretArn
+          NEO4J_BOLT_TLS: !If [BoltTlsEnabledCond, 'true', !Ref 'AWS::NoValue']
+          NEO4J_STACK_NAME: !Ref Neo4jStackName
+          NEO4J_STACK_ID: !Ref Neo4jStackId
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+        S3ObjectVersion: !If [HasObjectVersion, !Ref LambdaS3ObjectVersion, !Ref 'AWS::NoValue']
+
+  ResilienceFunctionUrl:
+    Type: AWS::Lambda::Url
+    Properties:
+      TargetFunctionArn: !GetAtt ResilienceFunction.Arn
+      AuthType: AWS_IAM
+
+  ResilienceFunctionUrlSsmParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/neo4j-sample-private-app/${AWS::StackName}/validate-url'
+      Type: String
+      Value: !GetAtt ResilienceFunctionUrl.FunctionUrl
+      Description: Function URL of the Neo4j sample private app resilience Lambda.
+
+Outputs:
+  FunctionUrl:
+    Value: !GetAtt FunctionUrl.FunctionUrl
+  FunctionArn:
+    Value: !GetAtt Function.Arn
+  ResilienceFunctionUrl:
+    Value: !GetAtt ResilienceFunctionUrl.FunctionUrl
+  ResilienceFunctionArn:
+    Value: !GetAtt ResilienceFunction.Arn

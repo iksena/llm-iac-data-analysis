@@ -1,0 +1,332 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Setup optional resources in in the Hub account to support tenant2.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: "TGW-GenAI-Project-Hub"
+  ParentStackName:
+    Type: String
+    Description: Name of the parent stack.
+    Default: "TGW-GenAI-Hub-Stack"
+  Spoke2Account:
+    Type: String
+    AllowedPattern: '^[0-9]{12}$'
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      -
+        Label:
+          default: "Bedrock Infra Setup Parameters"
+        Parameters:
+          - ProjectName
+          - ProviderVpcCIDR
+          - PrivateSubnet1CIDR
+          - PrivateSubnet2CIDR
+          - PublicSubnet1CIDR
+          - PublicSubnet2CIDR
+
+Resources:
+  BedrockLambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - !Ref StsPolicy
+      Policies:
+        - PolicyName: DynamoDBGetPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                Resource:
+                  Fn::ImportValue:
+                    !Sub "${ParentStackName}-DynamoDBTableArn"
+
+        - PolicyName: GetSSMParameterPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 'ssm:DescribeParameters'
+                Resource: '*'
+              - Effect: Allow
+                Action: 'ssm:GetParameter'
+                Resource:
+                  Fn::ImportValue:
+                    !Sub "${ParentStackName}-JWKSParameterArn"
+
+  StsPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${ProjectName}-sts-policy-tenant2
+      Description: Policy for access to assume role in spoke account
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: "STSAllow"
+            Effect: "Allow"
+            Action:
+              - "sts:AssumeRole"
+            Resource: !Sub "arn:aws:iam::${Spoke2Account}:*"
+
+  BedrockLambdaFunctionTenant2:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt 'BedrockLambdaFunctionRole.Arn'
+      Runtime: python3.12
+      Environment:
+        Variables:
+          tenantMappingLookUpTable:
+            Fn::ImportValue:
+              !Sub "${ParentStackName}-DynamoDBTableArn"
+          CognitoUserPoolJWKSTGW:
+            Fn::ImportValue:
+              !Sub "${ParentStackName}-JWKSSSMParameterTGW"
+          cognitoUserPoolId:
+            Fn::ImportValue:
+              !Sub "${ParentStackName}-CognitoUserPoolUserPoolId"
+          cognitoUserPoolClientId:
+            Fn::ImportValue:
+              !Sub "${ParentStackName}-CognitoUserPoolClientClientId"
+
+      Timeout: 20
+      MemorySize: 512
+      VpcConfig:
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub "${ParentStackName}-LambdaSecurityGroup"
+        SubnetIds:
+          - Fn::ImportValue: !Sub "${ParentStackName}-PrivateSubnet1"
+          - Fn::ImportValue: !Sub "${ParentStackName}-PrivateSubnet2"
+      Layers:
+        - Fn::ImportValue: !Sub "${ParentStackName}-JWTValidationLambdaLayer"
+      Code:
+        ZipFile: |
+          import os
+          import base64
+          import json
+          import boto3
+          import jose.jwt
+          from jose import jwk, jwt
+          from jose.utils import base64url_decode
+
+          # Set up Cognito user pool details
+          region = os.environ['AWS_REGION']
+          region = boto3.session.Session().region_name
+
+          os.environ.get('CognitoUserPoolJWKSTGW', 'default')
+
+          cognitoUserPoolId = os.environ.get('cognitoUserPoolId', 'default')
+          cognitoUserPoolClientId = os.environ.get('cognitoUserPoolClientId', 'default')
+
+          def validateTokenGetClaims(token):
+              validatedClaims = {}
+
+              #retrieve jwks from an SSM parameter named public_jwks
+              endpoint_url='https://ssm.'+region+'.amazonaws.com'
+              ssm_client = boto3.client('ssm', region_name=region, endpoint_url=endpoint_url)
+              public_jwks = ssm_client.get_parameter(Name=os.environ.get('CognitoUserPoolJWKSTGW', 'default'), WithDecryption=True)
+              cognito_jwks = json.loads(public_jwks['Parameter']['Value'])
+
+              # Search for the kid in the downloaded public keys
+              keys=cognito_jwks['keys']
+              headers = jwt.get_unverified_headers(token)
+              unverified_kid = headers['kid']
+              key_index = -1
+              for i in range(len(keys)):
+                  if unverified_kid == keys[i]['kid']:
+                      key_index = i
+                      break
+
+              if key_index == -1:
+                  print('Public key not found in jwks.json')
+                  raise ValueError('Unauthorized: Public key not found in jwks.json')
+              else:
+                  # Construct the public key
+                  public_key = jwk.construct(keys[key_index])
+                  # Verify the token
+                  try:
+                      payload = jwt.decode(
+                          token,
+                          public_key,
+                          algorithms=['RS256'],
+                          audience=cognitoUserPoolClientId,
+                          issuer=f'https://cognito-idp.{region}.amazonaws.com/{cognitoUserPoolId}'
+                      )
+                      print(f'Token is valid. Claims: {payload}')
+                      validatedClaims=payload
+                  except jwt.JWTError as e:
+                      print(f'Token is invalid: {e}')
+
+              return validatedClaims
+
+          def getTenantMapping(tenantId):
+              endpoint_url='https://dynamodb.'+region+'.amazonaws.com'
+              dynamoDB_client = boto3.client('dynamodb', region_name=region, endpoint_url=endpoint_url)
+              #get the tenant mapping from the tenant mapping look up dynamoDB table with a hashkey of "tenantId"
+              tenantMappingLookUpTable = os.environ.get('tenantMappingLookUpTable', 'default')
+              tenant_mapping = dynamoDB_client.get_item(TableName=tenantMappingLookUpTable, Key={'tenant_id': {'S': tenantId}})
+              return tenant_mapping
+
+          def lambda_handler(event, context):
+              print(event)
+
+              body = event['body']
+              try:
+                  if event.get('isBase64Encoded', False):
+                      decoded_bytes = base64.b64decode(body)
+                      decoded_body = decoded_bytes.decode("utf-8")
+                  else:
+                      decoded_body = body
+                  print("decoded_body", decoded_body)
+              except Exception as e:
+                  print(f"Error decoding body: {e}")
+                  decoded_body = body  # Use raw body if decoding fails
+
+              # Extract token from the authorization header
+              if 'headers' in event and 'authorization' in event['headers']:
+                  auth_header = event['headers']['authorization']
+                  PREFIX = 'Bearer '
+                  if auth_header.startswith(PREFIX):
+                      token = auth_header[len(PREFIX):]
+                      #print(f"Bearer token: {token}")
+                  else:
+                      print("Authorization header does not start with 'Bearer '")
+              else:
+                  print("Authorization header not found in the dictionary")
+
+              validatedToken = validateTokenGetClaims(token)
+              # Invoke Bedrock only if token is valid
+              if validatedToken is not None and validatedToken:
+                  tenantId = validatedToken['custom:tenant_id']
+                  tenantMapping = getTenantMapping(tenantId)
+
+                  #cross_account_role_arn = os.environ.get('cross_account_role_arn', 'default')
+                  #tenant_bedrock_vpce_dns = os.environ.get('tenant_bedrock_vpce_dns', 'default')
+                  cross_account_role_arn = tenantMapping['Item']['cross_account_role_arn']['S']
+                  tenant_bedrock_vpce_dns = tenantMapping['Item']['tenant_bedrock_vpce_dns']['S']
+                  model_id=tenantMapping['Item']['model_id']['S']
+                  endpoint_url='https://sts.'+region+'.amazonaws.com'
+                  sts_client = boto3.client('sts', region_name=region, endpoint_url=endpoint_url)
+
+                  #Assume rule in spoke account
+                  print("Assuming role in tenant account: ", cross_account_role_arn)
+                  assumed_role_object = sts_client.assume_role(
+                      RoleArn=cross_account_role_arn,
+                      RoleSessionName="Assume-spoke-role-session"
+                  )
+                  #print(assumed_role_object)
+
+                  credentials=assumed_role_object['Credentials']
+                  #Create bedrock runtime client that points to the Bedrock VPCE in the spoke account
+                  runtime_client = boto3.client(
+                      'bedrock-runtime',
+                      aws_access_key_id=credentials['AccessKeyId'],
+                      aws_secret_access_key=credentials['SecretAccessKey'],
+                      aws_session_token=credentials['SessionToken'],
+                      endpoint_url="https://" + tenant_bedrock_vpce_dns
+                  )
+
+                  prompt_data = decoded_body
+                  # Format the request payload using the model's native structure.
+                  native_request = {
+                      "anthropic_version": "bedrock-2023-05-31",
+                      "max_tokens": 512,
+                      "temperature": 0.5,
+                      "messages": [
+                          {
+                              "role": "user",
+                              "content": [{"type": "text", "text": prompt_data}],
+                          }
+                      ],
+                  }
+
+                  # Convert the native request to JSON.
+                  request = json.dumps(native_request)
+
+                  accept = 'application/json'
+                  content_type = 'application/json'
+
+                  response = runtime_client.invoke_model(
+                      body=request,
+                      modelId=model_id,
+                      accept=accept,
+                      contentType=content_type
+                  )
+
+                  # Print response
+                  response_body = json.loads(response['body'].read())
+                  completion = response_body["content"][0]["text"]
+                  print(completion)
+
+                  response_dict = {
+                      'tenantId': tenantId,
+                      'modelId': model_id,
+                      'completion': completion
+                  }
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps(response_dict)
+                  }
+              else:
+                  print("Token is invalid")
+                  return {
+                      'statusCode': 401,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps('Unauthorized')
+                  }
+
+#### Create a lambda target group for tenant2
+  LambdaTargetGroupTenant2:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckEnabled: false
+      Name: !Sub ${ProjectName}-alb-tg-t2
+      TargetType: lambda
+      Targets:
+      - Id: !GetAtt [ BedrockLambdaFunctionTenant2, Arn ]
+
+### create a AWS::Lambda::Permission resource that grants the Elastic Load Balancing service principal permission to invoke the Lambda function
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BedrockLambdaFunctionTenant2
+      Action: lambda:InvokeFunction
+      Principal: elasticloadbalancing.amazonaws.com
+
+#### Assign the lambda target group to the alb
+
+  Tenant2InvokeRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref LambdaTargetGroupTenant2
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values:
+              - "/tenant2/invoke*"
+      ListenerArn:
+        Fn::ImportValue:
+          !Sub "${ParentStackName}-ALBListenerArn"
+      Priority: 2
+
+Outputs:
+  LambdaTargetGroupTenant2Arn:
+    Description: The Lambda Target Group for tenant2 ARN
+    Value: !Ref LambdaTargetGroupTenant2

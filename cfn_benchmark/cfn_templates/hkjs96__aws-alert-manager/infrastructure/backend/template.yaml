@@ -1,0 +1,1680 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AWS Monitoring Engine - EC2/RDS/ELB resource monitoring automation engine.
+  Daily_Monitor (daily metric check) + Remediation_Handler (CloudTrail event-based auto remediation).
+  Pure CloudFormation, no SAM. Upload zips to S3 then deploy via console.
+
+Parameters:
+  DeploymentBucket:
+    Type: String
+    MinLength: 3
+    MaxLength: 63
+    Description: S3 bucket name where Lambda zip files are uploaded
+
+  CodeVersion:
+    Type: String
+    Default: latest
+    MinLength: 1
+    Description: S3 object key prefix (e.g. v20260306 or latest)
+
+  DefaultCpuThreshold:
+    Type: Number
+    Default: 80
+    Description: Default CPU utilization threshold (%)
+
+  DefaultMemoryThreshold:
+    Type: Number
+    Default: 80
+    Description: Default memory utilization threshold (%)
+
+  DefaultConnectionsThreshold:
+    Type: Number
+    Default: 100
+    Description: Default DB connection count threshold
+
+  DefaultFreeMemoryGBThreshold:
+    Type: Number
+    Default: 2
+    Description: Default free memory threshold in GB (alert when below this value)
+
+  DefaultFreeStorageGBThreshold:
+    Type: Number
+    Default: 10
+    Description: Default free storage threshold in GB (alert when below this value)
+
+  DefaultDiskThreshold:
+    Type: Number
+    Default: 80
+    Description: Default disk utilization threshold (%)
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: Deployment environment (development / staging / production)
+
+  GoogleClientId:
+    Type: String
+    Default: ""
+    Description: >
+      Google OAuth client ID (audience) for the HTTP API JWT authorizer.
+      Leave empty to keep the API public (no authorizer); set it to enforce
+      Google-issued ID token validation at API Gateway.
+
+  AllowedEmails:
+    Type: String
+    Default: ""
+    Description: >
+      Comma-separated allowlist of individual Google account emails permitted
+      to call the API. Empty means no per-email restriction.
+
+  AllowedEmailDomains:
+    Type: String
+    Default: ""
+    Description: >
+      Comma-separated allowlist of email/Workspace domains (e.g. company.com)
+      permitted to call the API. Empty means no domain restriction.
+
+  AdminEmails:
+    Type: String
+    Default: ""
+    Description: >
+      Comma-separated list of admin emails. Admins may delete customers.
+      Empty means no admins (delete disabled for everyone).
+
+Mappings:
+  LambdaConfig:
+    Settings:
+      Runtime: python3.12
+      Timeout: 300
+      MemorySize: 256
+  # Full name -> short abbreviation for resource naming
+  EnvShortName:
+    development:
+      short: dev
+    staging:
+      short: stg
+    production:
+      short: prod
+
+Conditions:
+  # Auth is enabled only when a Google OAuth client ID is supplied.
+  # Empty GoogleClientId keeps the HTTP API public (current behavior),
+  # allowing code to be deployed first and auth flipped on later.
+  AuthEnabled: !Not [!Equals [!Ref GoogleClientId, ""]]
+
+Resources:
+
+  # ════════════════════════════════════════════
+  # DynamoDB 테이블 (api_handler 데이터 저장소)
+  # ════════════════════════════════════════════
+
+  CustomersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub
+        - aws-monitoring-customers-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: customer_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customer_id
+          KeyType: HASH
+      Tags:
+        - Key: ManagedBy
+          Value: AlarmManager
+
+  UserPreferencesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub
+        - aws-monitoring-user-prefs-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_email
+          KeyType: HASH
+      Tags:
+        - Key: ManagedBy
+          Value: AlarmManager
+
+  AccountsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub
+        - aws-monitoring-accounts-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: customer_id
+          AttributeType: S
+        - AttributeName: account_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customer_id
+          KeyType: HASH
+        - AttributeName: account_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: account_id-index
+          KeySchema:
+            - AttributeName: account_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: ManagedBy
+          Value: AlarmManager
+
+  ThresholdOverridesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub
+        - aws-monitoring-threshold-overrides-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: scope_id    # "customer_id:cust-001" 또는 "resource_id:i-12345"
+          AttributeType: S
+        - AttributeName: metric_key  # "CPU", "FreeMemoryGB" 등
+          AttributeType: S
+      KeySchema:
+        - AttributeName: scope_id
+          KeyType: HASH
+        - AttributeName: metric_key
+          KeyType: RANGE
+      Tags:
+        - Key: ManagedBy
+          Value: AlarmManager
+
+  # ════════════════════════════════════════════
+  # API Handler Lambda + API Gateway
+  # ════════════════════════════════════════════
+
+  JobStatusTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub
+        - aws-monitoring-job-status-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: ManagedBy
+          Value: AlarmManager
+
+  MonitorRunHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub
+        - aws-monitoring-monitor-runs-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: scope
+          AttributeType: S
+        - AttributeName: started_at
+          AttributeType: S
+        - AttributeName: run_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: scope
+          KeyType: HASH
+        - AttributeName: started_at
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: run_id-index
+          KeySchema:
+            - AttributeName: run_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: ManagedBy
+          Value: AlarmManager
+
+  ResourceInventoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub
+        - aws-monitoring-resource-inventory-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: resource_id
+          AttributeType: S
+        - AttributeName: account_id
+          AttributeType: S
+        - AttributeName: customer_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: resource_id
+          KeyType: HASH
+        - AttributeName: account_id
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: customer_id-index
+          KeySchema:
+            - AttributeName: customer_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+        - IndexName: account_id-index
+          KeySchema:
+            - AttributeName: account_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: ManagedBy
+          Value: AlarmManager
+
+  BulkOperationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub
+        - aws-monitoring-engine-bulk-dlq-${EnvShort}.fifo
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600
+
+  BulkOperationQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub
+        - aws-monitoring-engine-bulk-${EnvShort}.fifo
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      VisibilityTimeout: 900
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt BulkOperationDLQ.Arn
+        maxReceiveCount: 3
+
+  ApiHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - aws-monitoring-engine-api-handler-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      Description: REST API handler for Alarm Manager frontend
+      Runtime: !FindInMap [LambdaConfig, Settings, Runtime]
+      Timeout: 30
+      MemorySize: 256
+      Handler: lambda_handler.lambda_handler
+      Role: !GetAtt ApiHandlerRole.Arn
+      Layers:
+        - !Ref CommonLayer
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: !Sub ${CodeVersion}/api_handler.zip
+      Environment:
+        Variables:
+          CUSTOMERS_TABLE: !Ref CustomersTable
+          ACCOUNTS_TABLE: !Ref AccountsTable
+          THRESHOLD_OVERRIDES_TABLE: !Ref ThresholdOverridesTable
+          JOB_STATUS_TABLE: !Ref JobStatusTable
+          MONITOR_RUN_HISTORY_TABLE: !Ref MonitorRunHistoryTable
+          RESOURCE_INVENTORY_TABLE: !Ref ResourceInventoryTable
+          BULK_OPERATION_QUEUE_URL: !Ref BulkOperationQueue
+          API_STAGE: !FindInMap [EnvShortName, !Ref Environment, short]
+          DAILY_MONITOR_FUNCTION_NAME: !Ref DailyMonitorFunction
+          ALLOWED_EMAILS: !Ref AllowedEmails
+          ALLOWED_EMAIL_DOMAINS: !Ref AllowedEmailDomains
+          ADMIN_EMAILS: !Ref AdminEmails
+          USER_PREFERENCES_TABLE: !Ref UserPreferencesTable
+
+  ApiHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - aws-monitoring-engine-api-handler-role-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ApiHandlerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt CustomersTable.Arn
+                  - !GetAtt UserPreferencesTable.Arn
+                  - !GetAtt AccountsTable.Arn
+                  - !Sub "${AccountsTable.Arn}/index/*"
+                  - !GetAtt ThresholdOverridesTable.Arn
+                  - !GetAtt JobStatusTable.Arn
+                  - !GetAtt MonitorRunHistoryTable.Arn
+                  - !Sub "${MonitorRunHistoryTable.Arn}/index/*"
+                  - !GetAtt ResourceInventoryTable.Arn
+                  - !Sub "${ResourceInventoryTable.Arn}/index/*"
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt BulkOperationQueue.Arn
+              - Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:ListTagsForResource
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:TagResource
+                  - cloudwatch:ListMetrics
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                  - ec2:CreateTags
+                  - ec2:DescribeNatGateways
+                  - rds:DescribeDBInstances
+                  - rds:ListTagsForResource
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeTags
+                  - lambda:ListFunctions
+                  - lambda:ListTags
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketTagging
+                  - s3:GetBucketLocation
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticache:DescribeCacheClusters
+                  - elasticache:ListTagsForResource
+                Resource: "*"
+              # 모니터링 토글(Resource Groups Tagging API) + 확장 리소스 디스커버리.
+              # RGT tag_resources는 tag:TagResources + 서비스별 태깅 권한을 위임 호출한다.
+              # (거버넌스 AP-19: 태깅 경로가 권한을 빠뜨리면 토글이 영구 AccessDenied로 고착.)
+              - Effect: Allow
+                Action:
+                  - tag:TagResources
+                  # RGT가 위임하는 서비스별 태그 쓰기 (ec2:CreateTags는 위에 이미 있음)
+                  - rds:AddTagsToResource
+                  - elasticache:AddTagsToResource
+                  - lambda:TagResource
+                  - s3:PutBucketTagging
+                  - elasticloadbalancing:AddTags
+                  - sqs:TagQueue
+                  - dynamodb:TagResource
+                  - elasticfilesystem:TagResource
+                  - es:AddTags
+                  - ecs:TagResource
+                  # 확장 리소스 디스커버리 read (api_handler sync_resources용)
+                  - sqs:ListQueues
+                  - sqs:ListQueueTags
+                  - dynamodb:ListTables
+                  - dynamodb:DescribeTable
+                  - dynamodb:ListTagsOfResource
+                  - elasticfilesystem:DescribeFileSystems
+                  - ecs:ListClusters
+                  - ecs:ListServices
+                  - ecs:DescribeServices
+                  - ecs:ListTagsForResource
+                  - es:ListDomainNames
+                  - es:DescribeDomains
+                  - es:ListTags
+                Resource: "*"
+              # Batch 2 확장 디스커버리(read) + 모니터링 토글(RGT 위임 태그 write).
+              - Effect: Allow
+                Action:
+                  # read (api_handler sync_resources 디스커버리)
+                  - apigateway:GET
+                  - acm:ListCertificates
+                  - acm:DescribeCertificate
+                  - backup:ListBackupVaults
+                  - backup:ListTags
+                  - mq:ListBrokers
+                  - mq:DescribeBroker
+                  - kafka:ListClustersV2
+                  - wafv2:ListWebACLs
+                  - wafv2:ListTagsForResource
+                  - directconnect:DescribeConnections
+                  - directconnect:DescribeTags
+                  - sagemaker:ListEndpoints
+                  - sagemaker:ListTags
+                  - sns:ListTopics
+                  - sns:ListTagsForResource
+                  - ec2:DescribeVpnConnections
+                  - cloudfront:ListDistributions
+                  - cloudfront:ListTagsForResource
+                  - route53:ListHealthChecks
+                  - route53:ListTagsForResource
+                  # tag write (RGT가 위임; ec2:CreateTags는 위에 이미 있어 VPN 커버)
+                  - acm:AddTagsToCertificate
+                  - backup:TagResource
+                  - mq:CreateTags
+                  - kafka:TagResource
+                  - wafv2:TagResource
+                  - directconnect:TagResource
+                  - sagemaker:AddTags
+                  - sns:TagResource
+                  - cloudfront:TagResource
+                  - route53:ChangeTagsForResource
+                Resource: "*"
+              # APIGW 태깅 하드닝(별도 statement). RGT의 API Gateway 태깅 동사는
+              # 라이브 검증으로 확정: v2(HTTP/WS) 태깅 = POST/PATCH on
+              # /tags/{apiArn} (태그 sub-resource), v1(REST) = PUT/PATCH /tags·
+              # TagResource. POST는 /tags/* 에만 허용(컬렉션 /apis·/restapis 미부여
+              # = 신규 API 생성 불가). 모든 동사에 aws:TagKeys 조건으로 'Monitoring
+              # 태그가 포함된 요청'만 허용(태그 키 없는 순수 config 변경은 차단).
+              - Effect: Allow
+                Action:
+                  - apigateway:PUT
+                  - apigateway:PATCH
+                  - apigateway:POST
+                  - apigateway:TagResource
+                Resource:
+                  - "arn:aws:apigateway:*::/apis/*"
+                  - "arn:aws:apigateway:*::/restapis/*"
+                  - "arn:aws:apigateway:*::/tags/*"
+                Condition:
+                  "Null":
+                    "aws:TagKeys": "false"
+                  "ForAllValues:StringEquals":
+                    "aws:TagKeys":
+                      - "Monitoring"
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: "arn:aws:iam::*:role/AlarmManagerRole"
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt DailyMonitorFunction.Arn
+
+  SqsWorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - aws-monitoring-engine-sqs-worker-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      Description: SQS worker for bulk alarm operations
+      Runtime: !FindInMap [LambdaConfig, Settings, Runtime]
+      Timeout: 900
+      MemorySize: 256
+      Handler: lambda_handler.lambda_handler
+      Role: !GetAtt SqsWorkerRole.Arn
+      Layers:
+        - !Ref CommonLayer
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: !Sub ${CodeVersion}/sqs_worker.zip
+      Environment:
+        Variables:
+          JOB_STATUS_TABLE: !Ref JobStatusTable
+          BULK_OPERATION_QUEUE_URL: !Ref BulkOperationQueue
+
+  SqsWorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - aws-monitoring-engine-sqs-worker-role-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SqsWorkerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt JobStatusTable.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt BulkOperationQueue.Arn
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:ListTagsForResource
+                  - cloudwatch:TagResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: "arn:aws:iam::*:role/AlarmManagerRole"
+
+  SqsWorkerEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt BulkOperationQueue.Arn
+      FunctionName: !GetAtt SqsWorkerFunction.Arn
+      BatchSize: 10
+      FunctionResponseTypes:
+        - ReportBatchItemFailures
+
+  AlarmManagerHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub
+        - alarm-manager-api-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+          - x-api-key
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+
+  AlarmManagerApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref AlarmManagerHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ApiHandlerFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  # JWT authorizer validating Google-issued ID tokens (created only when
+  # GoogleClientId is provided). Verifies signature/issuer/audience/expiry
+  # against Google's OIDC discovery — no Cognito, no custom Lambda.
+  AlarmManagerJwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Condition: AuthEnabled
+    Properties:
+      ApiId: !Ref AlarmManagerHttpApi
+      AuthorizerType: JWT
+      Name: google-jwt
+      IdentitySource:
+        - "$request.header.Authorization"
+      JwtConfiguration:
+        Issuer: "https://accounts.google.com"
+        Audience:
+          - !Ref GoogleClientId
+
+  AlarmManagerApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AlarmManagerHttpApi
+      RouteKey: "$default"
+      Target: !Sub "integrations/${AlarmManagerApiIntegration}"
+      AuthorizationType: !If [AuthEnabled, JWT, NONE]
+      AuthorizerId: !If [AuthEnabled, !Ref AlarmManagerJwtAuthorizer, !Ref "AWS::NoValue"]
+
+  AlarmManagerApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref AlarmManagerHttpApi
+      StageName: !FindInMap [EnvShortName, !Ref Environment, short]
+      AutoDeploy: true
+
+  ApiHandlerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ApiHandlerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AlarmManagerHttpApi}/*"
+
+  # -- Lambda Layer: common module ------------
+  CommonLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub
+        - aws-monitoring-engine-common-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      Description: AWS Monitoring Engine common modules (tag_resolver, sns_notifier, collectors)
+      Content:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: !Sub ${CodeVersion}/common_layer.zip
+      CompatibleRuntimes:
+        - python3.12
+
+  # -- Daily Monitor Lambda -------------------
+  DailyMonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - aws-monitoring-engine-daily-monitor-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      Description: EC2/RDS/ELB daily metric check and threshold alert
+      Runtime: !FindInMap [LambdaConfig, Settings, Runtime]
+      Timeout: !FindInMap [LambdaConfig, Settings, Timeout]
+      MemorySize: !FindInMap [LambdaConfig, Settings, MemorySize]
+      Handler: lambda_handler.lambda_handler
+      Role: !GetAtt MonitoringEngineRole.Arn
+      Layers:
+        - !Ref CommonLayer
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: !Sub ${CodeVersion}/daily_monitor.zip
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref MonitoringAlertTopic
+          SNS_TOPIC_ARN_ALERT: !Ref MonitoringAlertTopic
+          SNS_TOPIC_ARN_REMEDIATION: !Ref RemediationAlertTopic
+          SNS_TOPIC_ARN_LIFECYCLE: !Ref LifecycleAlertTopic
+          SNS_TOPIC_ARN_ERROR: !Ref ErrorAlertTopic
+          SNS_TOPIC_ARN_GLOBAL_ALERT: !GetAtt GlobalAlertSetup.TopicArn
+          DEFAULT_CPU_THRESHOLD: !Ref DefaultCpuThreshold
+          DEFAULT_MEMORY_THRESHOLD: !Ref DefaultMemoryThreshold
+          DEFAULT_CONNECTIONS_THRESHOLD: !Ref DefaultConnectionsThreshold
+          DEFAULT_FREE_MEMORY_GB_THRESHOLD: !Ref DefaultFreeMemoryGBThreshold
+          DEFAULT_FREE_STORAGE_GB_THRESHOLD: !Ref DefaultFreeStorageGBThreshold
+          DEFAULT_DISK_THRESHOLD: !Ref DefaultDiskThreshold
+          ENVIRONMENT: !FindInMap [EnvShortName, !Ref Environment, short]
+          ACCOUNTS_TABLE: !Ref AccountsTable
+          RESOURCE_INVENTORY_TABLE: !Ref ResourceInventoryTable
+          MONITOR_RUN_HISTORY_TABLE: !Ref MonitorRunHistoryTable
+          JOB_STATUS_TABLE: !Ref JobStatusTable
+
+  # -- Dead Letter Queue: Remediation Handler (RISK-08) --
+  RemediationDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub
+        - aws-monitoring-engine-remediation-dlq-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      MessageRetentionPeriod: 1209600  # 14일 (최대)
+      Tags:
+        - Key: ManagedBy
+          Value: AlarmManager
+
+  # -- CloudWatch Alarm: DLQ 메시지 축적 감지 --
+  RemediationDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub
+        - "[RemediationDLQ] 처리 실패 이벤트 축적 (${EnvShort})"
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      AlarmDescription: "Remediation Handler 실패 이벤트가 DLQ에 쌓임. 즉시 확인 필요."
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt RemediationDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ErrorAlertTopic
+      OKActions:
+        - !Ref ErrorAlertTopic
+
+  # -- Remediation Handler Lambda -------------
+  RemediationHandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - aws-monitoring-engine-remediation-handler-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      Description: CloudTrail event-based auto remediation and lifecycle alerts
+      Runtime: !FindInMap [LambdaConfig, Settings, Runtime]
+      Timeout: !FindInMap [LambdaConfig, Settings, Timeout]
+      MemorySize: !FindInMap [LambdaConfig, Settings, MemorySize]
+      Handler: lambda_handler.lambda_handler
+      Role: !GetAtt RemediationHandlerRole.Arn
+      Layers:
+        - !Ref CommonLayer
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: !Sub ${CodeVersion}/remediation_handler.zip
+      DeadLetterConfig:
+        TargetArn: !GetAtt RemediationDLQ.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref MonitoringAlertTopic
+          SNS_TOPIC_ARN_ALERT: !Ref MonitoringAlertTopic
+          SNS_TOPIC_ARN_REMEDIATION: !Ref RemediationAlertTopic
+          SNS_TOPIC_ARN_LIFECYCLE: !Ref LifecycleAlertTopic
+          SNS_TOPIC_ARN_ERROR: !Ref ErrorAlertTopic
+          SNS_TOPIC_ARN_GLOBAL_ALERT: !GetAtt GlobalAlertSetup.TopicArn
+          DEFAULT_CPU_THRESHOLD: !Ref DefaultCpuThreshold
+          DEFAULT_MEMORY_THRESHOLD: !Ref DefaultMemoryThreshold
+          DEFAULT_CONNECTIONS_THRESHOLD: !Ref DefaultConnectionsThreshold
+          DEFAULT_FREE_MEMORY_GB_THRESHOLD: !Ref DefaultFreeMemoryGBThreshold
+          DEFAULT_FREE_STORAGE_GB_THRESHOLD: !Ref DefaultFreeStorageGBThreshold
+          DEFAULT_DISK_THRESHOLD: !Ref DefaultDiskThreshold
+          ENVIRONMENT: !FindInMap [EnvShortName, !Ref Environment, short]
+
+  # -- Orchestrator Lambda -------------------
+  OrchestratorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub
+        - aws-monitoring-engine-orchestrator-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      Description: Daily Monitor Orchestrator — reads account list and fans out to Worker Lambdas
+      Runtime: !FindInMap [LambdaConfig, Settings, Runtime]
+      Timeout: 60
+      MemorySize: 128
+      Handler: orchestrator.lambda_handler
+      Role: !GetAtt OrchestratorRole.Arn
+      Layers:
+        - !Ref CommonLayer
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: !Sub ${CodeVersion}/daily_monitor.zip
+      Environment:
+        Variables:
+          WORKER_FUNCTION_NAME: !Ref DailyMonitorFunction
+          MONITORED_ACCOUNTS: ""   # JSON array — Phase 2에서 DynamoDB로 교체
+
+  # -- EventBridge Scheduler: Daily Monitor (Orchestrator 경유) --
+  DailyMonitorSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub
+        - daily-monitor-schedule-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      Description: Run Daily Monitor every day at 09:00 KST (00:00 UTC)
+      ScheduleExpression: "cron(0 0 * * ? *)"
+      ScheduleExpressionTimezone: UTC
+      State: ENABLED
+      FlexibleTimeWindow:
+        Mode: "OFF"
+      Target:
+        Arn: !GetAtt OrchestratorFunction.Arn
+        RoleArn: !GetAtt SchedulerInvokeRole.Arn
+
+  # -- Lambda Permission: Scheduler -> Orchestrator --
+  DailyMonitorSchedulerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt OrchestratorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: scheduler.amazonaws.com
+      SourceArn: !GetAtt DailyMonitorSchedule.Arn
+
+  # -- EventBridge Rule: CloudTrail events ---
+  CloudTrailModifyRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub
+        - cloudtrail-modify-events-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      Description: Detect EC2/RDS/ELB modify, delete, and tag change events via CloudTrail
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.ec2
+          - aws.rds
+          - aws.elasticloadbalancing
+          - aws.elasticache
+          - aws.lambda
+          - aws.apigateway
+          - aws.acm
+          - aws.backup
+          - aws.amazonmq
+          - aws.es
+          # -- Extended Resource Monitoring (12 new sources) ---
+          - aws.sqs
+          - aws.ecs
+          - aws.kafka
+          - aws.dynamodb
+          - aws.cloudfront
+          - aws.wafv2
+          - aws.route53
+          - aws.directconnect
+          - aws.elasticfilesystem
+          - aws.s3
+          - aws.sagemaker
+          - aws.sns
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventName:
+            - ModifyInstanceAttribute
+            - ModifyInstanceType
+            - ModifyDBInstance
+            - ModifyLoadBalancerAttributes
+            - ModifyListener
+            - TerminateInstances
+            - DeleteDBInstance
+            - DeleteLoadBalancer
+            - DeleteTargetGroup
+            - CreateTags
+            - DeleteTags
+            - AddTagsToResource
+            - RemoveTagsFromResource
+            - AddTags
+            - RemoveTags
+            - RunInstances
+            - CreateDBInstance
+            - CreateLoadBalancer
+            - CreateTargetGroup
+            - CreateCacheCluster
+            - DeleteCacheCluster
+            - ModifyCacheCluster
+            - CreateNatGateway
+            - DeleteNatGateway
+            # -- ---
+            - CreateFunction20150331
+            - DeleteFunction20150331
+            - DeleteVpnConnection
+            - CreateRestApi
+            - DeleteRestApi
+            - CreateApi
+            - DeleteApi
+            - DeleteCertificate
+            - CreateBackupVault
+            - DeleteBackupVault
+            - CreateBroker
+            - DeleteBroker
+            - CreateDomain
+            - DeleteDomain
+            - TagResource
+            - UntagResource
+            # -- Extended Resource Monitoring (new events) ---
+            - CreateQueue
+            - DeleteQueue
+            - TagQueue
+            - UntagQueue
+            - CreateService
+            - DeleteService
+            - CreateCluster
+            - DeleteCluster
+            - CreateTable
+            - DeleteTable
+            - CreateDistribution
+            - DeleteDistribution
+            - CreateWebACL
+            - DeleteWebACL
+            - CreateHealthCheck
+            - DeleteHealthCheck
+            - CreateConnection
+            - DeleteConnection
+            - CreateFileSystem
+            - DeleteFileSystem
+            - CreateBucket
+            - DeleteBucket
+            - CreateEndpoint
+            - DeleteEndpoint
+            - CreateTopic
+            - DeleteTopic
+      Targets:
+        - Id: RemediationHandlerTarget
+          Arn: !GetAtt RemediationHandlerFunction.Arn
+
+  # -- Lambda Permission: EventBridge -> RemediationHandler --
+  RemediationHandlerEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt RemediationHandlerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt CloudTrailModifyRule.Arn
+
+  # -- SNS Topics ----------------------------
+  MonitoringAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub
+        - aws-monitoring-engine-alert-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      DisplayName: AWS Monitoring Engine - Threshold Alert
+
+  RemediationAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub
+        - aws-monitoring-engine-remediation-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      DisplayName: AWS Monitoring Engine - Auto-Remediation Complete
+
+  LifecycleAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub
+        - aws-monitoring-engine-lifecycle-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      DisplayName: AWS Monitoring Engine - Resource Lifecycle Alert
+
+  ErrorAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub
+        - aws-monitoring-engine-error-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      DisplayName: AWS Monitoring Engine - Error Alert
+
+  # -- IAM Role: EventBridge Scheduler -------
+  SchedulerInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - aws-monitoring-engine-scheduler-role-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeOrchestrator
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt OrchestratorFunction.Arn
+
+  # -- IAM Role: Daily Monitor ---------------
+  MonitoringEngineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - aws-monitoring-engine-daily-monitor-role-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DailyMonitorPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                  - ec2:DescribeNatGateways
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                  - rds:ListTagsForResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeTags
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetGroupAttributes
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - elasticache:DescribeCacheClusters
+                  - elasticache:ListTagsForResource
+                Resource: "*"
+              # -- --- (Daily Monitor)
+              - Effect: Allow
+                Action:
+                  - lambda:ListFunctions
+                  - lambda:ListTags
+                  - lambda:GetFunction
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpnConnections
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - apigateway:GET
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - apigateway:GetRestApis
+                  - apigateway:GetTags
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - apigatewayv2:GetApis
+                  - apigatewayv2:GetApi
+                  - apigatewayv2:GetTags
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - acm:ListCertificates
+                  - acm:DescribeCertificate
+                  - acm:ListTagsForCertificate
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - backup:ListBackupVaults
+                  - backup:DescribeBackupVault
+                  - backup:ListTags
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - mq:ListBrokers
+                  - mq:DescribeBroker
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - es:ListDomainNames
+                  - es:DescribeDomains
+                  - es:ListTags
+                Resource: "*"
+              # -- Extended Resource Monitoring (12 new types) ---
+              - Effect: Allow
+                Action:
+                  - sqs:ListQueues
+                  - sqs:ListQueueTags
+                  - sqs:GetQueueUrl
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecs:ListClusters
+                  - ecs:ListServices
+                  - ecs:DescribeServices
+                  - ecs:ListTagsForResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kafka:ListClustersV2
+                  - kafka:ListTagsForResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:ListTables
+                  - dynamodb:ListTagsOfResource
+                  - dynamodb:DescribeTable
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudfront:ListDistributions
+                  - cloudfront:ListTagsForResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - wafv2:ListWebACLs
+                  - wafv2:ListTagsForResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - route53:ListHealthChecks
+                  - route53:ListTagsForResource
+                  - route53:GetHealthCheck
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - directconnect:DescribeConnections
+                  - directconnect:DescribeTags
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:DescribeFileSystems
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketTagging
+                  - s3:GetBucketLocation
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sagemaker:ListEndpoints
+                  - sagemaker:DescribeEndpoint
+                  - sagemaker:ListTags
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:ListTopics
+                  - sns:ListTagsForResource
+                  - sns:GetTopicAttributes
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: "*"
+              # CloudWatch 읽기 — Resource: "*" 불가피 (Describe/List는 리소스 레벨 권한 미지원)
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:ListMetrics
+                  - cloudwatch:ListTagsForResource
+                Resource: "*"
+              # CloudWatch 쓰기 — ManagedBy=AlarmManager 태그가 있는 알람만 삭제 가능
+              # (수동 생성 알람 실수 삭제 방지)
+              - Effect: Allow
+                Action:
+                  - cloudwatch:DeleteAlarms
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "aws:ResourceTag/ManagedBy": "AlarmManager"
+              # 알람 생성 + 태깅은 제한 없음 (신규 알람은 태그 미부착 상태로 시작)
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:TagResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref MonitoringAlertTopic
+                  - !Ref ErrorAlertTopic
+                  - !GetAtt GlobalAlertSetup.TopicArn
+              # -- DynamoDB: AccountsTable 메타데이터 조회 (inventory sync 전 단계) --
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt AccountsTable.Arn
+                  - !Sub "${AccountsTable.Arn}/index/*"
+              # -- DynamoDB: ResourceInventoryTable upsert (Daily Monitor inventory sync) --
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:DeleteItem
+                Resource:
+                  - !GetAtt ResourceInventoryTable.Arn
+                  - !Sub "${ResourceInventoryTable.Arn}/index/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt MonitorRunHistoryTable.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt JobStatusTable.Arn
+              # -- 멀티 어카운트: 대상 계정 Role AssumeRole --
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: "arn:aws:iam::*:role/AlarmManagerRole"
+                # TODO: Phase 2에서 각 고객사의 실제 Role ARN으로 교체
+
+  # -- IAM Role: Orchestrator ----------------
+  OrchestratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - aws-monitoring-engine-orchestrator-role-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeWorker
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt DailyMonitorFunction.Arn
+
+  # -- IAM Role: Remediation Handler ---------
+  RemediationHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - aws-monitoring-engine-remediation-role-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RemediationHandlerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeTags
+                  - ec2:DescribeInstances
+                  - ec2:StopInstances
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - rds:ListTagsForResource
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                  - rds:StopDBInstance
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - elasticloadbalancing:DescribeTags
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DeleteLoadBalancer
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - elasticache:DescribeCacheClusters
+                  - elasticache:ListTagsForResource
+                Resource: "*"
+              # -- --- (Remediation Handler)
+              - Effect: Allow
+                Action:
+                  - lambda:ListTags
+                  - lambda:GetFunction
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpnConnections
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - apigateway:GET
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - apigatewayv2:GetApis
+                  - apigatewayv2:GetApi
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - acm:ListTagsForCertificate
+                  - acm:DescribeCertificate
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - backup:ListTags
+                  - backup:DescribeBackupVault
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - mq:DescribeBroker
+                  - mq:ListBrokers
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - es:DescribeDomains
+                  - es:ListTags
+                  - es:ListDomainNames
+                Resource: "*"
+              # -- Extended Resource Monitoring (12 new types) ---
+              - Effect: Allow
+                Action:
+                  - sqs:ListQueueTags
+                  - sqs:GetQueueUrl
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:ListTagsForResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - kafka:ListTagsForResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:ListTagsOfResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudfront:ListTagsForResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - wafv2:ListTagsForResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - route53:ListTagsForResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - directconnect:DescribeTags
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:DescribeFileSystems
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketTagging
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sagemaker:ListTags
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:ListTagsForResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricAlarm
+                  - cloudwatch:DeleteAlarms
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:ListMetrics
+                  # TagResource 필수: 알람 생성 직후 ManagedBy=AlarmManager 태그를 부여한다.
+                  # 누락 시 알람이 태그 없이 생성되어, daily monitor의 조건부 DeleteAlarms
+                  # (aws:ResourceTag/ManagedBy=AlarmManager)가 막혀 임계치 갱신/정리가 영구 고착된다.
+                  - cloudwatch:TagResource
+                  - cloudwatch:ListTagsForResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref RemediationAlertTopic
+                  - !Ref LifecycleAlertTopic
+                  - !Ref ErrorAlertTopic
+                  - !GetAtt GlobalAlertSetup.TopicArn
+              # -- DLQ: Lambda 실패 시 Dead Letter Queue에 메시지 전송 --
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt RemediationDLQ.Arn
+
+  # -- IAM Role: Global Alert Setup Lambda --
+  GlobalAlertSetupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - aws-monitoring-engine-global-alert-setup-role-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: GlobalSnsSetupPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:CreateTopic
+                  - sns:DeleteTopic
+                  - sns:GetTopicAttributes
+                Resource: !Sub "arn:aws:sns:us-east-1:${AWS::AccountId}:*"
+
+  # -- Custom Resource: us-east-1 Global SNS Topic --
+  GlobalAlertSetupFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - GlobalAlertSetupRole
+    Properties:
+      FunctionName: !Sub
+        - aws-monitoring-engine-global-alert-setup-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      Description: CFN Custom Resource - creates us-east-1 SNS topic for global service alarms
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 128
+      Handler: index.handler
+      Role: !GetAtt GlobalAlertSetupRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, json, logging, urllib.request
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def send_response(event, status, physical_id, data=None, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "PhysicalResourceId": physical_id,
+                  "Data": data or {},
+              }).encode()
+              req = urllib.request.Request(
+                  event["ResponseURL"], data=body, method="PUT",
+                  headers={"Content-Type": "application/json"},
+              )
+              urllib.request.urlopen(req, timeout=10)
+
+          def handler(event, context):
+              logger.info("GlobalAlertSetup event: %s", json.dumps(event))
+              request_type = event.get("RequestType")
+              topic_name = event["ResourceProperties"]["TopicName"]
+              physical_id = event.get("PhysicalResourceId", "")
+              try:
+                  sns = boto3.client("sns", region_name="us-east-1")
+                  if request_type == "Create":
+                      resp = sns.create_topic(Name=topic_name)
+                      topic_arn = resp["TopicArn"]
+                      logger.info("Created SNS topic: %s", topic_arn)
+                      send_response(event, "SUCCESS", topic_arn, {"TopicArn": topic_arn})
+                  elif request_type == "Update":
+                      topic_arn = physical_id
+                      logger.info("Update: reusing existing topic %s", topic_arn)
+                      send_response(event, "SUCCESS", topic_arn, {"TopicArn": topic_arn})
+                  else:
+                      try:
+                          sns.delete_topic(TopicArn=physical_id)
+                          logger.info("Deleted SNS topic: %s", physical_id)
+                      except Exception as e:
+                          logger.error("Delete topic failed (non-blocking): %s", e)
+                      send_response(event, "SUCCESS", physical_id)
+              except Exception as e:
+                  logger.error("GlobalAlertSetup failed: %s", e)
+                  send_response(event, "FAILED", physical_id or "error", reason=str(e))
+
+  GlobalAlertSetup:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - GlobalAlertSetupFunction
+    Properties:
+      ServiceToken: !GetAtt GlobalAlertSetupFunction.Arn
+      TopicName: !Sub
+        - aws-monitoring-engine-global-alert-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+
+  # -- IAM Role: Initial Sync Lambda --------
+  InitialSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - aws-monitoring-engine-initial-sync-role-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeDailyMonitor
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt DailyMonitorFunction.Arn
+
+  # -- Custom Resource: Initial Alarm Sync ---
+  InitialSyncFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - InitialSyncRole
+    Properties:
+      FunctionName: !Sub
+        - aws-monitoring-engine-initial-sync-${EnvShort}
+        - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+      Description: CFN Custom Resource - triggers daily-monitor once on stack create/update
+      Runtime: python3.12
+      Timeout: 360
+      MemorySize: 128
+      Handler: index.handler
+      Role: !GetAtt InitialSyncRole.Arn
+      Code:
+        ZipFile: |
+          import boto3, json, logging, urllib.request
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              logger.info("InitialSync event: %s", json.dumps(event))
+              request_type = event.get("RequestType")
+              response_url = event["ResponseURL"]
+              status = "SUCCESS"
+              reason = ""
+              try:
+                  if request_type in ("Create", "Update"):
+                      fn = event["ResourceProperties"]["DailyMonitorArn"]
+                      logger.info("Invoking daily-monitor: %s", fn)
+                      boto3.client("lambda").invoke(
+                          FunctionName=fn,
+                          InvocationType="Event",
+                      )
+                      logger.info("daily-monitor invoked successfully")
+                  else:
+                      logger.info("RequestType=%s, skipping invoke", request_type)
+              except Exception as e:
+                  logger.error("Failed to invoke daily-monitor: %s", e)
+                  reason = str(e)
+              response = {
+                  "Status": status,
+                  "Reason": reason,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "PhysicalResourceId": "initial-alarm-sync",
+                  "Data": {},
+              }
+              body = json.dumps(response).encode()
+              logger.info("Sending CFN response: status=%s", status)
+              req = urllib.request.Request(
+                  response_url, data=body, method="PUT",
+                  headers={"Content-Type": "application/json"}
+              )
+              urllib.request.urlopen(req, timeout=10)
+              logger.info("CFN response sent")
+
+  InitialAlarmSync:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - DailyMonitorFunction
+      - CommonLayer
+      - InitialSyncFunction
+    Properties:
+      ServiceToken: !GetAtt InitialSyncFunction.Arn
+      DailyMonitorArn: !GetAtt DailyMonitorFunction.Arn
+      TriggerVersion: !Ref CodeVersion
+
+Outputs:
+  ApiEndpointUrl:
+    Description: "API Gateway endpoint URL (NEXT_PUBLIC_API_BASE_URL에 설정)"
+    Value: !Sub
+      - "https://${AlarmManagerHttpApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvShort}"
+      - EnvShort: !FindInMap [EnvShortName, !Ref Environment, short]
+
+  CustomersTableName:
+    Description: DynamoDB Customers table name
+    Value: !Ref CustomersTable
+
+  AccountsTableName:
+    Description: DynamoDB Accounts table name
+    Value: !Ref AccountsTable
+
+  DailyMonitorFunctionArn:
+    Description: Daily Monitor Lambda ARN
+    Value: !GetAtt DailyMonitorFunction.Arn
+
+  RemediationHandlerFunctionArn:
+    Description: Remediation Handler Lambda ARN
+    Value: !GetAtt RemediationHandlerFunction.Arn
+
+  MonitoringAlertTopicArn:
+    Description: Threshold alert SNS topic ARN
+    Value: !Ref MonitoringAlertTopic
+
+  RemediationAlertTopicArn:
+    Description: Auto-Remediation complete SNS topic ARN
+    Value: !Ref RemediationAlertTopic
+
+  LifecycleAlertTopicArn:
+    Description: Resource lifecycle alert SNS topic ARN
+    Value: !Ref LifecycleAlertTopic
+
+  ErrorAlertTopicArn:
+    Description: Error alert SNS topic ARN
+    Value: !Ref ErrorAlertTopic
+
+  BulkOperationQueueUrl:
+    Description: SQS FIFO queue URL for bulk alarm operations
+    Value: !Ref BulkOperationQueue
+
+  JobStatusTableName:
+    Description: DynamoDB Job Status table name
+    Value: !Ref JobStatusTable
+
+  MonitorRunHistoryTableName:
+    Description: DynamoDB Daily Monitor run history table name
+    Value: !Ref MonitorRunHistoryTable
+
+  GlobalAlertTopicArn:
+    Description: us-east-1 SNS topic ARN for global service alarms (CloudFront/Route53)
+    Value: !GetAtt GlobalAlertSetup.TopicArn

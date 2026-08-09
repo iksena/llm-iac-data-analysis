@@ -1,0 +1,236 @@
+---
+# Bashlinux::Kubernetes Master::EC2 Instance
+#
+#   Cloudformation template to deploy a Kubernetes master EC2 instance
+#   in a private VPC.
+#
+#   Manuel F Martinez
+#   Bashlinux
+#   Los Angeles, CA
+#
+AWSTemplateFormatVersion: "2010-09-09"
+Description: EC2 Kubernetes Master instance template
+
+###############################################################################
+Parameters:
+
+  AWSKubernetesAMI:
+    Description: Automatically select the lates AL2023 AMI using the SSM parameter
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64"
+
+  Environment:
+    Description: Kubernetes Master environment
+    Type: String
+    MinLength: "1"
+    MaxLength: "20"
+    Default: staging
+    AllowedValues: [ "prod", "staging" ]
+    ConstraintDescription: Environment name can only contain "prod" or "staging".
+
+  EC2KubernetesMasterInstanceSize:
+    Description: EC2 instance size for Kubernetes Master instance
+    Type: String
+    MinLength: "1"
+    MaxLength: "32"
+    Default: t4g.small
+    AllowedValues:
+    - t4g.micro
+    - t4g.small
+    - t4g.medium
+    - t4g.large
+    - c6g.large
+    - c6g.xlarge
+    - c6g.2xlarge
+    - c6g.4xlarge
+    - m6g.large
+    - m6g.xlarge
+    - m6g.2xlarge
+    - m6g.4xlarge
+    - r6g.large
+    - r6g.xlarge
+    - r6g.2xlarge
+    - r6g.4xlarge
+    ConstraintDescription: >
+      EC2 instance size must be micro, small, medium, or large of the "t4g"
+      type or large, xlarge, 2xlarge, or 4xlarge of the "c6g", "m6g", or "r6g" type.
+
+  KubernetesVersion:
+    Description: Kubernetes Version
+    Type: String
+    MinLength: "3"
+    MaxLength: "5"
+    Default: "1.32"
+    AllowedValues:
+      - "1.33"
+      - "1.32"
+      - "1.31"
+
+  Organization:
+    Description: Organization or Customer name
+    Type: String
+    MinLength: "1"
+    MaxLength: "32"
+    Default: bashlinux
+    AllowedPattern: "[a-zA-Z0-9\\-]*"
+    ConstraintDescription: >
+      Name of the organization must contains only letters, numbers and hyphens
+
+###############################################################################
+Resources:
+
+  EC2KubernetesInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      BlockDeviceMappings:
+      - DeviceName: "/dev/xvda"
+        Ebs:
+          VolumeType: gp3
+      DisableApiTermination: "false"
+      IamInstanceProfile: !ImportValue
+        "Fn::Sub": "${Organization}-${Environment}-master-KubernetesEc2RoleName"
+      InstanceInitiatedShutdownBehavior: stop
+      ImageId: !Ref AWSKubernetesAMI
+      InstanceType: !Ref EC2KubernetesMasterInstanceSize
+      KeyName: !Sub "bashlinux-${Environment}"
+      Monitoring: "false"
+      NetworkInterfaces:
+      - AssociatePublicIpAddress: "False"
+        DeviceIndex: "0"
+        GroupSet:
+        - !ImportValue
+          "Fn::Sub": "${Organization}-${Environment}-master-Ec2KubernetesSecurityGroupId"
+        SubnetId: !ImportValue
+          "Fn::Sub": "${Organization}-${Environment}-VpcOrgAppSubnetId"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -xe
+
+          # Setup kubernetes repository
+          cat <<EOF > /etc/yum.repos.d/kubernetes.repo
+          [kubernetes]
+          name=Kubernetes
+          baseurl=https://pkgs.k8s.io/core:/stable:/v${KubernetesVersion}/rpm/
+          enabled=1
+          gpgcheck=1
+          gpgkey=https://pkgs.k8s.io/core:/stable:/v${KubernetesVersion}/rpm/repodata/repomd.xml.key
+          EOF
+
+          # Setup CRI-O repository
+          cat <<EOF > /etc/yum.repos.d/cri-o.repo
+          [cri-o]
+          name=CRI-O
+          baseurl=https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${KubernetesVersion}/rpm/
+          enabled=1
+          gpgcheck=1
+          gpgkey=https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${KubernetesVersion}/rpm/repodata/repomd.xml.key
+          EOF
+
+          # Install dependencies
+          dnf -y install container-selinux
+
+          # Install kubeadm
+          dnf -y install cri-o kubelet kubeadm kubectl
+
+          # Enable and start services
+          systemctl enable sshd kubelet crio
+          systemctl start sshd
+          systemctl start kubelet
+          systemctl start crio
+
+          # Bootstrap preparation
+          swapoff -a
+          modprobe br_netfilter
+          sysctl -w net.ipv4.ip_forward=1
+
+          # Set up Kubernetes control plane
+          KUBEADM_VERSION=$(rpm -qa kubeadm | sed 's/^.*m-//;s/-.*//')
+          cat <<EOF > /tmp/kubeadm-config.yaml
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: InitConfiguration
+          localAPIEndpoint:
+            advertiseAddress: $(hostname -I | awk '{print $1}')
+            bindPort: 6443
+          ---
+          apiVersion: kubeadm.k8s.io/v1beta3
+          kind: ClusterConfiguration
+          kubernetesVersion: $KUBEADM_VERSION
+          ---
+          apiVersion: kubelet.config.k8s.io/v1beta1
+          kind: KubeletConfiguration
+          serverTLSBootstrap: true
+          EOF
+
+          kubeadm config migrate --old-config /tmp/kubeadm-config.yaml --new-config /etc/kubeadm-config.yaml
+          kubeadm init --config /etc/kubeadm-config.yaml --upload-certs
+
+          mkdir -p /root/.kube
+          cp /etc/kubernetes/admin.conf /root/.kube/config
+
+          # Install Calico (or any CNI)
+          curl https://raw.githubusercontent.com/projectcalico/calico/v3.27.0/manifests/calico.yaml -o /root/calico.yaml
+          kubectl --kubeconfig /etc/kubernetes/admin.conf apply -f /root/calico.yaml
+
+          # Generate join command
+          JOIN_CMD=$(kubeadm token create --print-join-command)
+
+          # Register join command
+          aws ssm put-parameter \
+            --name "/${Organization}/${Environment}/kubernetes/join-command" \
+            --type "String" \
+            --value "$JOIN_CMD" \
+            --overwrite \
+            --region ${AWS::Region}
+      Tags:
+      - Key: bashlinux:network-visibility
+        Value: private
+      - Key: bashlinux:organization-name
+        Value: !Ref Organization
+      - Key: bashlinux:environment-name
+        Value: !Ref Environment
+      - Key: bashlinux:application-role
+        Value: kubernetes-master
+      - Key: bashlinux:application-id
+        Value: !Ref AWS::StackName
+      - Key: Name
+        Value:
+          !Join
+          - ""
+          - - !Sub "${Organization}-kubernetes-master."
+            - !ImportValue
+                "Fn::Sub": "bashlinux-${Environment}-EnvPrivateDomain"
+
+  dnsRoute53KubernetesInstance:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneName: !Join
+          - ""
+          - - !ImportValue
+                "Fn::Sub": "bashlinux-${Environment}-EnvPrivateDomain"
+            - "."
+      Name:
+          !Join
+          - ""
+          - - !Sub "${Organization}-kubernetes-master."
+            - !ImportValue
+                "Fn::Sub": "bashlinux-${Environment}-EnvPrivateDomain"
+            - "."
+      Type: A
+      TTL: "300"
+      ResourceRecords: [ !GetAtt EC2KubernetesInstance.PrivateIp ]
+
+###############################################################################
+Outputs:
+
+  EC2KubernetesInstanceId:
+    Description: "EC2: Kubernetes instance ID"
+    Value: !Ref EC2KubernetesInstance
+
+  EC2KubernetesInstancePrivateIPv4:
+    Description: "EC2: Kubernetes instance private IP address"
+    Value: !GetAtt EC2KubernetesInstance.PrivateIp
+
+  dnsRoute53KubernetesInstanceHostname:
+    Description: "DNS: Kubernetes instance hostname"
+    Value: !Ref dnsRoute53KubernetesInstance

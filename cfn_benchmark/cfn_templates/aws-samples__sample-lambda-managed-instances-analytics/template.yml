@@ -1,0 +1,300 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: In-Memory Customer Analytics with Lambda Managed Instances
+
+Parameters:
+  DataBucketName:
+    Type: String
+    Description: S3 bucket for customer data
+  FileName:
+    Type: String
+    Description: S3 key for the parquet data file
+    Default: customer_transactions.parquet
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: Subnet IDs from the same VPC (recommend at least 2 subnets across AZs for resiliency)
+  SecurityGroupId:
+    Type: String
+    Description: Security group ID for capacity provider
+
+Resources:
+
+  # KMS Key for encrypting Lambda environment variables (CKV_AWS_173)
+  LambdaEnvEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for encrypting Lambda environment variables
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowLambdaServiceAccess
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: AllowCloudWatchLogsAccess
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+
+  # CloudWatch Log Group for API Gateway Access Logging (CKV_AWS_76 / W69)
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${AWS::StackName}-access-logs
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt LambdaEnvEncryptionKey.Arn
+
+  # IAM Role for API Gateway to write CloudWatch Logs (account-level setting)
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # Set the CloudWatch Logs role at the API Gateway account level
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  # Cognito User Pool for API authentication
+  CustomerAnalyticsUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-user-pool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+
+  # Cognito User Pool Client for the UI
+  CustomerAnalyticsUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-ui-client
+      UserPoolId: !Ref CustomerAnalyticsUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      SupportedIdentityProviders:
+        - COGNITO
+      AllowedOAuthFlows:
+        - implicit
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - http://localhost:8000
+      LogoutURLs:
+        - http://localhost:8000
+
+  # Cognito User Pool Domain for hosted UI
+  CustomerAnalyticsUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub ${AWS::StackName}-${AWS::AccountId}
+      UserPoolId: !Ref CustomerAnalyticsUserPool
+
+  # API Gateway for analytics queries
+  CustomerAnalyticsApi:
+    Type: AWS::Serverless::Api
+    DependsOn: ApiGatewayAccount
+    Properties:
+      StageName: prod
+      TracingEnabled: true  # CKV_AWS_73: Enable X-Ray tracing
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt CustomerAnalyticsUserPool.Arn
+      AccessLogSetting:  # CKV_AWS_76 / W69: Enable access logging
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength"}'
+      Cors:
+        AllowMethods: "'POST, GET, OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+        AllowOrigin: "'http://localhost:8000'"
+      MethodSettings:
+        - ResourcePath: /*
+          HttpMethod: '*'
+          ThrottlingBurstLimit: 10
+          ThrottlingRateLimit: 5
+
+  # Lambda Function for in-memory analytics with AI (Container Image)
+  CustomerAnalyticsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      PackageType: Image
+      MemorySize: 32768  # 32GB
+      Timeout: 900  # 15 minutes
+      Architectures:
+        - x86_64
+      CapacityProviderConfig:
+        Arn: !GetAtt MyCapacityProvider.Arn
+        ExecutionEnvironmentMemoryGiBPerVCpu: 2.0
+        PerExecutionEnvironmentMaxConcurrency: 2
+      Environment:
+        Variables:
+          DATA_BUCKET: !Ref DataBucketName
+          FILE_NAME: !Ref FileName
+      KmsKeyArn: !GetAtt LambdaEnvEncryptionKey.Arn
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref DataBucketName
+        - Statement:
+            - Sid: CloudWatchLogsAccess
+              Effect: Allow
+              Action:
+                - logs:CreateLogGroup
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*
+            - Sid: EC2NetworkingAccess
+              Effect: Allow
+              Action:
+                - ec2:DescribeSecurityGroups
+                - ec2:DescribeSubnets
+                - ec2:DescribeVpcs
+                - ec2:DescribeNetworkInterfaces
+                - ec2:CreateNetworkInterface
+                - ec2:DeleteNetworkInterface
+              Resource: "*"
+      Events:
+        AnalyticsApi:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CustomerAnalyticsApi
+            Path: /analytics
+            Method: post
+        HealthCheck:
+          Type: Api
+          Properties:
+            RestApiId: !Ref CustomerAnalyticsApi
+            Path: /health
+            Method: get
+    Metadata:
+      Dockerfile: Dockerfile
+      DockerContext: ./customer_analytics
+      DockerTag: python3.13-v1
+
+  MyCapacityProvider:
+    Type: AWS::Serverless::CapacityProvider
+    Properties:
+      #CapacityProviderName: !Sub '${AWS::StackName}-CapacityProvider-${AWS::AccountId}'
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+      Tags:
+        Environment: Production
+        Team: ServerlessTeam
+
+  # CloudWatch Log Group
+  # AnalyticsLogGroup:
+  #   Type: AWS::Logs::LogGroup
+  #   Properties:
+  #     LogGroupName: !Sub /aws/lambda/${CustomerAnalyticsFunction}
+  #     RetentionInDays: 7
+
+  # CloudWatch Dashboard
+  AnalyticsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      #DashboardName: !Sub '${AWS::StackName}-Dashboard-${AWS::AccountId}'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Duration", {"stat": "Average", "label": "Avg Duration"}],
+                  [".", ".", {"stat": "Maximum", "label": "Max Duration"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Duration",
+                "yAxis": {"left": {"label": "Milliseconds"}}
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "MemoryUtilization", {"stat": "Average"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Memory Utilization"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${CustomerAnalyticsApi}.execute-api.${AWS::Region}.amazonaws.com/prod/analytics
+  FunctionArn:
+    Description: Lambda Function ARN
+    Value: !GetAtt CustomerAnalyticsFunction.Arn
+  DataBucket:
+    Description: S3 Bucket for customer data
+    Value: !Ref DataBucketName
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CustomerAnalyticsUserPool
+  CognitoClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref CustomerAnalyticsUserPoolClient
+  CognitoDomain:
+    Description: Cognito Hosted UI Domain
+    Value: !Sub https://${AWS::StackName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com
+  CognitoLoginUrl:
+    Description: Cognito Hosted UI Login URL
+    Value: !Sub https://${AWS::StackName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${CustomerAnalyticsUserPoolClient}&response_type=token&scope=openid+email+profile&redirect_uri=http://localhost:8000

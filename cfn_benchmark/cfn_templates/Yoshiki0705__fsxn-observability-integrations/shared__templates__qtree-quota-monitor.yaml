@@ -1,0 +1,351 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  FSx for ONTAP Qtree Quota Monitoring.
+
+  Polls ONTAP REST API for quota usage reports and publishes CloudWatch
+  custom metrics per qtree. Fires alarms when usage exceeds thresholds.
+  Replaces System Manager's quota monitoring view.
+
+  Requires VPC access to ONTAP management endpoint.
+  Stack name pattern: fsxn-qtree-monitor
+
+Parameters:
+  OntapMgmtIp:
+    Type: String
+    Description: FSx for ONTAP management endpoint IP address
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
+
+  OntapCredentialsSecretArn:
+    Type: String
+    Description: Secrets Manager ARN for ONTAP admin credentials (JSON with username/password)
+    AllowedPattern: '^arn:aws:secretsmanager:.*'
+
+  SvmName:
+    Type: String
+    Description: SVM name to monitor qtree quotas for
+    Default: 'svm-prod-01'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where FSx for ONTAP is deployed
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs with access to ONTAP management endpoint
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID that allows HTTPS (443) to ONTAP management IP
+
+  PollIntervalMinutes:
+    Type: Number
+    Description: How often to poll ONTAP for quota reports (minutes)
+    Default: 5
+    MinValue: 1
+    MaxValue: 60
+
+  QuotaThresholdPercent:
+    Type: Number
+    Description: Quota usage threshold (%) for alarm. Default 85% gives warning before hard limit.
+    Default: 85
+    MinValue: 50
+    MaxValue: 99
+
+  NotificationEmail:
+    Type: String
+    Description: Email for quota alarm notifications (leave empty to skip)
+    Default: ''
+
+  CreateSecretsManagerEndpoint:
+    Type: String
+    Description: Create Interface VPC Endpoint for Secrets Manager. Set false if already exists.
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  ShouldCreateSmEndpoint: !Equals [!Ref CreateSecretsManagerEndpoint, 'true']
+
+Resources:
+  # ================================================================
+  # VPC Endpoint (optional)
+  # ================================================================
+  SecretsManagerEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateSmEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref SecurityGroupId
+      PrivateDnsEnabled: true
+
+  # ================================================================
+  # SNS Topic (optional)
+  # ================================================================
+  QuotaAlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: HasNotificationEmail
+    Properties:
+      DisplayName: !Sub 'FSx ONTAP Qtree Quota Alert (${SvmName})'
+
+  QuotaAlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref QuotaAlarmTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # ================================================================
+  # IAM Role
+  # ================================================================
+  QuotaMonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: QtreeQuotaMonitorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SecretsRead
+                Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref OntapCredentialsSecretArn
+              - Sid: CloudWatchPublish
+                Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: FSxONTAP/Qtree
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*:*'
+
+  # ================================================================
+  # Lambda — Qtree Quota Poller
+  # ================================================================
+  QuotaMonitorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-poller'
+      RetentionInDays: 30
+
+  QuotaMonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-poller'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt QuotaMonitorRole.Arn
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+      Environment:
+        Variables:
+          ONTAP_MGMT_IP: !Ref OntapMgmtIp
+          ONTAP_CREDENTIALS_SECRET_ARN: !Ref OntapCredentialsSecretArn
+          SVM_NAME: !Ref SvmName
+          METRIC_NAMESPACE: FSxONTAP/Qtree
+      Code:
+        ZipFile: |
+          """Qtree Quota Monitor — polls ONTAP REST API and publishes CloudWatch metrics.
+
+          Publishes:
+            - QtreeQuotaUsedPercent (per qtree, per volume)
+            - QtreeQuotaUsedBytes
+            - QtreeQuotaLimitBytes
+
+          Dimensions: SvmName, VolumeName, QtreeName
+          """
+          import json
+          import logging
+          import os
+          from typing import Any
+
+          import boto3
+          import urllib3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          http = urllib3.PoolManager(cert_reqs="CERT_NONE")
+          cw = boto3.client("cloudwatch")
+          _creds_cache = None
+
+          def _get_credentials():
+              global _creds_cache
+              if _creds_cache is None:
+                  sm = boto3.client("secretsmanager")
+                  secret = sm.get_secret_value(SecretId=os.environ["ONTAP_CREDENTIALS_SECRET_ARN"])
+                  _creds_cache = json.loads(secret["SecretString"])
+              return _creds_cache
+
+          def _ontap_get(path):
+              creds = _get_credentials()
+              mgmt_ip = os.environ["ONTAP_MGMT_IP"]
+              auth = urllib3.util.make_headers(
+                  basic_auth=f"{creds['username']}:{creds['password']}"
+              )
+              headers = {**auth, "Accept": "application/json"}
+              url = f"https://{mgmt_ip}/api{path}"
+              resp = http.request("GET", url, headers=headers, timeout=30.0)
+              if resp.status >= 400:
+                  raise RuntimeError(f"ONTAP API GET {path}: HTTP {resp.status}")
+              return json.loads(resp.data) if resp.data else {}
+
+          def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+              svm_name = os.environ["SVM_NAME"]
+              namespace = os.environ["METRIC_NAMESPACE"]
+
+              # Get quota reports for the SVM
+              data = _ontap_get(
+                  f"/storage/quota/reports?svm.name={svm_name}"
+                  "&type=tree"
+                  "&fields=space.used.total,space.hard_limit,qtree.name,volume.name"
+                  "&max_records=200"
+              )
+
+              records = data.get("records", [])
+              logger.info("Found %d qtree quota reports for SVM %s", len(records), svm_name)
+
+              metric_data = []
+              for record in records:
+                  qtree_name = record.get("qtree", {}).get("name", "")
+                  volume_name = record.get("volume", {}).get("name", "")
+                  used = record.get("space", {}).get("used", {}).get("total", 0)
+                  limit = record.get("space", {}).get("hard_limit", 0)
+
+                  if not qtree_name or limit == 0:
+                      continue  # Skip qtrees without quotas or unnamed
+
+                  used_percent = (used / limit * 100) if limit > 0 else 0
+
+                  dimensions = [
+                      {"Name": "SvmName", "Value": svm_name},
+                      {"Name": "VolumeName", "Value": volume_name},
+                      {"Name": "QtreeName", "Value": qtree_name},
+                  ]
+
+                  metric_data.extend([
+                      {
+                          "MetricName": "QtreeQuotaUsedPercent",
+                          "Dimensions": dimensions,
+                          "Value": used_percent,
+                          "Unit": "Percent",
+                      },
+                      {
+                          "MetricName": "QtreeQuotaUsedBytes",
+                          "Dimensions": dimensions,
+                          "Value": used,
+                          "Unit": "Bytes",
+                      },
+                      {
+                          "MetricName": "QtreeQuotaLimitBytes",
+                          "Dimensions": dimensions,
+                          "Value": limit,
+                          "Unit": "Bytes",
+                      },
+                  ])
+
+              # CloudWatch PutMetricData (max 1000 per call, batch by 20)
+              published = 0
+              for i in range(0, len(metric_data), 20):
+                  batch = metric_data[i:i+20]
+                  cw.put_metric_data(Namespace=namespace, MetricData=batch)
+                  published += len(batch)
+
+              logger.info("Published %d metric data points", published)
+              return {"qtrees_monitored": len(records), "metrics_published": published}
+
+  # ================================================================
+  # EventBridge Schedule
+  # ================================================================
+  QuotaPollSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-schedule'
+      Description: !Sub 'Poll ONTAP qtree quotas every ${PollIntervalMinutes} minutes'
+      ScheduleExpression: !Sub 'rate(${PollIntervalMinutes} minutes)'
+      State: ENABLED
+      Targets:
+        - Id: QuotaMonitorLambda
+          Arn: !GetAtt QuotaMonitorFunction.Arn
+
+  QuotaPollPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref QuotaMonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt QuotaPollSchedule.Arn
+
+  # ================================================================
+  # CloudWatch Alarm — Qtree Quota Usage
+  # Note: This alarm uses a metric math expression to find the MAX
+  # usage across all qtrees. For per-qtree alarms, create additional
+  # alarms with specific QtreeName dimensions after deployment.
+  # ================================================================
+  QtreeQuotaAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-quota-high'
+      AlarmDescription: !Sub >-
+        One or more qtrees on SVM ${SvmName} exceeded
+        ${QuotaThresholdPercent}% quota usage. Check CloudWatch metrics
+        (namespace: FSxONTAP/Qtree) to identify which qtree(s).
+        Consider expanding the quota, archiving data, or enabling
+        FabricPool tiering for cold data.
+      Namespace: FSxONTAP/Qtree
+      MetricName: QtreeQuotaUsedPercent
+      Dimensions:
+        - Name: SvmName
+          Value: !Ref SvmName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref QuotaThresholdPercent
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: missing
+      AlarmActions: !If
+        - HasNotificationEmail
+        - - !Ref QuotaAlarmTopic
+        - !Ref 'AWS::NoValue'
+
+Outputs:
+  MonitorFunctionArn:
+    Description: Lambda function ARN for the quota poller
+    Value: !GetAtt QuotaMonitorFunction.Arn
+
+  MetricNamespace:
+    Description: CloudWatch namespace for qtree quota metrics
+    Value: FSxONTAP/Qtree
+
+  AlarmArn:
+    Description: Quota threshold alarm ARN
+    Value: !GetAtt QtreeQuotaAlarm.Arn
+
+  ScheduleArn:
+    Description: EventBridge schedule rule ARN
+    Value: !GetAtt QuotaPollSchedule.Arn

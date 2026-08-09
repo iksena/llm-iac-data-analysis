@@ -1,0 +1,890 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+#
+# DISCLAIMER: This code is provided as a reference implementation and is not
+# intended for production use without thorough review and customization.
+# Review IAM policies, security group rules, and encryption settings to ensure
+# they meet your organization's security requirements. This template does not
+# represent all possible security configurations or best practices.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Cross-Region Resilience for OpenSearch Service - Primary Region Infrastructure'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    Description: Environment name prefix for resources
+
+  UseExistingVPC:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Set to 'true' to use existing VPC, 'false' to use VPC from stack exports
+
+  VpcId:
+    Type: String
+    Default: ''
+    Description: VPC ID (required only if UseExistingVPC is true)
+
+  PrivateSubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Comma-separated list of private subnet IDs (required only if UseExistingVPC is true)
+
+  MSKInstanceType:
+    Type: String
+    Default: kafka.m5.large
+    AllowedValues:
+      - kafka.m5.large
+      - kafka.m5.xlarge
+      - kafka.m5.2xlarge
+      - kafka.m5.4xlarge
+    Description: MSK broker instance type
+
+  MSKBrokerCount:
+    Type: Number
+    Default: 3
+    MinValue: 2
+    MaxValue: 15
+    Description: Number of MSK brokers
+
+  MSKBrokerStorageSize:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    MaxValue: 16384
+    Description: Storage size per broker in GB
+
+  OSIMinCapacity:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 96
+    Description: Minimum OCU capacity for OSI pipeline
+
+  OSIMaxCapacity:
+    Type: Number
+    Default: 4
+    MinValue: 1
+    MaxValue: 96
+    Description: Maximum OCU capacity for OSI pipeline
+
+  SecondaryRegion:
+    Type: String
+    Default: us-west-2
+    Description: Secondary region for disaster recovery
+
+  KafkaTopicName:
+    Type: String
+    Default: opensearch-data
+    Description: Kafka topic name for data streaming
+
+  DeployOSIPipeline:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Set to 'true' to deploy OSI pipeline (requires multi-VPC connectivity enabled on MSK first)
+
+  DeployReverseReplicator:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Set to 'true' to deploy reverse MSK Replicator (Secondary → Primary) for Active-Active
+
+  SecondaryMSKClusterArn:
+    Type: String
+    Default: ''
+    Description: ARN of the secondary MSK cluster (required for reverse replicator)
+
+  SecondaryMSKSecurityGroupId:
+    Type: String
+    Default: ''
+    Description: Security Group ID for secondary MSK cluster (required for reverse replicator)
+
+  SecondaryPrivateSubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Comma-separated list of private subnet IDs from secondary region (required for reverse replicator)
+
+Conditions:
+  UseExistingVPCCondition: !Equals [!Ref UseExistingVPC, 'true']
+  UseStackVPCCondition: !Equals [!Ref UseExistingVPC, 'false']
+  DeployOSIPipelineCondition: !Equals [!Ref DeployOSIPipeline, 'true']
+  DeployReverseReplicatorCondition: !Equals [!Ref DeployReverseReplicator, 'true']
+
+Resources:
+  # KMS Key for MSK Encryption
+  MSKEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for MSK cluster encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          # Note: In KMS key policies, Resource: '*' refers to "this key" (the key the policy is attached to)
+          # This is standard AWS practice per https://docs.aws.amazon.com/kms/latest/developerguide/key-policies.html
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow MSK to use the key
+            Effect: Allow
+            Principal:
+              Service: kafka.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+            Resource: '*'
+
+  MSKEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${EnvironmentName}-msk-primary'
+      TargetKeyId: !Ref MSKEncryptionKey
+
+  # Security Groups
+  MSKSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-msk-primary-sg'
+      GroupDescription: Security group for MSK cluster
+      VpcId: !If
+        - UseExistingVPCCondition
+        - !Ref VpcId
+        - Fn::ImportValue: !Sub '${EnvironmentName}-vpc-id'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-msk-primary-sg'
+
+  MSKSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref MSKSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9098
+      ToPort: 9098
+      SourceSecurityGroupId: !Ref MSKSecurityGroup
+      Description: Allow MSK IAM authentication from within the security group
+
+  MSKSecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref MSKSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+      # Note: 0.0.0.0/0 is required for HTTPS egress to reach AWS service endpoints (MSK, CloudWatch, etc.)
+      # These endpoints are public and cannot be restricted to specific CIDRs without VPC endpoints
+      Description: Allow HTTPS outbound for AWS API calls (required for service endpoints)
+
+  MSKSecurityGroupEgressMSK:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref MSKSecurityGroup
+      IpProtocol: tcp
+      FromPort: 9098
+      ToPort: 9098
+      CidrIp: 0.0.0.0/0
+      # Note: 0.0.0.0/0 is required for cross-region MSK replication to reach brokers in other regions
+      Description: Allow MSK IAM authentication outbound for cross-region replication
+
+  # MSK Cluster Configuration
+  MSKConfiguration:
+    Type: AWS::MSK::Configuration
+    Properties:
+      Name: !Sub '${EnvironmentName}-msk-primary-config'
+      Description: MSK cluster configuration for OpenSearch ingestion
+      ServerProperties: |
+        auto.create.topics.enable=true
+        default.replication.factor=3
+        min.insync.replicas=2
+        num.io.threads=8
+        num.network.threads=5
+        num.replica.fetchers=2
+        replica.lag.time.max.ms=30000
+        socket.receive.buffer.bytes=102400
+        socket.request.max.bytes=104857600
+        socket.send.buffer.bytes=102400
+        unclean.leader.election.enable=false
+        zookeeper.session.timeout.ms=18000
+        compression.type=snappy
+        log.retention.hours=24
+        log.segment.bytes=1073741824
+
+  # MSK Cluster
+  MSKCluster:
+    Type: AWS::MSK::Cluster
+    Properties:
+      ClusterName: !Sub '${EnvironmentName}-msk-primary'
+      KafkaVersion: 3.6.0
+      NumberOfBrokerNodes: !Ref MSKBrokerCount
+      BrokerNodeGroupInfo:
+        InstanceType: !Ref MSKInstanceType
+        ClientSubnets: !If
+          - UseExistingVPCCondition
+          - !Ref PrivateSubnetIds
+          - - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-1'
+            - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-2'
+            - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-3'
+        SecurityGroups:
+          - !Ref MSKSecurityGroup
+        StorageInfo:
+          EBSStorageInfo:
+            VolumeSize: !Ref MSKBrokerStorageSize
+      ConfigurationInfo:
+        Arn: !GetAtt MSKConfiguration.Arn
+        Revision: 1
+      EncryptionInfo:
+        EncryptionInTransit:
+          ClientBroker: TLS
+          InCluster: true
+        EncryptionAtRest:
+          DataVolumeKMSKeyId: !Ref MSKEncryptionKey
+      ClientAuthentication:
+        Sasl:
+          Iam:
+            Enabled: true
+      EnhancedMonitoring: PER_TOPIC_PER_BROKER
+      LoggingInfo:
+        BrokerLogs:
+          CloudWatchLogs:
+            Enabled: true
+            LogGroup: !Ref MSKLogGroup
+      Tags:
+        Environment: !Ref EnvironmentName
+        Region: Primary
+
+  # MSK Cluster Policy - Required for OSI and MSK Replicator to connect
+  MSKClusterPolicy:
+    Type: AWS::MSK::ClusterPolicy
+    Properties:
+      ClusterArn: !Ref MSKCluster
+      Policy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: osis-pipelines.amazonaws.com
+            Action:
+              - 'kafka:CreateVpcConnection'
+              - 'kafka:GetBootstrapBrokers'
+              - 'kafka:DescribeCluster'
+              - 'kafka:DescribeClusterV2'
+            Resource: !Ref MSKCluster
+          - Effect: Allow
+            Principal:
+              Service: kafka.amazonaws.com
+            Action:
+              - 'kafka:CreateVpcConnection'
+              - 'kafka:GetBootstrapBrokers'
+              - 'kafka:DescribeCluster'
+              - 'kafka:DescribeClusterV2'
+            Resource: !Ref MSKCluster
+
+  # CloudWatch Log Group for MSK
+  MSKLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/msk/${EnvironmentName}-primary'
+      RetentionInDays: 7
+
+  # Lambda function to get MSK bootstrap brokers
+  # Note: RoleName is omitted to allow CloudFormation stack updates that require resource replacement
+  GetBootstrapBrokersLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole'
+      Policies:
+        - PolicyName: MSKDescribe
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kafka:GetBootstrapBrokers'
+                  - 'kafka:DescribeCluster'
+                Resource: !Sub 'arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:cluster/${EnvironmentName}-msk-primary/*'
+
+  GetBootstrapBrokersLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-get-bootstrap-brokers'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt GetBootstrapBrokersLambdaRole.Arn
+      Timeout: 60
+      ReservedConcurrentExecutions: 5
+      VpcConfig:
+        SubnetIds: !If
+          - UseExistingVPCCondition
+          - !Ref PrivateSubnetIds
+          - - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-1'
+            - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-2'
+            - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-3'
+        SecurityGroupIds:
+          - !Ref MSKSecurityGroup
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+
+          def handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  cluster_arn = event['ResourceProperties']['ClusterArn']
+                  client = boto3.client('kafka')
+
+                  response = client.get_bootstrap_brokers(ClusterArn=cluster_arn)
+
+                  bootstrap_brokers = response.get('BootstrapBrokerStringSaslIam', '')
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'BootstrapBrokersSaslIam': bootstrap_brokers
+                  })
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  MSKBootstrapBrokers:
+    Type: Custom::MSKBootstrapBrokers
+    DependsOn: MSKCluster
+    Properties:
+      ServiceToken: !GetAtt GetBootstrapBrokersLambda.Arn
+      ClusterArn: !Ref MSKCluster
+
+  # S3 Bucket for DLQ
+  DLQBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-opensearch-dlq-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireDLQMessages
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # S3 Bucket Policy for DLQ - Restricts access to OSI pipeline role only
+  DLQBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DLQBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowOSIPipelineAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt OSIPipelineRole.Arn
+            Action:
+              - 's3:PutObject'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+            Resource:
+              - !GetAtt DLQBucket.Arn
+              - !Sub '${DLQBucket.Arn}/*'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt DLQBucket.Arn
+              - !Sub '${DLQBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  # OpenSearch Serverless Collection
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn:
+      - OpenSearchEncryptionPolicy
+      - OpenSearchNetworkPolicy
+      - OpenSearchDataAccessPolicy
+    Properties:
+      Name: !Sub '${EnvironmentName}-opensearch-primary'
+      Type: TIMESERIES
+      Description: Primary region OpenSearch Serverless collection
+
+  # OpenSearch Serverless Security Policies
+  OpenSearchEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${EnvironmentName}-encryption-primary'
+      Type: encryption
+      Policy: !Sub |
+        {
+          "Rules": [
+            {
+              "ResourceType": "collection",
+              "Resource": ["collection/${EnvironmentName}-opensearch-primary"]
+            }
+          ],
+          "AWSOwnedKey": true
+        }
+
+  OpenSearchNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub '${EnvironmentName}-network-primary'
+      Type: network
+      Policy: !Sub
+        - |
+          [
+            {
+              "Rules": [
+                {
+                  "ResourceType": "collection",
+                  "Resource": ["collection/${EnvironmentName}-opensearch-primary"]
+                },
+                {
+                  "ResourceType": "dashboard",
+                  "Resource": ["collection/${EnvironmentName}-opensearch-primary"]
+                }
+              ],
+              "AllowFromPublic": false,
+              "SourceVPCEs": ["${VPCEndpointId}"]
+            }
+          ]
+        - VPCEndpointId: !Ref VPCEndpoint
+
+  OpenSearchDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub '${EnvironmentName}-data-access-primary'
+      Type: data
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "index",
+                "Resource": ["index/${EnvironmentName}-opensearch-primary/*"],
+                "Permission": [
+                  "aoss:CreateIndex",
+                  "aoss:DeleteIndex",
+                  "aoss:UpdateIndex",
+                  "aoss:DescribeIndex",
+                  "aoss:ReadDocument",
+                  "aoss:WriteDocument"
+                ]
+              },
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${EnvironmentName}-opensearch-primary"],
+                "Permission": ["aoss:CreateCollectionItems"]
+              }
+            ],
+            "Principal": [
+              "${OSIPipelineRole.Arn}",
+              "arn:aws:iam::${AWS::AccountId}:root"
+            ]
+          }
+        ]
+
+  # VPC Endpoint for OpenSearch Serverless
+  VPCEndpoint:
+    Type: AWS::OpenSearchServerless::VpcEndpoint
+    Properties:
+      Name: !Sub '${EnvironmentName}-aoss-vpce-primary'
+      VpcId: !If
+        - UseExistingVPCCondition
+        - !Ref VpcId
+        - Fn::ImportValue: !Sub '${EnvironmentName}-vpc-id'
+      SubnetIds: !If
+        - UseExistingVPCCondition
+        - !Ref PrivateSubnetIds
+        - - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-1'
+          - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-2'
+          - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-3'
+      SecurityGroupIds:
+        - !Ref OpenSearchVPCESecurityGroup
+
+  OpenSearchVPCESecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-aoss-vpce-sg'
+      GroupDescription: Security group for OpenSearch Serverless VPC Endpoint
+      VpcId: !If
+        - UseExistingVPCCondition
+        - !Ref VpcId
+        - Fn::ImportValue: !Sub '${EnvironmentName}-vpc-id'
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref MSKSecurityGroup
+          Description: Allow HTTPS traffic from MSK security group for OpenSearch Serverless access
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          # Note: 0.0.0.0/0 is required for HTTPS egress to reach OpenSearch Serverless endpoints
+          Description: Allow HTTPS outbound for OpenSearch Serverless API calls (required for service endpoints)
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-aoss-vpce-sg'
+
+  # IAM Role for OSI Pipeline
+  # Note: RoleName is omitted to allow CloudFormation stack updates that require resource replacement
+  OSIPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: osis-pipelines.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchLogsFullAccess'
+      Policies:
+        - PolicyName: MSKAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kafka-cluster:Connect'
+                  - 'kafka-cluster:DescribeCluster'
+                  - 'kafka-cluster:ReadData'
+                  - 'kafka-cluster:DescribeTopic'
+                  - 'kafka-cluster:DescribeGroup'
+                  - 'kafka-cluster:AlterGroup'
+                Resource:
+                  - !Sub '${MSKCluster.Arn}'
+                  - !Sub '${MSKCluster.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 'kafka:DescribeCluster'
+                  - 'kafka:DescribeClusterV2'
+                  - 'kafka:GetBootstrapBrokers'
+                Resource:
+                  - !Sub '${MSKCluster.Arn}'
+        - PolicyName: OpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'aoss:APIAccessAll'
+                  - 'aoss:BatchGetCollection'
+                Resource: !Sub 'arn:aws:aoss:${AWS::Region}:${AWS::AccountId}:collection/*'
+        - PolicyName: S3DLQAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                Resource:
+                  - !GetAtt DLQBucket.Arn
+                  - !Sub '${DLQBucket.Arn}/*'
+
+  # OSI Pipeline
+  OSIPipeline:
+    Type: AWS::OSIS::Pipeline
+    Condition: DeployOSIPipelineCondition
+    DependsOn:
+      - OpenSearchCollection
+      - MSKCluster
+    Properties:
+      PipelineName: !Sub '${EnvironmentName}-osi-primary'
+      MinUnits: !Ref OSIMinCapacity
+      MaxUnits: !Ref OSIMaxCapacity
+      VpcOptions:
+        SubnetIds: !If
+          - UseExistingVPCCondition
+          - !Ref PrivateSubnetIds
+          - - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-1'
+            - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-2'
+            - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-3'
+        SecurityGroupIds:
+          - !Ref MSKSecurityGroup
+      PipelineConfigurationBody: !Sub
+        - |
+          version: "2"
+          kafka-pipeline:
+            source:
+              kafka:
+                acknowledgments: true
+                topics:
+                  - name: "${KafkaTopicName}"
+                    group_id: "osi-consumer-group-primary"
+                aws:
+                  msk:
+                    arn: "${MSKClusterArn}"
+                  region: "${AWS::Region}"
+                  sts_role_arn: "${OSIPipelineRoleArn}"
+            sink:
+              - opensearch:
+                  hosts:
+                    - "${OpenSearchEndpoint}"
+                  index: "application-logs-${!yyyy.MM.dd}"
+                  aws:
+                    serverless: true
+                    region: "${AWS::Region}"
+                    sts_role_arn: "${OSIPipelineRoleArn}"
+                  dlq:
+                    s3:
+                      bucket: "${DLQBucketName}"
+                      region: "${AWS::Region}"
+                      sts_role_arn: "${OSIPipelineRoleArn}"
+        - MSKClusterArn: !Ref MSKCluster
+          OpenSearchEndpoint: !GetAtt OpenSearchCollection.CollectionEndpoint
+          DLQBucketName: !Ref DLQBucket
+          OSIPipelineRoleArn: !GetAtt OSIPipelineRole.Arn
+      LogPublishingOptions:
+        IsLoggingEnabled: true
+        CloudWatchLogDestination:
+          LogGroup: !Sub '/aws/vendedlogs/osis/${EnvironmentName}-primary'
+
+  # CloudWatch Log Group for OSI
+  OSILogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/osis/${EnvironmentName}-primary'
+      RetentionInDays: 7
+
+  # CloudWatch Alarms
+  MSKReplicationLagAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-msk-replication-lag-primary'
+      AlarmDescription: Alert when MSK replication lag exceeds threshold
+      MetricName: ReplicationLatency
+      Namespace: AWS/Kafka
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 60000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: Cluster Name
+          Value: !Sub '${EnvironmentName}-msk-primary'
+
+  OSIPipelineFailuresAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: DeployOSIPipelineCondition
+    Properties:
+      AlarmName: !Sub '${EnvironmentName}-osi-failures-primary'
+      AlarmDescription: Alert when OSI pipeline has high failure rate
+      MetricName: DocumentsFailed
+      Namespace: AWS/OSIS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: PipelineName
+          Value: !Sub '${EnvironmentName}-osi-primary'
+
+  # IAM Role for MSK Replicator (Reverse: Secondary → Primary)
+  # Note: RoleName is omitted to allow CloudFormation stack updates that require resource replacement
+  MSKReplicatorRole:
+    Type: AWS::IAM::Role
+    Condition: DeployReverseReplicatorCondition
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: kafka.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: MSKReplicatorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Cluster-level permissions
+              - Effect: Allow
+                Action:
+                  - 'kafka-cluster:Connect'
+                  - 'kafka-cluster:DescribeCluster'
+                  - 'kafka-cluster:AlterCluster'
+                  - 'kafka-cluster:DescribeClusterDynamicConfiguration'
+                Resource:
+                  - !Ref SecondaryMSKClusterArn
+                  - !Ref MSKCluster
+              # Topic-level permissions
+              - Effect: Allow
+                Action:
+                  - 'kafka-cluster:ReadData'
+                  - 'kafka-cluster:DescribeTopic'
+                  - 'kafka-cluster:WriteData'
+                  - 'kafka-cluster:CreateTopic'
+                  - 'kafka-cluster:AlterTopic'
+                  - 'kafka-cluster:DeleteTopic'
+                  - 'kafka-cluster:DescribeTopicDynamicConfiguration'
+                  - 'kafka-cluster:AlterTopicDynamicConfiguration'
+                Resource:
+                  - !Sub 'arn:aws:kafka:${SecondaryRegion}:${AWS::AccountId}:topic/${EnvironmentName}-msk-secondary/*'
+                  - !Sub 'arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:topic/${EnvironmentName}-msk-primary/*'
+              # Consumer group permissions
+              - Effect: Allow
+                Action:
+                  - 'kafka-cluster:DescribeGroup'
+                  - 'kafka-cluster:AlterGroup'
+                  - 'kafka-cluster:DeleteGroup'
+                Resource:
+                  - !Sub 'arn:aws:kafka:${SecondaryRegion}:${AWS::AccountId}:group/${EnvironmentName}-msk-secondary/*'
+                  - !Sub 'arn:aws:kafka:${AWS::Region}:${AWS::AccountId}:group/${EnvironmentName}-msk-primary/*'
+              # EC2 permissions for network interfaces (EC2 Describe actions require * resource per AWS documentation)
+              - Effect: Allow
+                Action:
+                  - 'ec2:CreateNetworkInterface'
+                  - 'ec2:DeleteNetworkInterface'
+                Resource: !Sub 'arn:aws:ec2:*:${AWS::AccountId}:network-interface/*'
+              - Effect: Allow
+                Action:
+                  - 'ec2:CreateNetworkInterface'
+                Resource:
+                  - !Sub 'arn:aws:ec2:*:${AWS::AccountId}:subnet/*'
+                  - !Sub 'arn:aws:ec2:*:${AWS::AccountId}:security-group/*'
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeNetworkInterfaces'
+                  - 'ec2:DescribeSubnets'
+                  - 'ec2:DescribeVpcs'
+                  - 'ec2:DescribeSecurityGroups'
+                Resource: '*'
+                # Note: EC2 Describe* actions do not support resource-level permissions per AWS documentation
+                # https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonec2.html
+
+  # MSK Replicator (Reverse: Secondary → Primary) for Active-Active
+  # This replicator handles data written to secondary region being replicated to primary
+  MSKReverseReplicator:
+    Type: AWS::MSK::Replicator
+    Condition: DeployReverseReplicatorCondition
+    DependsOn: MSKCluster
+    Properties:
+      ReplicatorName: !Sub '${EnvironmentName}-secondary-to-primary'
+      Description: Active-Active replication from secondary to primary with identical topic names
+      ServiceExecutionRoleArn: !GetAtt MSKReplicatorRole.Arn
+      KafkaClusters:
+        # Secondary cluster (source) - uses VPC config from SECONDARY region
+        - AmazonMskCluster:
+            MskClusterArn: !Ref SecondaryMSKClusterArn
+          VpcConfig:
+            SubnetIds: !Ref SecondaryPrivateSubnetIds
+            SecurityGroupIds:
+              - !Ref SecondaryMSKSecurityGroupId
+        # Primary cluster (target) - uses VPC config from THIS (primary) region
+        - AmazonMskCluster:
+            MskClusterArn: !Ref MSKCluster
+          VpcConfig:
+            SubnetIds: !If
+              - UseExistingVPCCondition
+              - !Ref PrivateSubnetIds
+              - - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-1'
+                - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-2'
+                - Fn::ImportValue: !Sub '${EnvironmentName}-private-subnet-3'
+            SecurityGroupIds:
+              - !Ref MSKSecurityGroup
+      ReplicationInfoList:
+        - SourceKafkaClusterArn: !Ref SecondaryMSKClusterArn
+          TargetKafkaClusterArn: !Ref MSKCluster
+          TargetCompressionType: SNAPPY
+          TopicReplication:
+            TopicsToReplicate:
+              - !Ref KafkaTopicName
+            CopyTopicConfigurations: true
+            CopyAccessControlListsForTopics: false
+            DetectAndCopyNewTopics: true
+            TopicNameConfiguration:
+              Type: IDENTICAL
+          ConsumerGroupReplication:
+            ConsumerGroupsToReplicate:
+              - '.*'
+            DetectAndCopyNewConsumerGroups: true
+
+Outputs:
+  MSKClusterArn:
+    Description: ARN of the MSK cluster
+    Value: !Ref MSKCluster
+    Export:
+      Name: !Sub '${EnvironmentName}-msk-primary-arn'
+
+  MSKBootstrapServers:
+    Description: MSK bootstrap servers with IAM authentication
+    Value: !GetAtt MSKBootstrapBrokers.BootstrapBrokersSaslIam
+    Export:
+      Name: !Sub '${EnvironmentName}-msk-primary-bootstrap'
+
+  MSKSecurityGroupId:
+    Description: Security group ID for MSK cluster
+    Value: !Ref MSKSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}-msk-primary-sg'
+
+  OpenSearchCollectionArn:
+    Description: ARN of OpenSearch Serverless collection
+    Value: !GetAtt OpenSearchCollection.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-opensearch-primary-arn'
+
+  OpenSearchCollectionEndpoint:
+    Description: Endpoint of OpenSearch Serverless collection
+    Value: !GetAtt OpenSearchCollection.CollectionEndpoint
+    Export:
+      Name: !Sub '${EnvironmentName}-opensearch-primary-endpoint'
+
+  OSIPipelineArn:
+    Condition: DeployOSIPipelineCondition
+    Description: ARN of OSI pipeline
+    Value: !GetAtt OSIPipeline.PipelineArn
+    Export:
+      Name: !Sub '${EnvironmentName}-osi-primary-arn'
+
+  DLQBucketName:
+    Description: Name of DLQ S3 bucket
+    Value: !Ref DLQBucket
+    Export:
+      Name: !Sub '${EnvironmentName}-dlq-bucket-primary'
+
+  OSIPipelineRoleArn:
+    Description: ARN of OSI pipeline IAM role
+    Value: !GetAtt OSIPipelineRole.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-osi-role-primary-arn'

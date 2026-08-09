@@ -1,0 +1,242 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Image recognition pipeline with Rekognition and SMS alerts
+
+Parameters:
+  PhoneNumber:
+    Type: String
+    Default: '+14071113333'
+    AllowedPattern: '^\\+\\d{11,15}$'
+    Description: Phone number for SMS alerts (E.164 format)
+  BucketName:
+    Type: String
+    Default: 'image-recognition-bucket-${AWS::AccountId}'
+    AllowedPattern: '^[a-z0-9.-]{3,63}$'
+    Description: Name for the S3 bucket to store images
+
+Resources:
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+        - Id: DeleteAfter30Days
+          Status: Enabled
+          ExpirationInDays: 30
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: events.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: InvokeStepFunctionPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action: states:StartExecution
+            Resource: !GetAtt StateMachine.Arn
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: states.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+      - PolicyName: StepFunctionPermissionsPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:GetObject
+            Resource: !Sub 'arn:aws:s3:::${BucketName}/*'
+          - Effect: Allow
+            Action:
+            - rekognition:DetectLabels
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - sns:Publish
+            Resource: !Ref SNSTopic
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: ImageRecognitionAlerts
+      Subscription:
+      - Protocol: sms
+        Endpoint: !Ref PhoneNumber
+
+  StateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StateMachineRole.Arn
+      DefinitionString: !Sub
+      - |
+        {
+          "Comment": "Image recognition workflow",
+          "StartAt": "ValidateImage",
+          "States": {
+            "ValidateImage": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Or": [
+                    {
+                      "Variable": "$.detail.object.key",
+                      "StringMatches": "*.jpg"
+                    },
+                    {
+                      "Variable": "$.detail.object.key",
+                      "StringMatches": "*.jpeg"
+                    },
+                    {
+                      "Variable": "$.detail.object.key",
+                      "StringMatches": "*.png"
+                    }
+                  ],
+                  "Next": "DetectLabels"
+                }
+              ],
+              "Default": "UnsupportedFileType"
+            },
+            "DetectLabels": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:rekognition:detectLabels",
+              "Parameters": {
+                "Image": {
+                  "S3Object": {
+                    "Bucket": "${Bucket}",
+                    "Name": "$.detail.object.key"
+                  }
+                },
+                "MinConfidence": 90
+              },
+              "Next": "CheckForHuman"
+            },
+            "CheckForHuman": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Labels[?(@.Name=='Human' || @.Name=='Person')]",
+                  "IsPresent": true,
+                  "Next": "SendAlert"
+                }
+              ],
+              "Default": "NoHumanDetected"
+            },
+            "SendAlert": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:sns:publish",
+              "Parameters": {
+                "TopicArn": "${Topic}",
+                "Message": "Human detected in image: $.detail.object.key"
+              },
+              "End": true
+            },
+            "UnsupportedFileType": {
+              "Type": "Pass",
+              "End": true
+            },
+            "NoHumanDetected": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        }
+      - { Bucket: !Ref BucketName, Topic: !Ref SNSTopic }
+
+  BucketEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger Step Function on image upload
+      EventPattern:
+        source:
+        - aws.s3
+        detail-type:
+        - Object Created
+        detail:
+          bucket:
+            name:
+            - !Ref BucketName
+      Targets:
+      - Arn: !GetAtt StateMachine.Arn
+        Id: TriggerStepFunction
+        RoleArn: !GetAtt EventBridgeRole.Arn
+
+  CleanupLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+      - PolicyName: S3BucketAccessPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - s3:ListBucket
+            - s3:DeleteObject
+            Resource:
+            - !Sub 'arn:aws:s3:::${BucketName}'
+            - !Sub 'arn:aws:s3:::${BucketName}/*'
+
+  CleanupLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt CleanupLambdaRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  s3 = boto3.resource('s3')
+                  bucket = s3.Bucket('${BucketName}')
+                  bucket.objects.all().delete()
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+      Timeout: 300
+
+  LambdaInvocationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt CleanupLambda.Arn
+      Principal: cloudformation.amazonaws.com
+
+Outputs:
+  BucketName:
+    Description: Name of the S3 bucket for image uploads
+    Value: !Ref BucketName
+  StateMachineARN:
+    Description: ARN of the Step Functions state machine
+    Value: !GetAtt StateMachine.Arn
+  SNSTopicARN:
+    Description: ARN of the SNS topic for alerts
+    Value: !Ref SNSTopic

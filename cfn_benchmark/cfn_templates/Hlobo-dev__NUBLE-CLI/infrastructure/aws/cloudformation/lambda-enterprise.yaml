@@ -1,0 +1,696 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  NUBLE ELITE - Enterprise Signal Validator Lambda
+  =====================================================
+  Ultra-fast signal validation with <10ms target latency
+  Features:
+  - Provisioned concurrency for zero cold starts
+  - X-Ray tracing for latency analysis
+  - Dead letter queue for failed invocations
+  - CloudWatch Insights for advanced logging
+  - DynamoDB with on-demand scaling
+  - EventBridge for event-driven architecture
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+
+  NetworkStackName:
+    Type: String
+    Description: Name of the VPC CloudFormation stack
+
+  LambdaS3Bucket:
+    Type: String
+    Description: S3 bucket containing Lambda deployment package
+
+  LambdaS3Key:
+    Type: String
+    Default: function.zip
+    Description: S3 key for Lambda deployment package
+
+  ProvisionedConcurrency:
+    Type: Number
+    Default: 5
+    Description: Provisioned concurrency for zero cold starts
+
+Resources:
+  # ============================================================
+  # IAM ROLES
+  # ============================================================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub nuble-${Environment}-lambda-execution
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchGetItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt SignalsTable.Arn
+                  - !GetAtt DecisionsTable.Arn
+                  - !Sub ${SignalsTable.Arn}/index/*
+                  - !Sub ${DecisionsTable.Arn}/index/*
+
+        - PolicyName: EventBridgeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource:
+                  - !GetAtt SignalEventBus.Arn
+
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt DeadLetterQueue.Arn
+                  - !GetAtt SignalProcessingQueue.Arn
+
+        - PolicyName: SSMAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                  - ssm:GetParametersByPath
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/nuble/*
+
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:PutMetricFilter
+                  - logs:PutRetentionPolicy
+                Resource: '*'
+
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: NUBLE
+
+  # ============================================================
+  # LAMBDA FUNCTION
+  # ============================================================
+
+  SignalValidatorFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaExecutionRole
+    Properties:
+      FunctionName: !Sub nuble-${Environment}-signal-validator
+      Description: Ultra-fast signal validation for TradingView webhooks (<10ms target)
+      Runtime: python3.11
+      Handler: handler.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      MemorySize: 1024
+      Timeout: 30
+      ReservedConcurrentExecutions: 100
+
+      # VPC Configuration for ElastiCache access
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - Fn::ImportValue: !Sub ${NetworkStackName}-PrivateSubnet1
+          - Fn::ImportValue: !Sub ${NetworkStackName}-PrivateSubnet2
+
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          POWERTOOLS_SERVICE_NAME: nuble-signal-validator
+          POWERTOOLS_METRICS_NAMESPACE: NUBLE
+          LOG_LEVEL: INFO
+          DYNAMODB_SIGNALS_TABLE: !Ref SignalsTable
+          DYNAMODB_DECISIONS_TABLE: !Ref DecisionsTable
+          EVENTBRIDGE_BUS_NAME: !Ref SignalEventBus
+          SQS_QUEUE_URL: !Ref SignalProcessingQueue
+
+      # X-Ray tracing
+      TracingConfig:
+        Mode: Active
+
+      # Dead letter queue
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: signal-validator
+        - Key: CostCenter
+          Value: nuble-trading
+
+  # Lambda Version for Alias
+  SignalValidatorVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref SignalValidatorFunction
+      Description: Production version
+
+  # Lambda Alias (without provisioned concurrency for initial deployment)
+  SignalValidatorAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref SignalValidatorFunction
+      FunctionVersion: !GetAtt SignalValidatorVersion.Version
+      Name: live
+      # Provisioned concurrency disabled for initial deployment - enable after testing
+      # ProvisionedConcurrencyConfig:
+      #   ProvisionedConcurrentExecutions: !Ref ProvisionedConcurrency
+
+  # Lambda Security Group
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Lambda functions
+      GroupName: !Sub nuble-${Environment}-lambda-sg
+      VpcId:
+        Fn::ImportValue: !Sub ${NetworkStackName}-VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub nuble-${Environment}-lambda-sg
+
+  # Lambda Permission for API Gateway
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SignalValidatorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*
+
+  # Lambda Permission for Alias
+  LambdaAliasApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SignalValidatorAlias
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:*
+
+  # ============================================================
+  # CLOUDWATCH LOG GROUP
+  # ============================================================
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/nuble-${Environment}-signal-validator
+      RetentionInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # SQS QUEUES
+  # ============================================================
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub nuble-${Environment}-dlq
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeout: 300
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  SignalProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub nuble-${Environment}-signals
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 86400  # 1 day
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DeadLetterQueue.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # EVENTBRIDGE
+  # ============================================================
+
+  SignalEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub nuble-${Environment}-signals
+
+  # Rule to log all events for debugging
+  EventLoggingRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub nuble-${Environment}-log-all-events
+      EventBusName: !Ref SignalEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - prefix: nuble
+      Targets:
+        - Id: cloudwatch-logs
+          Arn: !GetAtt EventLogGroup.Arn
+
+  EventLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/events/nuble-${Environment}
+      RetentionInDays: 14
+
+  # EventBridge to CloudWatch Logs permission
+  EventLogGroupPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub nuble-${Environment}-eventbridge-logs
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [{
+            "Sid": "EventBridgeToCloudWatchLogs",
+            "Effect": "Allow",
+            "Principal": {"Service": "events.amazonaws.com"},
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": "${EventLogGroup.Arn}"
+          }]
+        }
+
+  # Rule to route validated signals to SQS for ECS processing
+  SignalToSQSRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub nuble-${Environment}-signal-to-sqs
+      EventBusName: !Ref SignalEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - nuble.signal.validator
+        detail-type:
+          - SignalValidated
+      Targets:
+        - Id: sqs-target
+          Arn: !GetAtt SignalProcessingQueue.Arn
+
+  # SQS Policy to allow EventBridge
+  SignalQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref SignalProcessingQueue
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt SignalProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt SignalToSQSRule.Arn
+
+  # ============================================================
+  # DYNAMODB TABLES
+  # ============================================================
+
+  SignalsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub nuble-${Environment}-signals
+      BillingMode: PAY_PER_REQUEST
+
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: symbol
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: gsi1pk
+          AttributeType: S
+        - AttributeName: gsi1sk
+          AttributeType: S
+
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+      GlobalSecondaryIndexes:
+        - IndexName: symbol-timestamp-index
+          KeySchema:
+            - AttributeName: symbol
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+        - IndexName: gsi1-index
+          KeySchema:
+            - AttributeName: gsi1pk
+              KeyType: HASH
+            - AttributeName: gsi1sk
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+
+      ContributorInsightsSpecification:
+        Enabled: true
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: signals
+
+  DecisionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub nuble-${Environment}-decisions
+      BillingMode: PAY_PER_REQUEST
+
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: symbol
+          AttributeType: S
+        - AttributeName: decision_time
+          AttributeType: N
+
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+
+      GlobalSecondaryIndexes:
+        - IndexName: symbol-time-index
+          KeySchema:
+            - AttributeName: symbol
+              KeyType: HASH
+            - AttributeName: decision_time
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Service
+          Value: decisions
+
+  # ============================================================
+  # SSM PARAMETERS
+  # ============================================================
+
+  SignalsTableParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /nuble/dynamodb/signals-table
+      Type: String
+      Value: !Ref SignalsTable
+      Description: DynamoDB Signals table name
+      Tags:
+        Environment: !Ref Environment
+
+  DecisionsTableParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /nuble/dynamodb/decisions-table
+      Type: String
+      Value: !Ref DecisionsTable
+      Description: DynamoDB Decisions table name
+      Tags:
+        Environment: !Ref Environment
+
+  EventBusParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /nuble/eventbridge/bus-name
+      Type: String
+      Value: !Ref SignalEventBus
+      Description: EventBridge bus name for signals
+      Tags:
+        Environment: !Ref Environment
+
+  # ============================================================
+  # CLOUDWATCH ALARMS
+  # ============================================================
+
+  LambdaErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub nuble-${Environment}-lambda-errors
+      AlarmDescription: Lambda function error rate is high
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SignalValidatorFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  LambdaLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub nuble-${Environment}-lambda-latency
+      AlarmDescription: Lambda p99 latency exceeds 50ms
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SignalValidatorFunction
+      ExtendedStatistic: p99
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 50
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  LambdaThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub nuble-${Environment}-lambda-throttles
+      AlarmDescription: Lambda function is being throttled
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SignalValidatorFunction
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  DLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub nuble-${Environment}-dlq-messages
+      AlarmDescription: Messages in dead letter queue
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub nuble-${Environment}-dynamodb-throttle
+      AlarmDescription: DynamoDB is being throttled
+      MetricName: ThrottledRequests
+      Namespace: AWS/DynamoDB
+      Dimensions:
+        - Name: TableName
+          Value: !Ref SignalsTable
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  SignalValidatorFunctionArn:
+    Description: Lambda Function ARN
+    Value: !GetAtt SignalValidatorFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaArn
+
+  SignalValidatorAliasArn:
+    Description: Lambda Alias ARN (with provisioned concurrency)
+    Value: !Ref SignalValidatorAlias
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaAliasArn
+
+  SignalEventBusArn:
+    Description: EventBridge Bus ARN
+    Value: !GetAtt SignalEventBus.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-EventBusArn
+
+  SignalEventBusName:
+    Description: EventBridge Bus Name
+    Value: !Ref SignalEventBus
+    Export:
+      Name: !Sub ${AWS::StackName}-EventBusName
+
+  SignalsTableArn:
+    Description: DynamoDB Signals Table ARN
+    Value: !GetAtt SignalsTable.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-SignalsTableArn
+
+  SignalsTableName:
+    Description: DynamoDB Signals Table Name
+    Value: !Ref SignalsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-SignalsTableName
+
+  SignalsTableStreamArn:
+    Description: DynamoDB Signals Table Stream ARN
+    Value: !GetAtt SignalsTable.StreamArn
+    Export:
+      Name: !Sub ${AWS::StackName}-SignalsTableStreamArn
+
+  DecisionsTableArn:
+    Description: DynamoDB Decisions Table ARN
+    Value: !GetAtt DecisionsTable.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-DecisionsTableArn
+
+  DecisionsTableName:
+    Description: DynamoDB Decisions Table Name
+    Value: !Ref DecisionsTable
+    Export:
+      Name: !Sub ${AWS::StackName}-DecisionsTableName
+
+  SignalProcessingQueueUrl:
+    Description: SQS Queue URL for signal processing
+    Value: !Ref SignalProcessingQueue
+    Export:
+      Name: !Sub ${AWS::StackName}-QueueUrl
+
+  SignalProcessingQueueArn:
+    Description: SQS Queue ARN for signal processing
+    Value: !GetAtt SignalProcessingQueue.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-QueueArn
+
+  DeadLetterQueueUrl:
+    Description: Dead Letter Queue URL
+    Value: !Ref DeadLetterQueue
+    Export:
+      Name: !Sub ${AWS::StackName}-DLQUrl
+
+  LambdaSecurityGroupId:
+    Description: Lambda Security Group ID
+    Value: !Ref LambdaSecurityGroup
+    Export:
+      Name: !Sub ${AWS::StackName}-LambdaSGId

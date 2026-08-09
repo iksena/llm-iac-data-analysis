@@ -1,0 +1,240 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Product Catalog Service — Lambda + API Gateway infrastructure.
+  deploy.sh builds the JAR, uploads it to S3, then deploys this stack.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: product-catalog
+    Description: Prefix for all resource names.
+  ApiKey:
+    Type: String
+    NoEcho: true
+    Description: API key that protects product catalog endpoints (x-api-key header).
+  CodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing the deployment JAR.
+  CodeS3Key:
+    Type: String
+    Default: product-catalog-service.jar
+    Description: S3 key of the deployment JAR.
+
+Resources:
+
+  # ===================================================================
+  # IAM Role for Lambda
+  # ===================================================================
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # ===================================================================
+  # Lambda Function (Java 21 + SnapStart)
+  # ===================================================================
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn-guard:
+        suppress:
+          - id: LAMBDA_DLQ_CHECK
+            reason: "API Gateway-invoked Lambda — synchronous invocation, DLQ not applicable"
+          - id: LAMBDA_CONCURRENCY_CHECK
+            reason: "Workshop Lambda does not need reserved concurrency limits"
+          - id: LAMBDA_INSIDE_VPC
+            reason: "Public API Lambda accessing S3/DynamoDB does not require VPC placement"
+    Properties:
+      FunctionName: !Sub "${ProjectName}-service"
+      Runtime: java21
+      Handler: com.example.productcatalog.StreamLambdaHandler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref CodeS3Key
+      MemorySize: 1024
+      Timeout: 30
+      SnapStart:
+        ApplyOn: PublishedVersions
+
+  LambdaVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    Properties:
+      FunctionName: !Ref LambdaFunction
+      Description: Deployed version
+
+  LambdaAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      Name: live
+      FunctionName: !Ref LambdaFunction
+      FunctionVersion: !GetAtt LambdaVersion.Version
+
+  # ===================================================================
+  # API Gateway REST API (proxy integration → Lambda alias)
+  # API key authentication is enforced at the gateway layer.
+  # ===================================================================
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${ProjectName}-api"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # --- API Key + Usage Plan ---
+
+  ApiKeyResource:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ApiStage
+    Properties:
+      Name: !Sub "${ProjectName}-api-key"
+      Enabled: true
+      Value: !Ref ApiKey
+      StageKeys:
+        - RestApiId: !Ref ApiGateway
+          StageName: prod
+
+  UsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiStage
+    Properties:
+      UsagePlanName: !Sub "${ProjectName}-usage-plan"
+      ApiStages:
+        - ApiId: !Ref ApiGateway
+          Stage: prod
+
+  UsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref ApiKeyResource
+      KeyType: API_KEY
+      UsagePlanId: !Ref UsagePlan
+
+  # --- Resources and Methods ---
+
+  ProxyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: "{proxy+}"
+
+  ProxyMethod:
+    Type: AWS::ApiGateway::Method
+    Metadata:
+      cfn-guard:
+        suppress:
+          - id: API_GW_METHOD_AUTHORIZATION_TYPE_RULE
+            reason: "API uses API key authentication via x-api-key header (ApiKeyRequired: true), not IAM authorization"
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref ProxyResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaAlias}/invocations"
+
+  RootMethod:
+    Type: AWS::ApiGateway::Method
+    Metadata:
+      cfn-guard:
+        suppress:
+          - id: API_GW_METHOD_AUTHORIZATION_TYPE_RULE
+            reason: "API uses API key authentication via x-api-key header (ApiKeyRequired: true), not IAM authorization"
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !GetAtt ApiGateway.RootResourceId
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaAlias}/invocations"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ProxyMethod
+      - RootMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: ApiGatewayAccount
+    Properties:
+      RestApiId: !Ref ApiGateway
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","responseLength":"$context.responseLength"}'
+
+  ApiGatewayLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-apigw-log-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    DependsOn: ApiGateway
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayLogRole.Arn
+
+  ApiGatewayAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn-guard:
+        suppress:
+          - id: CLOUDWATCH_LOG_GROUP_ENCRYPTED
+            reason: "Workshop log group uses AWS-managed encryption; KMS adds cost and complexity unnecessary for workshop"
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${ProjectName}-access-logs"
+      RetentionInDays: 7
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaAlias
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*"
+
+Outputs:
+  ProductCatalogUrl:
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Description: Base URL for the product catalog API
+  LambdaFunctionName:
+    Value: !Ref LambdaFunction
+    Description: Name of the Lambda function running the product catalog service
+  ApiGatewayId:
+    Value: !Ref ApiGateway
+    Description: ID of the API Gateway for the product catalog REST API

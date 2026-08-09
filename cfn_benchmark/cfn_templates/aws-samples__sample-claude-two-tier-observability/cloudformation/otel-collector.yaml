@@ -1,0 +1,306 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  OTEL Collector on ECS Fargate — receives OTLP metrics from Claude Code
+  clients, extracts user identity from HTTP headers (set by otel_helper.py),
+  and exports to CloudWatch EMF for real-time dashboards.
+  Stack name convention: claude-code-collector-{OrgName}-{Environment}
+
+Parameters:
+  OrgName:
+    Type: String
+    Default: my-org
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC from otel-networking stack
+  PublicSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  PublicSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  AlbSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  EcsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+  CollectorImage:
+    Type: String
+    Default: 'public.ecr.aws/aws-observability/aws-otel-collector:latest'
+    Description: ADOT collector container image
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 5
+  CollectorConfigParam:
+    Type: String
+    Description: SSM parameter name containing the collector YAML config
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ''
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [30, 60, 90, 180, 365]
+
+Conditions:
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, '']]
+
+Resources:
+  # =========================================================================
+  # CloudWatch Log Groups
+  # =========================================================================
+  # checkov:skip=CKV_AWS_158:Sample uses default encryption — production deployments should add KMS
+  CollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Sample uses default encryption — production deployments should add KMS"
+    Properties:
+      LogGroupName: !Sub '/aws/claude-code/otel-collector/${OrgName}-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # checkov:skip=CKV_AWS_158:Sample uses default encryption — production deployments should add KMS
+  OtelMetricsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Sample uses default encryption — production deployments should add KMS"
+    Properties:
+      LogGroupName: !Sub '/aws/claude-code/otel-metrics/${OrgName}-${Environment}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # checkov:skip=CKV_AWS_158:Sample uses default encryption — production deployments should add KMS
+  OtelLogsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Sample uses default encryption — production deployments should add KMS"
+    Properties:
+      LogGroupName: /aws/claude-code/otel-logs
+      RetentionInDays: !Ref LogRetentionDays
+
+  # =========================================================================
+  # ECS Cluster
+  # =========================================================================
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub 'claude-code-cluster-${OrgName}-${Environment}'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub 'claude-code-cluster-${OrgName}-${Environment}'
+
+  # =========================================================================
+  # ECS Task Execution Role (pull image, write logs)
+  # =========================================================================
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name required for deploy.sh cross-stack references"
+    Properties:
+      RoleName: !Sub 'claude-code-exec-${OrgName}-${Environment}'
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ssm-read
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/claude-code/${OrgName}/*'
+
+  # =========================================================================
+  # ECS Task Role (what the collector can do at runtime)
+  # =========================================================================
+  TaskRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name required for deploy.sh cross-stack references"
+          - id: W11
+            reason: "CloudWatch PutMetricData and Logs actions require Resource: '*' — standard for OTEL collector"
+    Properties:
+      RoleName: !Sub 'claude-code-task-${OrgName}-${Environment}'
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: cloudwatch-write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: '*'
+
+  # =========================================================================
+  # Task Definition
+  # =========================================================================
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub 'claude-code-collector-${OrgName}-${Environment}'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: otel-collector
+          Image: !Ref CollectorImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 4318
+              Protocol: tcp
+          Secrets:
+            - Name: AOT_CONFIG_CONTENT
+              ValueFrom: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${CollectorConfigParam}'
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref 'AWS::Region'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CollectorLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: collector
+
+  # =========================================================================
+  # ALB
+  # =========================================================================
+  # checkov:skip=CKV_AWS_91:Sample uses CloudWatch metrics — production should enable access logging
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W52
+            reason: "Sample uses CloudWatch metrics — production should enable access logging"
+          - id: W28
+            reason: "Explicit name required for deploy.sh cross-stack references"
+    Properties:
+      Name: !Sub 'claude-code-${Environment}'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1Id
+        - !Ref PublicSubnet2Id
+      SecurityGroups:
+        - !Ref AlbSecurityGroupId
+      LoadBalancerAttributes:
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+      Tags:
+        - Key: Name
+          Value: !Sub 'claude-code-alb-${OrgName}-${Environment}'
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub 'namer-fsi-otel-tg-${Environment}'
+      Port: 4318
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckPath: /
+      HealthCheckPort: '13133'
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+
+  # checkov:skip=CKV_AWS_2:OTLP uses HTTP/protobuf on port 4318 by design
+  # checkov:skip=CKV_AWS_103:OTLP uses HTTP — TLS termination optional via ALB HTTPS listener
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W56
+            reason: "OTLP uses HTTP/protobuf on port 4318 by design — TLS optional"
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 4318
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # =========================================================================
+  # ECS Service
+  # =========================================================================
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      ServiceName: !Sub 'claude-code-collector-${OrgName}-${Environment}'
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !Ref PublicSubnet1Id
+            - !Ref PublicSubnet2Id
+          SecurityGroups:
+            - !Ref EcsSecurityGroupId
+      LoadBalancers:
+        - ContainerName: otel-collector
+          ContainerPort: 4318
+          TargetGroupArn: !Ref TargetGroup
+
+Outputs:
+  OtelEndpoint:
+    Description: OTLP HTTP endpoint for Claude Code clients
+    Value: !Sub 'http://${Alb.DNSName}:4318'
+    Export:
+      Name: !Sub '${AWS::StackName}-OtelEndpoint'
+  ClusterName:
+    Value: !Ref EcsCluster
+  ServiceName:
+    Value: !GetAtt EcsService.Name
+  AlbDnsName:
+    Value: !GetAtt Alb.DNSName

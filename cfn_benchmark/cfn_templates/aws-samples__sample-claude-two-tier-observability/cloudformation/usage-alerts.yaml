@@ -1,0 +1,265 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Token usage monitoring and SNS alerts for Claude Code. Runs on a schedule,
+  checks per-user token/cost thresholds, and sends alerts via SNS.
+
+Parameters:
+  OrgName:
+    Type: String
+    Description: Organization name
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  AlertEmail:
+    Type: String
+    Description: Email address for usage alerts (admin). Will receive a subscription confirmation.
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+
+  DailyTokenLimit:
+    Type: Number
+    Default: 5000000
+    Description: Default daily token limit per user (triggers alert when exceeded)
+
+  DailyCostLimitUSD:
+    Type: Number
+    Default: 50
+    Description: Default daily cost limit per user in USD (triggers alert when exceeded)
+
+  MonitorSchedule:
+    Type: String
+    Default: 'rate(1 hour)'
+    Description: How often to check usage (e.g., rate(1 hour), rate(30 minutes))
+
+  SummaryHourUTC:
+    Type: Number
+    Default: 17
+    MinValue: 0
+    MaxValue: 23
+    Description: Hour (UTC) to send daily summary email (default 17 = 10am PT)
+
+  EnablePerUserThresholds:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Create a DynamoDB table for per-user threshold overrides
+
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ''
+    Description: IAM Permissions Boundary ARN (required for accounts with restrictive SCPs)
+
+Conditions:
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, '']]
+  CreateThresholdTable: !Equals [!Ref EnablePerUserThresholds, 'true']
+
+Resources:
+
+  # =========================================================================
+  # SNS Topic for Usage Alerts
+  # =========================================================================
+  UsageAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub 'claude-code-usage-alerts-${OrgName}'
+      DisplayName: !Sub 'Claude Code Usage Alerts (${OrgName})'
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Project
+          Value: claude-code
+
+  # Email subscription for admin
+  AdminEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref UsageAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # =========================================================================
+  # Optional: DynamoDB table for per-user thresholds
+  # =========================================================================
+  # checkov:skip=CKV_AWS_119:AWS managed SSE enabled — CMK optional for production
+  ThresholdTable:
+    Type: AWS::DynamoDB::Table
+    Condition: CreateThresholdTable
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name required for deploy.sh cross-stack references"
+          - id: W78
+            reason: "AWS managed SSE enabled — CMK optional for production"
+    Properties:
+      TableName: !Sub 'claude-code-usage-thresholds-${OrgName}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: claude-code
+
+  # =========================================================================
+  # Usage Monitor Lambda
+  # =========================================================================
+  # checkov:skip=CKV_AWS_117:Lambdas call AWS APIs only — VPC adds NAT Gateway cost with no benefit
+  # checkov:skip=CKV_AWS_116:Synchronous invocation — DLQ not applicable
+  # checkov:skip=CKV_AWS_173:Environment variables contain config (table names, ARNs), not secrets
+  UsageMonitorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda calls AWS APIs only — VPC adds cost with no benefit"
+          - id: W92
+            reason: "ReservedConcurrentExecutions set on function"
+    Properties:
+      FunctionName: !Sub 'claude-code-usage-monitor-${OrgName}-${Environment}'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      MemorySize: 256
+      ReservedConcurrentExecutions: 5
+      Role: !GetAtt UsageMonitorRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref UsageAlertTopic
+          ORG_NAME: !Ref OrgName
+          DAILY_TOKEN_LIMIT: !Ref DailyTokenLimit
+          DAILY_COST_LIMIT_USD: !Ref DailyCostLimitUSD
+          SUMMARY_HOUR_UTC: !Ref SummaryHourUTC
+          THRESHOLD_TABLE: !If
+            - CreateThresholdTable
+            - !Ref ThresholdTable
+            - ''
+      Code:
+        # Stub — full implementation in lambda/usage_monitor/index.py
+        ZipFile: |
+          def handler(event, context):
+              print("Deploy the full monitor from lambda/usage_monitor/")
+              return {"statusCode": 200}
+      Tags:
+        - Key: Project
+          Value: claude-code
+
+  UsageMonitorRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name required for deploy.sh cross-stack references"
+          - id: W11
+            reason: "CloudWatch GetMetricStatistics and ListMetrics require Resource: '*'"
+    Properties:
+      RoleName: !Sub 'claude-code-usage-monitor-role-${OrgName}-${Environment}'
+      PermissionsBoundary: !If
+        - HasPermissionsBoundary
+        - !Ref PermissionsBoundaryArn
+        - !Ref AWS::NoValue
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref UsageAlertTopic
+        - PolicyName: DynamoDBRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource: !If
+                  - CreateThresholdTable
+                  - !GetAtt ThresholdTable.Arn
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/nonexistent'
+
+  # =========================================================================
+  # EventBridge Schedule Rule
+  # =========================================================================
+  UsageMonitorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'claude-code-usage-monitor-${OrgName}'
+      Description: Scheduled token usage monitoring for Claude Code
+      ScheduleExpression: !Ref MonitorSchedule
+      State: ENABLED
+      Targets:
+        - Id: UsageMonitorLambda
+          Arn: !GetAtt UsageMonitorFunction.Arn
+
+  UsageMonitorSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt UsageMonitorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UsageMonitorSchedule.Arn
+
+  # =========================================================================
+  # Lambda Log Group (explicit retention)
+  # =========================================================================
+  # checkov:skip=CKV_AWS_158:Sample uses default encryption — production deployments should add KMS
+  UsageMonitorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Sample uses default encryption — production deployments should add KMS"
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/claude-code-usage-monitor-${OrgName}-${Environment}'
+      RetentionInDays: 30
+
+Outputs:
+  SNSTopicArn:
+    Description: SNS topic ARN for usage alerts
+    Value: !Ref UsageAlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-SNSTopicArn'
+
+  UsageMonitorFunctionName:
+    Description: Usage monitor Lambda function name
+    Value: !Ref UsageMonitorFunction
+
+  ThresholdTableName:
+    Condition: CreateThresholdTable
+    Description: DynamoDB table for per-user threshold overrides
+    Value: !Ref ThresholdTable
+
+  AlertSubscription:
+    Description: Admin email subscribed to alerts
+    Value: !Ref AlertEmail

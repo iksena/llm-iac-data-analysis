@@ -1,0 +1,275 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AMR Emulator public demo (amr-emulator.com): one Lambda serving every
+  tracked MiR REST API version behind an API Gateway HTTP API. Hardened for
+  public exposure: stage throttling, reserved concurrency, scoped IAM,
+  capped log retention.
+
+Parameters:
+  CodeS3Bucket:
+    Type: String
+    Description: Private artifacts bucket holding the Lambda code zip
+  CodeS3Key:
+    Type: String
+    Description: Content-hashed key of the Lambda code zip
+  ThrottleRateLimit:
+    Type: Number
+    Default: 25
+    Description: Steady-state requests/second across the whole API
+  ThrottleBurstLimit:
+    Type: Number
+    Default: 50
+    Description: Burst requests/second across the whole API
+  ReservedConcurrency:
+    Type: Number
+    Default: 10
+    Description: Hard cap on concurrent executions (cost / account-limit guard)
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+  DomainName:
+    Type: String
+    Default: ""
+    Description: Canonical custom domain for the API (e.g. amr-emulator.com); empty disables
+  HostedZoneId:
+    Type: String
+    Default: ""
+    Description: Route53 public hosted zone that owns DomainName
+  LegacyDomainName:
+    Type: String
+    Default: ""
+    Description: Extra alias kept alive for old links (e.g. mir.advin.io); empty disables
+  LegacyHostedZoneId:
+    Type: String
+    Default: ""
+    Description: Route53 public hosted zone that owns LegacyDomainName's parent
+
+Conditions:
+  HasCustomDomain: !And
+    - !Not [!Equals [!Ref DomainName, ""]]
+    - !Not [!Equals [!Ref HostedZoneId, ""]]
+  HasLegacyDomain: !And
+    - !Not [!Equals [!Ref LegacyDomainName, ""]]
+    - !Not [!Equals [!Ref LegacyHostedZoneId, ""]]
+
+Resources:
+  FunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/mir-emulator-demo
+      RetentionInDays: !Ref LogRetentionDays
+
+  AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/apigateway/mir-emulator-demo
+      RetentionInDays: !Ref LogRetentionDays
+
+  FunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: write-own-logs-only
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "${FunctionLogGroup.Arn}:*"
+
+  Function:
+    Type: AWS::Lambda::Function
+    DependsOn: FunctionLogGroup
+    Properties:
+      FunctionName: mir-emulator-demo
+      Description: MiR REST API emulator - all tracked versions at /<version>/api/v2.0.0
+      Runtime: python3.13
+      Architectures: [arm64]
+      Handler: mir_emulator.serverless.handler
+      MemorySize: 512
+      Timeout: 10
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      Role: !GetAtt FunctionRole.Arn
+      Code:
+        S3Bucket: !Ref CodeS3Bucket
+        S3Key: !Ref CodeS3Key
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: mir-emulator-demo
+      Description: Public demo endpoint for the MiR REST API emulator
+      ProtocolType: HTTP
+
+  Integration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt Function.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 10500
+
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: $default
+      Target: !Sub integrations/${Integration}
+
+  Stage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingRateLimit: !Ref ThrottleRateLimit
+        ThrottlingBurstLimit: !Ref ThrottleBurstLimit
+      AccessLogSettings:
+        DestinationArn: !GetAtt AccessLogGroup.Arn
+        # Metadata only - no bodies, no auth headers. requestId first for grep.
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "requestTime":"$context.requestTime","method":"$context.httpMethod",
+          "path":"$context.path","protocol":"$context.protocol",
+          "status":"$context.status","responseLength":"$context.responseLength",
+          "integrationLatencyMs":"$context.integrationLatency",
+          "error":"$context.error.messageString"}
+
+  # Canonical domain (amr-emulator.com). New logical IDs so the legacy
+  # resources below keep their names — flipping the old IDs to the new
+  # domain would force a replacement that collides on the in-use
+  # API Gateway domain name mid-update.
+  PrimaryCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasCustomDomain
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  PrimaryApiDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: HasCustomDomain
+    Properties:
+      DomainName: !Ref DomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref PrimaryCertificate
+          EndpointType: REGIONAL
+          SecurityPolicy: TLS_1_2
+
+  PrimaryApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: HasCustomDomain
+    Properties:
+      ApiId: !Ref HttpApi
+      DomainName: !Ref PrimaryApiDomain
+      Stage: !Ref Stage
+
+  PrimaryDnsAliasA:
+    Type: AWS::Route53::RecordSet
+    Condition: HasCustomDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt PrimaryApiDomain.RegionalDomainName
+        HostedZoneId: !GetAtt PrimaryApiDomain.RegionalHostedZoneId
+
+  PrimaryDnsAliasAAAA:
+    Type: AWS::Route53::RecordSet
+    Condition: HasCustomDomain
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt PrimaryApiDomain.RegionalDomainName
+        HostedZoneId: !GetAtt PrimaryApiDomain.RegionalHostedZoneId
+
+  # Legacy alias (mir.advin.io): the original logical IDs, now fed by the
+  # Legacy* parameters with the same values they were created with, so this
+  # update is a no-op for the live resources and old links keep resolving.
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasLegacyDomain
+    Properties:
+      DomainName: !Ref LegacyDomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref LegacyDomainName
+          HostedZoneId: !Ref LegacyHostedZoneId
+
+  ApiDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Condition: HasLegacyDomain
+    Properties:
+      DomainName: !Ref LegacyDomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref Certificate
+          EndpointType: REGIONAL
+          SecurityPolicy: TLS_1_2
+
+  ApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Condition: HasLegacyDomain
+    Properties:
+      ApiId: !Ref HttpApi
+      DomainName: !Ref ApiDomain
+      Stage: !Ref Stage
+
+  DnsAliasA:
+    Type: AWS::Route53::RecordSet
+    Condition: HasLegacyDomain
+    Properties:
+      HostedZoneId: !Ref LegacyHostedZoneId
+      Name: !Ref LegacyDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt ApiDomain.RegionalDomainName
+        HostedZoneId: !GetAtt ApiDomain.RegionalHostedZoneId
+
+  DnsAliasAAAA:
+    Type: AWS::Route53::RecordSet
+    Condition: HasLegacyDomain
+    Properties:
+      HostedZoneId: !Ref LegacyHostedZoneId
+      Name: !Ref LegacyDomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt ApiDomain.RegionalDomainName
+        HostedZoneId: !GetAtt ApiDomain.RegionalHostedZoneId
+
+  InvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref Function
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*
+
+Outputs:
+  ApiUrl:
+    Description: Base URL of the public demo API ($default stage)
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  PublicUrl:
+    Description: Custom-domain URL (empty when no domain configured)
+    Value: !If [HasCustomDomain, !Sub "https://${DomainName}", ""]
+  LegacyUrl:
+    Description: Legacy alias URL (empty when no legacy domain configured)
+    Value: !If [HasLegacyDomain, !Sub "https://${LegacyDomainName}", ""]
+  FunctionName:
+    Value: !Ref Function

@@ -1,0 +1,481 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  FSx for ONTAP Lakehouse Long-Term Retention - Ships audit log records to
+  Amazon S3 in Apache Parquet format via Kinesis Data Firehose (with record
+  format conversion), catalogued in a Glue Data Catalog table, queryable via
+  Amazon Athena. Complements the observability vendor pipelines in this
+  project with a long-term (multi-year) SQL-queryable retention path.
+  Stack name: fsxn-lakehouse-retention
+
+# WHAT YOU NEED BEFORE STARTING:
+#   - An AWS account with permission to create S3 buckets, a Glue database/table,
+#     a Kinesis Data Firehose delivery stream, IAM roles, and an Athena workgroup
+#   - Two globally-unique S3 bucket names (RetentionBucketName, AthenaResultsBucketName)
+#     that do not already exist anywhere in AWS (bucket names are global)
+#   - IMPORTANT: check whether AWS Lake Formation is enabled in this account BEFORE
+#     deploying. If any Glue database/table in this account has ever been registered
+#     with Lake Formation, this template's IAM-only permissions on the Firehose role
+#     are NOT sufficient by themselves -- see "Lake Formation pre-flight check" below.
+#     This template already includes the required AWS::LakeFormation::PrincipalPermissions
+#     resources, but understanding why they exist will save you time if you fork this
+#     template or hit a similar issue elsewhere.
+#
+# LAKE FORMATION PRE-FLIGHT CHECK (run before deploying):
+#   aws lakeformation get-data-lake-settings --region <your-region> \
+#     --query "DataLakeSettings.DataLakeAdmins"
+#   If this returns any principals, Lake Formation is active in this account.
+#   Glue/Firehose access then requires BOTH an IAM policy AND a Lake Formation grant
+#   on the same principal -- having only one silently fails with:
+#     "Insufficient Lake Formation permission(s): Required Describe on <table>"
+#   This template already handles the grant (FirehoseLakeFormationDatabasePermission /
+#   FirehoseLakeFormationTablePermission resources below); if the deploying principal
+#   is not a Lake Formation admin, ask a Lake Formation admin to run this check first,
+#   since AWS::LakeFormation::PrincipalPermissions creation itself may also require
+#   Lake Formation admin rights depending on your account's settings.
+#
+# DEPLOYMENT TIME ESTIMATE: ~2-3 minutes for this stack. See docs/en/lakehouse-long-term-retention.md
+# ("Deployment Time Estimate" section) for the full pipeline timeline including first
+# Parquet file arrival and Snowflake setup.
+#
+# DEPLOYMENT:
+#   aws cloudformation deploy \
+#     --template-file integrations/lakehouse-retention/template.yaml \
+#     --stack-name fsxn-lakehouse-retention \
+#     --parameter-overrides \
+#       RetentionBucketName=<globally-unique-bucket-name> \
+#       AthenaResultsBucketName=<globally-unique-results-bucket-name> \
+#     --capabilities CAPABILITY_NAMED_IAM \
+#     --region <your-region>
+#
+# CLEANUP (see docs for full rollback steps -- Athena workgroup deletion needs
+# --recursive-delete-option if any queries were run, and S3 buckets must be
+# emptied, including all object versions, before the stack can be deleted):
+#   aws athena delete-work-group --work-group <AthenaWorkgroupName> --recursive-delete-option --region <your-region>
+#   aws s3 rm s3://<RetentionBucketName> --recursive --region <your-region>
+#   aws s3 rm s3://<AthenaResultsBucketName> --recursive --region <your-region>
+#   aws cloudformation delete-stack --stack-name fsxn-lakehouse-retention --region <your-region>
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Storage
+        Parameters:
+          - RetentionBucketName
+          - AthenaResultsBucketName
+      - Label:
+          default: Glue Data Catalog
+        Parameters:
+          - GlueDatabaseName
+          - GlueTableName
+      - Label:
+          default: Firehose Delivery Stream
+        Parameters:
+          - BufferSizeMBs
+          - BufferIntervalSeconds
+      - Label:
+          default: Athena
+        Parameters:
+          - AthenaWorkgroupName
+          - AthenaScanLimitGB
+    ParameterLabels:
+      RetentionBucketName:
+        default: Retention bucket name (must be globally unique)
+      AthenaResultsBucketName:
+        default: Athena query results bucket name (must be globally unique)
+      GlueDatabaseName:
+        default: Glue database name
+      GlueTableName:
+        default: Glue table name
+      BufferSizeMBs:
+        default: Firehose buffer size (MB)
+      BufferIntervalSeconds:
+        default: Firehose buffer interval (seconds)
+      AthenaWorkgroupName:
+        default: Athena workgroup name
+      AthenaScanLimitGB:
+        default: Athena per-query scan limit (GB)
+
+Parameters:
+  RetentionBucketName:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: >-
+      Must be a valid S3 bucket name (lowercase letters, numbers, hyphens,
+      periods; 3-63 characters).
+    Description: >-
+      Name for the new S3 bucket that stores Parquet-converted audit log
+      records for long-term retention. S3 bucket names are globally unique
+      across all AWS accounts, so pick a name unlikely to collide, e.g.
+      '<your-org>-fsxn-audit-lakehouse-<region>'. This template creates the
+      bucket; it must not already exist.
+  AthenaResultsBucketName:
+    Type: String
+    AllowedPattern: '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$'
+    ConstraintDescription: >-
+      Must be a valid S3 bucket name (lowercase letters, numbers, hyphens,
+      periods; 3-63 characters).
+    Description: >-
+      Name for the new S3 bucket that stores Athena query results. Must be
+      globally unique and must not already exist; this template creates the
+      bucket, e.g. '<your-org>-fsxn-athena-results-<region>'.
+  GlueDatabaseName:
+    Type: String
+    Default: fsxn_audit_lakehouse
+    Description: >-
+      Glue Data Catalog database name. Change this if it collides with an
+      existing database in your account, or to namespace multiple
+      environments (e.g. fsxn_audit_lakehouse_dev).
+  GlueTableName:
+    Type: String
+    Default: audit_logs
+    Description: Glue Data Catalog table name for the Parquet audit log records.
+  BufferSizeMBs:
+    Type: Number
+    Default: 64
+    MinValue: 64
+    MaxValue: 128
+    Description: >-
+      Firehose buffering size in MB before flushing to S3. 64 MB is the
+      Firehose-enforced minimum once Parquet record format conversion is
+      enabled (a plain, non-Parquet Firehose stream could go as low as
+      1 MB, but this template always converts to Parquet, so the 64 MB
+      floor applies). Larger values produce fewer, larger Parquet files
+      (better query performance per byte scanned) at the cost of longer
+      delivery latency.
+  BufferIntervalSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: >-
+      Firehose buffering interval in seconds before flushing to S3, whichever
+      of size or interval is reached first. 300s (5 minutes) is a reasonable
+      default for audit log retention (not real-time alerting); lower this
+      toward 60s if you need fresher data in Athena/Snowflake sooner, at the
+      cost of more, smaller Parquet files.
+  AthenaWorkgroupName:
+    Type: String
+    Default: fsxn-lakehouse-retention
+    Description: >-
+      Athena workgroup name. Must be unique within this AWS account/region;
+      change it if you already have a workgroup with this name.
+  AthenaScanLimitGB:
+    Type: String
+    Default: '10'
+    AllowedValues: ['1', '5', '10', '20', '50', '100', '200', '500']
+    Description: >-
+      Per-query data scan cap for the Athena workgroup, in GB. Protects
+      against a single runaway or overly broad query generating unexpected
+      cost (Athena bills per TB scanned). Raise this if your production
+      queries routinely need to scan more than the default 10 GB (e.g. a
+      full-table scan across several years of retained data). Restricted to
+      a fixed set of values because CloudFormation has no arithmetic
+      intrinsic function to convert an arbitrary GB figure to bytes (see
+      the AthenaScanLimitBytes mapping below).
+
+Mappings:
+  # CloudFormation has no arithmetic intrinsic to convert GB -> bytes, so this
+  # maps each AllowedValue of AthenaScanLimitGB to its exact byte count
+  # (GB * 1024^3), used by AthenaWorkgroup's BytesScannedCutoffPerQuery below.
+  AthenaScanLimitBytes:
+    '1':
+      Bytes: 1073741824
+    '5':
+      Bytes: 5368709120
+    '10':
+      Bytes: 10737418240
+    '20':
+      Bytes: 21474836480
+    '50':
+      Bytes: 53687091200
+    '100':
+      Bytes: 107374182400
+    '200':
+      Bytes: 214748364800
+    '500':
+      Bytes: 536870912000
+
+Resources:
+  # --- S3 buckets ---
+  RetentionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref RetentionBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: transition-to-infrequent-access
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 90
+              - StorageClass: GLACIER_IR
+                TransitionInDays: 365
+
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref AthenaResultsBucketName
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-query-results
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # --- Glue Data Catalog ---
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: FSx for ONTAP audit log long-term retention database (Parquet, partitioned by date)
+
+  # Schema-on-write table: Firehose's DataFormatConversionConfiguration reads
+  # this table's column definitions to build the Parquet schema. Partition
+  # columns use Partition Projection so no Glue Crawler is required to
+  # discover new year/month/day partitions (lower cost, no crawl lag).
+  GlueTable:
+    Type: AWS::Glue::Table
+    DependsOn: GlueDatabase
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabaseName
+      TableInput:
+        Name: !Ref GlueTableName
+        Description: FSx for ONTAP audit log records (Parquet, partitioned by year/month/day)
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          'projection.enabled': 'true'
+          'projection.year.type': 'integer'
+          'projection.year.range': '2025,2035'
+          'projection.month.type': 'integer'
+          'projection.month.range': '1,12'
+          'projection.month.digits': '2'
+          'projection.day.type': 'integer'
+          'projection.day.range': '1,31'
+          'projection.day.digits': '2'
+          'storage.location.template': !Sub 's3://${RetentionBucketName}/audit-logs/year=${!year}/month=${!month}/day=${!day}'
+        StorageDescriptor:
+          Location: !Sub 's3://${RetentionBucketName}/audit-logs/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            - Name: timestamp
+              Type: string
+            - Name: eventid
+              Type: string
+            - Name: svmname
+              Type: string
+            - Name: username
+              Type: string
+            - Name: clientip
+              Type: string
+            - Name: operation
+              Type: string
+            - Name: objectname
+              Type: string
+            - Name: result
+              Type: string
+        PartitionKeys:
+          - Name: year
+            Type: string
+          - Name: month
+            Type: string
+          - Name: day
+            Type: string
+
+  # --- IAM: Firehose delivery role ---
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-firehose-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref AWS::AccountId
+      Policies:
+        - PolicyName: S3Write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt RetentionBucket.Arn
+                  - !Sub '${RetentionBucket.Arn}/*'
+        - PolicyName: GlueSchemaRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${GlueTableName}'
+        - PolicyName: Logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/${AWS::StackName}*:*'
+
+  # --- Lake Formation: grant the Firehose role catalog access ---
+  # Required in Lake Formation-managed accounts even when the IAM policy
+  # above already allows glue:GetTable — Lake Formation permissions are
+  # evaluated in addition to (not instead of) IAM.
+  FirehoseLakeFormationDatabasePermission:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt FirehoseDeliveryRole.Arn
+      Resource:
+        Database:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabaseName
+      Permissions:
+        - DESCRIBE
+      PermissionsWithGrantOption: []
+
+  FirehoseLakeFormationTablePermission:
+    Type: AWS::LakeFormation::PrincipalPermissions
+    DependsOn: GlueTable
+    Properties:
+      Principal:
+        DataLakePrincipalIdentifier: !GetAtt FirehoseDeliveryRole.Arn
+      Resource:
+        Table:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabaseName
+          Name: !Ref GlueTableName
+      Permissions:
+        - DESCRIBE
+        - SELECT
+        - ALTER
+        - INSERT
+      PermissionsWithGrantOption: []
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${AWS::StackName}'
+      RetentionInDays: 30
+
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: S3Delivery
+
+  # --- Firehose Delivery Stream (JSON -> Parquet, partitioned by date) ---
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - FirehoseLakeFormationDatabasePermission
+      - FirehoseLakeFormationTablePermission
+    Properties:
+      DeliveryStreamName: !Sub '${AWS::StackName}-audit-logs'
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        BucketARN: !GetAtt RetentionBucket.Arn
+        Prefix: 'audit-logs/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        ErrorOutputPrefix: 'errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        BufferingHints:
+          SizeInMBs: !Ref BufferSizeMBs
+          IntervalInSeconds: !Ref BufferIntervalSeconds
+        CompressionFormat: UNCOMPRESSED
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: !Ref FirehoseLogStream
+        DataFormatConversionConfiguration:
+          Enabled: true
+          InputFormatConfiguration:
+            Deserializer:
+              OpenXJsonSerDe: {}
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe:
+                Compression: SNAPPY
+          SchemaConfiguration:
+            CatalogId: !Ref AWS::AccountId
+            DatabaseName: !Ref GlueDatabaseName
+            TableName: !Ref GlueTableName
+            Region: !Ref AWS::Region
+            RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+
+  # --- Athena workgroup ---
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref AthenaWorkgroupName
+      Description: !Sub 'FSx for ONTAP audit log lakehouse retention workgroup (${AthenaScanLimitGB} GB scan cap per query)'
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${AthenaResultsBucketName}/athena-results/'
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: !FindInMap [AthenaScanLimitBytes, !Ref AthenaScanLimitGB, Bytes]
+
+Outputs:
+  RetentionBucketName:
+    Value: !Ref RetentionBucket
+  AthenaResultsBucketName:
+    Value: !Ref AthenaResultsBucket
+  GlueDatabaseName:
+    Value: !Ref GlueDatabaseName
+  GlueTableName:
+    Value: !Ref GlueTableName
+  DeliveryStreamName:
+    Value: !Ref DeliveryStream
+  DeliveryStreamArn:
+    Value: !GetAtt DeliveryStream.Arn
+  AthenaWorkgroupName:
+    Value: !Ref AthenaWorkgroup
+  FirehoseDeliveryRoleArn:
+    Value: !GetAtt FirehoseDeliveryRole.Arn

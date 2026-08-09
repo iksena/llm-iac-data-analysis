@@ -1,0 +1,500 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Amazon S3 Find and Forget Deployment helper
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 900
+    Layers: !Ref CommonLayers
+
+Parameters:
+  ApiUrl:
+    Type: String
+  ArtefactName:
+    Type: String
+    Default: build/s3f2.zip
+  AthenaExecutionRole:
+    Type: String
+  CloudFrontDistribution:
+    Type: String
+  CodeBuildArtefactBucket:
+    Type: String
+  CognitoIdentityPoolId:
+    Type: String
+  CognitoUserPoolClientId:
+    Type: String
+  CognitoUserPoolId:
+    Type: String
+  CommonLayers:
+    Type: CommaDelimitedList
+  DeployWebUI:
+    Type: String
+  DeployCognito:
+    Type: String
+  ECRRepository:
+    Type: String
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues:
+    - CRITICAL
+    - FATAL
+    - ERROR
+    - WARNING
+    - INFO
+    - DEBUG
+    - NOTSET
+  PreBuiltArtefactsBucket:
+    Type: String
+  ResourcePrefix:
+    Type: String
+  Version:
+    Type: String
+  WebUIBucket:
+    Type: String
+
+Conditions:
+  WithoutCloudFront: !Equals [!Ref CloudFrontDistribution, "none"]
+  ShouldDeployWebUI: !Equals [!Ref DeployWebUI, "true"]
+
+Resources:
+  CodeBuildBackendServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - ecr:GetAuthorizationToken
+              - Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+              - Resource: !Sub arn:${AWS::Partition}:s3:::${CodeBuildArtefactBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:List*
+              - Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ECRRepository}
+                Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+
+  CodeBuildFrontendServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Statement:
+              - Resource: "*"
+                Effect: Allow
+                Action: logs:CreateLogGroup
+              - Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:*
+                Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+              - Resource: !Sub arn:${AWS::Partition}:s3:::${CodeBuildArtefactBucket}/*
+                Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:List*
+              - !If
+                - ShouldDeployWebUI
+                - Resource: !Sub arn:${AWS::Partition}:s3:::${WebUIBucket}/*
+                  Effect: Allow
+                  Action: s3:PutObject*
+                - !Ref AWS::NoValue
+              - !If
+                - WithoutCloudFront
+                - !Ref AWS::NoValue
+                - Resource: !Sub arn:${AWS::Partition}:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+                  Effect: Allow
+                  Action: cloudfront:CreateInvalidation
+
+  CodeBuildBackend:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - aws ecr get-login-password | docker login --username AWS --password-stdin "$IMAGE_URI"
+            build:
+              commands:
+                - docker build --tag "$IMAGE_URI" -f backend/ecs_tasks/delete_files/Dockerfile .
+            post_build:
+              commands:
+                - docker push "$IMAGE_URI"
+      EncryptionKey: alias/aws/s3
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: IMAGE_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${ECRRepository}
+      Name: !Sub ${ResourcePrefix}BackendBuild
+      ServiceRole: !Ref CodeBuildBackendServiceRole
+
+  CodeBuildFrontend:
+    Type: AWS::CodeBuild::Project
+    Condition: ShouldDeployWebUI
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - BUCKET="${WEB_UI_BUCKET}"
+                - echo "${WEB_SETTINGS}" > frontend/build/settings.js
+            build:
+              commands:
+                - cd frontend/build
+                - aws s3 cp . s3://$BUCKET --recursive
+            post_build:
+              commands:
+                - |
+                  if [ "${CLOUDFRONT_DISTRIBUTION}" = "none" ]; then
+                    echo "Skipping CloudFront invalidation"
+                  else
+                    aws cloudfront create-invalidation --distribution-id $CLOUDFRONT_DISTRIBUTION --paths "/*"
+                  fi
+      EncryptionKey: alias/aws/s3
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: CLOUDFRONT_DISTRIBUTION
+            Value: !Ref CloudFrontDistribution
+          - Name: WEB_SETTINGS
+            Value:  !Sub |
+              window.s3f2Settings = {
+                apiUrl: "${ApiUrl}",
+                athenaExecutionRole: "${AthenaExecutionRole}",
+                cognitoIdentityPool: "${CognitoIdentityPoolId}",
+                cognitoUserPoolId: "${CognitoUserPoolId}",
+                cognitoUserPoolClientId: "${CognitoUserPoolClientId}",
+                region: "${AWS::Region}",
+                version: "${Version}"
+              };
+          - Name: WEB_UI_BUCKET
+            Value: !Ref WebUIBucket
+      Name: !Sub ${ResourcePrefix}FrontendBuild
+      ServiceRole: !Ref CodeBuildFrontendServiceRole
+
+  CodePipelineServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: /
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Resource: "*"
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:RegisterTaskDefinition
+                  - ecs:UpdateService
+              - Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/${CodeBuildBackend}
+                Action:
+                  - codebuild:BatchGetBuilds
+                  - codebuild:StartBuild
+              - !If
+                - ShouldDeployWebUI
+                - Effect: Allow
+                  Resource:
+                    - !Sub arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/${CodeBuildFrontend}
+                  Action:
+                    - codebuild:BatchGetBuilds
+                    - codebuild:StartBuild
+                - !Ref AWS::NoValue
+              - Effect: Allow
+                Resource: !Sub arn:${AWS::Partition}:s3:::${CodeBuildArtefactBucket}
+                Action:
+                  - s3:GetBucket*
+                  - s3:List*
+              - Effect: Allow
+                Resource: !Sub arn:${AWS::Partition}:s3:::${CodeBuildArtefactBucket}/*
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineServiceRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref CodeBuildArtefactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: App
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Version: "1"
+                Provider: S3
+              Configuration:
+                S3Bucket: !Ref CodeBuildArtefactBucket
+                S3ObjectKey: !Ref ArtefactName
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: S3F2
+              RunOrder: 1
+        - !If
+          - ShouldDeployWebUI
+          - Name: Frontend
+            Actions:
+              - Name: Build
+                ActionTypeId:
+                  Category: Build
+                  Owner: AWS
+                  Version: "1"
+                  Provider: CodeBuild
+                Configuration:
+                  ProjectName: !Ref CodeBuildFrontend
+                InputArtifacts:
+                  - Name: S3F2
+                OutputArtifacts:
+                  - Name: BuildFrontendOutput
+                RunOrder: 1
+          - !Ref AWS::NoValue
+        - Name: Backend
+          Actions:
+            - Name: Build
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Version: "1"
+                Provider: CodeBuild
+              Configuration:
+                ProjectName: !Ref CodeBuildBackend
+              InputArtifacts:
+                - Name: S3F2
+              OutputArtifacts:
+                - Name: BuildBackendOutput
+              RunOrder: 2
+
+  CopyBuildArtefactFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: copy_build_artefact.handler
+      CodeUri: ../backend/lambdas/custom_resources/
+      Description: Custom Lambda resource for the Amazon S3 Find and Forget Cloudformation Stack
+      Policies:
+        - Statement:
+          - Effect: Allow
+            Action: s3:PutObject*
+            Resource: !Sub arn:${AWS::Partition}:s3:::${CodeBuildArtefactBucket}/*
+          - Effect: Allow
+            Action: s3:GetObject
+            Resource: !Sub arn:${AWS::Partition}:s3:::${PreBuiltArtefactsBucket}/*
+
+  CleanupBucketFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: cleanup_bucket.handler
+      CodeUri: ../backend/lambdas/custom_resources/
+      Description: Custom Lambda resource for the Amazon S3 Find and Forget Cloudformation Stack
+      Policies:
+        - Statement:
+          - Effect: Allow
+            Action:
+              - s3:DeleteObject*
+              - s3:GetBucketVersioning
+              - s3:ListBucket*
+              - s3:ListObject*
+            Resource:
+              - !Sub arn:${AWS::Partition}:s3:::${CodeBuildArtefactBucket}
+              - !Sub arn:${AWS::Partition}:s3:::${CodeBuildArtefactBucket}/*
+              - !Sub arn:${AWS::Partition}:s3:::${WebUIBucket}
+              - !Sub arn:${AWS::Partition}:s3:::${WebUIBucket}/*
+
+  CleanupRepositoryFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: cleanup_repository.handler
+      CodeUri: ../backend/lambdas/custom_resources/
+      Description: Custom Lambda resource for the Amazon S3 Find and Forget Cloudformation Stack
+      Policies:
+        - Statement:
+          - Effect: Allow
+            Action:
+              - ecr:BatchDeleteImage
+              - ecr:ListImages
+            Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ECRRepository}
+
+  WaitForContainerBuildFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: wait_container_build.handler
+      CodeUri: ../backend/lambdas/custom_resources/
+      Description: Custom Lambda resource for the Amazon S3 Find and Forget Cloudformation Stack
+      Policies:
+        - Statement:
+          - Effect: Allow
+            Action:
+              - lambda:AddPermission
+              - lambda:RemovePermission
+              - events:PutRule
+              - events:DeleteRule
+              - events:PutTargets
+              - events:RemoveTargets
+            Resource: "*"
+          - Effect: Allow
+            Action: s3:GetObject*
+            Resource: !Sub "arn:${AWS::Partition}:s3:::${CodeBuildArtefactBucket}/*"
+          - Effect: Allow
+            Action: ecr:DescribeImages
+            Resource: !Sub arn:${AWS::Partition}:ecr:${AWS::Region}:${AWS::AccountId}:repository/${ECRRepository}
+
+  RedeployApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: redeploy_apigw.handler
+      CodeUri: ../backend/lambdas/custom_resources/
+      Description: Custom Lambda resource for the Amazon S3 Find and Forget Cloudformation Stack
+      Policies:
+        - Statement:
+          - Effect: Allow
+            Action:
+              - apigateway:POST
+            Resource:
+              - !Sub
+                - arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${ApiId}/deployments
+                - ApiId: !Select [0, !Split [".", !Select [2, !Split ["/", !Ref ApiUrl]]]]
+
+  RerunPipelineFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: rerun_pipeline.handler
+      CodeUri: ../backend/lambdas/custom_resources/
+      Description: Custom Lambda resource for the Amazon S3 Find and Forget Cloudformation Stack
+      Policies:
+        - Statement:
+          - Effect: Allow
+            Action:
+              - codepipeline:StartPipelineExecution
+            Resource:
+              - !Sub arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${CodePipeline}
+
+  CleanupCodeBuildArtefactBucket:
+    Type: Custom::Setup
+    Properties:
+      ServiceToken: !GetAtt CleanupBucketFunction.Arn
+      LogLevel: !Ref LogLevel
+      Bucket: !Ref CodeBuildArtefactBucket
+
+  CleanupWebUIBucket:
+    Type: Custom::Setup
+    Properties:
+      ServiceToken: !GetAtt CleanupBucketFunction.Arn
+      LogLevel: !Ref LogLevel
+      Bucket: !Ref WebUIBucket
+      DeployWebUI: !Ref DeployWebUI
+
+  CleanupECRRepository:
+    Type: Custom::Setup
+    Properties:
+      ServiceToken: !GetAtt CleanupRepositoryFunction.Arn
+      LogLevel: !Ref LogLevel
+      Repository: !Ref ECRRepository
+
+  CopyBuildArtefact:
+    Type: Custom::Setup
+    DependsOn: CodePipeline
+    Properties:
+      ServiceToken: !GetAtt CopyBuildArtefactFunction.Arn
+      ArtefactName: !Ref ArtefactName
+      CodeBuildArtefactBucket: !Ref CodeBuildArtefactBucket
+      CodeBuildArtefactBucketArn: !Sub arn:${AWS::Partition}:s3:::${CodeBuildArtefactBucket}
+      LogLevel: !Ref LogLevel
+      Region: !Ref AWS::Region
+      PreBuiltArtefactsBucket: !Ref PreBuiltArtefactsBucket
+      Version: !Ref Version
+
+  WaitForContainerBuild:
+    Type: Custom::Setup
+    DependsOn: RerunPipeline
+    Properties:
+      ServiceToken: !GetAtt WaitForContainerBuildFunction.Arn
+      ArtefactName: !Ref ArtefactName
+      CodeBuildArtefactBucket: !Ref CodeBuildArtefactBucket
+      ECRRepository: !Ref ECRRepository
+      LogLevel: !Ref LogLevel
+      Version: !Ref Version
+
+  RedeployApi:
+    Type: Custom::Setup
+    Properties:
+      ServiceToken: !GetAtt RedeployApiFunction.Arn
+      LogLevel: !Ref LogLevel
+      ApiId: !Select [0, !Split [".", !Select [2, !Split ["/", !Ref ApiUrl]]]]
+      ApiStage: !Select [3, !Split ["/", !Ref ApiUrl]]
+      DeployCognito: !Ref DeployCognito
+
+  RerunPipeline:
+    Type: Custom::Setup
+    DependsOn: CopyBuildArtefact
+    Properties:
+      ServiceToken: !GetAtt RerunPipelineFunction.Arn
+      LogLevel: !Ref LogLevel
+      PipelineName: !Ref CodePipeline
+      DeployWebUI: !Ref DeployWebUI
+      Version: !Ref Version

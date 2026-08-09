@@ -1,0 +1,469 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Static infrastructure for TICF Query results
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  Environment:
+    Description: The environment type
+    Type: String
+    AllowedValues:
+      - dev
+      - build
+      - staging
+      - integration
+      - production
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
+  LockCrossAccountPermissionsToLambdaRoles:
+    !Not [!Equals [!Ref Environment, dev]]
+  NotTestEnvironment:
+    !Or [
+      !Equals [!Ref Environment, production],
+      !Equals [!Ref Environment, integration]
+    ]
+  TestEnvironment: !Not [Condition: NotTestEnvironment]
+
+Resources:
+  QueryResultsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      BucketName: !Sub ${AWS::StackName}-${Environment}-query-results-bucket
+      LifecycleConfiguration:
+        Rules:
+          - Id: AnalysisCleanupRule
+            Status: Enabled
+            ExpirationInDays: 30
+      LoggingConfiguration:
+        DestinationBucketName: '{{resolve:ssm:S3LogsBucketName}}'
+        LogFilePrefix: !Sub ${AWS::StackName}-${Environment}-query-results-bucket/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  SecureFraudSiteDataTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub ${AWS::StackName}-secure-fraud-site-data
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: !If [NotTestEnvironment, false, true]
+      AttributeDefinitions:
+        - AttributeName: downloadHash
+          AttributeType: S
+        - AttributeName: zendeskId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: downloadHash
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: zendeskIdAndDownloadHashIndex
+          KeySchema:
+            - AttributeName: zendeskId
+              KeyType: HASH
+          Projection:
+            ProjectionType: 'KEYS_ONLY'
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: '{{resolve:ssm:DatabaseKmsKeyArn}}'
+      Tags:
+        - Key: BackupFrequency
+          Value: Bihourly
+      DeletionProtectionEnabled: true
+
+  # Need a separate KMS key here for the audit queue because we need to grant access to the event processing account
+  # and our main KMS key definitions are in 'core', which is a shared set of definitions across all stacks.
+  AuditDataRequestEventsQueueKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable Root access
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - kms:*
+            Resource: '*'
+          - Sid: Enable Decrypt access for Event Processing
+            Effect: Allow
+            Principal:
+              AWS: !Sub '{{resolve:ssm:EventProcessingAccountRootArn}}'
+            Action:
+              - kms:Decrypt
+            Resource: '*'
+          - Sid: Allow AWS Lambda access
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Encrypt
+              - kms:Decrypt
+            Resource: '*'
+
+  AuditDataRequestEventsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      # We've been asked to use a message retention period of 14 days in production to allow ample time for integration
+      # Elswhere, to save wasted queue entries, we use two hours
+      MessageRetentionPeriod: !If [IsProduction, 1209600, 7200]
+      QueueName: !Sub ${AWS::StackName}-${Environment}-audit-data-request-events-queue
+      KmsMasterKeyId: !GetAtt AuditDataRequestEventsQueueKmsKey.Arn
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt AuditDataRequestEventsDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  AuditDataRequestEventsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-${Environment}-audit-data-request-events-dlq
+      KmsMasterKeyId: !GetAtt AuditDataRequestEventsQueueKmsKey.Arn
+
+  AuditDataRequestQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref AuditDataRequestEventsQueue
+      PolicyDocument:
+        Statement:
+          - Sid: AllowEventProcessingAccountQueueRead
+            Action:
+              - 'sqs:ChangeMessageVisibility'
+              - 'sqs:DeleteMessage'
+              - 'sqs:GetQueueAttributes'
+              - 'sqs:ReceiveMessage'
+            Effect: 'Allow'
+            Resource: !GetAtt AuditDataRequestEventsQueue.Arn
+            Principal:
+              AWS:
+                - '{{resolve:ssm:EventProcessingAccountRootArn}}'
+
+  # Need a separate KMS key here for the close zendesk queue because we need to grant access to the audit account
+  # and our main KMS key definitions are in 'core', which is a shared set of definitions across all stacks.
+  CloseZendeskTicketQueueKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable Root access
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - kms:*
+            Resource: '*'
+          - !If
+            - LockCrossAccountPermissionsToLambdaRoles
+            # If we are in a non-dev environment so know the lambda role name
+            - Sid: Enable Decrypt access for Audit account close ticket lambda
+              Effect: Allow
+              Principal:
+                AWS: '{{resolve:ssm:AuditAccountRootArn}}'
+              Action:
+                - kms:Decrypt
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  'aws:principalArn': !Sub 'arn:aws:iam::{{resolve:ssm:AuditAccountNumber}}:role/txma-ticf-integration-${Environment}-close-zendesk-ticket-role'
+            # Otherwise allow anything in the dev audit root account
+            - Sid: Enable Decrypt access for Audit dev account
+              Effect: Allow
+              Principal:
+                AWS: '{{resolve:ssm:AuditAccountRootArn}}'
+              Action:
+                - kms:Decrypt
+              Resource: '*'
+          - Sid: Allow AWS Lambda access
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Encrypt
+              - kms:Decrypt
+            Resource: '*'
+
+  CloseZendeskTicketQueueKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}/${Environment}/close-zendesk-ticket-queue-kms-key
+      TargetKeyId: !Ref CloseZendeskTicketQueueKmsKey
+
+  CloseZendeskTicketQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-${Environment}-close-zendesk-ticket-queue
+      KmsMasterKeyId: !GetAtt CloseZendeskTicketQueueKmsKey.Arn
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt CloseZendeskTicketDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  CloseZendeskTicketQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref CloseZendeskTicketQueue
+      PolicyDocument:
+        Statement:
+          - !If
+            - LockCrossAccountPermissionsToLambdaRoles
+            # If we are in a non-dev environment so know the lambda role name
+            - Sid: AllowAuditAccountCloseTicketQueueReadForLambdaRole
+              Action:
+                - 'sqs:ChangeMessageVisibility'
+                - 'sqs:DeleteMessage'
+                - 'sqs:GetQueueAttributes'
+                - 'sqs:ReceiveMessage'
+              Effect: 'Allow'
+              Resource: !GetAtt CloseZendeskTicketQueue.Arn
+              Principal:
+                AWS: '{{resolve:ssm:AuditAccountRootArn}}'
+              Condition:
+                StringEquals:
+                  'aws:principalArn': !Sub 'arn:aws:iam::{{resolve:ssm:AuditAccountNumber}}:role/txma-ticf-integration-${Environment}-close-zendesk-ticket-role'
+            # Otherwise allow anything in the dev audit root account
+            - Sid: AllowResultsDeliveryQueueReadForAuditAccount
+              Action:
+                - 'sqs:ChangeMessageVisibility'
+                - 'sqs:DeleteMessage'
+                - 'sqs:GetQueueAttributes'
+                - 'sqs:ReceiveMessage'
+              Effect: 'Allow'
+              Resource: !GetAtt CloseZendeskTicketQueue.Arn
+              Principal:
+                AWS: '{{resolve:ssm:AuditAccountRootArn}}'
+
+  CloseZendeskTicketDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-${Environment}-close-zendesk-ticket-dlq
+      KmsMasterKeyId: !GetAtt CloseZendeskTicketQueueKmsKey.Arn
+
+  # Query results integration test resources
+  # Writing test data to athena bucket in audit account
+  # Need a separate KMS key here for the integration tests trigger queue because we need to grant access to the audit account
+  # and our main KMS key definitions are in 'core', which is a shared set of definitions across all stacks.
+  WriteTestDataToAthenaBucketQueueKmsKey:
+    Condition: TestEnvironment
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable Root access
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action:
+              - kms:*
+            Resource: '*'
+          - !If
+            - LockCrossAccountPermissionsToLambdaRoles
+            # If we are in a non-dev environment so know the lambda role name
+            - Sid: Enable Decrypt access for Audit account write test data to athena bucket lambda
+              Effect: Allow
+              Principal:
+                AWS: '{{resolve:ssm:AuditAccountRootArn}}'
+              Action:
+                - kms:Decrypt
+              Resource: '*'
+              Condition:
+                StringEquals:
+                  'aws:principalArn': !Sub 'arn:aws:iam::{{resolve:ssm:AuditAccountNumber}}:role/txma-audit-test-tools-${Environment}-write-test-data-to-athena-bucket'
+            # Otherwise allow anything in the dev audit root account
+            - Sid: Enable Decrypt access for Audit dev account
+              Effect: Allow
+              Principal:
+                AWS: '{{resolve:ssm:AuditAccountRootArn}}'
+              Action:
+                - kms:Decrypt
+              Resource: '*'
+          - Sid: Allow AWS Lambda access
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Encrypt
+              - kms:Decrypt
+            Resource: '*'
+
+  WriteTestDataToAthenaBucketQueueKmsKeyAlias:
+    Condition: TestEnvironment
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${AWS::StackName}/${Environment}/write-test-data-to-athena-bucket-queue-kms-key
+      TargetKeyId: !Ref WriteTestDataToAthenaBucketQueueKmsKey
+
+  WriteTestDataToAthenaBucketQueue:
+    Condition: TestEnvironment
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-${Environment}-write-test-data-to-athena-bucket-queue
+      KmsMasterKeyId: !GetAtt WriteTestDataToAthenaBucketQueueKmsKey.Arn
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt WriteTestDataToAthenaBucketDeadLetterQueue.Arn
+        maxReceiveCount: 5
+
+  WriteTestDataToAthenaBucketQueuePolicy:
+    Condition: TestEnvironment
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref WriteTestDataToAthenaBucketQueue
+      PolicyDocument:
+        Statement:
+          - !If
+            - LockCrossAccountPermissionsToLambdaRoles
+            # If we are in a non-dev environment so know the lambda role name
+            - Sid: AllowWriteTestDataToAthenaBucketQueueReadForLambdaRole
+              Action:
+                - 'sqs:ChangeMessageVisibility'
+                - 'sqs:DeleteMessage'
+                - 'sqs:GetQueueAttributes'
+                - 'sqs:ReceiveMessage'
+              Effect: 'Allow'
+              Resource: !GetAtt WriteTestDataToAthenaBucketQueue.Arn
+              Principal:
+                AWS: '{{resolve:ssm:AuditAccountRootArn}}'
+              Condition:
+                StringEquals:
+                  'aws:principalArn': !Sub 'arn:aws:iam::{{resolve:ssm:AuditAccountNumber}}:role/txma-audit-test-tools-${Environment}-write-test-data-to-athena-bucket'
+            # Otherwise allow anything in the dev audit root account
+            - Sid: AllowWriteTestDataToAthenaBucketQueueReadForAuditAccount
+              Action:
+                - 'sqs:ChangeMessageVisibility'
+                - 'sqs:DeleteMessage'
+                - 'sqs:GetQueueAttributes'
+                - 'sqs:ReceiveMessage'
+              Effect: 'Allow'
+              Resource: !GetAtt WriteTestDataToAthenaBucketQueue.Arn
+              Principal:
+                AWS: '{{resolve:ssm:AuditAccountRootArn}}'
+
+  WriteTestDataToAthenaBucketDeadLetterQueue:
+    Condition: TestEnvironment
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-${Environment}-write-test-data-to-athena-bucket-dlq
+      KmsMasterKeyId: !GetAtt WriteTestDataToAthenaBucketQueueKmsKey.Arn
+
+  QueryResultsBucketArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: QueryResultsBucketArn
+      Type: String
+      Value: !GetAtt QueryResultsBucket.Arn
+
+  QueryResultsBucketNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: QueryResultsBucketName
+      Type: String
+      Value: !Ref QueryResultsBucket
+
+  SecureFraudSiteDataTableArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: SecureFraudSiteDataTableArn
+      Type: String
+      Value: !GetAtt SecureFraudSiteDataTable.Arn
+
+  SecureFraudSiteDataTableNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: SecureFraudSiteDataTableName
+      Type: String
+      Value: !Ref SecureFraudSiteDataTable
+
+  AuditDataRequestEventsQueueArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: AuditDataRequestEventsQueueArn
+      Type: String
+      Value: !GetAtt AuditDataRequestEventsQueue.Arn
+
+  AuditDataRequestEventsQueueUrlParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: AuditDataRequestEventsQueueUrl
+      Type: String
+      Value: !Ref AuditDataRequestEventsQueue
+
+  AuditDataRequestEventsQueueKmsKeyArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: AuditDataRequestEventsQueueKmsKeyArn
+      Type: String
+      Value: !GetAtt AuditDataRequestEventsQueueKmsKey.Arn
+
+  CloseZendeskTicketQueueArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: CloseZendeskTicketQueueArn
+      Type: String
+      Value: !GetAtt CloseZendeskTicketQueue.Arn
+
+  CloseZendeskTicketQueueUrlParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: CloseZendeskTicketQueueUrl
+      Type: String
+      Value: !Ref CloseZendeskTicketQueue
+
+  CloseZendeskTicketQueueKmsKeyArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: CloseZendeskTicketQueueKmsKeyArn
+      Type: String
+      Value: !GetAtt CloseZendeskTicketQueueKmsKey.Arn
+
+  WriteTestDataToAthenaBucketQueueArnParameter:
+    Condition: TestEnvironment
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /tests/WriteTestDataToAthenaBucketQueueArn
+      Type: String
+      Value: !GetAtt WriteTestDataToAthenaBucketQueue.Arn
+
+  WriteTestDataToAthenaBucketQueueUrlParameter:
+    Condition: TestEnvironment
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /tests/WriteTestDataToAthenaBucketQueueUrl
+      Type: String
+      Value: !Ref WriteTestDataToAthenaBucketQueue
+
+  WriteTestDataToAthenaBucketQueueKmsKeyArnParameter:
+    Condition: TestEnvironment
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /tests/WriteTestDataToAthenaBucketQueueKmsKeyArn
+      Type: String
+      Value: !GetAtt WriteTestDataToAthenaBucketQueueKmsKey.Arn
+
+Outputs:
+  QueryResultsBucketName:
+    Value: !Ref QueryResultsBucket
+    Export:
+      Name: QueryResultsBucketName

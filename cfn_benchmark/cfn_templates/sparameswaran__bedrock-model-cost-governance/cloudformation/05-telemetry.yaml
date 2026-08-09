@@ -1,0 +1,474 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Bedrock Governance Telemetry — ECS Fargate OpenTelemetry Collector with ALB,
+  exporting Claude Code telemetry to CloudWatch Metrics and S3 for analytics.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: "{{TELEMETRY_VPC_ID}}"
+    Description: VPC for the OTel collector (must have internet access for CloudWatch)
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Default: "{{TELEMETRY_SUBNET_IDS}}"
+    Description: Subnets for ALB and Fargate tasks (at least 2 AZs)
+  TelemetryBucket:
+    Type: String
+    Default: "{{TELEMETRY_BUCKET}}"
+    Description: S3 bucket for raw telemetry export (long-term analytics)
+  AssignPublicIp:
+    Type: String
+    Default: "{{TELEMETRY_PUBLIC_IP}}"
+    AllowedValues: ["ENABLED", "DISABLED"]
+    Description: >
+      ENABLED for public subnets (no NAT needed).
+      DISABLED for private subnets (requires NAT gateway for CloudWatch/S3 access).
+  CollectorImage:
+    Type: String
+    Default: "public.ecr.aws/aws-observability/aws-otel-collector:latest"
+    Description: AWS OTel Collector container image
+
+Resources:
+
+  # ─────────────────────────────────────────────────────────
+  # S3 Bucket for raw telemetry
+  # ─────────────────────────────────────────────────────────
+  TelemetryBucketResource:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref TelemetryBucket
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+          - Id: ExpireOldTelemetry
+            Status: Enabled
+            ExpirationInDays: 180
+
+  # ─────────────────────────────────────────────────────────
+  # Security Groups
+  # ─────────────────────────────────────────────────────────
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB for OTel Collector - accepts OTLP traffic
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/8
+          Description: HTTPS from internal networks
+        - IpProtocol: tcp
+          FromPort: 4318
+          ToPort: 4318
+          CidrIp: 10.0.0.0/8
+          Description: OTLP/HTTP from developer machines
+
+  CollectorSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: OTel Collector ECS tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 4317
+          ToPort: 4317
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: OTLP/gRPC from ALB
+        - IpProtocol: tcp
+          FromPort: 4318
+          ToPort: 4318
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: OTLP/HTTP from ALB
+        - IpProtocol: tcp
+          FromPort: 13133
+          ToPort: 13133
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: Health check
+
+  # ─────────────────────────────────────────────────────────
+  # Application Load Balancer
+  # ─────────────────────────────────────────────────────────
+  CollectorAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: otel-collector-alb
+      Scheme: internal
+      Type: application
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Subnets: !Ref SubnetIds
+
+  OtlpTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: otel-otlp-http
+      Port: 4318
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckPort: "13133"
+      HealthCheckProtocol: HTTP
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  OtlpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref CollectorAlb
+      Port: 4318
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref OtlpTargetGroup
+
+  # ─────────────────────────────────────────────────────────
+  # ECS Cluster & Task Definition
+  # ─────────────────────────────────────────────────────────
+  CollectorCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: bedrock-governance-telemetry
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  CollectorTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: bedrock-otel-collector-task
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchMetricsExport
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                Resource: "*"
+        - PolicyName: S3TelemetryExport
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                Resource:
+                  - !Sub "arn:aws:s3:::${TelemetryBucket}"
+                  - !Sub "arn:aws:s3:::${TelemetryBucket}/*"
+
+  CollectorExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: bedrock-otel-collector-execution
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  CollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/bedrock-otel-collector
+      RetentionInDays: 14
+
+  CollectorTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: bedrock-otel-collector
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "512"
+      Memory: "1024"
+      TaskRoleArn: !GetAtt CollectorTaskRole.Arn
+      ExecutionRoleArn: !GetAtt CollectorExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: otel-collector
+          Image: !Ref CollectorImage
+          Essential: true
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref "AWS::Region"
+            - Name: TELEMETRY_BUCKET
+              Value: !Ref TelemetryBucket
+            - Name: AOT_CONFIG_CONTENT
+              Value: !Sub |
+                receivers:
+                  otlp:
+                    protocols:
+                      grpc:
+                        endpoint: 0.0.0.0:4317
+                      http:
+                        endpoint: 0.0.0.0:4318
+                processors:
+                  batch:
+                    timeout: 10s
+                    send_batch_size: 512
+                  resource:
+                    attributes:
+                      - key: service.name
+                        value: claude-code
+                        action: upsert
+                extensions:
+                  health_check:
+                    endpoint: 0.0.0.0:13133
+                exporters:
+                  awsemf:
+                    namespace: ClaudeCode
+                    region: ${AWS::Region}
+                    log_group_name: /claude-code/telemetry
+                    log_stream_name: metrics
+                    dimension_rollup_option: NoDimensionRollup
+                    metric_declarations:
+                      - dimensions: [["user.email"], ["user.team"], ["Model"]]
+                        metric_name_selectors:
+                          - "InputTokens"
+                          - "OutputTokens"
+                          - "CacheReadTokens"
+                          - "EstimatedCost"
+                      - dimensions: [["user.email"], ["user.team"]]
+                        metric_name_selectors:
+                          - "FileEdits"
+                          - "CodeSearches"
+                          - "LinesAdded"
+                          - "LinesDeleted"
+                          - "ActiveUsers"
+                          - "SessionDuration"
+                          - "ToolCalls"
+                service:
+                  extensions: [health_check]
+                  pipelines:
+                    metrics:
+                      receivers: [otlp]
+                      processors: [resource, batch]
+                      exporters: [awsemf]
+          PortMappings:
+            - ContainerPort: 4317
+              Protocol: tcp
+            - ContainerPort: 4318
+              Protocol: tcp
+            - ContainerPort: 13133
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CollectorLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: collector
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "wget -qO- http://localhost:13133/ || exit 1"
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+
+  # ─────────────────────────────────────────────────────────
+  # ECS Service
+  # ─────────────────────────────────────────────────────────
+  CollectorService:
+    Type: AWS::ECS::Service
+    DependsOn: OtlpListener
+    Properties:
+      ServiceName: otel-collector
+      Cluster: !Ref CollectorCluster
+      TaskDefinition: !Ref CollectorTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 2
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !Ref AssignPublicIp
+          SecurityGroups:
+            - !Ref CollectorSecurityGroup
+          Subnets: !Ref SubnetIds
+      LoadBalancers:
+        - ContainerName: otel-collector
+          ContainerPort: 4318
+          TargetGroupArn: !Ref OtlpTargetGroup
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+
+  # ─────────────────────────────────────────────────────────
+  # CloudWatch Logs → S3 via Data Firehose (long-term analytics)
+  # ─────────────────────────────────────────────────────────
+  TelemetryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /claude-code/telemetry
+      RetentionInDays: 30
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: bedrock-telemetry-firehose
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Write
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${TelemetryBucket}"
+                  - !Sub "arn:aws:s3:::${TelemetryBucket}/*"
+
+  TelemetryFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: bedrock-telemetry-to-s3
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt TelemetryBucketResource.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: "raw/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/"
+        ErrorOutputPrefix: "errors/"
+        BufferingHints:
+          IntervalInSeconds: 300
+          SizeInMBs: 5
+        CompressionFormat: GZIP
+
+  LogsToFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: bedrock-telemetry-logs-to-firehose
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehosePut
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !GetAtt TelemetryFirehose.Arn
+
+  TelemetrySubscription:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn: TelemetryLogGroup
+    Properties:
+      LogGroupName: /claude-code/telemetry
+      FilterPattern: ""
+      DestinationArn: !GetAtt TelemetryFirehose.Arn
+      RoleArn: !GetAtt LogsToFirehoseRole.Arn
+
+  # ─────────────────────────────────────────────────────────
+  # CloudWatch Dashboard — Developer Telemetry
+  # ─────────────────────────────────────────────────────────
+  TelemetryDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: bedrock-claude-code-telemetry
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Active Claude Code Users (hourly)",
+                "metrics": [
+                  ["ClaudeCode", "ActiveUsers", {"stat": "Sum", "period": 3600}]
+                ],
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Token Consumption (input/output/cache)",
+                "metrics": [
+                  ["ClaudeCode", "InputTokens", {"stat": "Sum", "period": 300}],
+                  ["ClaudeCode", "OutputTokens", {"stat": "Sum", "period": 300}],
+                  ["ClaudeCode", "CacheReadTokens", {"stat": "Sum", "period": 300}]
+                ],
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Code Operations (edits, searches, docs)",
+                "metrics": [
+                  ["ClaudeCode", "FileEdits", {"stat": "Sum", "period": 300}],
+                  ["ClaudeCode", "CodeSearches", {"stat": "Sum", "period": 300}],
+                  ["ClaudeCode", "LinesAdded", {"stat": "Sum", "period": 300}],
+                  ["ClaudeCode", "LinesDeleted", {"stat": "Sum", "period": 300}]
+                ],
+                "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Estimated Hourly Cost by Model",
+                "metrics": [
+                  ["ClaudeCode", "EstimatedCost", "Model", "sonnet", {"stat": "Sum", "period": 3600}],
+                  ["ClaudeCode", "EstimatedCost", "Model", "haiku", {"stat": "Sum", "period": 3600}],
+                  ["ClaudeCode", "EstimatedCost", "Model", "opus", {"stat": "Sum", "period": 3600}]
+                ],
+                "region": "${AWS::Region}"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  CollectorEndpoint:
+    Description: OTLP/HTTP endpoint for Claude Code telemetry configuration
+    Value: !Sub "http://${CollectorAlb.DNSName}:4318"
+    Export:
+      Name: bedrock-governance-otel-endpoint
+
+  TelemetryDashboardUrl:
+    Description: CloudWatch dashboard URL for Claude Code telemetry
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=bedrock-claude-code-telemetry"
+
+  TelemetryBucketArn:
+    Description: S3 bucket for raw telemetry export
+    Value: !GetAtt TelemetryBucketResource.Arn

@@ -1,0 +1,301 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AirportHub Database - DocumentDB regional cluster, global cluster, Secrets Manager'
+
+Parameters:
+  StackPrefix:
+    Type: String
+    Description: Prefix for all resource names
+
+  IsPrimaryRegion:
+    Type: String
+    AllowedValues: ['true', 'false']
+    Description: Whether this is the primary region
+
+  GlobalClusterIdentifier:
+    Type: String
+    Default: ''
+    Description: Global cluster ID (empty on primary = create new, populated on secondary = join)
+
+  PrivateSubnet1Id:
+    Type: String
+    Description: Private subnet AZ-1
+
+  PrivateSubnet2Id:
+    Type: String
+    Description: Private subnet AZ-2
+
+  DocDbSecurityGroupId:
+    Type: String
+    Description: Security group for DocumentDB
+
+  SecondaryRegion:
+    Type: String
+    Default: ''
+    Description: Secondary region for secret replication (primary only)
+
+  InstanceClass:
+    Type: String
+    Default: 'db.r5.large'
+    Description: DocumentDB instance class
+
+Conditions:
+  IsPrimary: !Equals [!Ref IsPrimaryRegion, 'true']
+  IsSecondary: !Not [Condition: IsPrimary]
+
+Resources:
+
+  # ============================================================
+  # Subnet Group - places DocumentDB instances in private subnets
+  # ============================================================
+  SubnetGroup:
+    Type: AWS::DocDB::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub '${StackPrefix} DocumentDB subnet group'
+      DBSubnetGroupName: !Sub '${StackPrefix}-docdb-subnets'
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # Secrets Manager - stores DocumentDB credentials
+  # Primary creates the secret and replicates to secondary region.
+  # Secondary references the replica (same name, auto-replicated).
+  # ============================================================
+  DocDBSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: IsPrimary
+    Properties:
+      Name: !Sub '${StackPrefix}/docdb/credentials'
+      Description: !Sub '${StackPrefix} DocumentDB credentials'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "docdbadmin", "engine": "docdb", "port": 27017, "dbname": "airports"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '/@"''\'''
+      ReplicaRegions:
+        - Region: !Ref SecondaryRegion
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # Global Cluster - created in primary region only
+  # Engine docdb 5.0.0, encryption at rest enabled
+  # ============================================================
+  GlobalCluster:
+    Type: AWS::DocDB::GlobalCluster
+    Condition: IsPrimary
+    Properties:
+      GlobalClusterIdentifier: !Sub '${StackPrefix}-global-cluster'
+      Engine: docdb
+      EngineVersion: '5.0.0'
+      StorageEncrypted: true
+      DeletionProtection: false
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # Regional Cluster
+  # Primary: references GlobalCluster, uses secret for credentials
+  # Secondary: joins global cluster as a replica
+  # ============================================================
+  SecondaryKmsKey:
+    Type: AWS::KMS::Key
+    Condition: IsSecondary
+    Properties:
+      Description: !Sub '${StackPrefix} DocumentDB encryption key (secondary region)'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  RegionalCluster:
+    Type: AWS::DocDB::DBCluster
+    DependsOn:
+      - SubnetGroup
+    Properties:
+      DBClusterIdentifier: !Sub '${StackPrefix}-${AWS::Region}-cluster'
+      # Primary: reference the global cluster via !Ref for proper dependency ordering
+      # Secondary: pass the GlobalClusterIdentifier param to join as a replica
+      GlobalClusterIdentifier: !If
+        - IsPrimary
+        - !Ref GlobalCluster
+        - !Ref GlobalClusterIdentifier
+      MasterUsername: !If
+        - IsPrimary
+        - !Sub '{{resolve:secretsmanager:${DocDBSecret}:SecretString:username}}'
+        - !Ref 'AWS::NoValue'
+      MasterUserPassword: !If
+        - IsPrimary
+        - !Sub '{{resolve:secretsmanager:${DocDBSecret}:SecretString:password}}'
+        - !Ref 'AWS::NoValue'
+      # Cross-region replicas require an explicit KMS key in the secondary region
+      KmsKeyId: !If
+        - IsSecondary
+        - !GetAtt SecondaryKmsKey.Arn
+        - !Ref 'AWS::NoValue'
+      DBSubnetGroupName: !Ref SubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DocDbSecurityGroupId
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: '03:00-04:00'
+      PreferredMaintenanceWindow: 'sun:04:00-sun:05:00'
+      EnableCloudwatchLogsExports:
+        - audit
+        - profiler
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # Instances - 2 per region for multi-AZ
+  # ============================================================
+  Instance1:
+    Type: AWS::DocDB::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${StackPrefix}-${AWS::Region}-instance-1'
+      DBClusterIdentifier: !Ref RegionalCluster
+      DBInstanceClass: !Ref InstanceClass
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  Instance2:
+    Type: AWS::DocDB::DBInstance
+    DependsOn: Instance1
+    Properties:
+      DBInstanceIdentifier: !Sub '${StackPrefix}-${AWS::Region}-instance-2'
+      DBClusterIdentifier: !Ref RegionalCluster
+      DBInstanceClass: !Ref InstanceClass
+      AutoMinorVersionUpgrade: true
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # Custom Resource: Join secondary cluster to global cluster
+  # Only created in secondary region
+  # ============================================================
+  GlobalClusterJoinRole:
+    Type: AWS::IAM::Role
+    Condition: IsSecondary
+    Properties:
+      RoleName: !Sub '${StackPrefix}-global-cluster-join-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GlobalClusterJoinPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds:CreateDBCluster
+                  - rds:RemoveFromGlobalCluster
+                  - rds:DescribeGlobalClusters
+                  - rds:DescribeDBClusters
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  GlobalClusterJoinFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsSecondary
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-global-cluster-join'
+      Runtime: python3.12
+      Handler: lambda_function.handler
+      Code: ../custom-resources/global-cluster-join/
+      Role: !GetAtt GlobalClusterJoinRole.Arn
+      Timeout: 600
+      MemorySize: 128
+      ReservedConcurrentExecutions: 10
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  GlobalClusterJoinCustomResource:
+    Type: Custom::GlobalClusterJoin
+    Condition: IsSecondary
+    DependsOn:
+      - Instance1
+      - Instance2
+    Properties:
+      ServiceToken: !GetAtt GlobalClusterJoinFunction.Arn
+      ServiceTimeout: 600
+      GlobalClusterIdentifier: !Ref GlobalClusterIdentifier
+      RegionalClusterArn: !Sub 'arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${StackPrefix}-${AWS::Region}-cluster'
+
+# ============================================================
+# Outputs
+# ============================================================
+Outputs:
+  ClusterEndpoint:
+    Description: Regional cluster endpoint
+    Value: !GetAtt RegionalCluster.Endpoint
+
+  ClusterReadEndpoint:
+    Description: Regional cluster read endpoint
+    Value: !GetAtt RegionalCluster.ReadEndpoint
+
+  ClusterResourceId:
+    Description: Cluster resource ID (for ARC failover)
+    Value: !GetAtt RegionalCluster.ClusterResourceId
+
+  GlobalClusterIdentifier:
+    Description: Global cluster identifier
+    Value: !If
+      - IsPrimary
+      - !Ref GlobalCluster
+      - !Ref GlobalClusterIdentifier
+
+  SecretArn:
+    Description: Secrets Manager secret ARN
+    Value: !If
+      - IsPrimary
+      - !Ref DocDBSecret
+      - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${StackPrefix}/docdb/credentials'
+
+  ClusterIdentifier:
+    Description: Regional cluster identifier
+    Value: !Sub '${StackPrefix}-${AWS::Region}-cluster'

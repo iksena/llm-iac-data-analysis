@@ -1,0 +1,368 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  AX Ripple Network — HAProxy Stack
+  EC2 Auto Scaling Group running HAProxy for HTTP + WebSocket load balancing
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  VpcId:
+    Type: String
+  PublicSubnetIds:
+    Type: CommaDelimitedList
+  HAProxySGId:
+    Type: String
+  InstanceType:
+    Type: String
+    Default: t3.small
+  KeyPairName:
+    Type: String
+    Default: ""
+  ApiNodeDiscoveryEndpoint:
+    Type: String
+  AmiId:
+    Type: String
+    Description: >-
+      Amazon Linux 2023 AMI ID — resolved by Terraform via SSM parameter
+      /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+      so CloudFormation does not need ssm:GetParameters.
+
+Conditions:
+  HasKeyPair: !Not [!Equals [!Ref KeyPairName, ""]]
+
+Resources:
+  # ===========================================================================
+  # IAM
+  # ===========================================================================
+  HAProxyRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ax-ripple-${Environment}-haproxy-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: HAProxyAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::ax-ripple-${Environment}-configs/*"
+              - Effect: Allow
+                Action:
+                  - servicediscovery:DiscoverInstances
+                  - servicediscovery:RegisterInstance
+                  - servicediscovery:DeregisterInstance
+                  - servicediscovery:ListServices
+                  - servicediscovery:ListNamespaces
+                  - servicediscovery:GetOperation
+                Resource: "*"
+              # Required to re-associate the EIP on instance launch
+              - Effect: Allow
+                Action:
+                  - ec2:AssociateAddress
+                  - ec2:DescribeAddresses
+                Resource: "*"
+
+  HAProxyInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref HAProxyRole
+
+  # ===========================================================================
+  # Launch Template
+  # ===========================================================================
+  HAProxyLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "ax-ripple-${Environment}-haproxy-lt"
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt HAProxyInstanceProfile.Arn
+        KeyName: !If [HasKeyPair, !Ref KeyPairName, !Ref "AWS::NoValue"]
+        SecurityGroupIds:
+          - !Ref HAProxySGId
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "ax-ripple-${Environment}-haproxy"
+              - Key: Role
+                Value: haproxy
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            exec > >(tee /var/log/haproxy-setup.log) 2>&1
+
+            # ----------------------------------------------------------------
+            # cfn-bootstrap is pre-installed on this AMI at /opt/aws/bin/
+            # Set up the EXIT trap before set -e so CloudFormation is always
+            # signalled on both success and failure.
+            # ----------------------------------------------------------------
+            cfn_signal() {
+              /opt/aws/bin/cfn-signal -e "$1" \
+                --stack ${AWS::StackName} \
+                --resource HAProxyASG \
+                --region ${AWS::Region}
+            }
+            trap 'cfn_signal $?' EXIT
+
+            set -eo pipefail
+
+            # ----------------------------------------------------------------
+            # AL2023: curl-minimal pre-installed, skip dnf update
+            # ----------------------------------------------------------------
+            dnf install -y haproxy
+            systemctl enable haproxy
+
+            # ----------------------------------------------------------------
+            # Re-associate the Elastic IP to this instance on every launch
+            # IMDSv2 required — get token first
+            # ----------------------------------------------------------------
+            TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+            INSTANCE_ID=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/instance-id)
+            set +e
+            EIP_ALLOC=$(aws ec2 describe-addresses --region ${AWS::Region} \
+              --query "Addresses[?Tags[?Key=='aws:cloudformation:stack-name'&&Value=='${AWS::StackName}']].AllocationId" \
+              --output text 2>/dev/null)
+            set -e
+            if [ -n "$EIP_ALLOC" ]; then
+              aws ec2 associate-address --region ${AWS::Region} \
+                --instance-id "$INSTANCE_ID" \
+                --allocation-id "$EIP_ALLOC" \
+                --allow-reassociation
+              echo "EIP $EIP_ALLOC associated with $INSTANCE_ID"
+            fi
+
+            # ----------------------------------------------------------------
+            # Self-register this HAProxy instance in Cloud Map so Prometheus
+            # can resolve haproxy.<env>.local:8404 via DNS.
+            # Uses set +e / set -e blocks — avoids || which is stripped by
+            # CFN Fn::Base64 + !Sub YAML block scalar processing.
+            # ----------------------------------------------------------------
+            set +e
+            PRIVATE_IP=$(curl -sf -H "X-aws-ec2-metadata-token: $TOKEN" \
+              http://169.254.169.254/latest/meta-data/local-ipv4)
+            NS_ID=$(aws servicediscovery list-namespaces --region ${AWS::Region} \
+              --query "Namespaces[?Name=='${Environment}.local'].Id" \
+              --output text 2>/dev/null)
+            SVC_ID=""
+            if [ -n "$NS_ID" ]; then
+              SVC_ID=$(aws servicediscovery list-services --region ${AWS::Region} \
+                --filters "Name=NAMESPACE_ID,Values=$NS_ID,Condition=EQ" \
+                --query "Services[?Name=='haproxy'].Id" --output text 2>/dev/null)
+            fi
+            if [ -z "$SVC_ID" ] && [ -n "$NS_ID" ]; then
+              DNS_CFG="RoutingPolicy=MULTIVALUE,DnsRecords=[{Type=A,TTL=10}]"
+              SVC_ID=$(aws servicediscovery create-service \
+                --name haproxy \
+                --namespace-id "$NS_ID" \
+                --dns-config "$DNS_CFG" \
+                --health-check-custom-config FailureThreshold=1 \
+                --region ${AWS::Region} \
+                --query 'Service.Id' --output text 2>/dev/null)
+              echo "Created Cloud Map service haproxy: $SVC_ID"
+            fi
+            if [ -n "$SVC_ID" ]; then
+              OLD_INSTS=$(aws servicediscovery list-instances \
+                --service-id "$SVC_ID" --region ${AWS::Region} \
+                --query 'Instances[*].Id' --output text 2>/dev/null)
+              for old_id in $OLD_INSTS; do
+                OP_ID=$(aws servicediscovery deregister-instance \
+                  --service-id "$SVC_ID" --instance-id "$old_id" \
+                  --region ${AWS::Region} --query 'OperationId' --output text 2>/dev/null)
+                echo "Deregistered stale Cloud Map instance: $old_id (op=$OP_ID)"
+                # Wait for deregister to complete before registering
+                for _w in $(seq 1 30); do
+                  OP_STATUS=$(aws servicediscovery get-operation \
+                    --operation-id "$OP_ID" --region ${AWS::Region} \
+                    --query 'Operation.Status' --output text 2>/dev/null)
+                  if [ "$OP_STATUS" = "SUCCESS" ] || [ "$OP_STATUS" = "FAIL" ]; then break; fi
+                  sleep 2
+                done
+              done
+              aws servicediscovery register-instance \
+                --service-id "$SVC_ID" \
+                --instance-id "$INSTANCE_ID" \
+                --attributes "AWS_INSTANCE_IPV4=$PRIVATE_IP,AWS_INSTANCE_PORT=8404" \
+                --region ${AWS::Region} 2>/dev/null
+              echo "Registered haproxy in Cloud Map: $PRIVATE_IP:8404 (svc=$SVC_ID)"
+            fi
+            set -e
+
+            cat > /etc/haproxy/haproxy.cfg << 'HAPROXY_CFG'
+            global
+                log stdout format raw local0 info
+                maxconn 4096
+                daemon
+                stats socket /run/haproxy/admin.sock mode 660 level admin
+                stats timeout 30s
+
+            defaults
+                log     global
+                mode    http
+                option  httplog
+                option  dontlognull
+                option  forwardfor
+                timeout connect 5000ms
+                timeout client  50000ms
+                timeout server  50000ms
+                timeout tunnel  3600s
+                retries 3
+                option  redispatch
+
+            frontend stats_front
+                bind *:8404
+                http-request use-service prometheus-exporter if { path /metrics }
+                stats enable
+                stats uri /stats
+                stats refresh 10s
+                stats show-legends
+                stats show-node
+                stats admin if TRUE
+
+            frontend http_front
+                bind *:80
+                default_backend rippled_http
+
+            frontend ws_front
+                bind *:6006
+                default_backend rippled_ws
+
+            frontend grafana_front
+                bind *:3000
+                default_backend grafana_backend
+
+            frontend prometheus_front
+                bind *:9090
+                default_backend prometheus_backend
+
+            backend rippled_http
+                balance roundrobin
+                option httpchk
+                http-check send meth POST uri / ver HTTP/1.1 hdr Content-Type application/json hdr Content-Length 41 body "{\"method\":\"server_info\",\"params\":[{}]}"
+                http-check expect status 200
+                server-template api- 2 ${ApiNodeDiscoveryEndpoint}:51234 check resolvers dns init-addr none inter 5s fall 3 rise 2
+
+            backend rippled_ws
+                balance roundrobin
+                option tcp-check
+                tcp-check connect port 6006
+                stick-table type ip size 100k expire 30m
+                stick on src
+                server-template api- 2 ${ApiNodeDiscoveryEndpoint}:6006 check resolvers dns init-addr none inter 5s fall 3 rise 2
+
+            backend grafana_backend
+                balance roundrobin
+                server-template grafana- 1-2 grafana.${Environment}.local:3000 check resolvers dns init-addr none inter 10s fall 3 rise 2
+
+            backend prometheus_backend
+                balance roundrobin
+                server-template prometheus- 1-2 prometheus.${Environment}.local:9090 check resolvers dns init-addr none inter 10s fall 3 rise 2
+
+            frontend atlantis_front
+                bind *:4141
+                default_backend atlantis_backend
+
+            backend atlantis_backend
+                balance roundrobin
+                option httpchk GET /healthz
+                http-check expect status 200
+                server-template atlantis- 1-2 atlantis.${Environment}.local:4141 check resolvers dns init-addr none inter 10s fall 3 rise 2
+
+            resolvers dns
+                nameserver vpc 169.254.169.253:53
+                resolve_retries 3
+                timeout resolve 1s
+                timeout retry   1s
+                hold valid      10s
+                accepted_payload_size 8192
+            HAPROXY_CFG
+
+            mkdir -p /run/haproxy
+            haproxy -c -f /etc/haproxy/haproxy.cfg
+            systemctl start haproxy
+            # cfn-signal is sent automatically by the EXIT trap above
+
+  # ===========================================================================
+  # Auto Scaling Group
+  # ===========================================================================
+  HAProxyASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT10M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: false
+    Properties:
+      AutoScalingGroupName: !Sub "ax-ripple-${Environment}-haproxy-asg"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref HAProxyLaunchTemplate
+        Version: !GetAtt HAProxyLaunchTemplate.LatestVersionNumber
+      MinSize: "1"
+      MaxSize: "2"
+      DesiredCapacity: "1"
+      VPCZoneIdentifier: !Ref PublicSubnetIds
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      Tags:
+        - Key: Name
+          Value: !Sub "ax-ripple-${Environment}-haproxy"
+          PropagateAtLaunch: true
+
+  # ===========================================================================
+  # Elastic IP
+  # ===========================================================================
+  HAProxyEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "ax-ripple-${Environment}-haproxy-eip"
+
+Outputs:
+  HAProxyPublicIP:
+    Description: HAProxy public IP address
+    Value: !GetAtt HAProxyEIP.PublicIp
+    Export:
+      Name: !Sub "${AWS::StackName}-HAProxyPublicIP"
+
+  HAProxyHTTPEndpoint:
+    Description: HAProxy HTTP endpoint
+    Value: !Sub "http://${HAProxyEIP.PublicIp}"
+    Export:
+      Name: !Sub "${AWS::StackName}-HAProxyHTTPEndpoint"
+
+  HAProxyWSEndpoint:
+    Description: HAProxy WebSocket endpoint
+    Value: !Sub "ws://${HAProxyEIP.PublicIp}:6006"
+    Export:
+      Name: !Sub "${AWS::StackName}-HAProxyWSEndpoint"
+
+  HAProxyStatsEndpoint:
+    Description: HAProxy Stats endpoint
+    Value: !Sub "http://${HAProxyEIP.PublicIp}:8404/stats"
+    Export:
+      Name: !Sub "${AWS::StackName}-HAProxyStatsEndpoint"

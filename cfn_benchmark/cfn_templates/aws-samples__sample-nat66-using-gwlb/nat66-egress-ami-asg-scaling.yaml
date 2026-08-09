@@ -1,0 +1,809 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NAT66 Internet Egress via GWLB - AMI-based with horizontal autoscaling.
+  Uses pre-baked AMI (gwlbtun + Boost + deps) for fast boot (~60s).
+  5-tuple flow hashing on GWLB TG (stickiness disabled) for best load
+  distribution and near-zero-outage failover.
+  Horizontal scaling on CPU >80% and NetworkOut >80% of instance limit.
+  Single-AZ (POC). All lessons from prior labs baked in.
+
+Parameters:
+  ApplianceAmi:
+    Type: AWS::EC2::Image::Id
+    Description: Pre-baked NAT66 appliance AMI
+  ApplianceMinCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Minimum appliance count (baseline capacity)
+  ApplianceMaxCount:
+    Type: Number
+    Default: 6
+    MinValue: 2
+    MaxValue: 20
+    Description: Maximum appliance count during scale-out
+  ApplianceDesiredCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 20
+    Description: Initial desired count (between min and max)
+  InstanceType:
+    Type: String
+    Default: c6i.large
+    AllowedValues: [t3.medium, t3.large, c6i.large, c6i.xlarge, c6in.large, c6in.xlarge, c6in.2xlarge]
+  ScaleTargetCpuPercent:
+    Type: Number
+    Default: 80
+    MinValue: 30
+    MaxValue: 95
+    Description: Target CPU utilization percent for scaling (both out AND in)
+  LatestAl2023Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: AMI for the test client EC2
+
+Mappings:
+  # Instance NetworkOut threshold = 80% of instance baseline bandwidth.
+  # When the ASG average NetworkOut exceeds this, an instance is added.
+  # If you change InstanceType, threshold auto-adjusts via FindInMap.
+  # Values: BaselineBytesPerSec (baseline instance NIC), ThresholdBytesPerSec (= 80% of baseline).
+  InstanceNetworkBandwidth:
+    t3.medium:     {BaselineBytesPerSec: 64000000,   ThresholdBytesPerSec: 51200000}    # 80% of ~512 Mbps
+    t3.large:      {BaselineBytesPerSec: 96000000,   ThresholdBytesPerSec: 76800000}    # 80% of ~768 Mbps
+    c6i.large:     {BaselineBytesPerSec: 93750000,   ThresholdBytesPerSec: 75000000}    # 80% of 750 Mbps
+    c6i.xlarge:    {BaselineBytesPerSec: 156250000,  ThresholdBytesPerSec: 125000000}   # 80% of 1.25 Gbps
+    c6in.large:    {BaselineBytesPerSec: 390625000,  ThresholdBytesPerSec: 312500000}   # 80% of 3.125 Gbps
+    c6in.xlarge:   {BaselineBytesPerSec: 781250000,  ThresholdBytesPerSec: 625000000}   # 80% of 6.25 Gbps
+    c6in.2xlarge:  {BaselineBytesPerSec: 1562500000, ThresholdBytesPerSec: 1250000000}  # 80% of 12.5 Gbps
+
+Resources:
+
+  # ============================================================
+  # CLIENT VPC
+  # ============================================================
+  ClientVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.100.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: nat66-client-vpc}]
+
+  ClientVpcV6:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      VpcId: !Ref ClientVpc
+      AmazonProvidedIpv6CidrBlock: true
+
+  ClientIgw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: client-igw}]
+
+  ClientIgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref ClientVpc
+      InternetGatewayId: !Ref ClientIgw
+
+  ClientSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: ClientVpcV6
+    Properties:
+      VpcId: !Ref ClientVpc
+      CidrBlock: 10.100.1.0/24
+      Ipv6CidrBlock: !Select [0, !Cidr [!Select [0, !GetAtt ClientVpc.Ipv6CidrBlocks], 8, 64]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      AssignIpv6AddressOnCreation: true
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: client-subnet}]
+
+  ClientTgwSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: ClientVpcV6
+    Properties:
+      VpcId: !Ref ClientVpc
+      CidrBlock: 10.100.100.0/28
+      Ipv6CidrBlock: !Select [1, !Cidr [!Select [0, !GetAtt ClientVpc.Ipv6CidrBlocks], 8, 64]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      AssignIpv6AddressOnCreation: true
+      Tags: [{Key: Name, Value: client-tgw-subnet}]
+
+  ClientRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref ClientVpc
+      Tags: [{Key: Name, Value: client-rt}]
+
+  ClientRtAssoc1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ClientSubnet
+      RouteTableId: !Ref ClientRt
+
+  ClientRtAssoc2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref ClientTgwSubnet
+      RouteTableId: !Ref ClientRt
+
+  ClientRtV4Default:
+    Type: AWS::EC2::Route
+    DependsOn: ClientIgwAttach
+    Properties:
+      RouteTableId: !Ref ClientRt
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref ClientIgw
+
+  ClientRtV6Default:
+    Type: AWS::EC2::Route
+    DependsOn: ClientTgwAttach
+    Properties:
+      RouteTableId: !Ref ClientRt
+      DestinationIpv6CidrBlock: ::/0
+      TransitGatewayId: !Ref Tgw
+
+  # ============================================================
+  # INSPECTION VPC
+  # ============================================================
+  InspVpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.200.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{Key: Name, Value: nat66-inspection-vpc}]
+
+  InspVpcV6:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      VpcId: !Ref InspVpc
+      AmazonProvidedIpv6CidrBlock: true
+
+  InspIgw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{Key: Name, Value: inspection-igw}]
+
+  InspIgwAttach:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref InspVpc
+      InternetGatewayId: !Ref InspIgw
+
+  InspApplianceSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: InspVpcV6
+    Properties:
+      VpcId: !Ref InspVpc
+      CidrBlock: 10.200.1.0/24
+      Ipv6CidrBlock: !Select [0, !Cidr [!Select [0, !GetAtt InspVpc.Ipv6CidrBlocks], 8, 64]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      AssignIpv6AddressOnCreation: true
+      MapPublicIpOnLaunch: true
+      Tags: [{Key: Name, Value: insp-appliance-subnet}]
+
+  ApplianceRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspVpc
+      Tags: [{Key: Name, Value: appliance-rt}]
+
+  ApplianceRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref InspApplianceSubnet
+      RouteTableId: !Ref ApplianceRt
+
+  ApplianceRtV4Default:
+    Type: AWS::EC2::Route
+    DependsOn: InspIgwAttach
+    Properties:
+      RouteTableId: !Ref ApplianceRt
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InspIgw
+
+  ApplianceRtV6Default:
+    Type: AWS::EC2::Route
+    DependsOn: InspIgwAttach
+    Properties:
+      RouteTableId: !Ref ApplianceRt
+      DestinationIpv6CidrBlock: ::/0
+      GatewayId: !Ref InspIgw
+
+  InspGwlbeSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: InspVpcV6
+    Properties:
+      VpcId: !Ref InspVpc
+      CidrBlock: 10.200.2.0/28
+      Ipv6CidrBlock: !Select [1, !Cidr [!Select [0, !GetAtt InspVpc.Ipv6CidrBlocks], 8, 64]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      AssignIpv6AddressOnCreation: true
+      Tags: [{Key: Name, Value: insp-gwlbe-subnet}]
+
+  GwlbeRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspVpc
+      Tags: [{Key: Name, Value: gwlbe-rt}]
+
+  GwlbeRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref InspGwlbeSubnet
+      RouteTableId: !Ref GwlbeRt
+
+  GwlbeRtV6ToClient:
+    Type: AWS::EC2::Route
+    DependsOn: InspTgwAttach
+    Properties:
+      RouteTableId: !Ref GwlbeRt
+      DestinationIpv6CidrBlock: !Select [0, !GetAtt ClientVpc.Ipv6CidrBlocks]
+      TransitGatewayId: !Ref Tgw
+
+  InspTgwSubnet:
+    Type: AWS::EC2::Subnet
+    DependsOn: InspVpcV6
+    Properties:
+      VpcId: !Ref InspVpc
+      CidrBlock: 10.200.3.0/28
+      Ipv6CidrBlock: !Select [2, !Cidr [!Select [0, !GetAtt InspVpc.Ipv6CidrBlocks], 8, 64]]
+      AvailabilityZone: !Select [0, !GetAZs '']
+      AssignIpv6AddressOnCreation: true
+      Tags: [{Key: Name, Value: insp-tgw-subnet}]
+
+  TgwSubRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspVpc
+      Tags: [{Key: Name, Value: tgw-sub-rt}]
+
+  TgwSubRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref InspTgwSubnet
+      RouteTableId: !Ref TgwSubRt
+
+  TgwSubRtV6ToGwlbe:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref TgwSubRt
+      DestinationIpv6CidrBlock: ::/0
+      VpcEndpointId: !Ref GwlbEndpoint
+
+  # ============================================================
+  # TGW
+  # ============================================================
+  Tgw:
+    Type: AWS::EC2::TransitGateway
+    Properties:
+      Description: NAT66 Egress TGW (AMI-based ASG with horizontal scaling)
+      AmazonSideAsn: 64516
+      DefaultRouteTableAssociation: disable
+      DefaultRouteTablePropagation: disable
+      DnsSupport: enable
+      Tags: [{Key: Name, Value: nat66-egress-tgw}]
+
+  TgwRtClient:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref Tgw
+      Tags: [{Key: Name, Value: RT-client}]
+
+  TgwRtInspection:
+    Type: AWS::EC2::TransitGatewayRouteTable
+    Properties:
+      TransitGatewayId: !Ref Tgw
+      Tags: [{Key: Name, Value: RT-inspection}]
+
+  ClientTgwAttach:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties:
+      TransitGatewayId: !Ref Tgw
+      VpcId: !Ref ClientVpc
+      SubnetIds: [!Ref ClientTgwSubnet]
+      Tags: [{Key: Name, Value: tgw-attach-client}]
+
+  InspTgwAttach:
+    Type: AWS::EC2::TransitGatewayAttachment
+    Properties:
+      TransitGatewayId: !Ref Tgw
+      VpcId: !Ref InspVpc
+      SubnetIds: [!Ref InspTgwSubnet]
+      Options:
+        ApplianceModeSupport: enable
+      Tags: [{Key: Name, Value: tgw-attach-inspection}]
+
+  ClientTgwAssoc:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref ClientTgwAttach
+      TransitGatewayRouteTableId: !Ref TgwRtClient
+
+  InspTgwAssoc:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref InspTgwAttach
+      TransitGatewayRouteTableId: !Ref TgwRtInspection
+
+  ClientTgwRouteV6Default:
+    Type: AWS::EC2::TransitGatewayRoute
+    Properties:
+      TransitGatewayRouteTableId: !Ref TgwRtClient
+      DestinationCidrBlock: ::/0
+      TransitGatewayAttachmentId: !Ref InspTgwAttach
+
+  ClientPropToInsp:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Properties:
+      TransitGatewayAttachmentId: !Ref ClientTgwAttach
+      TransitGatewayRouteTableId: !Ref TgwRtInspection
+
+  InspToClientV6Static:
+    Type: AWS::EC2::TransitGatewayRoute
+    DependsOn: ClientTgwAttach
+    Properties:
+      TransitGatewayRouteTableId: !Ref TgwRtInspection
+      DestinationCidrBlock: !Select [0, !GetAtt ClientVpc.Ipv6CidrBlocks]
+      TransitGatewayAttachmentId: !Ref ClientTgwAttach
+
+  # ============================================================
+  # GWLB - dualstack, 5-tuple hashing (stickiness DISABLED)
+  # ============================================================
+  GwlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      # IPv6 egress is open by design. This security group is attached to the
+      # NAT66 appliance, which is an architectural egress chokepoint that
+      # forwards arbitrary IPv6 protocols (TCP, UDP, ICMPv6, ESP, AH, GRE,
+      # SCTP, etc.) on behalf of workload VPCs. Restricting egress to specific
+      # protocols would silently break workloads using less-common IPv6
+      # protocols and contradicts the appliance's stated function.
+      #
+      # Compensating controls:
+      #   - Appliance is fronted by GWLB and isolated in the inspection VPC
+      #   - Ingress is tightly scoped (Geneve from GWLB, healthcheck, ICMPv6)
+      #   - SNAT means egress source is always the appliance's own GUA, not
+      #     a workload identity, limiting what an attacker post-compromise
+      #     could observe of internal addressing
+      #   - All egress traffic transits the inspection VPC IGW, so VPC flow
+      #     logs on that IGW provide a single observation point
+      cfn_nag:
+        rules_to_suppress:
+          - id: W5
+            reason: NAT66 appliance forwards arbitrary IPv6 protocols by design.
+          - id: W40
+            reason: NAT66 appliance forwards arbitrary IPv6 protocols by design.
+      checkov:
+        skip:
+          - id: CKV_AWS_23
+            comment: NAT66 appliance forwards arbitrary IPv6 protocols by design.
+          - id: CKV_AWS_24
+            comment: NAT66 appliance forwards arbitrary IPv6 protocols by design.
+    Properties:
+      GroupDescription: GWLB + appliance SG (NAT66 egress)
+      VpcId: !Ref InspVpc
+      # Ingress is narrow:
+      #  - Geneve tunnel from GWLB (UDP 6081) within inspection VPC
+      #  - GWLB health check (TCP 80) within inspection VPC
+      #  - ICMPv6 from internet (PMTUD, Neighbor Discovery, ping replies)
+      # Return TCP/UDP traffic for flows initiated by the appliance (post-SNAT)
+      # is automatically permitted by SG statefulness - no explicit inbound rule
+      # is required for arriving reply packets from the IPv6 internet.
+      SecurityGroupIngress:
+        - IpProtocol: udp
+          FromPort: 6081
+          ToPort: 6081
+          CidrIp: 10.200.0.0/16
+          Description: Geneve tunnel from GWLB
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 10.200.0.0/16
+          Description: GWLB target health check
+        - IpProtocol: icmpv6
+          FromPort: -1
+          ToPort: -1
+          CidrIpv6: ::/0
+          Description: ICMPv6 (PMTUD, ND, ping)
+      # Egress:
+      #   IPv4 - narrow allowlist (SSM, dnf, CloudWatch, DNS, Geneve return)
+      #   IPv6 - open (-1 ::/0) because this is the NAT66 forwarding plane
+      #          and the appliance must be able to forward any IPv6 protocol
+      SecurityGroupEgress:
+        # Geneve return tunnel back to GWLB. CRITICAL: SG egress for UDP is not
+        # auto-permitted by inbound state-tracking the way TCP replies are.
+        # Without this rule, the appliance can decap traffic from GWLB but
+        # cannot send the encapsulated reply back, breaking the return path.
+        - IpProtocol: udp
+          FromPort: 6081
+          ToPort: 6081
+          CidrIp: 10.200.0.0/16
+          Description: Geneve tunnel return to GWLB
+        # IPv4 outbound: SSM, CloudWatch agent, dnf, AWS APIs
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS (IPv4) for SSM/CloudWatch/AWS APIs/dnf
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP (IPv4) for dnf repos
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS (IPv4)
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS over TCP (IPv4)
+        # IPv6 outbound: open by design - NAT66 forwarding plane.
+        # See Metadata block above for rationale and compensating controls.
+        - IpProtocol: '-1'
+          CidrIpv6: ::/0
+          Description: NAT66 forwarding (any IPv6 protocol)
+      Tags: [{Key: Name, Value: gwlb-sg}]
+
+  Gwlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: nat66-egress-gwlb
+      Type: gateway
+      IpAddressType: dualstack
+      Subnets: [!Ref InspApplianceSubnet]
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: 'true'
+      Tags: [{Key: Name, Value: nat66-gwlb}]
+
+  GwlbTg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: nat66-egress-tg
+      Protocol: GENEVE
+      Port: 6081
+      TargetType: instance
+      VpcId: !Ref InspVpc
+      HealthCheckProtocol: TCP
+      HealthCheckPort: '80'
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 3
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        # 5-tuple hashing: stickiness DISABLED = GWLB default
+        # (src-IP, dst-IP, src-port, dst-port, proto)
+        - Key: stickiness.enabled
+          Value: 'false'
+        - Key: target_failover.on_deregistration
+          Value: rebalance
+        - Key: target_failover.on_unhealthy
+          Value: rebalance
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+
+  GwlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Metadata:
+      # GWLB listeners use the GENEVE protocol on UDP 6081 - HTTPS/TLS rules
+      # do not apply. CKV_AWS_2 and CKV_AWS_103 match on the LB resource type
+      # (ELBv2::Listener) without distinguishing between ALB/NLB/GWLB.
+      checkov:
+        skip:
+          - id: CKV_AWS_2
+            comment: GWLB listener uses GENEVE protocol; ALB-style HTTPS check does not apply.
+          - id: CKV_AWS_103
+            comment: GWLB listener uses GENEVE protocol; TLS check does not apply.
+    Properties:
+      LoadBalancerArn: !Ref Gwlb
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref GwlbTg
+
+  GwlbEndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    Properties:
+      GatewayLoadBalancerArns: [!Ref Gwlb]
+      AcceptanceRequired: false
+      SupportedIpAddressTypes: [ipv4, ipv6]
+
+  GwlbEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref InspVpc
+      ServiceName: !Sub 'com.amazonaws.vpce.${AWS::Region}.${GwlbEndpointService}'
+      VpcEndpointType: GatewayLoadBalancer
+      SubnetIds: [!Ref InspGwlbeSubnet]
+      IpAddressType: dualstack
+
+  # ============================================================
+  # APPLIANCE
+  # ============================================================
+  ApplianceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: ModifyEniSourceDestCheck
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Allow appliance to disable source/dest check on its own ENIs only.
+              # Restricted via condition to ENIs in the inspection VPC, which is
+              # the only place these appliances run.
+              - Effect: Allow
+                Action: ec2:ModifyNetworkInterfaceAttribute
+                Resource: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*'
+                Condition:
+                  StringEquals:
+                    ec2:Vpc: !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:vpc/${InspVpc}'
+
+  ApplianceInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref ApplianceRole]
+
+  ApplianceLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Metadata:
+      # Public IP is required by design: the appliance is the egress point of
+      # the NAT66 architecture and routes IPv4 outbound directly via IGW.
+      # SSM (IPv4) is also reached via this public interface. Refactoring to
+      # use VPC endpoints + EIP-only would significantly increase complexity
+      # without changing the security posture (the appliance is fronted by
+      # GWLB; ingress to it is constrained by the GwlbSg security group).
+      checkov:
+        skip:
+          - id: CKV_AWS_88
+            comment: Appliance is the IPv6 egress gateway; public IPv4 required for IGW egress and SSM.
+      cfn_nag:
+        rules_to_suppress:
+          - id: W31  # Security Group should not allow ingress from 0.0.0.0/0 - false positive on LT scan
+            reason: Ingress is on the GwlbSg, scoped narrowly. LT itself does not define SGs.
+    Properties:
+      LaunchTemplateName: nat66-egress-lt
+      LaunchTemplateData:
+        ImageId: !Ref ApplianceAmi
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile: {Arn: !GetAtt ApplianceInstanceProfile.Arn}
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Ipv6AddressCount: 1
+            Groups: [!Ref GwlbSg]
+            SubnetId: !Ref InspApplianceSubnet
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              exec > >(tee /var/log/nat66-boot.log) 2>&1
+              echo "[$(date)] AMI-based boot starting"
+
+              TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+              MAC=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/mac)
+              ENI_ID=$(curl -sH "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/network/interfaces/macs/$MAC/interface-id)
+              aws ec2 modify-network-interface-attribute --region ${AWS::Region} \
+                --network-interface-id $ENI_ID --no-source-dest-check
+
+              cat > /etc/gwlbtun/nat-hook.sh <<'HOOK'
+              #!/bin/bash
+              MODE=$1
+              IN_IF=$2
+              OUT_IF=$3
+              CLIENT_V6_PREFIX="__CLIENT_V6_PREFIX__"
+              exec >> /var/log/gwlbtun-hooks.log 2>&1
+              echo "[$(date)] Mode=$MODE In=$IN_IF Out=$OUT_IF Eni=$4"
+              OUTINT=$(ip route show default | cut -f 5 -d " ")
+              if [ "$MODE" = "CREATE" ]; then
+                sysctl -w net.ipv4.ip_forward=1
+                sysctl -w net.ipv4.conf.all.rp_filter=0
+                sysctl -w net.ipv4.conf.$IN_IF.rp_filter=0 2>/dev/null || true
+                sysctl -w net.ipv6.conf.all.forwarding=1
+                sysctl -w net.ipv6.conf.$IN_IF.forwarding=1 2>/dev/null || true
+                sysctl -w net.ipv6.conf.$OUT_IF.forwarding=1 2>/dev/null || true
+                iptables  -t nat -A POSTROUTING -o $OUTINT -j MASQUERADE
+                iptables  -A FORWARD -i $IN_IF -o $OUTINT -j ACCEPT
+                iptables  -A FORWARD -i $OUTINT -o $OUT_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+                ip6tables -t nat -A POSTROUTING -o $OUTINT -j MASQUERADE
+                ip6tables -A FORWARD -i $IN_IF -o $OUTINT -j ACCEPT
+                ip6tables -A FORWARD -i $OUTINT -o $OUT_IF -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+                ip -6 route replace $CLIENT_V6_PREFIX dev $OUT_IF
+                echo "[$(date)] CREATE done. Route $CLIENT_V6_PREFIX via $OUT_IF"
+              elif [ "$MODE" = "DESTROY" ]; then
+                iptables  -t nat -D POSTROUTING -o $OUTINT -j MASQUERADE 2>/dev/null || true
+                iptables  -D FORWARD -i $IN_IF -o $OUTINT -j ACCEPT 2>/dev/null || true
+                ip6tables -t nat -D POSTROUTING -o $OUTINT -j MASQUERADE 2>/dev/null || true
+                ip6tables -D FORWARD -i $IN_IF -o $OUTINT -j ACCEPT 2>/dev/null || true
+                ip -6 route del $CLIENT_V6_PREFIX dev $OUT_IF 2>/dev/null || true
+              fi
+              HOOK
+              sed -i "s|__CLIENT_V6_PREFIX__|${ClientV6CIDR}|g" /etc/gwlbtun/nat-hook.sh
+              chmod +x /etc/gwlbtun/nat-hook.sh
+
+              systemctl daemon-reload
+              systemctl restart gwlb-healthcheck.service
+              systemctl restart gwlbtun.service
+
+              modprobe nf_conntrack 2>/dev/null || true
+              modprobe ip6table_nat 2>/dev/null || true
+
+              PRIM_IF=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+              APPL_V6=$(ip -6 addr show dev $PRIM_IF scope global | awk '/inet6/ {print $2}' | cut -d/ -f1 | head -1)
+              echo "$APPL_V6" > /etc/nat66-own-v6
+              echo "NAT66 ready $(date). SNAT source: $APPL_V6" > /var/run/nat66-ready
+              echo "[$(date)] boot complete"
+            - ClientV6CIDR: !Select [0, !GetAtt ClientVpc.Ipv6CidrBlocks]
+
+  # ============================================================
+  # ASG with horizontal scaling
+  # ============================================================
+  ApplianceAsg:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: nat66-egress-asg
+      MinSize: !Ref ApplianceMinCount
+      MaxSize: !Ref ApplianceMaxCount
+      DesiredCapacity: !Ref ApplianceDesiredCount
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ApplianceLaunchTemplate
+        Version: !GetAtt ApplianceLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier: [!Ref InspApplianceSubnet]
+      TargetGroupARNs: [!Ref GwlbTg]
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 120
+      MetricsCollection:
+        - Granularity: 1Minute
+      Tags:
+        - Key: Name
+          Value: nat66-appliance
+          PropagateAtLaunch: true
+
+  # ------------------------------------------------------------
+  # Scaling Policy 1: CPU — target tracking at 80%
+  # (Automatically scales out when avg CPU > 80%, scales in when < 80%
+  #  with appropriate hysteresis — this is the preferred mode)
+  # ------------------------------------------------------------
+  CpuScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ApplianceAsg
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: !Ref ScaleTargetCpuPercent
+        DisableScaleIn: false
+      EstimatedInstanceWarmup: 120
+
+  # ------------------------------------------------------------
+  # Scaling Policy 2: Network Out — target tracking at 80% of baseline bandwidth
+  # NetworkOut is in bytes/min (summed), convert % to absolute bytes.
+  # TargetValue = (InstanceBaselineBytesPerSec * 60) * (ScaleTargetNetworkPercent / 100)
+  # ------------------------------------------------------------
+  # Target tracking on NetworkOut: scale when appliance is pushing >80% of
+  # instance's baseline bandwidth. Mapping has pre-computed 80% thresholds
+  # in bytes/sec. If you change InstanceType, the threshold auto-adjusts.
+  NetworkScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref ApplianceAsg
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageNetworkOut
+        TargetValue: !FindInMap [InstanceNetworkBandwidth, !Ref InstanceType, ThresholdBytesPerSec]
+        DisableScaleIn: false
+      EstimatedInstanceWarmup: 120
+
+  # ============================================================
+  # TEST CLIENT
+  # ============================================================
+  ClientSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Test client SG
+      VpcId: !Ref ClientVpc
+      SecurityGroupIngress:
+        - IpProtocol: icmpv6
+          FromPort: -1
+          ToPort: -1
+          CidrIpv6: ::/0
+          Description: ICMPv6 ping replies (PMTUD/ND auto-handled)
+      # Egress: restricted to what the test client actually needs:
+      #   - HTTPS/HTTP for IPv4 SSM, dnf install, AWS APIs
+      #   - DNS for hostname resolution
+      #   - HTTPS/HTTP over IPv6 for the actual NAT66 egress test (curl -6)
+      #   - ICMPv6 echo for ping6 tests
+      # Reply traffic for inbound flows is auto-permitted by SG statefulness.
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS (IPv4) - SSM, dnf, AWS APIs
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP (IPv4) - dnf repos
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS (IPv4)
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: 0.0.0.0/0
+          Description: DNS over TCP (IPv4)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIpv6: ::/0
+          Description: HTTPS (IPv6) - NAT66 egress test target
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIpv6: ::/0
+          Description: HTTP (IPv6) - test target
+        - IpProtocol: icmpv6
+          FromPort: -1
+          ToPort: -1
+          CidrIpv6: ::/0
+          Description: ICMPv6 ping for connectivity tests
+      Tags: [{Key: Name, Value: client-sg}]
+
+  ClientEc2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAl2023Ami
+      InstanceType: t3.micro
+      SubnetId: !Ref ClientSubnet
+      SecurityGroupIds: [!Ref ClientSg]
+      IamInstanceProfile: !Ref ApplianceInstanceProfile
+      Ipv6AddressCount: 1
+      Tags: [{Key: Name, Value: nat66-test-client}]
+      UserData:
+        Fn::Base64: |
+          #!/bin/bash
+          dnf install -y iproute tcpdump bind-utils nmap-ncat curl traceroute iputils
+
+Outputs:
+  ClientInstanceId:
+    Value: !Ref ClientEc2
+  ClientVpcV6CIDR:
+    Value: !Select [0, !GetAtt ClientVpc.Ipv6CidrBlocks]
+  InspVpcV6CIDR:
+    Value: !Select [0, !GetAtt InspVpc.Ipv6CidrBlocks]
+  GwlbEndpointId:
+    Value: !Ref GwlbEndpoint
+  TgwId:
+    Value: !Ref Tgw
+  ApplianceAsgName:
+    Value: !Ref ApplianceAsg
+  ApplianceMinCount:
+    Value: !Ref ApplianceMinCount
+  ApplianceMaxCount:
+    Value: !Ref ApplianceMaxCount
+  SsmConnectClient:
+    Value: !Sub 'aws ssm start-session --region ${AWS::Region} --target ${ClientEc2}'
+  TestCommands:
+    Value: 'From client: ping6 -c 5 2606:4700:4700::1111 ; curl -6 -s https://api64.ipify.org'

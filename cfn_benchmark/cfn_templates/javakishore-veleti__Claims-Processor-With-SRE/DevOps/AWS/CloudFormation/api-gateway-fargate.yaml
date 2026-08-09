@@ -1,0 +1,2430 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  API Gateway (ALB) and AWS Fargate deployment for Claims Processor With SRE.
+  Deploys an ECS Cluster with 10 Fargate services behind an Application Load
+  Balancer using path-based routing to each microservice module.
+
+# ===========================================================================
+# Parameters
+# ===========================================================================
+Parameters:
+  Environment:
+    Type: String
+    Description: Deployment environment
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  ProjectName:
+    Type: String
+    Default: claims-proc
+    Description: Project name used for resource naming and tagging
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for the deployment
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: First public subnet for the ALB
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second public subnet for the ALB
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet::Id
+    Description: First private subnet for Fargate tasks
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second private subnet for Fargate tasks
+
+  AppSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group for application containers (ports 8081-8090)
+
+  ALBSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group for the ALB (ports 80/443)
+
+  FargateTaskCpu:
+    Type: String
+    Default: '512'
+    Description: CPU units for each Fargate task (256, 512, 1024, 2048, 4096)
+    AllowedValues:
+      - '256'
+      - '512'
+      - '1024'
+      - '2048'
+      - '4096'
+
+  FargateTaskMemory:
+    Type: String
+    Default: '1024'
+    Description: Memory (MiB) for each Fargate task
+    AllowedValues:
+      - '512'
+      - '1024'
+      - '2048'
+      - '4096'
+      - '8192'
+      - '16384'
+
+  DesiredServiceCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+    Description: Desired number of Fargate tasks per service
+
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: Docker image tag to deploy
+
+  ECRRepoPrefix:
+    Type: String
+    Description: >
+      ECR repository prefix (e.g. claims-proc-dev).
+      Full image URI: {AWSAccountId}.dkr.ecr.{AWSRegion}.amazonaws.com/{ECRRepoPrefix}/{module}:{ImageTag}
+
+  AWSAccountId:
+    Type: String
+    Description: AWS account ID for ECR image URIs
+
+  AWSRegion:
+    Type: String
+    Default: us-east-1
+    Description: AWS region for ECR image URIs
+
+  RDSSecretArn:
+    Type: String
+    Description: ARN of Secrets Manager secret containing RDS credentials
+
+  RedisSecretArn:
+    Type: String
+    Description: ARN of Secrets Manager secret containing Redis credentials
+
+  CognitoUserPoolId:
+    Type: String
+    Default: ''
+    Description: Cognito User Pool ID for authentication (optional)
+
+  EnableCache:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable Redis cache feature toggle in application containers
+
+  EnableSearch:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable OpenSearch/Elasticsearch search feature toggle in application containers
+
+  EnableEventStream:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable Kafka/MSK event stream feature toggle in application containers
+
+  EnableApplicationSignals:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >
+      Enable CloudWatch Application Signals (ADOT agent + collector sidecar).
+      Adds aws-signals Spring profile, ADOT Java agent, and ADOT Collector sidecar.
+      Ref: https://aws.amazon.com/about-aws/whats-new/2026/03/cloudwatch-application-signals-adds-slo-capabilities/
+
+# ===========================================================================
+# Conditions
+# ===========================================================================
+Conditions:
+  HasCognitoUserPool: !Not [!Equals [!Ref CognitoUserPoolId, '']]
+  IsProd: !Equals [!Ref Environment, 'prod']
+  IsNotProd: !Not [!Equals [!Ref Environment, 'prod']]
+  IsAppSignalsEnabled: !Equals [!Ref EnableApplicationSignals, 'true']
+
+# ===========================================================================
+# Resources
+# ===========================================================================
+Resources:
+
+  # -------------------------------------------------------------------------
+  # ECS Cluster
+  # -------------------------------------------------------------------------
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-${Environment}'
+      ClusterSettings:
+        - Name: containerInsights
+          # Container Insights costs ~$0.01/task/hour — disable in non-prod to save costs
+          Value: !If [IsProd, 'enabled', 'disabled']
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        # Dev/staging: 100% Spot (70% cheaper). Prod: 50/50 mix for reliability
+        - CapacityProvider: FARGATE_SPOT
+          Weight: !If [IsProd, 1, 4]
+          Base: 0
+        - CapacityProvider: FARGATE
+          Weight: !If [IsProd, 1, 0]
+          Base: !If [IsProd, 1, 0]
+      Configuration:
+        ExecuteCommandConfiguration:
+          Logging: DEFAULT
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Log Group for ECS
+  # -------------------------------------------------------------------------
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/${ProjectName}/${Environment}/ecs'
+      RetentionInDays: !If [IsProd, 90, 14]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -------------------------------------------------------------------------
+  # IAM — ECS Task Execution Role
+  # Permissions: ECR pull, CloudWatch Logs, Secrets Manager read
+  # -------------------------------------------------------------------------
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ecs-exec-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref RDSSecretArn
+                  - !Ref RedisSecretArn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ECSLogGroup.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -------------------------------------------------------------------------
+  # IAM — ECS Task Role
+  # Permissions: S3, Kinesis, Bedrock, X-Ray, CloudWatch
+  # -------------------------------------------------------------------------
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectName}-${Environment}-*'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-${Environment}-*/*'
+        - PolicyName: KinesisAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                  - kinesis:GetRecords
+                  - kinesis:GetShardIterator
+                  - kinesis:DescribeStream
+                  - kinesis:ListShards
+                Resource:
+                  - !Sub 'arn:aws:kinesis:${AWSRegion}:${AWSAccountId}:stream/${ProjectName}-${Environment}-*'
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:InvokeAgent
+                  - bedrock:Retrieve
+                Resource: '*'
+        - PolicyName: XRayAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+        - PolicyName: ApplicationSignals
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - application-signals:BatchGetServiceLevelObjectiveBudgetReport
+                  - application-signals:CreateServiceLevelObjective
+                  - application-signals:DeleteServiceLevelObjective
+                  - application-signals:GetService
+                  - application-signals:GetServiceLevelObjective
+                  - application-signals:ListServiceLevelObjectives
+                  - application-signals:ListServices
+                  - application-signals:UpdateServiceLevelObjective
+                  - application-signals:StartDiscovery
+                Resource: '*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -------------------------------------------------------------------------
+  # Application Load Balancer
+  # -------------------------------------------------------------------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref ALBSecurityGroupId
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '120'
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+        - Key: access_logs.s3.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-${Environment}-alb'
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # -------------------------------------------------------------------------
+  # ALB Listener — HTTP (port 80)
+  # In production, replace with HTTPS (443) + ACM certificate
+  # -------------------------------------------------------------------------
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TGPortalClaimsAdvisor
+
+  # =========================================================================
+  # Target Groups — one per module
+  # =========================================================================
+  TGApiClaims:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api-clm'
+      Port: 8083
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Module
+          Value: api-claims
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  TGApiMembers:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api-mbr'
+      Port: 8084
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Module
+          Value: api-members
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  TGApiTenants:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api-tnt'
+      Port: 8086
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Module
+          Value: api-tenants
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  TGApiEntitlements:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-api-entl'
+      Port: 8087
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Module
+          Value: api-entitlements
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  TGPortalClaimsAdvisor:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-ptl-adv'
+      Port: 8081
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Module
+          Value: portal-claims-advisor
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  TGPortalClaimsMember:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-ptl-mbr'
+      Port: 8082
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Module
+          Value: portal-claims-member
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  TGPortalBatchAssignment:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-ptl-bat'
+      Port: 8085
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Module
+          Value: portal-batch-assignment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  TGPortalTenants:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-ptl-tnt'
+      Port: 8088
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Module
+          Value: portal-tenants
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  TGPortalEntitlements:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-ptl-entl'
+      Port: 8089
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Module
+          Value: portal-entitlements
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  TGPortalSRE:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-ptl-sre'
+      Port: 8090
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /actuator/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Module
+          Value: portal-sre
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # =========================================================================
+  # ALB Listener Rules — Path-Based Routing
+  # =========================================================================
+  ListenerRuleApiClaims:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/api/v1/claims/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGApiClaims
+
+  ListenerRuleApiMembers:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 20
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/api/v1/members/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGApiMembers
+
+  ListenerRuleApiTenants:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 30
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/api/v1/tenants/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGApiTenants
+
+  ListenerRuleApiEntitlements:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 40
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/api/v1/entitlements/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGApiEntitlements
+
+  ListenerRulePortalMember:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 50
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/member/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGPortalClaimsMember
+
+  ListenerRulePortalBatch:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 60
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/batch/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGPortalBatchAssignment
+
+  ListenerRulePortalTenants:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 70
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/tenant-mgmt/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGPortalTenants
+
+  ListenerRulePortalEntitlements:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 80
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/entitlement-mgmt/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGPortalEntitlements
+
+  ListenerRulePortalSRE:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 90
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/sre/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGPortalSRE
+
+  # Default rule (priority 100) — /advisor/* routes to Portal-Claims-Advisor
+  ListenerRulePortalAdvisor:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ALBListener
+      Priority: 100
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - '/advisor/*'
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TGPortalClaimsAdvisor
+
+  # =========================================================================
+  # ECS Task Definitions — 10 modules
+  # =========================================================================
+
+  # --- Portal-Claims-Advisor (8081) ---
+  TaskDefPortalClaimsAdvisor:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-portal-claims-advisor'
+      Cpu: !Ref FargateTaskCpu
+      Memory: !Ref FargateTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: portal-claims-advisor
+          Image: !Sub '${AWSAccountId}.dkr.ecr.${AWSRegion}.amazonaws.com/${ECRRepoPrefix}/portal-claims-advisor:${ImageTag}'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8081
+              Protocol: tcp
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: !If
+                - IsAppSignalsEnabled
+                - !Sub '${Environment},aws,aws-signals'
+                - !Sub '${Environment},aws'
+            - Name: SERVER_PORT
+              Value: '8081'
+            - Name: FEATURE_CACHE_ENABLED
+              Value: !Ref EnableCache
+            - Name: FEATURE_SEARCH_ENABLED
+              Value: !Ref EnableSearch
+            - Name: FEATURE_EVENT_STREAM_ENABLED
+              Value: !Ref EnableEventStream
+            - Name: SPRING_FLYWAY_ENABLED
+              Value: 'true'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: JAVA_TOOL_OPTIONS
+                Value: '-javaagent:/opt/aws-opentelemetry-agent.jar'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: OTEL_RESOURCE_ATTRIBUTES
+                Value: !Sub 'service.name=portal-claims-advisor,service.namespace=${ProjectName},deployment.environment=${Environment}'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: ENVIRONMENT
+                Value: !Ref Environment
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: PROJECT_NAME
+                Value: !Ref ProjectName
+              - !Ref 'AWS::NoValue'
+          Secrets:
+            - Name: SPRING_DATASOURCE_URL
+              ValueFrom: !Sub '${RDSSecretArn}:jdbc_url::'
+            - Name: SPRING_DATASOURCE_USERNAME
+              ValueFrom: !Sub '${RDSSecretArn}:username::'
+            - Name: SPRING_DATASOURCE_PASSWORD
+              ValueFrom: !Sub '${RDSSecretArn}:password::'
+            - Name: SPRING_DATA_REDIS_URL
+              ValueFrom: !Sub '${RedisSecretArn}:url::'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost:8081/actuator/health || exit 1
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 240
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWSRegion
+              awslogs-stream-prefix: portal-claims-advisor
+        - !If
+          - IsAppSignalsEnabled
+          - Name: adot-collector
+            Image: public.ecr.aws/aws-observability/aws-otel-collector:latest
+            Essential: false
+            Command: ['--config=/etc/ecs/ecs-default-config.yaml']
+            PortMappings:
+              - ContainerPort: 4317
+                Protocol: tcp
+              - ContainerPort: 4318
+                Protocol: tcp
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref ECSLogGroup
+                awslogs-region: !Ref AWSRegion
+                awslogs-stream-prefix: adot-collector
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Module
+          Value: portal-claims-advisor
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --- Portal-Claims-Member (8082) ---
+  TaskDefPortalClaimsMember:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-portal-claims-member'
+      Cpu: !Ref FargateTaskCpu
+      Memory: !Ref FargateTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: portal-claims-member
+          Image: !Sub '${AWSAccountId}.dkr.ecr.${AWSRegion}.amazonaws.com/${ECRRepoPrefix}/portal-claims-member:${ImageTag}'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8082
+              Protocol: tcp
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: !If
+                - IsAppSignalsEnabled
+                - !Sub '${Environment},aws,aws-signals'
+                - !Sub '${Environment},aws'
+            - Name: SERVER_PORT
+              Value: '8082'
+            - Name: FEATURE_CACHE_ENABLED
+              Value: !Ref EnableCache
+            - Name: FEATURE_SEARCH_ENABLED
+              Value: !Ref EnableSearch
+            - Name: FEATURE_EVENT_STREAM_ENABLED
+              Value: !Ref EnableEventStream
+            - Name: SPRING_FLYWAY_ENABLED
+              Value: 'true'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: JAVA_TOOL_OPTIONS
+                Value: '-javaagent:/opt/aws-opentelemetry-agent.jar'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: OTEL_RESOURCE_ATTRIBUTES
+                Value: !Sub 'service.name=portal-claims-member,service.namespace=${ProjectName},deployment.environment=${Environment}'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: ENVIRONMENT
+                Value: !Ref Environment
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: PROJECT_NAME
+                Value: !Ref ProjectName
+              - !Ref 'AWS::NoValue'
+          Secrets:
+            - Name: SPRING_DATASOURCE_URL
+              ValueFrom: !Sub '${RDSSecretArn}:jdbc_url::'
+            - Name: SPRING_DATASOURCE_USERNAME
+              ValueFrom: !Sub '${RDSSecretArn}:username::'
+            - Name: SPRING_DATASOURCE_PASSWORD
+              ValueFrom: !Sub '${RDSSecretArn}:password::'
+            - Name: SPRING_DATA_REDIS_URL
+              ValueFrom: !Sub '${RedisSecretArn}:url::'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost:8082/actuator/health || exit 1
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 240
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWSRegion
+              awslogs-stream-prefix: portal-claims-member
+        - !If
+          - IsAppSignalsEnabled
+          - Name: adot-collector
+            Image: public.ecr.aws/aws-observability/aws-otel-collector:latest
+            Essential: false
+            Command: ['--config=/etc/ecs/ecs-default-config.yaml']
+            PortMappings:
+              - ContainerPort: 4317
+                Protocol: tcp
+              - ContainerPort: 4318
+                Protocol: tcp
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref ECSLogGroup
+                awslogs-region: !Ref AWSRegion
+                awslogs-stream-prefix: adot-collector
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Module
+          Value: portal-claims-member
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --- API-Claims (8083) ---
+  TaskDefApiClaims:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-api-claims'
+      Cpu: !Ref FargateTaskCpu
+      Memory: !Ref FargateTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: api-claims
+          Image: !Sub '${AWSAccountId}.dkr.ecr.${AWSRegion}.amazonaws.com/${ECRRepoPrefix}/api-claims:${ImageTag}'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8083
+              Protocol: tcp
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: !If
+                - IsAppSignalsEnabled
+                - !Sub '${Environment},aws,aws-signals'
+                - !Sub '${Environment},aws'
+            - Name: SERVER_PORT
+              Value: '8083'
+            - Name: FEATURE_CACHE_ENABLED
+              Value: !Ref EnableCache
+            - Name: FEATURE_SEARCH_ENABLED
+              Value: !Ref EnableSearch
+            - Name: FEATURE_EVENT_STREAM_ENABLED
+              Value: !Ref EnableEventStream
+            - Name: SPRING_FLYWAY_ENABLED
+              Value: 'true'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: JAVA_TOOL_OPTIONS
+                Value: '-javaagent:/opt/aws-opentelemetry-agent.jar'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: OTEL_RESOURCE_ATTRIBUTES
+                Value: !Sub 'service.name=api-claims,service.namespace=${ProjectName},deployment.environment=${Environment}'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: ENVIRONMENT
+                Value: !Ref Environment
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: PROJECT_NAME
+                Value: !Ref ProjectName
+              - !Ref 'AWS::NoValue'
+          Secrets:
+            - Name: SPRING_DATASOURCE_URL
+              ValueFrom: !Sub '${RDSSecretArn}:jdbc_url::'
+            - Name: SPRING_DATASOURCE_USERNAME
+              ValueFrom: !Sub '${RDSSecretArn}:username::'
+            - Name: SPRING_DATASOURCE_PASSWORD
+              ValueFrom: !Sub '${RDSSecretArn}:password::'
+            - Name: SPRING_DATA_REDIS_URL
+              ValueFrom: !Sub '${RedisSecretArn}:url::'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost:8083/actuator/health || exit 1
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 240
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWSRegion
+              awslogs-stream-prefix: api-claims
+        - !If
+          - IsAppSignalsEnabled
+          - Name: adot-collector
+            Image: public.ecr.aws/aws-observability/aws-otel-collector:latest
+            Essential: false
+            Command: ['--config=/etc/ecs/ecs-default-config.yaml']
+            PortMappings:
+              - ContainerPort: 4317
+                Protocol: tcp
+              - ContainerPort: 4318
+                Protocol: tcp
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref ECSLogGroup
+                awslogs-region: !Ref AWSRegion
+                awslogs-stream-prefix: adot-collector
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Module
+          Value: api-claims
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --- API-Members (8084) ---
+  TaskDefApiMembers:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-api-members'
+      Cpu: !Ref FargateTaskCpu
+      Memory: !Ref FargateTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: api-members
+          Image: !Sub '${AWSAccountId}.dkr.ecr.${AWSRegion}.amazonaws.com/${ECRRepoPrefix}/api-members:${ImageTag}'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8084
+              Protocol: tcp
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: !If
+                - IsAppSignalsEnabled
+                - !Sub '${Environment},aws,aws-signals'
+                - !Sub '${Environment},aws'
+            - Name: SERVER_PORT
+              Value: '8084'
+            - Name: FEATURE_CACHE_ENABLED
+              Value: !Ref EnableCache
+            - Name: FEATURE_SEARCH_ENABLED
+              Value: !Ref EnableSearch
+            - Name: FEATURE_EVENT_STREAM_ENABLED
+              Value: !Ref EnableEventStream
+            - Name: SPRING_FLYWAY_ENABLED
+              Value: 'true'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: JAVA_TOOL_OPTIONS
+                Value: '-javaagent:/opt/aws-opentelemetry-agent.jar'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: OTEL_RESOURCE_ATTRIBUTES
+                Value: !Sub 'service.name=api-members,service.namespace=${ProjectName},deployment.environment=${Environment}'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: ENVIRONMENT
+                Value: !Ref Environment
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: PROJECT_NAME
+                Value: !Ref ProjectName
+              - !Ref 'AWS::NoValue'
+          Secrets:
+            - Name: SPRING_DATASOURCE_URL
+              ValueFrom: !Sub '${RDSSecretArn}:jdbc_url::'
+            - Name: SPRING_DATASOURCE_USERNAME
+              ValueFrom: !Sub '${RDSSecretArn}:username::'
+            - Name: SPRING_DATASOURCE_PASSWORD
+              ValueFrom: !Sub '${RDSSecretArn}:password::'
+            - Name: SPRING_DATA_REDIS_URL
+              ValueFrom: !Sub '${RedisSecretArn}:url::'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost:8084/actuator/health || exit 1
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 240
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWSRegion
+              awslogs-stream-prefix: api-members
+        - !If
+          - IsAppSignalsEnabled
+          - Name: adot-collector
+            Image: public.ecr.aws/aws-observability/aws-otel-collector:latest
+            Essential: false
+            Command: ['--config=/etc/ecs/ecs-default-config.yaml']
+            PortMappings:
+              - ContainerPort: 4317
+                Protocol: tcp
+              - ContainerPort: 4318
+                Protocol: tcp
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref ECSLogGroup
+                awslogs-region: !Ref AWSRegion
+                awslogs-stream-prefix: adot-collector
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Module
+          Value: api-members
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --- Portal-Batch-Assignment (8085) ---
+  TaskDefPortalBatchAssignment:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-portal-batch-assignment'
+      Cpu: !Ref FargateTaskCpu
+      Memory: !Ref FargateTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: portal-batch-assignment
+          Image: !Sub '${AWSAccountId}.dkr.ecr.${AWSRegion}.amazonaws.com/${ECRRepoPrefix}/portal-batch-assignment:${ImageTag}'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8085
+              Protocol: tcp
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: !If
+                - IsAppSignalsEnabled
+                - !Sub '${Environment},aws,aws-signals'
+                - !Sub '${Environment},aws'
+            - Name: SERVER_PORT
+              Value: '8085'
+            - Name: FEATURE_CACHE_ENABLED
+              Value: !Ref EnableCache
+            - Name: FEATURE_SEARCH_ENABLED
+              Value: !Ref EnableSearch
+            - Name: FEATURE_EVENT_STREAM_ENABLED
+              Value: !Ref EnableEventStream
+            - Name: SPRING_FLYWAY_ENABLED
+              Value: 'true'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: JAVA_TOOL_OPTIONS
+                Value: '-javaagent:/opt/aws-opentelemetry-agent.jar'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: OTEL_RESOURCE_ATTRIBUTES
+                Value: !Sub 'service.name=portal-batch-assignment,service.namespace=${ProjectName},deployment.environment=${Environment}'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: ENVIRONMENT
+                Value: !Ref Environment
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: PROJECT_NAME
+                Value: !Ref ProjectName
+              - !Ref 'AWS::NoValue'
+          Secrets:
+            - Name: SPRING_DATASOURCE_URL
+              ValueFrom: !Sub '${RDSSecretArn}:jdbc_url::'
+            - Name: SPRING_DATASOURCE_USERNAME
+              ValueFrom: !Sub '${RDSSecretArn}:username::'
+            - Name: SPRING_DATASOURCE_PASSWORD
+              ValueFrom: !Sub '${RDSSecretArn}:password::'
+            - Name: SPRING_DATA_REDIS_URL
+              ValueFrom: !Sub '${RedisSecretArn}:url::'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost:8085/actuator/health || exit 1
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 240
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWSRegion
+              awslogs-stream-prefix: portal-batch-assignment
+        - !If
+          - IsAppSignalsEnabled
+          - Name: adot-collector
+            Image: public.ecr.aws/aws-observability/aws-otel-collector:latest
+            Essential: false
+            Command: ['--config=/etc/ecs/ecs-default-config.yaml']
+            PortMappings:
+              - ContainerPort: 4317
+                Protocol: tcp
+              - ContainerPort: 4318
+                Protocol: tcp
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref ECSLogGroup
+                awslogs-region: !Ref AWSRegion
+                awslogs-stream-prefix: adot-collector
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Module
+          Value: portal-batch-assignment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --- API-Tenants (8086) ---
+  TaskDefApiTenants:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-api-tenants'
+      Cpu: !Ref FargateTaskCpu
+      Memory: !Ref FargateTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: api-tenants
+          Image: !Sub '${AWSAccountId}.dkr.ecr.${AWSRegion}.amazonaws.com/${ECRRepoPrefix}/api-tenants:${ImageTag}'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8086
+              Protocol: tcp
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: !If
+                - IsAppSignalsEnabled
+                - !Sub '${Environment},aws,aws-signals'
+                - !Sub '${Environment},aws'
+            - Name: SERVER_PORT
+              Value: '8086'
+            - Name: FEATURE_CACHE_ENABLED
+              Value: !Ref EnableCache
+            - Name: FEATURE_SEARCH_ENABLED
+              Value: !Ref EnableSearch
+            - Name: FEATURE_EVENT_STREAM_ENABLED
+              Value: !Ref EnableEventStream
+            - Name: SPRING_FLYWAY_ENABLED
+              Value: 'true'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: JAVA_TOOL_OPTIONS
+                Value: '-javaagent:/opt/aws-opentelemetry-agent.jar'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: OTEL_RESOURCE_ATTRIBUTES
+                Value: !Sub 'service.name=api-tenants,service.namespace=${ProjectName},deployment.environment=${Environment}'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: ENVIRONMENT
+                Value: !Ref Environment
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: PROJECT_NAME
+                Value: !Ref ProjectName
+              - !Ref 'AWS::NoValue'
+          Secrets:
+            - Name: SPRING_DATASOURCE_URL
+              ValueFrom: !Sub '${RDSSecretArn}:jdbc_url::'
+            - Name: SPRING_DATASOURCE_USERNAME
+              ValueFrom: !Sub '${RDSSecretArn}:username::'
+            - Name: SPRING_DATASOURCE_PASSWORD
+              ValueFrom: !Sub '${RDSSecretArn}:password::'
+            - Name: SPRING_DATA_REDIS_URL
+              ValueFrom: !Sub '${RedisSecretArn}:url::'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost:8086/actuator/health || exit 1
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 240
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWSRegion
+              awslogs-stream-prefix: api-tenants
+        - !If
+          - IsAppSignalsEnabled
+          - Name: adot-collector
+            Image: public.ecr.aws/aws-observability/aws-otel-collector:latest
+            Essential: false
+            Command: ['--config=/etc/ecs/ecs-default-config.yaml']
+            PortMappings:
+              - ContainerPort: 4317
+                Protocol: tcp
+              - ContainerPort: 4318
+                Protocol: tcp
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref ECSLogGroup
+                awslogs-region: !Ref AWSRegion
+                awslogs-stream-prefix: adot-collector
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Module
+          Value: api-tenants
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --- API-Entitlements (8087) ---
+  TaskDefApiEntitlements:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-api-entitlements'
+      Cpu: !Ref FargateTaskCpu
+      Memory: !Ref FargateTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: api-entitlements
+          Image: !Sub '${AWSAccountId}.dkr.ecr.${AWSRegion}.amazonaws.com/${ECRRepoPrefix}/api-entitlements:${ImageTag}'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8087
+              Protocol: tcp
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: !If
+                - IsAppSignalsEnabled
+                - !Sub '${Environment},aws,aws-signals'
+                - !Sub '${Environment},aws'
+            - Name: SERVER_PORT
+              Value: '8087'
+            - Name: FEATURE_CACHE_ENABLED
+              Value: !Ref EnableCache
+            - Name: FEATURE_SEARCH_ENABLED
+              Value: !Ref EnableSearch
+            - Name: FEATURE_EVENT_STREAM_ENABLED
+              Value: !Ref EnableEventStream
+            - Name: SPRING_FLYWAY_ENABLED
+              Value: 'true'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: JAVA_TOOL_OPTIONS
+                Value: '-javaagent:/opt/aws-opentelemetry-agent.jar'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: OTEL_RESOURCE_ATTRIBUTES
+                Value: !Sub 'service.name=api-entitlements,service.namespace=${ProjectName},deployment.environment=${Environment}'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: ENVIRONMENT
+                Value: !Ref Environment
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: PROJECT_NAME
+                Value: !Ref ProjectName
+              - !Ref 'AWS::NoValue'
+          Secrets:
+            - Name: SPRING_DATASOURCE_URL
+              ValueFrom: !Sub '${RDSSecretArn}:jdbc_url::'
+            - Name: SPRING_DATASOURCE_USERNAME
+              ValueFrom: !Sub '${RDSSecretArn}:username::'
+            - Name: SPRING_DATASOURCE_PASSWORD
+              ValueFrom: !Sub '${RDSSecretArn}:password::'
+            - Name: SPRING_DATA_REDIS_URL
+              ValueFrom: !Sub '${RedisSecretArn}:url::'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost:8087/actuator/health || exit 1
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 240
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWSRegion
+              awslogs-stream-prefix: api-entitlements
+        - !If
+          - IsAppSignalsEnabled
+          - Name: adot-collector
+            Image: public.ecr.aws/aws-observability/aws-otel-collector:latest
+            Essential: false
+            Command: ['--config=/etc/ecs/ecs-default-config.yaml']
+            PortMappings:
+              - ContainerPort: 4317
+                Protocol: tcp
+              - ContainerPort: 4318
+                Protocol: tcp
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref ECSLogGroup
+                awslogs-region: !Ref AWSRegion
+                awslogs-stream-prefix: adot-collector
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Module
+          Value: api-entitlements
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --- Portal-Tenants (8088) ---
+  TaskDefPortalTenants:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-portal-tenants'
+      Cpu: !Ref FargateTaskCpu
+      Memory: !Ref FargateTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: portal-tenants
+          Image: !Sub '${AWSAccountId}.dkr.ecr.${AWSRegion}.amazonaws.com/${ECRRepoPrefix}/portal-tenants:${ImageTag}'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8088
+              Protocol: tcp
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: !If
+                - IsAppSignalsEnabled
+                - !Sub '${Environment},aws,aws-signals'
+                - !Sub '${Environment},aws'
+            - Name: SERVER_PORT
+              Value: '8088'
+            - Name: FEATURE_CACHE_ENABLED
+              Value: !Ref EnableCache
+            - Name: FEATURE_SEARCH_ENABLED
+              Value: !Ref EnableSearch
+            - Name: FEATURE_EVENT_STREAM_ENABLED
+              Value: !Ref EnableEventStream
+            - Name: SPRING_FLYWAY_ENABLED
+              Value: 'true'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: JAVA_TOOL_OPTIONS
+                Value: '-javaagent:/opt/aws-opentelemetry-agent.jar'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: OTEL_RESOURCE_ATTRIBUTES
+                Value: !Sub 'service.name=portal-tenants,service.namespace=${ProjectName},deployment.environment=${Environment}'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: ENVIRONMENT
+                Value: !Ref Environment
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: PROJECT_NAME
+                Value: !Ref ProjectName
+              - !Ref 'AWS::NoValue'
+          Secrets:
+            - Name: SPRING_DATASOURCE_URL
+              ValueFrom: !Sub '${RDSSecretArn}:jdbc_url::'
+            - Name: SPRING_DATASOURCE_USERNAME
+              ValueFrom: !Sub '${RDSSecretArn}:username::'
+            - Name: SPRING_DATASOURCE_PASSWORD
+              ValueFrom: !Sub '${RDSSecretArn}:password::'
+            - Name: SPRING_DATA_REDIS_URL
+              ValueFrom: !Sub '${RedisSecretArn}:url::'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost:8088/actuator/health || exit 1
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 240
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWSRegion
+              awslogs-stream-prefix: portal-tenants
+        - !If
+          - IsAppSignalsEnabled
+          - Name: adot-collector
+            Image: public.ecr.aws/aws-observability/aws-otel-collector:latest
+            Essential: false
+            Command: ['--config=/etc/ecs/ecs-default-config.yaml']
+            PortMappings:
+              - ContainerPort: 4317
+                Protocol: tcp
+              - ContainerPort: 4318
+                Protocol: tcp
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref ECSLogGroup
+                awslogs-region: !Ref AWSRegion
+                awslogs-stream-prefix: adot-collector
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Module
+          Value: portal-tenants
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --- Portal-Entitlements (8089) ---
+  TaskDefPortalEntitlements:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-portal-entitlements'
+      Cpu: !Ref FargateTaskCpu
+      Memory: !Ref FargateTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: portal-entitlements
+          Image: !Sub '${AWSAccountId}.dkr.ecr.${AWSRegion}.amazonaws.com/${ECRRepoPrefix}/portal-entitlements:${ImageTag}'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8089
+              Protocol: tcp
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: !If
+                - IsAppSignalsEnabled
+                - !Sub '${Environment},aws,aws-signals'
+                - !Sub '${Environment},aws'
+            - Name: SERVER_PORT
+              Value: '8089'
+            - Name: FEATURE_CACHE_ENABLED
+              Value: !Ref EnableCache
+            - Name: FEATURE_SEARCH_ENABLED
+              Value: !Ref EnableSearch
+            - Name: FEATURE_EVENT_STREAM_ENABLED
+              Value: !Ref EnableEventStream
+            - Name: SPRING_FLYWAY_ENABLED
+              Value: 'true'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: JAVA_TOOL_OPTIONS
+                Value: '-javaagent:/opt/aws-opentelemetry-agent.jar'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: OTEL_RESOURCE_ATTRIBUTES
+                Value: !Sub 'service.name=portal-entitlements,service.namespace=${ProjectName},deployment.environment=${Environment}'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: ENVIRONMENT
+                Value: !Ref Environment
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: PROJECT_NAME
+                Value: !Ref ProjectName
+              - !Ref 'AWS::NoValue'
+          Secrets:
+            - Name: SPRING_DATASOURCE_URL
+              ValueFrom: !Sub '${RDSSecretArn}:jdbc_url::'
+            - Name: SPRING_DATASOURCE_USERNAME
+              ValueFrom: !Sub '${RDSSecretArn}:username::'
+            - Name: SPRING_DATASOURCE_PASSWORD
+              ValueFrom: !Sub '${RDSSecretArn}:password::'
+            - Name: SPRING_DATA_REDIS_URL
+              ValueFrom: !Sub '${RedisSecretArn}:url::'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost:8089/actuator/health || exit 1
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 240
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWSRegion
+              awslogs-stream-prefix: portal-entitlements
+        - !If
+          - IsAppSignalsEnabled
+          - Name: adot-collector
+            Image: public.ecr.aws/aws-observability/aws-otel-collector:latest
+            Essential: false
+            Command: ['--config=/etc/ecs/ecs-default-config.yaml']
+            PortMappings:
+              - ContainerPort: 4317
+                Protocol: tcp
+              - ContainerPort: 4318
+                Protocol: tcp
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref ECSLogGroup
+                awslogs-region: !Ref AWSRegion
+                awslogs-stream-prefix: adot-collector
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Module
+          Value: portal-entitlements
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # --- Portal-SRE (8090) ---
+  TaskDefPortalSRE:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-${Environment}-portal-sre'
+      Cpu: !Ref FargateTaskCpu
+      Memory: !Ref FargateTaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: X86_64
+        OperatingSystemFamily: LINUX
+      ContainerDefinitions:
+        - Name: portal-sre
+          Image: !Sub '${AWSAccountId}.dkr.ecr.${AWSRegion}.amazonaws.com/${ECRRepoPrefix}/portal-sre:${ImageTag}'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8090
+              Protocol: tcp
+          Environment:
+            - Name: SPRING_PROFILES_ACTIVE
+              Value: !If
+                - IsAppSignalsEnabled
+                - !Sub '${Environment},aws,aws-signals'
+                - !Sub '${Environment},aws'
+            - Name: SERVER_PORT
+              Value: '8090'
+            - Name: FEATURE_CACHE_ENABLED
+              Value: !Ref EnableCache
+            - Name: FEATURE_SEARCH_ENABLED
+              Value: !Ref EnableSearch
+            - Name: FEATURE_EVENT_STREAM_ENABLED
+              Value: !Ref EnableEventStream
+            - Name: SPRING_FLYWAY_ENABLED
+              Value: 'true'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: JAVA_TOOL_OPTIONS
+                Value: '-javaagent:/opt/aws-opentelemetry-agent.jar'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: OTEL_RESOURCE_ATTRIBUTES
+                Value: !Sub 'service.name=portal-sre,service.namespace=${ProjectName},deployment.environment=${Environment}'
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: ENVIRONMENT
+                Value: !Ref Environment
+              - !Ref 'AWS::NoValue'
+            - !If
+              - IsAppSignalsEnabled
+              - Name: PROJECT_NAME
+                Value: !Ref ProjectName
+              - !Ref 'AWS::NoValue'
+          Secrets:
+            - Name: SPRING_DATASOURCE_URL
+              ValueFrom: !Sub '${RDSSecretArn}:jdbc_url::'
+            - Name: SPRING_DATASOURCE_USERNAME
+              ValueFrom: !Sub '${RDSSecretArn}:username::'
+            - Name: SPRING_DATASOURCE_PASSWORD
+              ValueFrom: !Sub '${RDSSecretArn}:password::'
+            - Name: SPRING_DATA_REDIS_URL
+              ValueFrom: !Sub '${RedisSecretArn}:url::'
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost:8090/actuator/health || exit 1
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 240
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWSRegion
+              awslogs-stream-prefix: portal-sre
+        - !If
+          - IsAppSignalsEnabled
+          - Name: adot-collector
+            Image: public.ecr.aws/aws-observability/aws-otel-collector:latest
+            Essential: false
+            Command: ['--config=/etc/ecs/ecs-default-config.yaml']
+            PortMappings:
+              - ContainerPort: 4317
+                Protocol: tcp
+              - ContainerPort: 4318
+                Protocol: tcp
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Ref ECSLogGroup
+                awslogs-region: !Ref AWSRegion
+                awslogs-stream-prefix: adot-collector
+          - !Ref 'AWS::NoValue'
+      Tags:
+        - Key: Module
+          Value: portal-sre
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # =========================================================================
+  # ECS Services — 10 Fargate services
+  # =========================================================================
+  ServicePortalClaimsAdvisor:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+      - ListenerRulePortalAdvisor
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-portal-claims-advisor'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefPortalClaimsAdvisor
+      DesiredCount: !Ref DesiredServiceCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref AppSecurityGroupId
+      LoadBalancers:
+        - ContainerName: portal-claims-advisor
+          ContainerPort: 8081
+          TargetGroupArn: !Ref TGPortalClaimsAdvisor
+      HealthCheckGracePeriodSeconds: 300
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Module
+          Value: portal-claims-advisor
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ServicePortalClaimsMember:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+      - ListenerRulePortalMember
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-portal-claims-member'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefPortalClaimsMember
+      DesiredCount: !Ref DesiredServiceCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref AppSecurityGroupId
+      LoadBalancers:
+        - ContainerName: portal-claims-member
+          ContainerPort: 8082
+          TargetGroupArn: !Ref TGPortalClaimsMember
+      HealthCheckGracePeriodSeconds: 300
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Module
+          Value: portal-claims-member
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ServiceApiClaims:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+      - ListenerRuleApiClaims
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-api-clm'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefApiClaims
+      DesiredCount: !Ref DesiredServiceCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref AppSecurityGroupId
+      LoadBalancers:
+        - ContainerName: api-claims
+          ContainerPort: 8083
+          TargetGroupArn: !Ref TGApiClaims
+      HealthCheckGracePeriodSeconds: 300
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Module
+          Value: api-claims
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ServiceApiMembers:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+      - ListenerRuleApiMembers
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-api-mbr'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefApiMembers
+      DesiredCount: !Ref DesiredServiceCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref AppSecurityGroupId
+      LoadBalancers:
+        - ContainerName: api-members
+          ContainerPort: 8084
+          TargetGroupArn: !Ref TGApiMembers
+      HealthCheckGracePeriodSeconds: 300
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Module
+          Value: api-members
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ServicePortalBatchAssignment:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+      - ListenerRulePortalBatch
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-portal-batch-assignment'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefPortalBatchAssignment
+      DesiredCount: !Ref DesiredServiceCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref AppSecurityGroupId
+      LoadBalancers:
+        - ContainerName: portal-batch-assignment
+          ContainerPort: 8085
+          TargetGroupArn: !Ref TGPortalBatchAssignment
+      HealthCheckGracePeriodSeconds: 300
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Module
+          Value: portal-batch-assignment
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ServiceApiTenants:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+      - ListenerRuleApiTenants
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-api-tnt'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefApiTenants
+      DesiredCount: !Ref DesiredServiceCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref AppSecurityGroupId
+      LoadBalancers:
+        - ContainerName: api-tenants
+          ContainerPort: 8086
+          TargetGroupArn: !Ref TGApiTenants
+      HealthCheckGracePeriodSeconds: 300
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Module
+          Value: api-tenants
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ServiceApiEntitlements:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+      - ListenerRuleApiEntitlements
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-api-entl'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefApiEntitlements
+      DesiredCount: !Ref DesiredServiceCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref AppSecurityGroupId
+      LoadBalancers:
+        - ContainerName: api-entitlements
+          ContainerPort: 8087
+          TargetGroupArn: !Ref TGApiEntitlements
+      HealthCheckGracePeriodSeconds: 300
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Module
+          Value: api-entitlements
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ServicePortalTenants:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+      - ListenerRulePortalTenants
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-ptl-tnt'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefPortalTenants
+      DesiredCount: !Ref DesiredServiceCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref AppSecurityGroupId
+      LoadBalancers:
+        - ContainerName: portal-tenants
+          ContainerPort: 8088
+          TargetGroupArn: !Ref TGPortalTenants
+      HealthCheckGracePeriodSeconds: 300
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Module
+          Value: portal-tenants
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ServicePortalEntitlements:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+      - ListenerRulePortalEntitlements
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-portal-entitlements'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefPortalEntitlements
+      DesiredCount: !Ref DesiredServiceCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref AppSecurityGroupId
+      LoadBalancers:
+        - ContainerName: portal-entitlements
+          ContainerPort: 8089
+          TargetGroupArn: !Ref TGPortalEntitlements
+      HealthCheckGracePeriodSeconds: 300
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Module
+          Value: portal-entitlements
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  ServicePortalSRE:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListener
+      - ListenerRulePortalSRE
+    Properties:
+      ServiceName: !Sub '${ProjectName}-${Environment}-ptl-sre'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefPortalSRE
+      DesiredCount: !Ref DesiredServiceCount
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+          SecurityGroups:
+            - !Ref AppSecurityGroupId
+      LoadBalancers:
+        - ContainerName: portal-sre
+          ContainerPort: 8090
+          TargetGroupArn: !Ref TGPortalSRE
+      HealthCheckGracePeriodSeconds: 300
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 50
+        MaximumPercent: 200
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Module
+          Value: portal-sre
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+# ===========================================================================
+# Outputs
+# ===========================================================================
+Outputs:
+  ALBDnsName:
+    Description: Application Load Balancer DNS name
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ALBDnsName'
+
+  ALBArn:
+    Description: Application Load Balancer ARN
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ALBArn'
+
+  ALBHostedZoneId:
+    Description: ALB Canonical Hosted Zone ID (for Route53 alias records)
+    Value: !GetAtt ApplicationLoadBalancer.CanonicalHostedZoneID
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ALBHostedZoneId'
+
+  ECSClusterArn:
+    Description: ECS Cluster ARN
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ECSClusterArn'
+
+  ECSClusterName:
+    Description: ECS Cluster name
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ECSClusterName'
+
+  ServiceArnPortalClaimsAdvisor:
+    Description: ECS Service ARN — Portal-Claims-Advisor
+    Value: !Ref ServicePortalClaimsAdvisor
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ServiceArn-portal-claims-advisor'
+
+  ServiceArnPortalClaimsMember:
+    Description: ECS Service ARN — Portal-Claims-Member
+    Value: !Ref ServicePortalClaimsMember
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ServiceArn-portal-claims-member'
+
+  ServiceArnApiClaims:
+    Description: ECS Service ARN — API-Claims
+    Value: !Ref ServiceApiClaims
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ServiceArn-api-claims'
+
+  ServiceArnApiMembers:
+    Description: ECS Service ARN — API-Members
+    Value: !Ref ServiceApiMembers
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ServiceArn-api-members'
+
+  ServiceArnPortalBatchAssignment:
+    Description: ECS Service ARN — Portal-Batch-Assignment
+    Value: !Ref ServicePortalBatchAssignment
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ServiceArn-portal-batch-assignment'
+
+  ServiceArnApiTenants:
+    Description: ECS Service ARN — API-Tenants
+    Value: !Ref ServiceApiTenants
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ServiceArn-api-tenants'
+
+  ServiceArnApiEntitlements:
+    Description: ECS Service ARN — API-Entitlements
+    Value: !Ref ServiceApiEntitlements
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ServiceArn-api-entitlements'
+
+  ServiceArnPortalTenants:
+    Description: ECS Service ARN — Portal-Tenants
+    Value: !Ref ServicePortalTenants
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ServiceArn-portal-tenants'
+
+  ServiceArnPortalEntitlements:
+    Description: ECS Service ARN — Portal-Entitlements
+    Value: !Ref ServicePortalEntitlements
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ServiceArn-portal-entitlements'
+
+  ServiceArnPortalSRE:
+    Description: ECS Service ARN — Portal-SRE
+    Value: !Ref ServicePortalSRE
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ServiceArn-portal-sre'

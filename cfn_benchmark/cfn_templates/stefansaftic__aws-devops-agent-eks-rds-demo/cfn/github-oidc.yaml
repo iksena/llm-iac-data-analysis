@@ -1,0 +1,191 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: GitHub Actions OIDC provider + IAM role for EKS-FAIL-DEMO deploys
+
+# One-time bootstrap stack. Deploys the IAM resources GitHub Actions needs
+# to authenticate to AWS without long-lived keys, scoped to a single repo.
+#
+# After this stack succeeds, run scripts/setup-github-oidc.sh to grant the
+# role cluster-admin on the EKS cluster via an Access Entry.
+
+Parameters:
+  GitHubOrg:
+    Type: String
+    Default: stefansaftic
+    Description: GitHub user or org that owns the repo.
+  GitHubRepo:
+    Type: String
+    Default: aws-devops-agent-eks-rds-demo
+    Description: Repo name (without owner).
+  RoleName:
+    Type: String
+    Default: github-actions-eks-demo
+  CreateOidcProvider:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: |
+      Set to 'false' if the GitHub OIDC provider already exists in this account
+      (e.g. another stack/team created it). Reusing avoids the
+      EntityAlreadyExists conflict.
+
+Conditions:
+  ShouldCreateOidcProvider: !Equals [!Ref CreateOidcProvider, 'true']
+
+Resources:
+  # GitHub Actions OIDC provider. Only one of these can exist per account.
+  # The thumbprint is required by the API but AWS no longer relies on it for
+  # validation (it uses its own CA chain check); any non-empty value works.
+  GitHubOidcProvider:
+    Condition: ShouldCreateOidcProvider
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+
+  GitHubActionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref RoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: !Sub arn:aws:iam::${AWS::AccountId}:oidc-provider/token.actions.githubusercontent.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              # Restrict to this repo only. The trailing :* allows any branch,
+              # tag, PR, or environment within the repo.
+              StringLike:
+                token.actions.githubusercontent.com:sub: !Sub repo:${GitHubOrg}/${GitHubRepo}:*
+      Policies:
+        # The workflow runs `kubectl apply` (via update-kubeconfig) +
+        # an `update-stack` on the parent CFN stack. The parent stack
+        # orchestrates VPC + EKS + RDS + FIS + EC2 nested stacks; CFN's
+        # update flow re-validates the full resource graph of every
+        # nested stack even when the actual diff is small, which means
+        # the role needs Describe-class access across every service the
+        # templates touch. Trying to enumerate the exact Describe calls
+        # CFN issues is a losing game (we hit DescribeAvailabilityZones,
+        # DescribeInternetGateways, DescribeVpcs in three separate
+        # rollback failures before going broad).
+        #
+        # The role is constrained by the OIDC trust policy to this one
+        # repo. Granting read-class actions broadly is fine. Writes are
+        # narrowed to the specific actions the demo's scenario PRs
+        # actually trigger.
+        - PolicyName: ReadAcrossStackedServices
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - ec2:GetSecurityGroupsForVpc
+                  - rds:Describe*
+                  - rds:ListTagsForResource
+                  - eks:Describe*
+                  - eks:List*
+                  - fis:Get*
+                  - fis:List*
+                  - iam:Get*
+                  - iam:List*
+                  - logs:Describe*
+                  - logs:GetLog*
+                  - logs:ListTagsForResource
+                  - cloudwatch:GetDashboard
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                  - ecr:Describe*
+                  - ecr:GetRepositoryPolicy
+                  - ecr:GetLifecyclePolicy
+                  - ecr:ListTagsForResource
+                  - sts:GetCallerIdentity
+                Resource: '*'
+              # AWS-owned SSM parameters CFN resolves at update time
+              # (the AmazonLinux 2023 AMI lookup in cfn/ec2-postgres).
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}::parameter/aws/service/*
+        - PolicyName: WriteScopedToDemoActions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # The workflow re-uploads nested templates to the same
+              # template bucket deploy.sh uses, then drives a parent
+              # update-stack. When the parent adds a new nested stack
+              # resource, CFN CreateStacks that nested stack under the
+              # covers, so we need CreateStack too. DeleteStack is
+              # required for rollback of newly-added nested stacks.
+              - Effect: Allow
+                Action:
+                  - cloudformation:UpdateStack
+                  - cloudformation:CreateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:ValidateTemplate
+                  - cloudformation:Describe*
+                  - cloudformation:Get*
+                  - cloudformation:List*
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::*-templates-${AWS::AccountId}-${AWS::Region}/*
+              # The cost-optimization scenario flips the gp3 data
+              # volume's Iops/Throughput defaults. CFN issues this call.
+              - Effect: Allow
+                Action:
+                  - ec2:ModifyVolume
+                Resource: '*'
+              # If CFN ever needs to replace the EC2 Instance (e.g.
+              # because the SSM-resolved AMI drifted), it calls
+              # iam:PassRole on the InstanceRole. Restrict to the
+              # project's own instance roles only.
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/devops-agent-demo-*-InstanceRole-*
+              # Some AWS::EC2::Instance property changes (e.g. AMI ID)
+              # require CFN to Stop -> modify -> Start the instance
+              # in-place rather than replace it. Grant those actions
+              # scoped to the project's instances via ResourceTag.
+              - Effect: Allow
+                Action:
+                  - ec2:StopInstances
+                  - ec2:StartInstances
+                  - ec2:RebootInstances
+                  - ec2:ModifyInstanceAttribute
+                  - ec2:RunInstances
+                  - ec2:TerminateInstances
+                Resource: '*'
+              # cfn/ec2-postgres.yaml owns the CloudWatch dashboard
+              # the demo uses. CFN re-applies it on every update.
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutDashboard
+                  - cloudwatch:DeleteDashboards
+                Resource: '*'
+      Tags:
+        - {Key: auto-delete, Value: never}
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt GitHubActionsRole.Arn
+    Description: Set this as the AWS_ROLE_ARN repository variable in GitHub.
+  RoleName:
+    Value: !Ref GitHubActionsRole

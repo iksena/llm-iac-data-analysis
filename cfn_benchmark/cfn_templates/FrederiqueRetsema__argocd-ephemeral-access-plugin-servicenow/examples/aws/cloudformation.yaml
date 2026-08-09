@@ -1,0 +1,2028 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Create demo environment for ArgoCD Ephemeral Access Plugin for ServiceNow in AWS
+
+Parameters:
+
+  Ubuntu2404AMI:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id
+  EC2InstanceType:
+    Type: String
+    Default: t2.large  # t2.large is 8 GiB ram, 2 vCPUs
+
+  ConsultantName:
+    Type: String
+  ConsultantEmail:
+    Type: String
+  GroupName:
+    Type: String
+  DefaultPassword:
+    Type: String
+  HostedZoneName:
+    Type: String
+  CertificateId:
+    Type: String
+  ServiceNowUrl:
+    Type: String
+  ArgoCDNamespace:
+    Type: String
+    Default: argocd
+  ArgoCDEphemeralAccessNamespace:
+    Type: String
+    Default: argocd-ephemeral-access
+  DemoSourceRepo:
+    Type: String
+    Default: https://github.com/FrederiqueRetsema/kubernetes-test-repo.git
+
+  KubernetesMinorVersion:
+    Type: String
+    Default: v1.33
+  KubernetesPatchVersion:
+    Type: String
+    Default: v1.33.0
+  ContainerdVersion:
+    Type: String
+    Default: 2.1.1    # without a v, is used without a v in the filename
+  NerdctlVersion:
+    Type: String
+    Default: 2.1.2    # without a v, is used without a v in the filename
+  BuildkitVersion:
+    Type: String
+    Default: v0.22.0
+  RuncVersion:
+    Type: String
+    Default: v1.3.0
+  ArgoCDExtensionInstallerVersion:
+    Type: String
+    Default: v0.0.8@sha256:e7cb054207620566286fce2d809b4f298a72474e0d8779ffa8ec92c3b630f054
+  ArgoCDVersion:
+    Type: String
+    Default: v3.0.5
+  EphemeralAccessExtensionVersion:
+    Type: String
+    Default: v0.1.6
+  EphemeralAccessExtensionPluginServiceNowVersion:
+    Type: String
+    Default: v0.0.3
+  PrivateIpControl:
+    Type: String
+    Default: 172.31.0.10
+  PrivateIpWorker:
+    Type: String
+    Default: 172.31.0.11
+  PrivateIpWorker2:
+    Type: String
+    Default: 172.31.0.12
+
+Mappings:
+  AWSManagedRoles:
+    SSM:
+      AmazonSSMManagedInstanceCore: "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+Resources:
+
+  ArgoCDCognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      UserPoolName: argocd-userpool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes: []
+      UsernameConfiguration:
+        CaseSensitive: false
+      UserPoolTier: "ESSENTIALS"
+
+  ArgoCDUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref ArgoCDCognitoUserPool
+      Domain: !Sub "argocd-xforce-${ConsultantName}"
+      ManagedLoginVersion: "2"
+
+  ArgoCDCognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref ArgoCDCognitoUserPool
+      ClientName: argocd
+      GenerateSecret: true
+      ExplicitAuthFlows:
+      - ALLOW_REFRESH_TOKEN_AUTH
+      - ALLOW_USER_AUTH
+      - ALLOW_USER_SRP_AUTH
+      SupportedIdentityProviders:
+      - COGNITO
+      CallbackURLs:
+      - !Sub "https://argocd.${HostedZoneName}/auth/callback"
+      AllowedOAuthFlows:
+      - code
+      AllowedOAuthScopes:
+      - email
+      - openid
+      AllowedOAuthFlowsUserPoolClient: true
+      PreventUserExistenceErrors: "ENABLED"
+
+  ArgoCDCognitoUserPoolManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    Properties:
+      UserPoolId: !Ref ArgoCDCognitoUserPool
+      ClientId: !Ref ArgoCDCognitoUserPoolClient
+      UseCognitoProvidedValues: true
+
+  CognitoUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      DesiredDeliveryMediums:
+      - EMAIL
+      Username: !Ref ConsultantName
+      UserAttributes:
+      - Name: name
+        Value: !Ref ConsultantName
+      - Name: email
+        Value: !Ref ConsultantEmail
+      UserPoolId: !Ref ArgoCDCognitoUserPool
+
+  CognitoGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: !Ref GroupName
+      UserPoolId: !Ref ArgoCDCognitoUserPool
+
+  CognitoUserInGroup:
+    Type: AWS::Cognito::UserPoolUserToGroupAttachment
+    Properties:
+      GroupName: !Ref CognitoGroup
+      Username: !Ref CognitoUser
+      UserPoolId: !Ref ArgoCDCognitoUserPool
+
+  LoadbalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Securitygroup for K8S
+      VpcId: !Ref KubernetesVPC
+      SecurityGroupIngress:
+        - CidrIp: "0.0.0.0/0"
+          FromPort: 443
+          ToPort: 443
+          IpProtocol: TCP
+      SecurityGroupEgress:
+        - DestinationSecurityGroupId: !Ref KubernetesSecurityGroup
+          FromPort: 30123
+          ToPort: 30123
+          IpProtocol: TCP
+
+  ArgoCDLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: ArgoCD
+      SecurityGroups:
+      - !Ref LoadbalancerSecurityGroup
+      Subnets:
+      - !Ref PublicSubnetAZa
+      - !Ref PublicSubnetAZb
+
+  ArgoCDListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Certificates:
+      - CertificateArn: !Sub "arn:${AWS::Partition}:acm:eu-west-1:${AWS::AccountId}:certificate/${CertificateId}"
+      Port: 443
+      Protocol: HTTPS
+      LoadBalancerArn: !Ref ArgoCDLoadBalancer
+      DefaultActions:
+        - Type: forward
+          ForwardConfig:
+            TargetGroups:
+              - TargetGroupArn: !Ref ArgoCDTargetGroup
+
+  ArgoCDTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckPort: 30123
+      Name: ArgoCDTargetGroup
+      Port: 30123
+      Protocol: HTTPS
+      TargetType: instance
+      Targets:
+      - Id: !Ref KubernetesControlNode
+      - Id: !Ref KubernetesWorkerNode
+      - Id: !Ref KubernetesWorkerNode2
+      VpcId: !Ref KubernetesVPC
+
+  ArgoCDRecordSet:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      AliasTarget:
+        DNSName: !GetAtt ArgoCDLoadBalancer.DNSName
+        HostedZoneId: !GetAtt ArgoCDLoadBalancer.CanonicalHostedZoneID
+      HostedZoneName: !Sub "${HostedZoneName}."
+      Name: !Sub "argocd.${HostedZoneName}."
+      Type: "A"
+
+  KubernetesVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 172.31.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub "k8s-${ConsultantName}"
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref KubernetesVPC
+
+  ExecuteDeleteVpcFunction:
+    Type: Custom::ExecuteDeleteVpcFunction
+    Properties:
+      Vpc           : !Ref KubernetesVPC
+      ServiceToken  : !GetAtt DeleteVpcFunction.Arn
+
+  PublicSubnetAZa:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Join ["", [!Ref "AWS::Region", "a"]]
+      CidrBlock: 172.31.0.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref KubernetesVPC
+      Tags:
+        - Key: Name
+          Value: PublicSubnetAZa
+  PublicSubnetAZaRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetAZa
+  PublicSubnetAZb:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Join ["", [!Ref "AWS::Region", "b"]]
+      CidrBlock: 172.31.1.0/24
+      MapPublicIpOnLaunch: true
+      VpcId: !Ref KubernetesVPC
+      Tags:
+        - Key: Name
+          Value: PublicSubnetAZb
+  PublicSubnetAZbRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      SubnetId: !Ref PublicSubnetAZb
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+      VpcId: !Ref KubernetesVPC
+  PublicRoutePublicInternet:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  KubernetesIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+              - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: Cognito
+          PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                  - Sid: CognitoAllResources
+                    Effect: Allow
+                    Action:
+                      - "cognito-idp:ListUserPools"
+                    Resource: "*"
+                  - Sid: CognitoResourceUserPool
+                    Effect: Allow
+                    Action:
+                      - "cognito-idp:ListUserPoolClients"
+                      - "cognito-idp:DescribeUserPool"
+                      - "cognito-idp:DescribeUserPoolClient"
+                    Resource:
+                      - !GetAtt ArgoCDCognitoUserPool.Arn
+        - PolicyName: ECR
+          PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                  - Sid: ECRAll
+                    Effect: Allow
+                    Action:
+                      - "ecr:GetAuthorizationToken"
+                    Resource: "*"
+      ManagedPolicyArns:
+        - !FindInMap [ "AWSManagedRoles", "SSM", "AmazonSSMManagedInstanceCore"]
+
+  KubernetesIAMInstanceProfile:
+    Type: "AWS::IAM::InstanceProfile"
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref KubernetesIAMRole
+
+  KubernetesSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Securitygroup for K8S
+      VpcId: !Ref KubernetesVPC
+      SecurityGroupIngress:
+        - CidrIp: 172.31.0.0/16
+          FromPort: 0
+          ToPort: 65535
+          IpProtocol: UDP
+        - CidrIp: 172.31.0.0/16
+          FromPort: 0
+          ToPort: 65535
+          IpProtocol: TCP
+
+  KubernetesControlNode:
+    DependsOn: KubernetesIAMRole
+    Type: AWS::EC2::Instance
+    Metadata:
+      'AWS::CloudFormation::Init':
+        config:
+          packages:
+            apt:
+              git: []
+          files:
+            '/opt/xforce/id_ed25519':
+              content: |
+                -----BEGIN OPENSSH PRIVATE KEY-----
+                b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+                QyNTUxOQAAACCTXTLuYK4zg+qPJ8FFLVs2v925WrVSksZ+GOQxwHgKmAAAAJjhL6Rc4S+k
+                XAAAAAtzc2gtZWQyNTUxOQAAACCTXTLuYK4zg+qPJ8FFLVs2v925WrVSksZ+GOQxwHgKmA
+                AAAEDmLUPDD+HXOBMbRcbuOBWBntS5+fr62g39VvLyix1Dx5NdMu5grjOD6o8nwUUtWza/
+                3blatVKSxn4Y5DHAeAqYAAAAEmZyZWRlcmlxdWVAd29ya2VyMgECAw==
+                -----END OPENSSH PRIVATE KEY-----
+              mode: '000400'
+            '/opt/xforce/id_ed25519.pub':
+              content: !Sub |
+                ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJNdMu5grjOD6o8nwUUtWza/3blatVKSxn4Y5DHAeAqY ${ConsultantName}@control
+              mode: '000400'
+            '/opt/xforce/authorized_keys':
+              content: !Sub |
+                ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJNdMu5grjOD6o8nwUUtWza/3blatVKSxn4Y5DHAeAqY ${ConsultantName}@control
+              mode: '000400'
+            '/opt/xforce/d':
+              content: !Sub |
+                #!/bin/bash
+                kubectl get pods -n ${ArgoCDEphemeralAccessNamespace} | grep controller | awk '{print "kubectl delete pod -n ${ArgoCDEphemeralAccessNamespace} "$1}' | bash
+                kubectl get accessrequests -n ${ArgoCDNamespace} | grep -v NAME | awk '{print "kubectl delete accessrequest -n argocd "$1}' | bash
+              mode: '000544'
+            '/opt/xforce/g':
+              content: !Sub |
+                #!/bin/bash
+                kubectl get pods -n ${ArgoCDEphemeralAccessNamespace} -w
+              mode: '000544'
+            '/opt/xforce/l':
+              content: !Sub |
+                #!/bin/bash
+                kubectl get pods -n ${ArgoCDEphemeralAccessNamespace} | grep controller | awk '{print "kubectl logs -n ${ArgoCDEphemeralAccessNamespace} "$1}' | bash
+              mode: '000544'
+            '/opt/xforce/accessbinding.yaml':
+              content: !Sub |
+                apiVersion: ephemeral-access.argoproj-labs.io/v1alpha1
+                kind: AccessBinding
+                metadata:
+                  name: access-binding-incidentmanager
+                spec:
+                  ordinal: 0
+                  friendlyName: "Incidentmgr (Write)"
+                  subjects:
+                    - ${GroupName}
+                  roleTemplateRef:
+                    name: incidentmanager
+                ---
+                apiVersion: ephemeral-access.argoproj-labs.io/v1alpha1
+                kind: AccessBinding
+                metadata:
+                  name: access-binding-devops
+                spec:
+                  ordinal: 1
+                  friendlyName: "Devops (Write)"
+                  subjects:
+                    - ${GroupName}
+                  roleTemplateRef:
+                    name: devops
+                ---
+                apiVersion: ephemeral-access.argoproj-labs.io/v1alpha1
+                kind: AccessBinding
+                metadata:
+                  name: access-binding-readonly
+                spec:
+                  ordinal: 2
+                  friendlyName: "ReadOnly"
+                  subjects:
+                    - ${GroupName}
+                  roleTemplateRef:
+                    name: readonly
+              mode: '000444'
+            '/opt/xforce/configmap-argocd-cm.yaml':
+              content: !Sub |
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: argocd-cm
+                data:
+                  url: https://argocd.${HostedZoneName}
+                  extension.config.ephemeral: |-
+                    services:
+                    - url: http://backend.argocd-ephemeral-access.svc.cluster.local
+                  oidc.config: |
+                    name: cognito
+                    issuer: ISSUER
+                    clientID: CLIENT_ID
+                    clientSecret: CLIENT_SECRET
+                    requestedScopes: ["email", "openid"]
+                    requestedIDTokenClaims: {"groups": {"essential": true}}
+                    redirectURI: https://argocd.${HostedZoneName}/auth/callback
+                    getUserInfo: true
+              mode: '000444'
+            '/opt/xforce/configmap-argocd-cmd-params-cmd.yaml':
+              content: |
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: argocd-cmd-params-cm
+                data:
+                  server.enable.proxy.extension: "true"
+              mode: '000444'
+            '/opt/xforce/configmap-argocd-ephemeral-access-controller-cm.yaml':
+              content: |
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: controller-cm
+                data:
+                  controller.log.level: debug
+                  exclusion-roles: |
+                    incidentmanager
+            '/opt/xforce/configmap-argocd-rbac-cm.yaml':
+              content: !Sub |
+                apiVersion: v1
+                kind: ConfigMap
+                metadata:
+                  name: argocd-rbac-cm
+                data:
+                  policy.csv: |-
+                    p, role:readonly, extensions, invoke, ephemeral, allow
+                    g, ${GroupName}, role:readonly
+                  scopes: '[cognito:groups, email]'
+              mode: '000444'
+            '/opt/xforce/demoproject.yaml':
+              content: !Sub |
+                apiVersion: argoproj.io/v1alpha1
+                kind: AppProject
+                metadata:
+                  name: demoproject
+                  namespace: ${ArgoCDNamespace}
+                spec:
+                  sourceRepos:
+                  - ${DemoSourceRepo}
+                  destinations:
+                  - name: in-cluster
+                    namespace: '*'
+                    server: https://kubernetes.default.svc
+                  clusterResourceWhitelist:
+                  - group: '*'
+                    kind: '*'
+                  namespaceResourceWhitelist:
+                  - group: '*'
+                    kind: '*'
+              mode: '000444'
+            '/opt/xforce/demoapp.yaml':
+              content: !Sub |
+                apiVersion: argoproj.io/v1alpha1
+                kind: Application
+                metadata:
+                  name: demoapp
+                  namespace: ${ArgoCDNamespace}
+                  labels:
+                    environment: production
+                    ciName: app-demoapp
+                spec:
+                  project: demoproject
+                  syncPolicy:
+                    syncOptions:
+                    - CreateNamespace=true
+                  source:
+                    path: demo-dir
+                    repoURL: ${DemoSourceRepo}
+                    targetRevision: HEAD
+                  destination:
+                    namespace: demonamespace
+                    server: https://kubernetes.default.svc
+              mode: '000444'
+            '/opt/xforce/roletemplate.yaml':
+              content: |
+                apiVersion: ephemeral-access.argoproj-labs.io/v1alpha1
+                kind: RoleTemplate
+                metadata:
+                  name: readonly
+                spec:
+                  description: readonly permission in application {{.application}}
+                  name: "readonly"
+                  policies:
+                  - p, {{.role}}, applications, readonly, {{.project}}/{{.application}}, allow
+                ---
+                apiVersion: ephemeral-access.argoproj-labs.io/v1alpha1
+                kind: RoleTemplate
+                metadata:
+                  name: "devops"
+                spec:
+                  description: write permission in application {{.application}}
+                  name: "devops"
+                  policies:
+                  - p, {{.role}}, applications, sync, {{.project}}/{{.application}}, allow
+                  - p, {{.role}}, applications, action/*, {{.project}}/{{.application}}, allow
+                ---
+                apiVersion: ephemeral-access.argoproj-labs.io/v1alpha1
+                kind: RoleTemplate
+                metadata:
+                  name: "incidentmanager"
+                spec:
+                  description: full access to application {{.application}}
+                  name: "incidentmanager"
+                  policies:
+                  - p, {{.role}}, applications, *, {{.project}}/{{.application}}, allow
+              mode: '000444'
+            '/opt/xforce/clusterrole-controller-role-patch.yaml':
+              content: |
+                - apiGroups:
+                  - ""
+                  resourceNames:
+                  - servicenow-secret
+                  resources:
+                  - secrets
+                  verbs:
+                  - get
+                - apiGroups:
+                  - batch
+                  resources:
+                  - cronjobs
+                  verbs:
+                  - create
+              mode: '000444'
+            '/opt/xforce/remove-accessrequest-job-sa.yaml':
+              content: !Sub |
+                apiVersion: v1
+                kind: ServiceAccount
+                metadata:
+                  name: remove-accessrequest-job-sa
+                  namespace: ${ArgoCDNamespace}
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: Role
+                metadata:
+                  name: remove-accessrequest-job-role
+                  namespace: ${ArgoCDNamespace}
+                rules:
+                - apiGroups:
+                  - ephemeral-access.argoproj-labs.io
+                  resources:
+                  - accessrequests
+                  verbs:
+                  - delete
+                - apiGroups:
+                  - batch
+                  resources:
+                  - cronjobs
+                  verbs:
+                  - delete
+                ---
+                apiVersion: rbac.authorization.k8s.io/v1
+                kind: RoleBinding
+                metadata:
+                  name: remove-accessrequest-job-role-binding
+                  namespace: ${ArgoCDNamespace}
+                roleRef:
+                  apiGroup: rbac.authorization.k8s.io
+                  kind: Role
+                  name: remove-accessrequest-job-role
+                subjects:
+                - kind: ServiceAccount
+                  name: remove-accessrequest-job-sa
+              mode: '000444'
+            '/opt/xforce/ui-extension.yaml':
+              content: !Sub |
+                apiVersion: apps/v1
+                kind: Deployment
+                metadata:
+                  name: argocd-server
+                spec:
+                  template:
+                    spec:
+                      initContainers:
+                        - name: extension-ephemeral-access
+                          image: quay.io/argoprojlabs/argocd-extension-installer:${ArgoCDExtensionInstallerVersion}
+                          env:
+                          - name: EXTENSION_NAME
+                            value: ephemeral-access
+                          - name: EXTENSION_URL
+                            value: https://github.com/argoproj-labs/argocd-ephemeral-access/releases/download/${EphemeralAccessExtensionVersion}/extension.tar.gz
+                          - name: EXTENSION_CHECKSUM_URL
+                            value: https://github.com/argoproj-labs/argocd-ephemeral-access/releases/download/${EphemeralAccessExtensionVersion}/extension_checksums.txt
+                          - name: EXTENSION_JS_VARS
+                            value: |
+                              {
+                                "EPHEMERAL_ACCESS_LABEL_KEY": "environment",
+                                "EPHEMERAL_ACCESS_LABEL_VALUE": "production",
+                                "EPHEMERAL_ACCESS_MAIN_BANNER": "All production changes require an associated change request. Click the REQUEST ACCESS button above to automatically create a change request associated with your user",
+                                "EPHEMERAL_ACCESS_MAIN_BANNER_ADDITIONAL_INFO_LINK": "https://github.com/argoproj-labs/argocd-ephemeral-access",
+                                "EPHEMERAL_ACCESS_DEFAULT_DISPLAY_ACCESS": "ReadOnly"
+                              }
+                          volumeMounts:
+                            - name: extensions
+                              mountPath: /tmp/extensions/
+                          securityContext:
+                            runAsUser: 1000
+                            allowPrivilegeEscalation: false
+                      containers:
+                        - name: argocd-server
+                          volumeMounts:
+                            - name: extensions
+                              mountPath: /tmp/extensions/
+                      volumes:
+                        - name: extensions
+                          emptyDir: {}
+              mode: '000444'
+            '/etc/systemd/system/buildkitd.service':
+              content: |
+                [Unit]
+                Description=Buildkit
+
+                [Service]
+                ExecStart=/opt/buildkit/bin/buildkitd
+                StandardError=journal
+                Restart=on-failure
+
+                [Install]
+                WantedBy=multi-user.target
+              mode: '000444'
+            '/etc/modules-load.d/containerd.conf':
+              content: |
+                overlay
+                br_netfilter
+              mode: '000444'
+            '/etc/sysctl.d/99-kubernetes-cri.conf':
+              content: |
+                net.bridge.bridge-nf-call-iptables  = 1
+                net.ipv4.ip_forward                 = 1
+                net.bridge.bridge-nf-call-ip6tables = 1
+                net.ipv6.conf.all.disable_ipv6      = 1
+                net.ipv6.conf.default.disable_ipv6  = 1
+                net.ipv6.conf.lo.disable_ipv6       = 1
+              mode: '000444'
+            '/etc/apt/sources.list.d/kubernetes.list':
+              content: !Sub |
+                deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${KubernetesMinorVersion}/deb/ /
+              mode: '000444'
+            '/opt/xforce/01-install-kubernetes-controlnode.sh':
+              content: !Sub |
+                #!/bin/bash
+
+                function show_function() {
+                  echo "="
+                  echo "=="
+                  echo "=== $(date +"%Y-%m-%d %H:%M:%S") $1 ==="
+                  echo "=="
+                  echo "="
+                }
+
+                function install_kubernetes_key() {
+                  show_function "install_kubernetes_key"
+
+                  mkdir -p /etc/apt/keyrings
+                  curl -fsSL https://pkgs.k8s.io/core:/stable:/${KubernetesMinorVersion}/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+                  chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg # allow unprivileged APT programs to read this keyring
+                }
+
+                function os_update() {
+                  show_function "os_update"
+
+                  apt update
+                  apt upgrade -y
+
+                  # sudo -i from ssm user not always possible, solution is to restart systemd-login
+                  systemctl restart systemd-logind
+                }
+
+                function install_tools() {
+                  show_function "install_tools"
+
+                  apt install -y unzip jq
+                }
+
+                function install_aws_cli() {
+                  show_function "install_aws_cli"
+                  cd /tmp
+
+                  curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                  unzip awscliv2.zip
+                  sudo ./aws/install
+
+                  cd -
+                }
+
+                function install_git() {
+                  show_function "install_git"
+
+                  apt install git pass-git-helper -y
+                }
+
+                function clone_relevant_repos() {
+                  show_function "clone_relevant_repos"
+
+                  mkdir -p /clone
+                  cd /clone
+                  git clone https://github.com/argoproj-labs/argocd-ephemeral-access.git
+                  git clone https://github.com/FrederiqueRetsema/argocd-ephemeral-access-plugin-servicenow
+                }
+
+                function change_hostname() {
+                  show_function "change_hostname"
+                  hostname=$1
+
+                  echo $hostname > /etc/hostname
+                  hostname $hostname
+                }
+
+                function add_hostnames_to_hosts_file() {
+                  show_function "add_hostnames_to_hosts_file"
+
+                  echo "${PrivateIpControl} control" >> /etc/hosts
+                  echo "${PrivateIpWorker} worker" >> /etc/hosts
+                  echo "${PrivateIpWorker2} worker2" >> /etc/hosts
+                }
+
+                function sudu_no_passwd() {
+                  show_function "sudu_no_passwd"
+
+                  sed -i "s/%admin ALL=(ALL) ALL/%admin ALL=(ALL) NOPASSWD: ALL/" /etc/sudoers
+                }
+
+                function add_user() {
+                  show_function "add_user"
+
+                  /usr/sbin/useradd -d /home/${ConsultantName} -G admin -m -s /bin/bash ${ConsultantName}
+                  echo -e "${DefaultPassword}\n${DefaultPassword}" | passwd ${ConsultantName}
+                }
+
+                function use_vim() {
+                  show_function "use_vim"
+
+                  echo "export VISUAL=vim" >> ~${ConsultantName}/.bashrc
+                  echo "export VISUAL=vim" >> ~root/.bashrc
+                }
+
+                function create_ssh_keyfiles() {
+                  show_function "create_ssh_keyfiles"
+
+                  mkdir -p /home/${ConsultantName}/.ssh
+
+                  mv /opt/xforce/id_ed25519 /home/${ConsultantName}/.ssh/id_ed25519
+                  chmod 400 /home/${ConsultantName}/.ssh/id_ed25519
+
+                  mv /opt/xforce/id_ed25519.pub /home/${ConsultantName}/.ssh/id_ed25519.pub
+                  chmod 400 /home/${ConsultantName}/.ssh/id_ed25519.pub
+
+                  mv /opt/xforce/authorized_keys /home/${ConsultantName}/.ssh/authorized_keys
+                  chmod 400 /home/${ConsultantName}/.ssh/authorized_keys
+
+                  systemctl daemon-reload
+                  systemctl restart ssh
+                }
+
+                function configure_node_for_kubernetes() {
+                  show_function "configure_node_for_kubernetes"
+
+                  swapoff -a
+                  modprobe overlay
+                  modprobe br_netfilter
+
+                  sysctl --system
+                  sysctl fs.inotify.max_user_watches=524288
+                  sysctl fs.inotify.max_user_instances=512
+                }
+
+                function install_containerd() {
+                  show_function "install_containerd"
+                  cd /tmp
+
+                  curl -LO https://github.com/containerd/containerd/releases/download/v${ContainerdVersion}/containerd-${ContainerdVersion}-linux-amd64.tar.gz
+                  tar Cxzvf /usr/local containerd-${ContainerdVersion}-linux-amd64.tar.gz
+
+                  curl -Lo /usr/lib/systemd/system/containerd.service https://raw.githubusercontent.com/containerd/containerd/main/containerd.service
+
+                  systemctl daemon-reload
+                  systemctl enable --now containerd
+
+                  curl -Lo /tmp/runc.amd64 https://github.com/opencontainers/runc/releases/download/${RuncVersion}/runc.amd64
+                  install -m 755 runc.amd64 /usr/local/sbin/runc
+
+                  curl -LO https://github.com/containernetworking/plugins/releases/download/${RuncVersion}/cni-plugins-linux-amd64-${RuncVersion}.tgz
+
+                  mkdir -p /opt/cni/bin
+                  tar Cxzvf /opt/cni/bin cni-plugins-linux-amd64-${RuncVersion}.tgz
+                }
+
+                function install_packages_needed_for_k8s() {
+                  show_function "install_packages_needed_for_k8s"
+
+                  apt update
+                  apt install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common
+
+                  install_containerd
+                  [ -d /etc/containerd ] || mkdir /etc/containerd
+
+                  containerd config default | tee /etc/containerd/config.toml
+
+                  systemctl daemon-reload
+                  systemctl restart dbus
+                }
+
+                function install_kubernetes_control() {
+                  show_function "install_kubernetes_control"
+
+                  export HOME=/home/${ConsultantName}
+
+                  systemd daemon-reload
+                  systemctl enable --now containerd
+
+                  apt update
+                  VERSION_KUBELET=$(apt list kubelet | grep amd64 | awk '{print $2}')
+                  VERSION_KUBEADM=$(apt list kubeadm | grep amd64 | awk '{print $2}')
+                  VERSION_KUBECTL=$(apt list kubectl | grep amd64 | awk '{print $2}')
+                  echo Versions: kubeadm=$VERSION_KUBEADM kubelet=$VERSION_KUBELET kubectl=$VERSION_KUBECTL
+
+                  apt install -y kubeadm=$VERSION_KUBEADM kubelet=$VERSION_KUBELET kubectl=$VERSION_KUBECTL
+                  apt-mark hold kubelet kubeadm kubectl
+
+                  kubeadm init --kubernetes-version=${KubernetesPatchVersion} --pod-network-cidr=10.0.0.0/8 --apiserver-advertise-address=${PrivateIpControl}
+                  kubeadm token create --print-join-command > $HOME/join-cmd.sh
+
+                  mkdir -p $HOME/.kube
+                  cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+                  chown $(id $ConsultantName -u):$(id $ConsultantName -g) $HOME/.kube/config
+                }
+
+                function wait_for_finished_installation() {
+                  show_function "wait_for_finished_installation"
+
+                  END="False"
+                  WAIT_FOR_PODS_RUNNING=7
+                  WAIT_FOR_PODS_PENDING=2
+
+                  while test "$END" != "True"
+                  do
+                    END="False"
+
+                    NUMBER_OF_RUNNING_1_1=$(kubectl get pods -n kube-system | grep "1/1"| wc -l)
+                    NUMBER_OF_PENDING=$(kubectl get pods -n kube-system | grep -i pending| wc -l)
+
+                    if test "$NUMBER_OF_RUNNING_1_1" == "$WAIT_FOR_PODS_RUNNING" -a "$NUMBER_OF_PENDING" == "$WAIT_FOR_PODS_PENDING"
+                    then
+                      END="True"
+                    fi
+
+                    echo "$NUMBER_OF_RUNNING_1_1/$WAIT_FOR_PODS_RUNNING pods correctly running, $NUMBER_OF_PENDING/$WAIT_FOR_PODS_PENDING pending"
+                    sleep 2
+                  done
+                }
+
+                function make_it_possible_for_root_to_use_kubectl() {
+                  show_function "make_it_possible_for_root_to_use_kubectl"
+
+                  HOME=/root
+
+                  mkdir -p $HOME/.kube
+                  cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+                  chown $(id -u):$(id -g) $HOME/.kube/config
+                }
+
+                function install_network() {
+                  show_function "install_network"
+
+                  cd /tmp
+
+                  CILIUM_CLI_VERSION=$(curl -s https://raw.githubusercontent.com/cilium/cilium-cli/master/stable.txt)
+                  curl -OL https://github.com/cilium/cilium-cli/releases/download/$CILIUM_CLI_VERSION/cilium-linux-amd64.tar.gz
+                  tar -xvf cilium-linux-amd64.tar.gz
+                  mv cilium /usr/local/bin
+                  chmod a+x /usr/local/bin/cilium
+
+                  cilium install
+
+                  cd /
+                }
+
+                function wait_for_finished_network_installation() {
+                  show_function "wait_for_finished_network_installation"
+
+                  END="False"
+                  WAITFORPODSRUNNING=16
+
+                  while test "$END" != "True"
+                  do
+                    NUMBER_OF_RUNNING_1_1=$(kubectl get pods -n kube-system | grep "1/1"| wc -l)
+
+                    if test "$NUMBER_OF_RUNNING_1_1" == "$WAITFORPODSRUNNING"
+                    then
+                      END="True"
+                    fi
+
+                    echo "$NUMBER_OF_RUNNING_1_1/$WAITFORPODSRUNNING pods correctly running"
+                    sleep 2
+                  done
+                }
+
+                function change_permissions() {
+                  show_function "change_permissions"
+
+                  chown ${ConsultantName}:${ConsultantName} -R /home/${ConsultantName}
+                }
+
+                function install_nerdctl() {
+                  show_function "install_nerdctl"
+
+                  cd /tmp
+                  wget https://github.com/containerd/nerdctl/releases/download/v${NerdctlVersion}/nerdctl-${NerdctlVersion}-linux-amd64.tar.gz
+                  tar -xvf nerdctl-${NerdctlVersion}-linux-amd64.tar.gz
+                  mv nerdctl /usr/local/bin/
+                }
+
+                function install_buildkit() {
+                  show_function "install_buildkit"
+
+                  mkdir -p /opt/buildkit
+                  cd /opt/buildkit
+                  wget https://github.com/moby/buildkit/releases/download/${BuildkitVersion}/buildkit-${BuildkitVersion}.linux-amd64.tar.gz
+                  tar -xvf buildkit-${BuildkitVersion}.linux-amd64.tar.gz
+                  export PATH=$PATH:$(pwd)/bin
+                  ln -s $(pwd)/bin/buildctl /usr/local/bin/buildctl
+                  systemctl start --now buildkitd
+                }
+
+                function install_kustomize() {
+                  show_function "install_kustomize"
+
+                  mkdir -p /opt/kustomize
+                  cd /opt/kustomize
+                  curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh"  | bash
+                  ln -s $(pwd)/kustomize /usr/local/bin/kustomize
+                }
+
+                function alias_dgl() {
+                  echo alias d=/opt/xforce/d >> /root/.profile
+                  echo alias g=/opt/xforce/g >> /root/.profile
+                  echo alias l=/opt/xforce/l >> /root/.profile
+
+                  echo alias d=/opt/xforce/d >> /home/${ConsultantName}/.profile
+                  echo alias g=/opt/xforce/g >> /home/${ConsultantName}/.profile
+                  echo alias l=/opt/xforce/l >> /home/${ConsultantName}/.profile
+                }
+
+                function install_argocd() {
+                  show_function "install_argocd"
+
+                  kubectl create namespace ${ArgoCDNamespace}
+
+                  echo "Wait 1 second before install of argocd"
+                  sleep 1
+                  kubectl apply -n ${ArgoCDNamespace} -f https://raw.githubusercontent.com/argoproj/argo-cd/${ArgoCDVersion}/manifests/install.yaml
+                }
+
+                function make_argo_service_accessible_from_remote() {
+                  show_function "make_argo_service_accessible_from_remote"
+
+                  NAMESPACE=$1
+                  SERVICE_NAME=$2
+                  PORT_NAME=$3
+                  PORT_NUMBER=$4
+
+                  kubectl -n $NAMESPACE get service $SERVICE_NAME -o yaml > /tmp/service-argo-service-clusterip.yaml
+                  cat /tmp/service-argo-service-clusterip.yaml | sed "s/type: ClusterIP/type: NodePort/" > /tmp/service-argo-service-nodeport.yaml
+
+                  LINENUMBER=$(cat /tmp/service-argo-service-nodeport.yaml | grep -n -e "- name: $PORT_NAME$" | awk -F":" '{print $1+1}')
+                  CHANGE_CMD="$LINENUMBER""i \ \ \ \ nodePort: $PORT_NUMBER"
+                  sed -i "$CHANGE_CMD" /tmp/service-argo-service-nodeport.yaml
+
+                  kubectl apply -f /tmp/service-argo-service-nodeport.yaml
+                }
+
+                function install_argocd_cli() {
+                  show_function "install_argocd_cli"
+
+                  cd /usr/local/bin
+                  curl -L -o argocd https://github.com/argoproj/argo-cd/releases/download/${ArgoCDVersion}/argocd-linux-amd64
+                  chmod a+x argocd
+                }
+
+                function change_configmap_argocd_cm() {
+                  show_function "change_configmap_argocd_cm"
+
+                  FILENAME=/opt/xforce/configmap-argocd-cm.yaml
+                  USERPOOL_ID=$(aws cognito-idp list-user-pools --max-results 5 --region ${AWS::Region}|jq '.UserPools[] | select(.Name == "argocd-userpool").Id' | awk -F'"' '{print $2}')
+                  CLIENT_ID=$(aws cognito-idp list-user-pool-clients --user-pool-id $USERPOOL_ID --region ${AWS::Region} | jq '.UserPoolClients[0].ClientId' | awk -F'"' '{print $2}')
+                  CLIENT_SECRET=$(aws cognito-idp  describe-user-pool-client --user-pool-id $USERPOOL_ID --client-id $CLIENT_ID --region ${AWS::Region} | jq ".UserPoolClient.ClientSecret" | awk -F'"' '{print $2}')
+
+                  sed -i "s/ISSUER/https:\/\/cognito-idp.${AWS::Region}.amazonaws.com\/$USERPOOL_ID/" $FILENAME
+                  sed -i "s/CLIENT_ID/$CLIENT_ID/" $FILENAME
+                  sed -i "s/CLIENT_SECRET/$CLIENT_SECRET/" $FILENAME
+                }
+
+                function install_argocd_demoapp() {
+                  show_function "install_argocd_demoapp"
+
+                  kubectl apply -n ${ArgoCDNamespace} -f /opt/xforce/demoproject.yaml
+                  kubectl apply -n ${ArgoCDNamespace} -f /opt/xforce/demoapp.yaml
+                }
+
+                function install_ephemeral_access_extension() {
+                  show_function "install_ephemeral_access_extension"
+
+                  kubectl apply -f https://github.com/argoproj-labs/argocd-ephemeral-access/releases/download/${EphemeralAccessExtensionVersion}/install.yaml
+                }
+
+                function add_roles() {
+                  show_function "add_roles"
+
+                  kubectl apply -n ${ArgoCDNamespace} -f /opt/xforce/accessbinding.yaml
+                  kubectl apply -n ${ArgoCDNamespace} -f /opt/xforce/roletemplate.yaml
+                }
+
+                function install_plugin() {
+                  show_function "install_plugin"
+
+                  cd /tmp
+
+                  curl -OL https://github.com/FrederiqueRetsema/argocd-ephemeral-access-plugin-servicenow/releases/download/${EphemeralAccessExtensionPluginServiceNowVersion}/install.sh
+                  sed -i "s^https://dev123456.service-now.com^${ServiceNowUrl}^" install.sh
+                  bash install.sh
+
+                  cd -
+                }
+
+                function patch_argocd_server() {
+                  show_function "patch_argocd_server"
+
+                  kubectl patch configmap -n ${ArgoCDNamespace} argocd-cmd-params-cm --patch-file /opt/xforce/configmap-argocd-cmd-params-cmd.yaml
+                  kubectl patch configmap -n ${ArgoCDNamespace} argocd-rbac-cm --patch-file /opt/xforce/configmap-argocd-rbac-cm.yaml
+                  kubectl patch configmap -n ${ArgoCDNamespace} argocd-cm --patch-file /opt/xforce/configmap-argocd-cm.yaml
+                  kubectl patch configmap -n ${ArgoCDEphemeralAccessNamespace} controller-cm --patch-file /opt/xforce/configmap-argocd-ephemeral-access-controller-cm.yaml
+                  kubectl patch deployment argocd-server --patch-file=/opt/xforce/ui-extension.yaml -n argocd
+
+                  # Patch will overwrite all other permissions, so just add the new permissions to the current role
+                  kubectl get clusterrole controller-role -o yaml > /tmp/controller-role.yaml
+                  cat /tmp/controller-role.yaml /opt/xforce/clusterrole-controller-role-patch.yaml > /tmp/controller-role.yaml.$$
+                  kubectl apply -f /tmp/controller-role.yaml.$$
+
+                  # Pod needs to be restarted to take effect
+                  sleep 5
+                  kubectl get pods -n ${ArgoCDEphemeralAccessNamespace} | grep controller | awk '{print "kubectl delete pod -n ${ArgoCDEphemeralAccessNamespace} "$1}' | bash
+                }
+
+                function force_password_change() {
+                  show_function "force_password_change"
+
+                  passwd -e ${ConsultantName}
+                }
+
+                install_kubernetes_key
+                os_update
+                install_tools
+                install_aws_cli
+                install_git
+                clone_relevant_repos
+
+                change_hostname control
+                add_hostnames_to_hosts_file
+
+                sudu_no_passwd
+                add_user
+                use_vim
+                create_ssh_keyfiles
+                change_permissions
+
+                configure_node_for_kubernetes
+                install_packages_needed_for_k8s
+                install_kubernetes_control
+                make_it_possible_for_root_to_use_kubectl
+                wait_for_finished_installation
+                install_network
+                wait_for_finished_network_installation
+
+                install_nerdctl
+                install_buildkit
+                install_kustomize
+                configure_plugin
+                alias_dgl
+
+                install_argocd
+                make_argo_service_accessible_from_remote ${ArgoCDNamespace} argocd-server http 30123
+                install_argocd_cli
+                change_configmap_argocd_cm
+                install_argocd_demoapp
+
+                install_ephemeral_access_extension
+
+                add_roles
+                install_plugin
+                patch_argocd_server
+
+                change_permissions
+                echo wait 5 minutes before enforcement of password change
+                sleep 300
+                force_password_change
+              mode: '000544'
+          commands:
+            01-install-kubernetes-controlnode:
+              command: /opt/xforce/01-install-kubernetes-controlnode.sh 2>&1 | tee /var/log/01-install-kubernetes-controlnode.out
+              ignoreErrors: false
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+    Properties:
+      ImageId: !Ref Ubuntu2404AMI
+      InstanceType: !Ref EC2InstanceType
+      IamInstanceProfile: !Ref KubernetesIAMInstanceProfile
+      Tags:
+        - Key: Name
+          Value: KubernetesControlNode
+      SecurityGroupIds:
+        - !Ref KubernetesSecurityGroup
+      SubnetId: !Ref PublicSubnetAZa
+      PrivateIpAddress: !Ref PrivateIpControl
+      BlockDeviceMappings:
+      - DeviceName: /dev/sda1
+        Ebs:
+          VolumeType: gp3
+          VolumeSize: 20
+          DeleteOnTermination: true
+          Encrypted: false
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash
+            # ===
+            # Source: https://gist.github.com/b0tting/f1a83a8ecca42ae37cc2c40d6174cead - used to install cfn-init and cfn-signal
+            export DEBIAN_FRONTEND=noninteractive
+            export VENV_DIR=/opt/aws/cfn-bootstrap-venv
+            export HELPER_SCRIPTS_BIN_DIR=/opt/aws/bin
+
+            # Install python 3.11 from deadsnakes, this will not be the default python, that will stay on 3.12
+            apt update
+            apt-get install -y tzdata software-properties-common
+            add-apt-repository -y ppa:deadsnakes/ppa
+            apt update
+            apt install -y python3.11 python3.11-venv
+
+            # Set up a virtual env
+            mkdir -p $VENV_DIR
+            python3.11 -m venv $VENV_DIR
+            source $VENV_DIR/bin/activate
+
+            # Install the CFN helper scripts. These will link to the virtual environment & 3.11, not touching the
+            # system standard python 3.12
+            pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+            mkdir -p $HELPER_SCRIPTS_BIN_DIR
+            ln -s $VENV_DIR/bin/cfn-* $HELPER_SCRIPTS_BIN_DIR
+            deactivate
+            #===
+
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource KubernetesControlNode --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource KubernetesControlNode --region ${AWS::Region}
+            sleep 5
+
+  KubernetesWorkerNode:
+    Type: AWS::EC2::Instance
+    Metadata:
+      'AWS::CloudFormation::Init':
+        config:
+          packages:
+            apt:
+              git: []
+          files:
+            '/opt/xforce/id_ed25519':
+              content: |
+                -----BEGIN OPENSSH PRIVATE KEY-----
+                b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+                QyNTUxOQAAACCTXTLuYK4zg+qPJ8FFLVs2v925WrVSksZ+GOQxwHgKmAAAAJjhL6Rc4S+k
+                XAAAAAtzc2gtZWQyNTUxOQAAACCTXTLuYK4zg+qPJ8FFLVs2v925WrVSksZ+GOQxwHgKmA
+                AAAEDmLUPDD+HXOBMbRcbuOBWBntS5+fr62g39VvLyix1Dx5NdMu5grjOD6o8nwUUtWza/
+                3blatVKSxn4Y5DHAeAqYAAAAEmZyZWRlcmlxdWVAd29ya2VyMgECAw==
+                -----END OPENSSH PRIVATE KEY-----
+              mode: '000400'
+            '/opt/xforce/id_ed25519.pub':
+              content: !Sub |
+                ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJNdMu5grjOD6o8nwUUtWza/3blatVKSxn4Y5DHAeAqY ${ConsultantName}@control
+              mode: '000400'
+            '/opt/xforce/authorized_keys':
+              content: !Sub |
+                ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJNdMu5grjOD6o8nwUUtWza/3blatVKSxn4Y5DHAeAqY ${ConsultantName}@control
+              mode: '000400'
+            '/etc/modules-load.d/containerd.conf':
+              content: |
+                overlay
+                br_netfilter
+              mode: '000444'
+            '/etc/sysctl.d/99-kubernetes-cri.conf':
+              content: |
+                net.bridge.bridge-nf-call-iptables  = 1
+                net.ipv4.ip_forward                 = 1
+                net.bridge.bridge-nf-call-ip6tables = 1
+                net.ipv6.conf.all.disable_ipv6      = 1
+                net.ipv6.conf.default.disable_ipv6  = 1
+                net.ipv6.conf.lo.disable_ipv6       = 1
+              mode: '000444'
+            '/etc/apt/sources.list.d/kubernetes.list':
+              content: !Sub |
+                deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${KubernetesMinorVersion}/deb/ /
+              mode: '000444'
+            '/opt/xforce/01-install-kubernetes-workernode.sh':
+              content: !Sub |
+                #!/bin/bash
+
+                function show_function() {
+                  echo "="
+                  echo "=="
+                  echo "=== $(date +"%Y-%m-%d %H:%M:%S") $1 ==="
+                  echo "=="
+                  echo "="
+                }
+
+                function install_kubernetes_key() {
+                  show_function "install_kubernetes_key"
+
+                  mkdir -p /etc/apt/keyrings
+                  curl -fsSL https://pkgs.k8s.io/core:/stable:/${KubernetesMinorVersion}/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+                  chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg # allow unprivileged APT programs to read this keyring
+                }
+
+                function os_update() {
+                  show_function "os_update"
+
+                  apt update
+                  apt upgrade -y
+
+                  # sudo -i from ssm user not always possible, solution is to restart systemd-login
+                  systemctl restart systemd-logind
+                }
+
+                function install_tools() {
+                  show_function "install_tools"
+
+                  apt install -y unzip jq
+                }
+
+                function install_aws_cli() {
+                  show_function "install_aws_cli"
+                  cd /tmp
+
+                  curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                  unzip awscliv2.zip
+                  sudo ./aws/install
+
+                  cd -
+                }
+
+                function install_git() {
+                  show_function "install_git"
+
+                  apt install git pass-git-helper -y
+                }
+
+                function change_hostname() {
+                  show_function "change_hostname"
+                  hostname=$1
+
+                  echo $hostname > /etc/hostname
+                  hostname $hostname
+                }
+
+                function add_hostnames_to_hosts_file() {
+                  show_function "add_hostnames_to_hosts_file"
+
+                  echo "${PrivateIpControl} control" >> /etc/hosts
+                  echo "${PrivateIpWorker} worker" >> /etc/hosts
+                  echo "${PrivateIpWorker2} worker2" >> /etc/hosts
+                }
+
+                function sudu_no_passwd() {
+                  show_function "sudu_no_passwd"
+
+                  sed -i "s/%admin ALL=(ALL) ALL/%admin ALL=(ALL) NOPASSWD: ALL/" /etc/sudoers
+                }
+
+                function add_user() {
+                  show_function "add_user"
+
+                  /usr/sbin/useradd -d /home/${ConsultantName} -G admin -m -s /bin/bash ${ConsultantName}
+                  echo -e "${DefaultPassword}\n${DefaultPassword}" | passwd ${ConsultantName}
+                }
+
+                function use_vim() {
+                  show_function "use_vim"
+
+                  echo "export VISUAL=vim" >> ~${ConsultantName}/.bashrc
+                  echo "export VISUAL=vim" >> ~root/.bashrc
+                }
+
+                function create_ssh_keyfiles() {
+                  show_function "create_ssh_keyfiles"
+
+                  mkdir -p /home/${ConsultantName}/.ssh
+
+                  mv /opt/xforce/id_ed25519 /home/${ConsultantName}/.ssh/id_ed25519
+                  chmod 400 /home/${ConsultantName}/.ssh/id_ed25519
+
+                  mv /opt/xforce/id_ed25519.pub /home/${ConsultantName}/.ssh/id_ed25519.pub
+                  chmod 400 /home/${ConsultantName}/.ssh/id_ed25519.pub
+
+                  mv /opt/xforce/authorized_keys /home/${ConsultantName}/.ssh/authorized_keys
+                  chmod 400 /home/${ConsultantName}/.ssh/authorized_keys
+
+                  systemctl daemon-reload
+                  systemctl restart ssh
+                }
+
+                function configure_node_for_kubernetes() {
+                  show_function "configure_node_for_kubernetes"
+
+                  swapoff -a
+                  modprobe overlay
+                  modprobe br_netfilter
+
+                  sysctl --system
+                  sysctl fs.inotify.max_user_watches=524288
+                  sysctl fs.inotify.max_user_instances=512
+                }
+
+                function install_containerd() {
+                  show_function "install_containerd"
+                  cd /tmp
+
+                  curl -LO https://github.com/containerd/containerd/releases/download/v${ContainerdVersion}/containerd-${ContainerdVersion}-linux-amd64.tar.gz
+                  tar Cxzvf /usr/local containerd-${ContainerdVersion}-linux-amd64.tar.gz
+
+                  curl -Lo /usr/lib/systemd/system/containerd.service https://raw.githubusercontent.com/containerd/containerd/main/containerd.service
+
+                  systemctl daemon-reload
+                  systemctl enable --now containerd
+
+                  curl -Lo /tmp/runc.amd64 https://github.com/opencontainers/runc/releases/download/${RuncVersion}/runc.amd64
+                  install -m 755 runc.amd64 /usr/local/sbin/runc
+
+                  curl -LO https://github.com/containernetworking/plugins/releases/download/${RuncVersion}/cni-plugins-linux-amd64-${RuncVersion}.tgz
+
+                  mkdir -p /opt/cni/bin
+                  tar Cxzvf /opt/cni/bin cni-plugins-linux-amd64-${RuncVersion}.tgz
+                }
+
+                function install_packages_needed_for_k8s() {
+                  show_function "install_packages_needed_for_k8s"
+
+                  apt update
+                  apt install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common
+
+                  install_containerd
+                  [ -d /etc/containerd ] || mkdir /etc/containerd
+
+                  containerd config default | tee /etc/containerd/config.toml
+
+                  systemctl daemon-reload
+                  systemctl restart dbus
+                }
+
+                function install_kubernetes_worker() {
+                  show_function "install_kubernetes_worker"
+
+                  export HOME=/home/${ConsultantName}
+
+                  systemd daemon-reload
+                  systemctl enable --now containerd
+
+                  apt update
+                  VERSION_KUBELET=$(apt list kubelet | grep amd64 | awk '{print $2}')
+                  VERSION_KUBEADM=$(apt list kubeadm | grep amd64 | awk '{print $2}')
+                  VERSION_KUBECTL=$(apt list kubectl | grep amd64 | awk '{print $2}')
+                  echo Versions: kubeadm=$VERSION_KUBEADM kubelet=$VERSION_KUBELET kubectl=$VERSION_KUBECTL
+                  apt install -y kubeadm=$VERSION_KUBEADM kubelet=$VERSION_KUBELET kubectl=$VERSION_KUBECTL
+                  apt-mark hold kubelet kubeadm kubectl
+                }
+
+                function change_permissions() {
+                  show_function "change_permissions"
+
+                  chown ${ConsultantName}:${ConsultantName} -R /home/${ConsultantName}
+                }
+
+                function install_nerdctl() {
+                  show_function "install_nerdctl"
+
+                  cd /tmp
+                  wget https://github.com/containerd/nerdctl/releases/download/v${NerdctlVersion}/nerdctl-${NerdctlVersion}-linux-amd64.tar.gz
+                  tar -xvf nerdctl-${NerdctlVersion}-linux-amd64.tar.gz
+                  mv nerdctl /usr/local/bin/
+                }
+
+                function join_cluster() {
+                  show_function "join_cluster"
+
+                  su - ${ConsultantName}
+                  cd ~${ConsultantName}
+
+                  while true
+                  do
+                    sudo -u ${ConsultantName} scp -o StrictHostKeyChecking=no ${ConsultantName}@control:/home/${ConsultantName}/join-cmd.sh .
+
+                    if test -f ./join-cmd.sh
+                    then
+                      sudo bash ./join-cmd.sh
+                      break
+                    else
+                      echo wait for join command...
+                      sleep 10
+                    fi
+                  done
+                }
+
+                function force_password_change() {
+                  show_function "force_password_change"
+
+                  passwd -e ${ConsultantName}
+                }
+
+                install_kubernetes_key
+                os_update
+                install_tools
+                install_aws_cli
+                install_git
+
+                change_hostname worker
+                add_hostnames_to_hosts_file
+                sudu_no_passwd
+
+                add_user
+                use_vim
+                create_ssh_keyfiles
+                change_permissions
+
+                configure_node_for_kubernetes
+                install_packages_needed_for_k8s
+                install_kubernetes_worker
+                change_permissions
+                install_nerdctl
+
+                join_cluster
+
+                sleep 300
+                force_password_change
+              mode: '000544'
+          commands:
+            01-install-kubernetes-workernode:
+              command: /opt/xforce/01-install-kubernetes-workernode.sh 2>&1 | tee /var/log/01-install-kubernetes-workernode.out
+              ignoreErrors: false
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+    Properties:
+      ImageId: !Ref Ubuntu2404AMI
+      InstanceType: !Ref EC2InstanceType
+      IamInstanceProfile: !Ref KubernetesIAMInstanceProfile
+      Tags:
+        - Key: Name
+          Value: KubernetesWorkerNode
+      SecurityGroupIds:
+        - !Ref KubernetesSecurityGroup
+      SubnetId: !Ref PublicSubnetAZa
+      PrivateIpAddress: !Ref PrivateIpWorker
+      BlockDeviceMappings:
+      - DeviceName: /dev/sda1
+        Ebs:
+          VolumeType: gp3
+          VolumeSize: 20
+          DeleteOnTermination: true
+          Encrypted: false
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash
+            # ===
+            # Source: https://gist.github.com/b0tting/f1a83a8ecca42ae37cc2c40d6174cead - used to install cfn-init and cfn-signal
+            export DEBIAN_FRONTEND=noninteractive
+            export VENV_DIR=/opt/aws/cfn-bootstrap-venv
+            export HELPER_SCRIPTS_BIN_DIR=/opt/aws/bin
+
+            # Install python 3.11 from deadsnakes, this will not be the default python, that will stay on 3.12
+            apt update
+            apt-get install -y tzdata software-properties-common
+            add-apt-repository -y ppa:deadsnakes/ppa
+            apt update
+            apt install -y python3.11 python3.11-venv
+
+            # Set up a virtual env
+            mkdir -p $VENV_DIR
+            python3.11 -m venv $VENV_DIR
+            source $VENV_DIR/bin/activate
+
+            # Install the CFN helper scripts. These will link to the virtual environment & 3.11, not touching the
+            # system standard python 3.12
+            pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+            mkdir -p $HELPER_SCRIPTS_BIN_DIR
+            ln -s $VENV_DIR/bin/cfn-* $HELPER_SCRIPTS_BIN_DIR
+            deactivate
+            #===
+
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource KubernetesWorkerNode --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource KubernetesWorkerNode --region ${AWS::Region}
+            sleep 5
+
+  KubernetesWorkerNode2:
+    Type: AWS::EC2::Instance
+    Metadata:
+      'AWS::CloudFormation::Init':
+        config:
+          packages:
+            apt:
+              git: []
+          files:
+            '/opt/xforce/id_ed25519':
+              content: |
+                -----BEGIN OPENSSH PRIVATE KEY-----
+                b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+                QyNTUxOQAAACCTXTLuYK4zg+qPJ8FFLVs2v925WrVSksZ+GOQxwHgKmAAAAJjhL6Rc4S+k
+                XAAAAAtzc2gtZWQyNTUxOQAAACCTXTLuYK4zg+qPJ8FFLVs2v925WrVSksZ+GOQxwHgKmA
+                AAAEDmLUPDD+HXOBMbRcbuOBWBntS5+fr62g39VvLyix1Dx5NdMu5grjOD6o8nwUUtWza/
+                3blatVKSxn4Y5DHAeAqYAAAAEmZyZWRlcmlxdWVAd29ya2VyMgECAw==
+                -----END OPENSSH PRIVATE KEY-----
+              mode: '000400'
+            '/opt/xforce/id_ed25519.pub':
+              content: !Sub |
+                ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJNdMu5grjOD6o8nwUUtWza/3blatVKSxn4Y5DHAeAqY ${ConsultantName}@control
+              mode: '000400'
+            '/opt/xforce/authorized_keys':
+              content: !Sub |
+                ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJNdMu5grjOD6o8nwUUtWza/3blatVKSxn4Y5DHAeAqY ${ConsultantName}@control
+              mode: '000400'
+            '/etc/modules-load.d/containerd.conf':
+              content: |
+                overlay
+                br_netfilter
+              mode: '000444'
+            '/etc/sysctl.d/99-kubernetes-cri.conf':
+              content: |
+                net.bridge.bridge-nf-call-iptables  = 1
+                net.ipv4.ip_forward                 = 1
+                net.bridge.bridge-nf-call-ip6tables = 1
+                net.ipv6.conf.all.disable_ipv6      = 1
+                net.ipv6.conf.default.disable_ipv6  = 1
+                net.ipv6.conf.lo.disable_ipv6       = 1
+              mode: '000444'
+            '/etc/apt/sources.list.d/kubernetes.list':
+              content: !Sub |
+                deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${KubernetesMinorVersion}/deb/ /
+              mode: '000444'
+            '/opt/xforce/01-install-kubernetes-workernode.sh':
+              content: !Sub |
+                #!/bin/bash
+
+                function show_function() {
+                  echo "="
+                  echo "=="
+                  echo "=== $(date +"%Y-%m-%d %H:%M:%S") $1 ==="
+                  echo "=="
+                  echo "="
+                }
+
+                function install_kubernetes_key() {
+                  show_function "install_kubernetes_key"
+
+                  mkdir -p /etc/apt/keyrings
+                  curl -fsSL https://pkgs.k8s.io/core:/stable:/${KubernetesMinorVersion}/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+                  chmod 644 /etc/apt/keyrings/kubernetes-apt-keyring.gpg # allow unprivileged APT programs to read this keyring
+                }
+
+                function os_update() {
+                  show_function "os_update"
+
+                  apt update
+                  apt upgrade -y
+
+                  # sudo -i from ssm user not always possible, solution is to restart systemd-login
+                  systemctl restart systemd-logind
+                }
+
+                function install_tools() {
+                  show_function "install_tools"
+
+                  apt install -y unzip jq
+                }
+
+                function install_aws_cli() {
+                  show_function "install_aws_cli"
+                  cd /tmp
+
+                  curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                  unzip awscliv2.zip
+                  sudo ./aws/install
+
+                  cd -
+                }
+
+                function install_git() {
+                  show_function "install_git"
+
+                  apt install git pass-git-helper -y
+                }
+
+                function change_hostname() {
+                  show_function "change_hostname"
+                  hostname=$1
+
+                  echo $hostname > /etc/hostname
+                  hostname $hostname
+                }
+
+                function add_hostnames_to_hosts_file() {
+                  show_function "add_hostnames_to_hosts_file"
+
+                  echo "${PrivateIpControl} control" >> /etc/hosts
+                  echo "${PrivateIpWorker} worker" >> /etc/hosts
+                  echo "${PrivateIpWorker2} worker2" >> /etc/hosts
+                }
+
+                function sudu_no_passwd() {
+                  show_function "sudu_no_passwd"
+
+                  sed -i "s/%admin ALL=(ALL) ALL/%admin ALL=(ALL) NOPASSWD: ALL/" /etc/sudoers
+                }
+
+                function add_user() {
+                  show_function "add_user"
+
+                  /usr/sbin/useradd -d /home/${ConsultantName} -G admin -m -s /bin/bash ${ConsultantName}
+                  echo -e "${DefaultPassword}\n${DefaultPassword}" | passwd ${ConsultantName}
+                }
+
+                function use_vim() {
+                  show_function "use_vim"
+
+                  echo "export VISUAL=vim" >> ~${ConsultantName}/.bashrc
+                  echo "export VISUAL=vim" >> ~root/.bashrc
+                }
+
+                function create_ssh_keyfiles() {
+                  show_function "create_ssh_keyfiles"
+
+                  mkdir -p /home/${ConsultantName}/.ssh
+
+                  mv /opt/xforce/id_ed25519 /home/${ConsultantName}/.ssh/id_ed25519
+                  chmod 400 /home/${ConsultantName}/.ssh/id_ed25519
+
+                  mv /opt/xforce/id_ed25519.pub /home/${ConsultantName}/.ssh/id_ed25519.pub
+                  chmod 400 /home/${ConsultantName}/.ssh/id_ed25519.pub
+
+                  mv /opt/xforce/authorized_keys /home/${ConsultantName}/.ssh/authorized_keys
+                  chmod 400 /home/${ConsultantName}/.ssh/authorized_keys
+
+                  systemctl daemon-reload
+                  systemctl restart ssh
+                }
+
+                function configure_node_for_kubernetes() {
+                  show_function "configure_node_for_kubernetes"
+
+                  swapoff -a
+                  modprobe overlay
+                  modprobe br_netfilter
+
+                  sysctl --system
+                  sysctl fs.inotify.max_user_watches=524288
+                  sysctl fs.inotify.max_user_instances=512
+                }
+
+                function install_containerd() {
+                  show_function "install_containerd"
+                  cd /tmp
+
+                  curl -LO https://github.com/containerd/containerd/releases/download/v${ContainerdVersion}/containerd-${ContainerdVersion}-linux-amd64.tar.gz
+                  tar Cxzvf /usr/local containerd-${ContainerdVersion}-linux-amd64.tar.gz
+
+                  curl -Lo /usr/lib/systemd/system/containerd.service https://raw.githubusercontent.com/containerd/containerd/main/containerd.service
+
+                  systemctl daemon-reload
+                  systemctl enable --now containerd
+
+                  curl -Lo /tmp/runc.amd64 https://github.com/opencontainers/runc/releases/download/${RuncVersion}/runc.amd64
+                  install -m 755 runc.amd64 /usr/local/sbin/runc
+
+                  curl -LO https://github.com/containernetworking/plugins/releases/download/${RuncVersion}/cni-plugins-linux-amd64-${RuncVersion}.tgz
+
+                  mkdir -p /opt/cni/bin
+                  tar Cxzvf /opt/cni/bin cni-plugins-linux-amd64-${RuncVersion}.tgz
+                }
+
+                function install_packages_needed_for_k8s() {
+                  show_function "install_packages_needed_for_k8s"
+
+                  apt update
+                  apt install -y apt-transport-https ca-certificates curl gnupg-agent software-properties-common
+
+                  install_containerd
+                  [ -d /etc/containerd ] || mkdir /etc/containerd
+
+                  containerd config default | tee /etc/containerd/config.toml
+
+                  systemctl daemon-reload
+                  systemctl restart dbus
+                }
+
+                function install_kubernetes_worker() {
+                  show_function "install_kubernetes_worker"
+
+                  export HOME=/home/${ConsultantName}
+                  systemd daemon-reload
+                  systemctl enable --now containerd
+
+                  apt update
+                  VERSION_KUBELET=$(apt list kubelet | grep amd64 | awk '{print $2}')
+                  VERSION_KUBEADM=$(apt list kubeadm | grep amd64 | awk '{print $2}')
+                  VERSION_KUBECTL=$(apt list kubectl | grep amd64 | awk '{print $2}')
+                  echo Versions: kubeadm=$VERSION_KUBEADM kubelet=$VERSION_KUBELET kubectl=$VERSION_KUBECTL
+                  apt install -y kubeadm=$VERSION_KUBEADM kubelet=$VERSION_KUBELET kubectl=$VERSION_KUBECTL
+                  apt-mark hold kubelet kubeadm kubectl
+                }
+
+                function join_cluster() {
+                  show_function "join_cluster"
+
+                  su - ${ConsultantName}
+                  cd ~${ConsultantName}
+
+                  while true
+                  do
+                    sudo -u ${ConsultantName} scp -o StrictHostKeyChecking=no ${ConsultantName}@control:/home/${ConsultantName}/join-cmd.sh .
+
+                    if test -f ./join-cmd.sh
+                    then
+                      sudo bash ./join-cmd.sh
+                      break
+                    else
+                      echo wait for join command...
+                      sleep 10
+                    fi
+                  done
+                }
+
+                function change_permissions() {
+                  show_function "change_permissions"
+
+                  chown ${ConsultantName}:${ConsultantName} -R /home/${ConsultantName}
+                }
+
+                function install_nerdctl() {
+                  show_function "install_nerdctl"
+
+                  cd /tmp
+                  wget https://github.com/containerd/nerdctl/releases/download/v${NerdctlVersion}/nerdctl-${NerdctlVersion}-linux-amd64.tar.gz
+                  tar -xvf nerdctl-${NerdctlVersion}-linux-amd64.tar.gz
+                  mv nerdctl /usr/local/bin/
+                }
+
+                function force_password_change() {
+                  show_function "force_password_change"
+
+                  passwd -e ${ConsultantName}
+                }
+
+                install_kubernetes_key
+                os_update
+                install_tools
+                install_aws_cli
+                install_git
+
+                change_hostname worker2
+                add_hostnames_to_hosts_file
+                sudu_no_passwd
+
+                add_user
+                use_vim
+                create_ssh_keyfiles
+                change_permissions
+
+                configure_node_for_kubernetes
+                install_packages_needed_for_k8s
+                install_kubernetes_worker
+                install_nerdctl
+
+                join_cluster
+
+                sleep 300
+                force_password_change
+              mode: '000544'
+          commands:
+            01-install-kubernetes-workernode:
+              command: /opt/xforce/01-install-kubernetes-workernode.sh 2>&1 | tee /var/log/01-install-kubernetes-workernode.out
+              ignoreErrors: false
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+    Properties:
+      ImageId: !Ref Ubuntu2404AMI
+      InstanceType: !Ref EC2InstanceType
+      IamInstanceProfile: !Ref KubernetesIAMInstanceProfile
+      Tags:
+        - Key: Name
+          Value: KubernetesWorkerNode2
+      SecurityGroupIds:
+        - !Ref KubernetesSecurityGroup
+      SubnetId: !Ref PublicSubnetAZa
+      PrivateIpAddress: !Ref PrivateIpWorker2
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 20
+            DeleteOnTermination: true
+            Encrypted: false
+      UserData:
+        "Fn::Base64":
+          !Sub |
+            #!/bin/bash
+            # ===
+            # Source: https://gist.github.com/b0tting/f1a83a8ecca42ae37cc2c40d6174cead - used to install cfn-init and cfn-signal
+            export DEBIAN_FRONTEND=noninteractive
+            export VENV_DIR=/opt/aws/cfn-bootstrap-venv
+            export HELPER_SCRIPTS_BIN_DIR=/opt/aws/bin
+
+            # Install python 3.11 from deadsnakes, this will not be the default python, that will stay on 3.12
+            apt update
+            apt-get install -y tzdata software-properties-common
+            add-apt-repository -y ppa:deadsnakes/ppa
+            apt update
+            apt install -y python3.11 python3.11-venv
+
+            # Set up a virtual env
+            mkdir -p $VENV_DIR
+            python3.11 -m venv $VENV_DIR
+            source $VENV_DIR/bin/activate
+
+            # Install the CFN helper scripts. These will link to the virtual environment & 3.11, not touching the
+            # system standard python 3.12
+            pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+            mkdir -p $HELPER_SCRIPTS_BIN_DIR
+            ln -s $VENV_DIR/bin/cfn-* $HELPER_SCRIPTS_BIN_DIR
+            deactivate
+            #===
+
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource KubernetesWorkerNode2 --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource KubernetesWorkerNode2 --region ${AWS::Region}
+            sleep 5
+
+  # DeleteVpc
+  # =========
+  # When the VPC is deleted, there might be extra security groups that have been added because someone tried f.e. to start a VM in that VPC. The deletion of the VPC
+  # will wait until these SGs have been removed. This is not friendly for the users of the templates, so delete the SGs by this custom resource.
+
+  DeleteVpcExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+              - "lambda.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "DeleteVpcExecutionRolePolicies"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudWatch
+                Effect: "Allow"
+                Action:
+                  - "logs:PutLogEvents"
+                  - "logs:CreateLogStream"
+                  - "logs:CreateLogGroup"
+                Resource: "*"
+              - Sid: EC2
+                Effect: "Allow"
+                Action:
+                  - "ec2:DescribeSecurityGroups"
+                  - "ec2:DeleteSecurityGroup"
+                Resource: "*"
+      Path: /
+  DeleteVpcFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt DeleteVpcExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          #!/usr/bin/env python
+          # -*- coding: utf-8 -*-
+          # https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-lambda-function-code-cfnresponsemodule.html
+
+          import json
+          import cfnresponse
+          import boto3
+
+          # get_security_groups
+          # ===================
+          def get_security_groups(vpc):
+            ec2 = boto3.client('ec2')
+            response = ec2.describe_security_groups(
+                Filters=[
+                    {
+                        'Name': 'vpc-id',
+                        'Values': [vpc]
+                    },
+                ]
+            )
+            return response["SecurityGroups"]
+
+          # delete_security_group
+          # =====================
+          def delete_security_group(security_group_name, security_group_id):
+            print("TRACE Delete security group " + security_group_name)
+
+            ec2 = boto3.client('ec2')
+            response = ec2.delete_security_group(
+              GroupId=security_group_id
+            )
+            print(response)
+
+          # Main
+          # ====
+
+          def lambda_handler(event, context):
+            try:
+                vpc = event['ResourceProperties']['Vpc']
+                print(event)
+
+                if event['RequestType'] == 'Delete':
+                    print ("TRACE Get security groups")
+                    security_groups = get_security_groups(vpc)
+                    print(security_groups)
+
+                    for security_group in security_groups:
+
+                      security_group_is_part_of_stack = False
+                      if ("Tags" in security_group):
+                        for tag in security_group["Tags"]:
+
+                          if (tag["Key"] == "aws:cloudformation:stack-name"):
+                            security_group_is_part_of_stack = True
+
+                      security_group_name = security_group["GroupName"]
+                      security_group_id   = security_group["GroupId"]
+
+                      if ((not security_group_is_part_of_stack) and
+                          (security_group_name != "default")):
+
+                        delete_security_group(security_group_name, security_group_id)
+
+                print("TRACE Before SUCCESS")
+                responseData = {}
+                cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "n/a")
+            except Exception as e:
+                print(e)
+                print("TRACE Before FAILED")
+                responseData = {}
+                cfnresponse.send(event, context, cfnresponse.FAILED, responseData, "n/a")
+
+            return
+      Runtime: python3.13
+
+Outputs:
+  ControlNodeId:
+    Value: !Ref KubernetesControlNode
+  ControlNodeIp:
+    Value: !GetAtt KubernetesControlNode.PublicIp
+  WorkerNodeId:
+    Value: !Ref KubernetesWorkerNode

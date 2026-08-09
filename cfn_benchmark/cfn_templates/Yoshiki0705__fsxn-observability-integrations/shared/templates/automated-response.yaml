@@ -1,0 +1,589 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  FSx for ONTAP Automated Response — User/IP blocking and snapshot creation
+  via ONTAP REST API. Triggered by SNS. Requires VPC access to ONTAP management
+  endpoint and the fsxn-shared-python Lambda Layer.
+
+# DEPLOYMENT PREREQUISITES:
+# 1. Deploy the fsxn-shared-python Lambda Layer first (shared/lambda-layers/).
+#    This provides ontap_response.py and auth_cache.py used by the handler.
+#    Without this layer, the handler will fail with ModuleNotFoundError.
+# 2. Ensure the VPC has outbound HTTPS (443) access to the ONTAP management IP.
+# 3. Either set CreateVpcEndpoints=true OR ensure the VPC already has
+#    Secrets Manager + SNS Interface VPC Endpoints (or a NAT Gateway).
+#
+# Example:
+#   aws cloudformation deploy \
+#     --template-file automated-response.yaml \
+#     --stack-name fsxn-automated-response \
+#     --parameter-overrides \
+#       OntapMgmtIp=<management-ip> \
+#       OntapCredentialsSecretArn=arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:fsx-ontap-creds-XXXXXX \
+#       VpcId=vpc-0123456789abcdef0 \
+#       SubnetIds=subnet-aaa,subnet-bbb \
+#       SecurityGroupId=sg-0123456789abcdef0 \
+#       DefaultSvmName=svm-prod \
+#       SharedPythonLayerArn=arn:aws:lambda:ap-northeast-1:123456789012:layer:fsxn-shared-python:2 \
+#     --capabilities CAPABILITY_NAMED_IAM
+
+Parameters:
+  OntapMgmtIp:
+    Type: String
+    Description: FSx for ONTAP management endpoint IP address
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
+
+  OntapCredentialsSecretArn:
+    Type: String
+    Description: Secrets Manager ARN for ONTAP admin credentials (JSON with username/password)
+    AllowedPattern: '^arn:aws:secretsmanager:.*'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where FSx for ONTAP is deployed
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs with access to ONTAP management endpoint
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID that allows HTTPS (443) to ONTAP management IP
+
+  DefaultSvmName:
+    Type: String
+    Description: Default SVM name for responses (can be overridden per invocation)
+    Default: ''
+
+  CooldownMinutes:
+    Type: Number
+    Description: Minimum minutes between protective snapshots (prevents snapshot storm)
+    Default: 15
+    MinValue: 0
+    MaxValue: 1440
+
+  LambdaMemorySize:
+    Type: Number
+    Description: Lambda memory size in MB
+    Default: 256
+    AllowedValues: [128, 256, 512]
+
+  LambdaTimeout:
+    Type: Number
+    Description: Lambda timeout in seconds
+    Default: 60
+    MinValue: 30
+    MaxValue: 300
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for response action notifications (optional)
+    Default: ''
+
+  ProtectedAccountsExtra:
+    Type: String
+    Description: >-
+      Comma-separated list of additional accounts that should never be auto-blocked
+      (e.g., service accounts: svc-ml-pipeline,svc-backup-agent). Added to the
+      built-in protection list (fsxadmin, administrator, vsadmin, system).
+    Default: ''
+
+  SharedPythonLayerArn:
+    Type: String
+    Description: >-
+      ARN of the fsxn-shared-python Lambda Layer containing ontap_response.py
+      and auth_cache.py. Required for the handler to function. Deploy the layer
+      first (shared/lambda-layers/), then provide its ARN here.
+      Example: arn:aws:lambda:ap-northeast-1:123456789012:layer:fsxn-shared-python:2
+    Default: ''
+
+  FsxSubnetId:
+    Type: String
+    Description: >-
+      Subnet ID where FSx for ONTAP ENIs reside (for network-layer NFS
+      blocking via NACL). When provided, the block_nfs_ip_network action
+      adds a deny rule to this subnet's NACL for immediate packet-level
+      blocking — bypassing NFS client-side attribute caching. Leave empty
+      to disable network-layer blocking (ONTAP export-policy only).
+    Default: ''
+
+  CreateVpcEndpoints:
+    Type: String
+    Description: >-
+      Create VPC Endpoints for Secrets Manager and SNS. Set to 'false' if your
+      VPC already has these endpoints. Lambda in VPC CANNOT reach AWS APIs
+      without VPC Endpoints or a NAT Gateway.
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  HasNotificationEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  HasDefaultSvm: !Not [!Equals [!Ref DefaultSvmName, '']]
+  HasSharedLayer: !Not [!Equals [!Ref SharedPythonLayerArn, '']]
+  ShouldCreateVpcEndpoints: !Equals [!Ref CreateVpcEndpoints, 'true']
+
+Resources:
+  # ================================================================
+  # VPC Endpoints — Required for Lambda to access AWS services
+  # Without these, Lambda in VPC cannot reach Secrets Manager or SNS.
+  # If your VPC already has these endpoints, set CreateVpcEndpoints=false.
+  # ================================================================
+  SecretsManagerVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  SnsVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sns'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      GroupDescription: Allow Lambda to access VPC Endpoints (Secrets Manager, SNS)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref SecurityGroupId
+          Description: Lambda SG to VPC Endpoint (HTTPS)
+
+  # ================================================================
+  # SNS Topics
+  # ================================================================
+
+  # SNS Topic — entry point for automated response triggers
+  ResponseTriggerTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-trigger'
+      KmsMasterKeyId: alias/aws/sns
+
+  # SNS Topic — notifications about completed response actions
+  ResponseNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-notifications'
+      KmsMasterKeyId: alias/aws/sns
+
+  NotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasNotificationEmail
+    Properties:
+      TopicArn: !Ref ResponseNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # Dead Letter Queue for failed response attempts
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: OntapResponsePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SecretsManagerRead
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref OntapCredentialsSecretArn
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref ResponseNotificationTopic
+              - Sid: SQSSendDLQ
+                Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-handler:*'
+              - Sid: NetworkAclBlock
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkAclEntry
+                  - ec2:DeleteNetworkAclEntry
+                  - ec2:DescribeNetworkAcls
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    'aws:RequestedRegion': !Ref 'AWS::Region'
+
+  # CloudWatch Log Group with retention (compliance: immutable audit trail)
+  ResponseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-handler'
+      RetentionInDays: 365
+
+  # Lambda Function — Automated Response Handler
+  ResponseHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-handler'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Layers:
+        !If
+          - HasSharedLayer
+          - - !Ref SharedPythonLayerArn
+          - !Ref AWS::NoValue
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+      Environment:
+        Variables:
+          ONTAP_MGMT_IP: !Ref OntapMgmtIp
+          ONTAP_CREDENTIALS_SECRET_ARN: !Ref OntapCredentialsSecretArn
+          DEFAULT_SVM_NAME: !If [HasDefaultSvm, !Ref DefaultSvmName, '']
+          COOLDOWN_MINUTES: !Ref CooldownMinutes
+          NOTIFICATION_TOPIC_ARN: !Ref ResponseNotificationTopic
+          PROTECTED_ACCOUNTS_EXTRA: !Ref ProtectedAccountsExtra
+          FSX_SUBNET_ID: !Ref FsxSubnetId
+      Code:
+        ZipFile: |
+          """Automated Response Lambda — executes containment via ONTAP REST API.
+
+          Triggered by SNS messages from CloudWatch Alarms, SIEM monitors,
+          or manual invocations. Executes user blocking, IP blocking, and
+          snapshot creation on FSx for ONTAP.
+
+          SNS Message Format (JSON):
+          {
+              "action": "contain_smb_threat" | "contain_nfs_threat" | "block_smb_user" |
+                        "block_nfs_ip" | "create_snapshot" | "unblock_smb_user" |
+                        "unblock_nfs_ip",
+              "svm_name": "svm-prod-01",
+              "domain": "CORP",           // for SMB actions
+              "username": "jdoe",         // for SMB actions
+              "client_ip": "10.0.5.99",   // for NFS actions
+              "volume_name": "vol1",      // for snapshot / composite actions
+              "policy_name": "default",   // for NFS actions (optional)
+              "reason": "ARP detection"   // human-readable reason
+          }
+          """
+
+          import json
+          import logging
+          import os
+          import sys
+          from typing import Any
+
+          import boto3
+          import urllib3
+
+          # Add shared layer to path (when using Lambda Layer)
+          sys.path.insert(0, "/opt/python")
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Module-level ONTAP client (reused across warm invocations)
+          _client = None
+          _secrets_cache = None
+
+          def _get_credentials():
+              """Get ONTAP credentials from Secrets Manager (cached)."""
+              global _secrets_cache
+              if _secrets_cache is None:
+                  sm = boto3.client("secretsmanager")
+                  secret = sm.get_secret_value(
+                      SecretId=os.environ["ONTAP_CREDENTIALS_SECRET_ARN"]
+                  )
+                  _secrets_cache = json.loads(secret["SecretString"])
+              return _secrets_cache
+
+          def _get_client():
+              """Get or create ONTAP response client."""
+              global _client
+              if _client is None:
+                  creds = _get_credentials()
+                  # Import from Lambda Layer or inline
+                  try:
+                      from ontap_response import OntapResponseClient
+                  except ImportError:
+                      # Fallback: module embedded in deployment package
+                      from shared.python.ontap_response import OntapResponseClient
+
+                  _client = OntapResponseClient(
+                      mgmt_ip=os.environ["ONTAP_MGMT_IP"],
+                      username=creds["username"],
+                      password=creds["password"],
+                  )
+              return _client
+
+          # Network-layer blocking client (NACL-based)
+          _net_client = None
+
+          def _get_network_client():
+              """Get or create network block client."""
+              global _net_client
+              if _net_client is None:
+                  try:
+                      from network_block import NetworkBlockClient
+                  except ImportError:
+                      from shared.python.network_block import NetworkBlockClient
+                  _net_client = NetworkBlockClient()
+              return _net_client
+
+          def _notify(result: dict, action: str):
+              """Send notification about completed response action."""
+              topic_arn = os.environ.get("NOTIFICATION_TOPIC_ARN")
+              if not topic_arn:
+                  return
+
+              status = result.get("status", "unknown")
+              subject = f"[FSx-ONTAP Response] {action}: {status}"
+
+              try:
+                  sns = boto3.client("sns")
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Subject=subject[:100],
+                      Message=json.dumps(result, indent=2, default=str),
+                  )
+              except Exception as e:
+                  logger.warning("Notification failed: %s", e)
+
+          def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+              """Process SNS-triggered response actions."""
+              # Parse SNS message
+              records = event.get("Records", [])
+              results = []
+
+              for record in records:
+                  sns_msg = record.get("Sns", {}).get("Message", "{}")
+                  try:
+                      payload = json.loads(sns_msg)
+                  except json.JSONDecodeError:
+                      logger.error("Invalid JSON in SNS message: %s", sns_msg[:200])
+                      continue
+
+                  action = payload.get("action", "")
+                  svm_name = payload.get("svm_name", os.environ.get("DEFAULT_SVM_NAME", ""))
+                  reason = payload.get("reason", "automated-response")
+
+                  if not svm_name:
+                      logger.error("No svm_name provided and no DEFAULT_SVM_NAME set")
+                      results.append({"action": action, "status": "error", "error": "svm_name required"})
+                      continue
+
+                  client = _get_client()
+                  result = {"action": action, "status": "error"}
+
+                  try:
+                      if action == "contain_smb_threat":
+                          result = client.contain_smb_threat(
+                              svm_name=svm_name,
+                              domain=payload.get("domain", ""),
+                              username=payload.get("username", ""),
+                              volume_name=payload.get("volume_name"),
+                              reason=reason,
+                          )
+                      elif action == "contain_nfs_threat":
+                          result = client.contain_nfs_threat(
+                              svm_name=svm_name,
+                              client_ip=payload.get("client_ip", ""),
+                              policy_name=payload.get("policy_name", "default"),
+                              volume_name=payload.get("volume_name"),
+                              reason=reason,
+                          )
+                          # Also apply network-layer block for immediate effect
+                          fsx_subnet = os.environ.get("FSX_SUBNET_ID", "")
+                          if fsx_subnet and payload.get("client_ip"):
+                              try:
+                                  net_client = _get_network_client()
+                                  net_result = net_client.block_ip(
+                                      subnet_id=fsx_subnet,
+                                      client_ip=payload["client_ip"],
+                                      reason=reason,
+                                  )
+                                  result["network_block"] = net_result
+                              except Exception as ne:
+                                  logger.warning("Network block failed (non-fatal): %s", ne)
+                                  result["network_block"] = {"status": "failed", "error": str(ne)}
+                      elif action == "contain_multiprotocol_threat":
+                          result = client.contain_multiprotocol_threat(
+                              svm_name=svm_name,
+                              domain=payload.get("domain", ""),
+                              username=payload.get("username", ""),
+                              client_ip=payload.get("client_ip", ""),
+                              volume_name=payload.get("volume_name"),
+                              policy_name=payload.get("policy_name", "default"),
+                              reason=reason,
+                          )
+                      elif action == "block_smb_user":
+                          result = client.block_smb_user(
+                              svm_name=svm_name,
+                              domain=payload.get("domain", ""),
+                              username=payload.get("username", ""),
+                          )
+                      elif action == "block_nfs_ip":
+                          result = client.block_nfs_ip(
+                              svm_name=svm_name,
+                              policy_name=payload.get("policy_name", "default"),
+                              client_ip=payload.get("client_ip", ""),
+                          )
+                      elif action == "create_snapshot":
+                          result = client.create_snapshot(
+                              svm_name=svm_name,
+                              volume_name=payload.get("volume_name", ""),
+                              comment=f"Response: {reason}",
+                              cooldown_minutes=int(os.environ.get("COOLDOWN_MINUTES", "15")),
+                          )
+                      elif action == "unblock_smb_user":
+                          result = client.unblock_smb_user(
+                              svm_name=svm_name,
+                              domain=payload.get("domain", ""),
+                              username=payload.get("username", ""),
+                          )
+                      elif action == "unblock_nfs_ip":
+                          result = client.unblock_nfs_ip(
+                              svm_name=svm_name,
+                              policy_name=payload.get("policy_name", "default"),
+                              client_ip=payload.get("client_ip", ""),
+                          )
+                      elif action == "list_active_blocks":
+                          result = client.list_active_blocks(svm_name=svm_name)
+                      elif action == "health_check":
+                          result = client.health_check(svm_name=svm_name)
+                      elif action == "block_nfs_ip_network":
+                          fsx_subnet = os.environ.get("FSX_SUBNET_ID", "")
+                          if not fsx_subnet:
+                              result = {"action": action, "status": "error", "error": "FSX_SUBNET_ID not configured"}
+                          else:
+                              net_client = _get_network_client()
+                              result = net_client.block_ip(
+                                  subnet_id=fsx_subnet,
+                                  client_ip=payload.get("client_ip", ""),
+                                  reason=reason,
+                                  block_all_ports=payload.get("block_all_ports", True),
+                              )
+                      elif action == "unblock_nfs_ip_network":
+                          fsx_subnet = os.environ.get("FSX_SUBNET_ID", "")
+                          if not fsx_subnet:
+                              result = {"action": action, "status": "error", "error": "FSX_SUBNET_ID not configured"}
+                          else:
+                              net_client = _get_network_client()
+                              result = net_client.unblock_ip(
+                                  subnet_id=fsx_subnet,
+                                  client_ip=payload.get("client_ip", ""),
+                              )
+                      else:
+                          result = {"action": action, "status": "error", "error": f"Unknown action: {action}"}
+
+                  except Exception as e:
+                      logger.exception("Response action failed: %s", action)
+                      result = {"action": action, "status": "error", "error": str(e)}
+
+                  _notify(result, action)
+                  results.append(result)
+
+              return {"statusCode": 200, "body": json.dumps(results, default=str)}
+
+  # SNS → Lambda permission
+  SNSInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ResponseHandler
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref ResponseTriggerTopic
+
+  # SNS Subscription (Lambda)
+  LambdaSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ResponseTriggerTopic
+      Protocol: lambda
+      Endpoint: !GetAtt ResponseHandler.Arn
+
+  # CloudWatch Alarm — DLQ depth (failed responses need attention)
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-dlq-depth'
+      AlarmDescription: Failed automated response actions in DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref ResponseNotificationTopic
+
+Outputs:
+  TriggerTopicArn:
+    Description: SNS Topic ARN to trigger automated responses (subscribe CloudWatch Alarms here)
+    Value: !Ref ResponseTriggerTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-trigger-topic-arn'
+
+  NotificationTopicArn:
+    Description: SNS Topic ARN for response action notifications
+    Value: !Ref ResponseNotificationTopic
+
+  ResponseHandlerArn:
+    Description: Lambda function ARN for direct invocation
+    Value: !GetAtt ResponseHandler.Arn
+
+  DeadLetterQueueUrl:
+    Description: DLQ URL for failed response actions
+    Value: !Ref DeadLetterQueue
+
+  TriggerMessageFormat:
+    Description: JSON format for SNS trigger messages
+    Value: |
+      {"action":"contain_smb_threat","svm_name":"svm-prod","domain":"CORP","username":"jdoe","volume_name":"vol1","reason":"ARP detection"}

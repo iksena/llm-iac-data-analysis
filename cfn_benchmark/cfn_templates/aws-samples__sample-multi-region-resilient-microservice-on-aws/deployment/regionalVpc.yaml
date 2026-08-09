@@ -1,0 +1,326 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: "2010-09-09"
+Description: 'Base Infrastructure (SO9020)'
+
+Parameters:
+  Env:
+    Type: String
+    Default: ''
+    Description: String to enable multiple deployments per AWS region
+  NamingPrefix:
+    Type: String
+    Description: The prefix to be used for resources created by this template.
+    Default: mr-app
+  PrimaryRegion:
+    Type: String
+    Description: Enter the Primary Region
+    Default: "us-east-1"
+  StandbyRegion:
+    Type: String
+    Description: Enter the Standby Region
+    Default: "us-west-2"
+  PrimaryOnly:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Set to true to skip standby-only resources (VPC peering)
+  PrimaryVpcId:
+    Type: String
+    Default: ""
+    Description: >-
+      VPC ID of the primary region VPC. Required when deploying in the standby
+      region so the peering connection can reference it without a cross-region
+      secret lookup. Leave empty for the primary region deploy.
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      "VPCCidrBlock": 10.1.0.0/16
+      "PrivateCidrBlock1": 10.1.0.0/20
+      "PrivateCidrBlock2": 10.1.16.0/20
+      "PrivateCidrBlock3": 10.1.32.0/20
+      "AvailabilityZoneId1": use1-az1
+      "AvailabilityZoneId2": use1-az4
+      "AvailabilityZoneId3": use1-az6
+    us-west-2:
+      "VPCCidrBlock": 10.2.0.0/16
+      "PrivateCidrBlock1": 10.2.0.0/20
+      "PrivateCidrBlock2": 10.2.16.0/20
+      "PrivateCidrBlock3": 10.2.32.0/20
+      "AvailabilityZoneId1": usw2-az1
+      "AvailabilityZoneId2": usw2-az2
+      "AvailabilityZoneId3": usw2-az3
+
+Conditions:
+  isStandby: !And
+    - !Equals [!Ref AWS::Region, us-west-2]
+    - !Equals [!Ref PrimaryOnly, "false"]
+
+Resources:
+  #VPC
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !FindInMap [RegionMap, !Ref "AWS::Region", "VPCCidrBlock"]
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+  VpcIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: !Sub VpcId${Env}
+      Value: !Ref Vpc
+  Peer:
+    Condition: isStandby
+    Type: AWS::EC2::VPCPeeringConnection
+    Properties:
+      PeerRegion: !Ref PrimaryRegion
+      PeerVpcId: !Ref PrimaryVpcId
+      VpcId: !Ref Vpc
+
+  #Canaries pres-reqs
+  canaryPolicy:
+      Type: "AWS::IAM::ManagedPolicy"
+      Properties:
+        #ManagedPolicyName: !Sub "CloudWatchSyntheticsPolicy${Env}"
+        Path: "/service-role/"
+        PolicyDocument: !Sub |
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "s3:PutObject",
+                            "s3:GetObject"
+                        ],
+                        "Resource": [
+                            "arn:aws:s3:::${canaryBucket}/canary/${AWS::Region}/*"
+                        ]
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "s3:GetBucketLocation"
+                        ],
+                        "Resource": [
+                            "arn:aws:s3:::${canaryBucket}"
+                        ]
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "logs:CreateLogStream",
+                            "logs:PutLogEvents",
+                            "logs:CreateLogGroup"
+                        ],
+                        "Resource": [
+                            "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/cwsyn-*"
+                        ]
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "s3:ListAllMyBuckets",
+                            "xray:PutTraceSegments"
+                        ],
+                        "Resource": [
+                            "*"
+                        ]
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Resource": "*",
+                        "Action": "cloudwatch:PutMetricData",
+                        "Condition": {
+                            "StringEquals": {
+                                "cloudwatch:namespace": "CloudWatchSynthetics"
+                            }
+                        }
+                    },
+                    {
+                        "Effect": "Allow",
+                        "Action": [
+                            "ec2:CreateNetworkInterface",
+                            "ec2:DescribeNetworkInterfaces",
+                            "ec2:DeleteNetworkInterface"
+                        ],
+                        "Resource": [
+                            "*"
+                        ]
+                    }
+                ]
+            }
+
+  canaryBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        LogFilePrefix: access-logs/
+      LifecycleConfiguration:
+        Rules:
+          # Canary artifacts are ephemeral. Versioning is enabled on this
+          # bucket, so expiring only current versions leaves noncurrent
+          # versions (and their delete markers) behind forever. Expire both,
+          # and abort dangling multipart uploads, so storage stays bounded.
+          - Id: DeleteAfter24Hours
+            Status: Enabled
+            ExpirationInDays: 1
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 1
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1
+          # Once a delete marker has no noncurrent versions behind it, remove
+          # it too (kept in a separate rule: ExpiredObjectDeleteMarker cannot
+          # coexist with ExpirationInDays in the same rule).
+          - Id: CleanupExpiredDeleteMarkers
+            Status: Enabled
+            ExpiredObjectDeleteMarker: true
+  canaryBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref canaryBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: logdelivery.elasticloadbalancing.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${canaryBucket.Arn}/alb-access-logs/*'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt canaryBucket.Arn
+              - !Sub '${canaryBucket.Arn}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+  canaryRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      Path: "/service-role/"
+      AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"lambda.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+      MaxSessionDuration: 3600
+      ManagedPolicyArns:
+        - !Ref canaryPolicy
+      Description: "CloudWatch Synthetics lambda execution role for running canaries"
+  canaryRoleArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: !Sub canaryRoleArn${Env}
+      Value: !GetAtt canaryRole.Arn
+  canaryBucketName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: !Sub canaryBucketName${Env}
+      Value: !Ref canaryBucket
+  canaryBucketArn:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: !Sub canaryBucketArn${Env}
+      Value: !GetAtt canaryBucket.Arn
+  VpcCidrParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: !Sub VpcCidr${Env}
+      Value: !FindInMap [RegionMap, !Ref "AWS::Region", "VPCCidrBlock"]
+
+  KmsKey:
+    Type: "AWS::KMS::Key"
+    Properties:
+      Enabled: true
+      EnableKeyRotation: true
+      Description: "retail-store-ar CMK"
+      KeyUsage: "ENCRYPT_DECRYPT"
+      KeyPolicy: !Sub |
+        {
+          "Version" : "2012-10-17",
+          "Id" : "key-default-1",
+          "Statement" : [
+            {
+            "Sid" : "Enable IAM User Permissions",
+            "Effect" : "Allow",
+            "Principal" : {
+              "AWS" : "arn:aws:iam::${AWS::AccountId}:root"
+            },
+            "Action" : "kms:*",
+            "Resource" : "*"
+          },
+          {
+            "Sid": "Allow access through AWS Secrets Manager for all principals in the account that are authorized to use AWS Secrets Manager",
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": [
+                "*"
+              ]
+            },
+            "Action": [
+              "kms:Encrypt",
+              "kms:Decrypt",
+              "kms:ReEncrypt*",
+              "kms:CreateGrant",
+              "kms:DescribeKey"
+            ],
+            "Resource": "*",
+            "Condition": {
+              "StringEquals": {
+                "kms:CallerAccount": "${AWS::AccountId}",
+                "kms:ViaService": "secretsmanager.${AWS::Region}.amazonaws.com"
+              }
+            }
+          },
+          {
+            "Sid": "Allow access through AWS Secrets Manager for all principals in the account that are authorized to use AWS Secrets Manager",
+            "Effect": "Allow",
+            "Principal": {
+              "AWS": [
+                "*"
+              ]
+            },
+            "Action": "kms:GenerateDataKey*",
+            "Resource": "*",
+            "Condition": {
+              "StringEquals": {
+                "kms:CallerAccount": "${AWS::AccountId}"
+              },
+              "StringLike": {
+                "kms:ViaService": "secretsmanager.${AWS::Region}.amazonaws.com"
+              }
+            }
+          } ]
+        }
+      KeySpec: "SYMMETRIC_DEFAULT"
+      MultiRegion: false
+  KmsKeyParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Type: String
+      Name: !Sub retail-store-ar${Env}
+      Value: !Ref KmsKey
+
+Outputs:
+  VpcId:
+    Value: !Ref Vpc
+    Description: VPC ID for this region
+  PeeringConnectionId:
+    Condition: isStandby
+    Value: !Ref Peer
+    Description: VPC Peering Connection ID (standby region only)

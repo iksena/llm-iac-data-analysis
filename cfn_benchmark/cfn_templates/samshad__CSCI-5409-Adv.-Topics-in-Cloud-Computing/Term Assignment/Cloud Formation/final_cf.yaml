@@ -1,0 +1,1371 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Provision essential AWS resources for the term project to support data management ,storage needs, logical operation, ensuring a streamlined deployment of infrastructure components.
+
+Resources:
+#  ------------------------------------------------DynamoDB Table-------------------------------------------------------
+
+  UsersTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: users
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      GlobalSecondaryIndexes:
+        - IndexName: email-index
+          KeySchema:
+            - AttributeName: email
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  TasksTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: tasks
+      AttributeDefinitions:
+        - AttributeName: task_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: task_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      GlobalSecondaryIndexes:
+        - IndexName: user_id-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+#  ---------------------------------------------S3 Bucket---------------------------------------------------------------
+
+  # S3 Buckets
+  UsersIdBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: 5409-users-id-bucket
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+  UsersSelfieBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: 5409-users-selfie-bucket
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: false
+        BlockPublicPolicy: false
+        IgnorePublicAcls: false
+        RestrictPublicBuckets: false
+
+#  --------------------------------------Lambda Dependency for Package (PyJWT and JWT)----------------------------------
+
+  LambdaDependencyLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: MyLambdaLayer
+      Description: A layer for Lambda with PyJWT and jwt
+      Content:
+        S3Bucket: 5409-identity-verification-dependencies
+        S3Key: layer.zip
+      CompatibleRuntimes:
+        - python3.8
+
+#  ----------------------------------------------Lambda Function--------------------------------------------------------
+  UserRegistrationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UserRegistrationFunction
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          from botocore.exceptions import ClientError
+          import hashlib
+          import uuid
+          import base64
+          from boto3.dynamodb.conditions import Key
+
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          sns = boto3.client('sns', region_name='us-east-1')
+
+          def hash_password(password):
+              return hashlib.sha256(password.encode()).hexdigest()
+
+          def generate_response(status_code, message, data=None):
+              body = {
+                  'message': message
+              }
+              if data:
+                  body['data'] = data
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Access-Control-Allow-Methods': 'OPTIONS,POST,GET,PUT,DELETE,PATCH'
+                  },
+                  'body': json.dumps(body)
+              }
+
+          def validate_payload(user_data):
+              required_fields = ['email', 'password', 'full_name', 'id_card']
+              for field in required_fields:
+                  if field not in user_data:
+                      return False, f'Missing required field: {field}'
+                  if not user_data[field]:
+                      return False, f'Field {field} cannot be empty'
+
+              # Additional validation for email, password, and full_name if needed
+              if not isinstance(user_data['email'], str) or '@' not in user_data['email']:
+                  return False, 'Invalid email format'
+              if not isinstance(user_data['password'], str) or len(user_data['password']) < 6:
+                  return False, 'Password must be at least 6 characters long'
+              if not isinstance(user_data['full_name'], str):
+                  return False, 'Full name must be a string'
+
+              return True, None
+
+          def lambda_handler(event, context):
+              table = dynamodb.Table('users')
+              user_id_bucket = '5409-users-id-bucket'
+
+              user_data = json.loads(event['body'])
+              # Validate payload
+              is_valid, error_message = validate_payload(user_data)
+              if not is_valid:
+                  return generate_response(400, error_message)
+
+              user_id = str(uuid.uuid4())
+              email = user_data['email']
+              password = hash_password(user_data['password'])
+              full_name = user_data['full_name']
+              id_card_base64 = user_data['id_card']
+
+              # Check if a user with the same email already exists
+              try:
+                  response = table.query(
+                      IndexName='email-index',
+                      KeyConditionExpression=Key('email').eq(email)
+                  )
+                  if response['Items']:
+                      return generate_response(400, 'User with this email already exists.')
+              except ClientError as e:
+                  return generate_response(500, f'Error checking existing user: {e}')
+
+              try:
+                  id_card_bytes = base64.b64decode(id_card_base64)
+              except base64.binascii.Error as e:
+                  return generate_response(400, f'Invalid Base 64 string: {e}')
+
+              if id_card_bytes[:3] != b'\xff\xd8\xff':
+                  return generate_response(400, 'Decoded bytes are not a valid JPEG image')
+
+              # Upload ID card to S3
+              try:
+                  s3.put_object(Bucket=user_id_bucket, Key=f'{user_id}.jpg', Body=id_card_bytes)
+              except ClientError as e:
+                  return generate_response(500, f'Error uploading ID card: {e}')
+
+              # SNS Topic and Subscription Handling
+              clean_email = email.split('@')[0]
+              topic_name = f"SendVerificationInfoTo-{clean_email}"
+              try:
+                  # Check if an SNS topic with the desired name format exists
+                  topics_response = sns.list_topics()
+                  topic_exists = any(topic_name in topic['TopicArn'] for topic in topics_response['Topics'])
+
+                  if not topic_exists:
+                      # Create a new SNS topic
+                      topic_response = sns.create_topic(Name=topic_name)
+                      topic_arn = topic_response['TopicArn']
+
+                      # Subscribe the user's email to the newly created topic
+                      sns.subscribe(
+                          TopicArn=topic_arn,
+                          Protocol='email',
+                          Endpoint=email
+                      )
+                  else:
+                      topic_arn = next(topic['TopicArn'] for topic in topics_response['Topics'] if topic_name in topic['TopicArn'])
+
+                      # Check if the email is already subscribed
+                      subscriptions_response = sns.list_subscriptions_by_topic(TopicArn=topic_arn)
+                      email_subscribed = any(
+                          subscription['Endpoint'] == email for subscription in subscriptions_response['Subscriptions'])
+
+                      if not email_subscribed:
+                          # Subscribe the user's email to the existing topic
+                          sns.subscribe(
+                              TopicArn=topic_arn,
+                              Protocol='email',
+                              Endpoint=email
+                          )
+
+              except ClientError as e:
+                  return generate_response(500, f'Error handling SNS topic: {e}')
+
+              # Store user data in DynamoDB
+              try:
+                  table.put_item(
+                      Item={
+                          'user_id': user_id,
+                          'email': email,
+                          'password': password,
+                          'full_name': full_name,
+                          'verification_status': 'Pending'
+                      }
+                  )
+
+              except ClientError as e:
+                  return generate_response(500, f'Error saving user data: {e}')
+
+              return generate_response(200, 'Registration successful', {
+                  'user_id': user_id,
+                  'email': email,
+                  'full_name': full_name
+              })
+
+      Layers:
+        - !Ref LambdaDependencyLayer
+      Role: arn:aws:iam::837364356508:role/LabRole
+      MemorySize: 512
+      Timeout: 60  # Timeout in seconds
+      EphemeralStorage:
+        Size: 512  # Size in MB
+
+  UserLoginFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UserLoginFunction
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import jwt
+          import hashlib
+          from datetime import datetime, timedelta
+          from botocore.exceptions import ClientError
+
+          SECRET_KEY = "^mw!h*35*mowxzp0n@9-fv2u1h8e*ulqgw=&863q0+bis)je27"
+          dynamodb = boto3.resource('dynamodb')
+
+          def hash_password(password):
+              return hashlib.sha256(password.encode()).hexdigest()
+
+          def generate_response(status_code, message, data=None):
+              body = {
+                  'message': message
+              }
+              if data:
+                  body['data'] = data
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Access-Control-Allow-Methods': 'OPTIONS,POST,GET,PUT,DELETE,PATCH'
+                  },
+                  'body': json.dumps(body)
+              }
+
+          def lambda_handler(event, context):
+              table = dynamodb.Table('users')
+
+              user_data = json.loads(event['body'])
+              email = user_data.get('email')
+              password = user_data.get('password')
+              if not email or email == "":
+                  return generate_response(400, 'Email must be provided')
+
+              if not password or not isinstance(password, str) or len(password) < 6:
+                  return generate_response(400, 'Valid password must be provided')
+
+              password = hash_password(password)
+
+              try:
+                  response = table.scan(
+                      FilterExpression=boto3.dynamodb.conditions.Attr('email').eq(email)
+                  )
+                  users = response.get('Items', [])
+                  if not users or users[0]['password'] != password:
+                      return generate_response(401, 'Invalid email or password')
+
+                  user = users[0]
+                  token = jwt.encode(
+                      {'email': email, 'user_id': user['user_id'], 'exp': datetime.utcnow() + timedelta(hours=1)},
+                      SECRET_KEY,
+                      algorithm='HS256'
+                  )
+
+                  data = {
+                      'user_id': user['user_id'],
+                      'email': user['email'],
+                      'full_name': user['full_name'],
+                      'verification_status': user['verification_status'],
+                      'token': token
+                  }
+
+                  return generate_response(200, 'Login successful', data)
+
+              except ClientError as e:
+                  return generate_response(500, f'Error logging in: {e}')
+
+      Layers:
+        - !Ref LambdaDependencyLayer
+      Role: arn:aws:iam::837364356508:role/LabRole
+      MemorySize: 512
+      Timeout: 60  # Timeout in seconds
+      EphemeralStorage:
+        Size: 512  # Size in MB
+
+  UserSelfieUploadFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UserSelfieUploadFunction
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import jwt
+          import base64
+          from botocore.exceptions import ClientError
+
+          SECRET_KEY = "^mw!h*35*mowxzp0n@9-fv2u1h8e*ulqgw=&863q0+bis)je27"
+
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          rekognition = boto3.client('rekognition', region_name='us-east-1')
+          sns = boto3.client('sns', region_name='us-east-1')
+          FACE_MATCHING_THRESHOLD = 80
+
+          def generate_response(status_code, message, data=None):
+              body = {
+                  'message': message
+              }
+              if data:
+                  body['data'] = data
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Access-Control-Allow-Methods': 'OPTIONS,POST,GET,PUT,DELETE,PATCH'
+                  },
+                  'body': json.dumps(body)
+              }
+
+          def validate_auth(event):
+              auth_header = event['headers'].get('Authorization')
+              if not auth_header:
+                  return None, generate_response(401, 'Missing Authorization header')
+
+              token = auth_header.split(' ')[1]
+              try:
+                  decoded_token = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+                  user_id = decoded_token['user_id']
+                  return user_id, None
+              except jwt.ExpiredSignatureError:
+                  return None, generate_response(401, 'Token has expired')
+              except jwt.InvalidTokenError:
+                  return None, generate_response(401, 'Invalid token')
+
+          def send_email(topic_name, subject, message):
+              try:
+                  # Check if the SNS topic exists
+                  topics_response = sns.list_topics()
+                  topic_arn = None
+                  for topic in topics_response['Topics']:
+                      if topic_name in topic['TopicArn']:
+                          topic_arn = topic['TopicArn']
+                          break
+
+                  if not topic_arn:
+                      # Create a new SNS topic
+                      topic_response = sns.create_topic(Name=topic_name)
+                      topic_arn = topic_response['TopicArn']
+
+                  # Publish the message to the SNS topic
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Subject=subject,
+                      Message=message
+                  )
+                  return topic_arn  # Return the topic ARN to use for deletion
+              except ClientError as e:
+                  return generate_response(500, f'Error sending email: {e}')
+
+          def get_user_info(user_id):
+              table = dynamodb.Table('users')
+              try:
+                  response = table.get_item(Key={'user_id': user_id})
+                  item = response.get('Item')
+                  if item:
+                      return item.get('email'), item.get('full_name')
+                  else:
+                      return None, None
+              except ClientError as e:
+                  return None, None
+
+          def delete_topic(topic_arn):
+              try:
+                  sns.delete_topic(TopicArn=topic_arn)
+              except ClientError as e:
+                  return generate_response(500, f'Error deleting SNS topic: {e}')
+
+          def lambda_handler(event, context):
+              table = dynamodb.Table('users')
+              selfie_bucket = '5409-users-selfie-bucket'
+              id_bucket = '5409-users-id-bucket'
+
+              user_id, code = validate_auth(event)
+              if code:
+                  return code
+
+              user_data = json.loads(event['body'])
+              selfie = user_data['selfie']
+
+              try:
+                  selfie_bytes = base64.b64decode(selfie)
+              except base64.binascii.Error as e:
+                  return generate_response(400, f'Invalid Base 64 string: {e}')
+
+              if selfie_bytes[:3] != b'\xff\xd8\xff':
+                  return generate_response(400, 'Decoded bytes are not a valid JPEG image')
+
+              try:
+                  s3.put_object(Bucket=selfie_bucket, Key=f'{user_id}.jpg', Body=selfie_bytes, ContentType='image/jpeg')
+              except ClientError as e:
+                  return generate_response(500, f'Error uploading selfie: {e}')
+
+              # Compare new selfie and ID card using Rekognition
+              try:
+
+                  response = rekognition.compare_faces(
+                      SourceImage={'S3Object': {'Bucket': selfie_bucket, 'Name': f'{user_id}.jpg'}},
+                      TargetImage={'S3Object': {'Bucket': id_bucket, 'Name': f'{user_id}.jpg'}},
+                      SimilarityThreshold=FACE_MATCHING_THRESHOLD
+                  )
+
+                  email, full_name = get_user_info(user_id)
+                  if not email:
+                      return generate_response(500, 'User information not found')
+                  clean_email = email.split('@')[0]
+
+                  if response['FaceMatches']:
+                      verification_status = 'Verified'
+                      # Update verification status in DynamoDB
+                      table.update_item(
+                          Key={'user_id': user_id},
+                          UpdateExpression='SET verification_status = :val',
+                          ExpressionAttributeValues={':val': verification_status}
+                      )
+                      topic_arn = send_email(
+                          topic_name=f"SendVerificationInfoTo-{clean_email}",
+                          subject='Congratulations!',
+                          message=f'Your account has been successfully verified. Welcome, {full_name}!'
+                      )
+
+                      if isinstance(topic_arn, dict):  # If send_email returns an error response
+                          return topic_arn
+                      delete_topic(topic_arn)  # Delete the topic after sending the email
+
+                      return generate_response(200, 'Verification completed', {
+                          'verification_status': verification_status
+                      })
+                  else:
+                       send_email(
+                          topic_name=f"SendVerificationInfoTo-{clean_email}",
+                          subject='Verification Failed',
+                          message=f'Your account verification has failed. Please retry by uploading a better selfie that matches with your ID card photo.'
+                       )
+
+                       try:
+                           s3.delete_object(Bucket=selfie_bucket, Key=f'{user_id}.jpg')
+                       except ClientError as e:
+                           return generate_response(500, f'Verification failed. Error deleting selfie: {e}')
+
+                       return generate_response(400, 'Verification failed', {
+                          'verification_status': 'Pending'
+                      })
+
+              except ClientError as e:
+                  return generate_response(500, f'Error verifying identity: {e}')
+
+      Layers:
+        - !Ref LambdaDependencyLayer
+      Role: arn:aws:iam::837364356508:role/LabRole
+      MemorySize: 512
+      Timeout: 60  # Timeout in seconds
+      EphemeralStorage:
+        Size: 512  # Size in MB
+
+  UserDetailFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UserDetailFunction
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import jwt
+          from botocore.exceptions import ClientError
+
+          SECRET_KEY = "^mw!h*35*mowxzp0n@9-fv2u1h8e*ulqgw=&863q0+bis)je27"
+
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+
+          def generate_response(status_code, message, data=None):
+              body = {
+                  'message': message
+              }
+              if data:
+                  body['data'] = data
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Access-Control-Allow-Methods': 'OPTIONS,POST,GET,PUT,DELETE,PATCH'
+                  },
+                  'body': json.dumps(body)
+              }
+
+          def validate_auth(event):
+              auth_header = event['headers'].get('Authorization')
+              if not auth_header:
+                  return None, generate_response(401, 'Missing Authorization header')
+
+              token = auth_header.split(' ')[1]
+              try:
+                  decoded_token = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+                  user_id = decoded_token['user_id']
+                  return user_id, None
+              except jwt.ExpiredSignatureError:
+                  return None, generate_response(401, 'Token has expired')
+              except jwt.InvalidTokenError:
+                  return None, generate_response(401, 'Invalid token')
+
+          def lambda_handler(event, context):
+              table = dynamodb.Table('users')
+              selfie_bucket = '5409-users-selfie-bucket'
+              id_bucket = '5409-users-id-bucket'
+
+              user_id, code = validate_auth(event)
+              if code:
+                  return code
+
+              # Get user details from DynamoDB
+              try:
+                  response = table.get_item(Key={'user_id': user_id})
+                  if 'Item' not in response:
+                      return generate_response(404, 'User not found')
+
+                  user_data = response['Item']
+                  user_data.pop('password', None)
+              except ClientError as e:
+                  return generate_response(500, f'Error fetching user data: {e}')
+
+              # Check if the selfie exists in S3
+              try:
+                  s3.head_object(Bucket=selfie_bucket, Key=f'{user_id}.jpg')
+                  selfie_url = s3.generate_presigned_url(
+                      'get_object',
+                      Params={'Bucket': selfie_bucket, 'Key': f'{user_id}.jpg'},
+                      ExpiresIn=3600
+                  )
+                  user_data['selfie_url'] = selfie_url
+              except ClientError as e:
+                  if e.response['Error']['Code'] == '404':
+                      user_data['selfie_url'] = None
+                  else:
+                      return generate_response(500, f'Error checking selfie existence: {e}')
+
+              # Check if the nid exists in S3
+              try:
+                  s3.head_object(Bucket=id_bucket, Key=f'{user_id}.jpg')
+                  id_url = s3.generate_presigned_url(
+                      'get_object',
+                      Params={'Bucket': id_bucket, 'Key': f'{user_id}.jpg'},
+                      ExpiresIn=3600
+                  )
+                  user_data['id_url'] = id_url
+              except ClientError as e:
+                  if e.response['Error']['Code'] == '404':
+                      user_data['id_url'] = None
+                  else:
+                      return generate_response(500, f'Error checking id existence: {e}')
+
+              return generate_response(200, 'User data retrieved successfully', user_data)
+
+      Layers:
+        - !Ref LambdaDependencyLayer
+      Role: arn:aws:iam::837364356508:role/LabRole
+      MemorySize: 512
+      Timeout: 60  # Timeout in seconds
+      EphemeralStorage:
+        Size: 512  # Size in MB
+
+  UserTaskManagementFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: UserTaskManagementFunction
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import jwt
+          from datetime import datetime
+          from boto3.dynamodb.conditions import Key
+          from botocore.exceptions import ClientError
+
+          SECRET_KEY = "^mw!h*35*mowxzp0n@9-fv2u1h8e*ulqgw=&863q0+bis)je27"
+
+          dynamodb = boto3.resource('dynamodb')
+          TASK_PRIORITY_TYPE_LIST = ['Low', 'Medium', 'High']
+          TASK_STATUS_LIST = ['ToDo', 'Done']
+
+          def generate_response(status_code, message, data=None):
+              body = {
+                  'message': message
+              }
+              if data:
+                  body['data'] = data
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*',
+                      'Access-Control-Allow-Headers': 'Content-Type',
+                      'Access-Control-Allow-Methods': 'OPTIONS,POST,GET,PUT,DELETE,PATCH'
+                  },
+                  'body': json.dumps(body)
+              }
+
+          def validate_auth(event):
+              auth_header = event['headers'].get('Authorization')
+              if not auth_header:
+                  return None, generate_response(401, 'Missing Authorization header')
+
+              token = auth_header.split(' ')[1]
+              try:
+                  decoded_token = jwt.decode(token, SECRET_KEY, algorithms=['HS256'])
+                  user_id = decoded_token['user_id']
+
+                  # Fetch the user's verification status
+                  table = dynamodb.Table('users')
+                  response = table.get_item(Key={'user_id': user_id})
+                  user = response.get('Item')
+                  if not user:
+                      return None, generate_response(404, 'User not found')
+
+                  verification_status = user.get('verification_status')
+                  if verification_status != 'Verified':
+                      return None, generate_response(403, 'User needs to be verified')
+                  return user_id, None
+              except jwt.ExpiredSignatureError:
+                  return None, generate_response(401, 'Token has expired')
+              except jwt.InvalidTokenError:
+                  return None, generate_response(401, 'Invalid token')
+              except ClientError as e:
+                  return None, generate_response(500, f'Error retrieving user data: {e}')
+
+          def check_task_owner(table, task_id, user_id):
+              try:
+                  response = table.get_item(Key={'task_id': task_id})
+                  existing_task = response.get('Item')
+                  if not existing_task:
+                      return generate_response(404, 'Task not found')
+
+                  if existing_task['user_id'] != user_id:
+                      return generate_response(403, 'User not authorized')
+
+                  return None
+              except ClientError as e:
+                  return generate_response(500, f'Error checking task owner: {e}')
+
+          def validate_task_payload(task_data):
+              required_fields = ['title', 'description', 'due_date', 'priority', 'status']
+              for field in required_fields:
+                  if field not in task_data:
+                      return False, f'Missing required field: {field}'
+                  if not task_data[field]:
+                      return False, f'Field {field} cannot be empty'
+
+              if task_data['priority'] not in TASK_PRIORITY_TYPE_LIST:
+                  return False, f'Invalid priority value. Must be one of {TASK_PRIORITY_TYPE_LIST}'
+              if task_data['status'] not in TASK_STATUS_LIST:
+                  return False, f'Invalid status value. Must be one of {TASK_STATUS_LIST}'
+
+              try:
+                  datetime.fromisoformat(task_data['due_date'])
+              except ValueError:
+                  return False, 'Invalid due_date format. Must be ISO 8601 format (YYYY-MM-DDTHH:MM:SS)'
+
+              return True, None
+
+          def lambda_handler(event, context):
+
+              user_id, error_code = validate_auth(event)
+              if error_code:
+                  return error_code
+
+              table = dynamodb.Table('tasks')
+              http_method = event['httpMethod']
+
+              query_parameters = event.get('queryStringParameters', {})
+              task_id = query_parameters.get('task_id') if query_parameters else None
+
+              if http_method == 'POST':
+                  return create_task(event, table, user_id)
+              elif http_method == 'GET':
+                  if task_id:
+                      return get_task_details(event, table, task_id)
+                  else:
+                      return list_tasks(event, table, user_id)
+              elif http_method == 'PUT':
+                  return update_task(event, table, user_id)
+              elif http_method == 'DELETE':
+                  return delete_task(event, table, user_id)
+              else:
+                  return generate_response(400, 'Unsupported HTTP method')
+
+          def create_task(event, table, user_id):
+              task_data = json.loads(event['body'])
+              is_valid, validation_error = validate_task_payload(task_data)
+              if not is_valid:
+                  return generate_response(400, validation_error)
+
+              task_id = str(uuid.uuid4())
+              title = task_data.get('title')
+              description = task_data.get('description')
+              due_date = task_data.get('due_date')
+              priority = task_data.get('priority')
+              status = task_data.get('status')
+              created_at = datetime.utcnow().isoformat()
+
+              try:
+                  table.put_item(
+                      Item={
+                          'user_id': user_id,
+                          'task_id': task_id,
+                          'title': title,
+                          'description': description,
+                          'due_date': due_date,
+                          'priority': priority,
+                          'status': status,
+                          'created_at': created_at
+                      }
+                  )
+                  return generate_response(200, 'Task created successfully', {
+                      'task_id': task_id,
+                      'title': title,
+                      'description': description,
+                      'due_date': due_date,
+                      'priority': priority,
+                      'status': status,
+                      'created_at': created_at
+                  })
+              except ClientError as e:
+                  return generate_response(500, f'Error creating task: {e}')
+
+          def list_tasks(event, table, user_id):
+              query_params = event.get('queryStringParameters', {})
+              priority_filter = query_params.get('priority') if query_params else None
+              status_filter = query_params.get('status') if query_params else None
+
+              if (priority_filter and priority_filter not in TASK_PRIORITY_TYPE_LIST) or priority_filter == "":
+                  priority_filter = None
+
+              if (status_filter and status_filter not in TASK_STATUS_LIST) or status_filter == "":
+                  status_filter = None
+
+              try:
+                  response = table.query(
+                      IndexName='user_id-index',
+                      KeyConditionExpression=Key('user_id').eq(user_id)
+                  )
+                  tasks = response.get('Items', [])
+                  tasks.sort(key=lambda x: x['created_at'], reverse=True)
+
+                  grouped_tasks = {
+                      'High': [],
+                      'Medium': [],
+                      'Low': []
+                  }
+
+                  for task in tasks:
+                      priority = task.get('priority', 'Medium')  # Default to 'Medium' if not specified when created
+                      status = task.get('status', 'ToDo')  # Default to 'ToDo' if not specified
+                      if (priority_filter is None or priority == priority_filter) and (status_filter is None or status == status_filter):
+                          grouped_tasks[priority].append(task)
+
+                  return generate_response(200, 'Tasks fetched successfully',
+                                           {priority_filter: grouped_tasks.get(priority_filter)} if priority_filter else grouped_tasks)
+              except ClientError as e:
+                  return generate_response(500, f'Error retrieving tasks: {e}')
+
+          def get_task_details(event, table, task_id):
+              try:
+                  response = table.get_item(Key={'task_id': task_id})
+                  task = response.get('Item')
+                  if task:
+                      return generate_response(200, 'Task fetched successfully', task)
+                  else:
+                      return generate_response(404, 'Task not found')
+              except ClientError as e:
+                  return generate_response(500, f'Error retrieving task: {e}')
+
+          def update_task(event, table, user_id):
+              task_data = json.loads(event['body'])
+              task_id = task_data['task_id']
+
+              try:
+                  error_code = check_task_owner(table, task_id, user_id)
+                  if error_code:
+                      return error_code
+
+                  update_expression = "SET "
+                  expression_attribute_values = {}
+                  expression_attribute_names = {}
+
+                  if 'title' in task_data:
+                      if task_data['title'] == "":
+                          return generate_response(400, f'title field can not be empty')
+                      update_expression += "#title = :title, "
+                      expression_attribute_values[':title'] = task_data['title']
+                      expression_attribute_names['#title'] = 'title'
+                  if 'description' in task_data:
+                      if task_data['description'] == "":
+                          return generate_response(400, f'description field can not be empty')
+                      update_expression += "#description = :description, "
+                      expression_attribute_values[':description'] = task_data['description']
+                      expression_attribute_names['#description'] = 'description'
+                  if 'due_date' in task_data:
+                      if task_data['due_date'] == "":
+                          return generate_response(400, f'due_date field can not be empty')
+                      update_expression += "due_date = :due_date, "
+                      expression_attribute_values[':due_date'] = task_data['due_date']
+                  if 'priority' in task_data:
+                      if task_data['priority'] not in TASK_PRIORITY_TYPE_LIST:
+                          return generate_response(400, f'Invalid priority value. Must be one of {TASK_PRIORITY_TYPE_LIST}')
+                      update_expression += "priority = :priority, "
+                      expression_attribute_values[':priority'] = task_data['priority']
+                  if 'status' in task_data:
+                      if task_data['status'] not in TASK_STATUS_LIST:
+                          return generate_response(400, f'Invalid status value. Must be one of {TASK_STATUS_LIST}')
+                      update_expression += "#status = :status, "
+                      expression_attribute_values[':status'] = task_data['status']
+                      expression_attribute_names['#status'] = 'status'
+
+                  update_expression = update_expression.rstrip(", ")
+
+                  if not expression_attribute_values:
+                      return generate_response(400, 'No valid fields to update')
+
+                  table.update_item(
+                      Key={'task_id': task_id},
+                      UpdateExpression=update_expression,
+                      ExpressionAttributeValues=expression_attribute_values,
+                      ExpressionAttributeNames=expression_attribute_names
+                  )
+                  return generate_response(200, 'Task updated successfully')
+              except ClientError as e:
+                  return generate_response(500, f'Error updating task: {e}')
+
+          def delete_task(event, table, user_id):
+              task_data = json.loads(event['body'])
+              task_id = task_data['task_id']
+
+              try:
+                  error_code = check_task_owner(table, task_id, user_id)
+                  if error_code:
+                      return error_code
+
+                  table.delete_item(Key={'task_id': task_id})
+                  return generate_response(200, 'Task deleted successfully')
+              except ClientError as e:
+                  return generate_response(500, f'Error deleting task: {e}')
+
+      Layers:
+        - !Ref LambdaDependencyLayer
+      Role: arn:aws:iam::837364356508:role/LabRole
+      MemorySize: 512
+      Timeout: 60  # Timeout in seconds
+      EphemeralStorage:
+        Size: 512  # Size in MB
+
+#  ------------------------------------------------API Gateway----------------------------------------------------------
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: "IdentityVerificationAPI's"
+      Description: Common API Gateway for User Verification and Task Functions
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  #  -------------------------------------------------API Gateway Resource------------------------------------------------
+
+  UserRegistrationApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: user-registration
+      RestApiId: !Ref ApiGateway
+
+  UserLoginApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: user-login
+      RestApiId: !Ref ApiGateway
+
+  UserSelfieUploadApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: selfie-upload
+      RestApiId: !Ref ApiGateway
+
+  UserDetailApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: user-details
+      RestApiId: !Ref ApiGateway
+
+  UserTaskManagementApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: task
+      RestApiId: !Ref ApiGateway
+
+#  -------------------------------------------------API Gateway Method--------------------------------------------------
+
+  UserRegistrationApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref UserRegistrationApiGatewayResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserRegistrationFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+            method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+        - StatusCode: 400
+        - StatusCode: 401
+        - StatusCode: 500
+
+  UserLoginApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref UserLoginApiGatewayResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserLoginFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+            method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+        - StatusCode: 400
+        - StatusCode: 401
+        - StatusCode: 500
+
+  UserSelfieUploadApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref UserSelfieUploadApiGatewayResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserSelfieUploadFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+            method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+        - StatusCode: 400
+        - StatusCode: 401
+        - StatusCode: 500
+
+  UserDetailApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref UserDetailApiGatewayResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserDetailFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+            method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+        - StatusCode: 400
+        - StatusCode: 401
+        - StatusCode: 500
+
+  UserTaskManagementApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      ResourceId: !Ref UserTaskManagementApiGatewayResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UserTaskManagementFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+            method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+        - StatusCode: 400
+        - StatusCode: 401
+        - StatusCode: 500
+
+#  ------------------------------------------------API Gateway Method(For CORS)-----------------------------------------
+
+  UserRegistrationApiGatewayOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref UserRegistrationApiGatewayResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+            method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+
+  UserLoginApiGatewayOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref UserLoginApiGatewayResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+            method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+
+  UserSelfieUploadApiGatewayOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref UserSelfieUploadApiGatewayResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+            method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+
+  UserDetailApiGatewayOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref UserDetailApiGatewayResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+            method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+
+  UserTaskManagementApiGatewayOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref UserTaskManagementApiGatewayResource
+      RestApiId: !Ref ApiGateway
+      Integration:
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        Type: MOCK
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: "'Content-Type'"
+            method.response.header.Access-Control-Allow-Methods: "'OPTIONS,POST,GET,PUT,DELETE,PATCH'"
+            method.response.header.Access-Control-Allow-Origin: "'*'"
+
+#  -----------------------------------------------API Gateway Deployment------------------------------------------------
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - UserRegistrationApiGatewayMethod
+      - UserRegistrationApiGatewayOptionsMethod
+      - UserLoginApiGatewayMethod
+      - UserLoginApiGatewayOptionsMethod
+      - UserSelfieUploadApiGatewayMethod
+      - UserSelfieUploadApiGatewayOptionsMethod
+      - UserDetailApiGatewayMethod
+      - UserDetailApiGatewayOptionsMethod
+      - UserTaskManagementApiGatewayMethod
+      - UserTaskManagementApiGatewayOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: dev
+
+#  -----------------------------------------------API Gateway Invoke Permission-----------------------------------------
+
+  LambdaUserRegistrationApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UserRegistrationFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/dev/*/*
+
+  LambdaUserLoginApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UserLoginFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/dev/*/*
+
+  LambdaUserSelfieUploadApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UserSelfieUploadFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/dev/*/*
+
+  LambdaUserDetailApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UserDetailFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/dev/*/*
+
+  LambdaUserTaskManagementApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref UserTaskManagementFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/dev/*/*
+
+#  ---------------------------------------------------EC2 Instance------------------------------------------------------
+
+  EC2Instance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      InstanceType: t2.micro
+      KeyName: Frontend-ec2-key # Create a Key Pair using this Name
+      ImageId: ami-00402f0bdf4996822  # Linux/UNIX - x86_64 - amazon/debian-12-amd64-20240702-1796
+      SecurityGroupIds:
+        - !Ref InstanceSecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64:
+          !Sub |
+          #!/bin/bash
+          set -x  # Enable debugging
+
+          # Update package list and install necessary tools
+          apt-get update -y
+
+          # Install Node.js (including npm)
+          curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
+          apt-get install -y nodejs
+
+          # Install unzip and awscli
+          apt-get install -y unzip awscli
+
+          # Download and unzip the project
+          aws s3 cp s3://5409-frontend-codebase-bucket/frontend.zip /var/www/html/
+          cd /var/www/html/
+          unzip frontend.zip
+          cd frontend
+
+          # Create and write to the .env file
+          echo 'VITE_BASE_URL="https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/dev"' > .env
+
+          # Install dependencies
+          npm install
+
+          # Build the project using Vite
+          npm run build
+
+          # Install 'serve' globally
+          npm install -g serve
+
+          # Serve the build directory
+          serve -s dist -l 80
+
+  EC2InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - LabRole
+
+  InstanceSecurityGroup:
+    Type: 'AWS::EC2::SecurityGroup'
+    Properties:
+      GroupDescription: Enable SSH and HTTP access
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+#  ---------------------------------------------------------Output------------------------------------------------------
+
+Outputs:
+
+  InstanceId:
+    Description: 'InstanceId of the newly created EC2 instance for Identity Verification Frontend'
+    Value: !Ref EC2Instance
+  PublicIP:
+    Description: 'Public IP address of the EC2 instance'
+    Value: !GetAtt EC2Instance.PublicIp
+  WebURL:
+    Description: 'Application URL'
+    Value: !Join
+      - ''
+      - - 'http://'
+        - !GetAtt EC2Instance.PublicDnsName
+
+  BaseUrl:
+    Description: "Backend BASE URL"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/dev"
+
+  UserRegistrationApiUrl:
+    Description: "URL of the User Registration API"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/dev/user-registration"
+
+  UserLoginApiUrl:
+    Description: "URL of the User Login API"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/dev/user-login"
+
+  UserSelfieUploadApiUrl:
+    Description: "URL of the User Selfie Upload API"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/dev/selfie-upload"
+
+  UserDetailApiUrl:
+    Description: "URL of the User Detail API"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/dev/user-details"
+
+  UserTaskManagementApiUrl:
+    Description: "URL of the User Task Management API"
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/dev/task"

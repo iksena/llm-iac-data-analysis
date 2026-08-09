@@ -1,0 +1,256 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CloudFormation template for a scalable URL-to-PNG screenshot service with automated load testing and S3/SQS integration
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Default: vpc-0000000000000000
+  Subnet1:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0000000000000000
+  Subnet2:
+    Type: AWS::EC2::Subnet::Id
+    Default: subnet-0000000000000000
+  InstanceType:
+    Type: String
+    Default: t3.micro
+  KeyName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: default-key
+  LoadTestInstanceType:
+    Type: String
+    Default: t3.micro
+
+Resources:
+  ScreenshotQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: ScreenshotQueue
+
+  ScreenshotBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub screenshot-bucket-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSQSFullAccess
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+      Policies:
+        - PolicyName: EC2ScreenshotPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt ScreenshotQueue.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt ScreenshotBucket.Arn
+                  - !Sub ${ScreenshotBucket.Arn}/*
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !Ref Subnet1
+        - !Ref Subnet2
+      LaunchTemplate:
+        LaunchTemplateName: ScreenshotWorkerTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: '1'
+      MaxSize: '2'
+      DesiredCapacity: '1'
+      TargetGroupARNs: []
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: ScreenshotWorkerTemplate
+      LaunchTemplateData:
+        ImageId: !Sub 'resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Name: !Ref EC2InstanceProfile
+        UserData:
+          Fn::Base64:
+            !Sub |
+              #!/bin/bash -xe
+              yum update -y
+              amazon-linux-extras install -y epel
+              yum install -y chromium-browser
+              curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+              yum install -y nodejs
+              npm install -g puppeteer
+              cat > /home/ec2-user/screenshot-worker.js << 'EOF'
+              const AWS = require('aws-sdk');
+              const puppeteer = require('puppeteer');
+              const sqs = new AWS.SQS({region: '${AWS::Region}'});
+              const s3 = new AWS.S3({region: '${AWS::Region}'});
+
+              async function processScreenshot() {
+                const queueUrl = '${ScreenshotQueue}';
+                const bucketName = '${ScreenshotBucket}';
+
+                const receiveParams = {
+                  QueueUrl: queueUrl,
+                  MaxNumberOfMessages: 1,
+                  WaitTimeSeconds: 20
+                };
+
+                const data = await sqs.receiveMessage(receiveParams).promise();
+                if (data.Messages) {
+                  const message = data.Messages[0];
+                  const url = message.Body;
+
+                  try {
+                    const browser = await puppeteer.launch({
+                      executablePath: '/usr/bin/chromium-browser',
+                      args: ['--no-sandbox', '--disable-setuid-sandbox']
+                    });
+                    const page = await browser.newPage();
+                    await page.goto(url, {waitUntil: 'networkidle2'});
+                    const screenshotBuffer = await page.screenshot();
+                    await browser.close();
+
+                    const s3Params = {
+                      Bucket: bucketName,
+                      Key: `${Date.now()}-${Math.random().toString(36)}.png`,
+                      Body: screenshotBuffer,
+                      ContentType: 'image/png'
+                    };
+
+                    await s3.putObject(s3Params).promise();
+                    await sqs.deleteMessage({
+                      QueueUrl: queueUrl,
+                      ReceiptHandle: message.ReceiptHandle
+                    }).promise();
+                    console.log('Screenshot saved and message deleted');
+                  } catch (error) {
+                    console.error('Error processing screenshot:', error);
+                  }
+                }
+              }
+
+              processScreenshot();
+              EOF
+              chmod +x /home/ec2-user/screenshot-worker.js
+              (crontab -l 2>/dev/null; echo "* * * * * node /home/ec2-user/screenshot-worker.js") | crontab -
+
+  ScaleUpPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGApproximateNumberOfMessagesVisible
+        TargetValue: 5.0
+
+  ScaleDownPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGApproximateNumberOfMessagesVisible
+        TargetValue: 1.0
+
+  LoadTestInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Sub 'resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+      InstanceType: !Ref LoadTestInstanceType
+      KeyName: !Ref KeyName
+      SubnetId: !Ref Subnet1
+      SecurityGroupIds:
+        - !Ref LoadTestSecurityGroup
+      UserData:
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -xe
+            yum update -y
+            amazon-linux-extras install -y epel
+            yum install -y nodejs
+            npm install -g aws-sdk
+            cat > /home/ec2-user/load-test.js << 'EOF'
+            const AWS = require('aws-sdk');
+            const sqs = new AWS.SQS({region: '${AWS::Region}'});
+
+            const queueUrl = '${ScreenshotQueue}';
+            const urls = [
+              'https://www.amazon.com',
+              'https://www.google.com',
+              'https://www.github.com',
+              'https://www.aws.amazon.com'
+            ];
+
+            async function populateQueue() {
+              for (let url of urls) {
+                const params = {
+                  QueueUrl: queueUrl,
+                  MessageBody: url
+                };
+                await sqs.sendMessage(params).promise();
+                console.log('Message sent to queue:', url);
+              }
+            }
+
+            populateQueue();
+            EOF
+            chmod +x /home/ec2-user/load-test.js
+            node /home/ec2-user/load-test.js
+
+  LoadTestSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for load test instance
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+
+Outputs:
+  ScreenshotQueueUrl:
+    Description: URL of the SQS queue
+    Value: !Ref ScreenshotQueue
+  ScreenshotBucketName:
+    Description: Name of the S3 bucket
+    Value: !Ref ScreenshotBucket
+  LoadTestInstancePublicIp:
+    Description: Public IP of the load test instance
+    Value: !GetAtt LoadTestInstance.PublicIp

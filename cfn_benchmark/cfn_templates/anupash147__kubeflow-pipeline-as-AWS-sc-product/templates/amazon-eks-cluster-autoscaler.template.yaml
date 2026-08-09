@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Metadata:
+  QSLint:
+    Exclusions: [W9002, W9003, W9004, W9006]
+Description: "Deploys the auto-scaler helm chart into an existing kubernetes cluster (qs-1ql475ceo)"
+Parameters:
+  NodeAutoScalingGroup:
+    Type: CommaDelimitedList
+  EksClusterName:
+    Type: String
+  KubernetesVersion:
+    Type: String
+    AllowedValues: [ "1.21", "1.20", "1.19", "1.18", "1.17" ]
+    Default: "1.21"
+# NOTE: The cluster autoscaler version number is dependant on the K8S version it is being
+#       deployed into. See...
+#       https://github.com/kubernetes/autoscaler/tree/master/cluster-autoscaler#releases
+#       https://github.com/kubernetes/autoscaler/releases
+# workaround for https://github.com/kubernetes/autoscaler/issues/3372
+Conditions:
+  NeedsStaticList: !Or
+    - !Equals [!Ref 'AWS::Region', 'af-south-1']
+    - !Equals [!Ref 'AWS::Region', 'eu-south-1']
+    - !Equals [!Ref 'AWS::Region', 'cn-north-1']
+    - !Equals [!Ref 'AWS::Region', 'cn-northwest-1']
+Mappings:
+  Config:
+    Prefix: { Value: 'eks-quickstart' }
+  # From : https://github.com/kubernetes/autoscaler/releases/tag/
+  K8sVersionMap:
+    "1.17":
+      ImageTag: v1.17.3
+    "1.18":
+      ImageTag: v1.18.3
+    "1.19":
+      ImageTag: v1.19.1
+    "1.20":
+      ImageTag: v1.20.0
+    "1.21":
+      ImageTag: v1.21.0
+Resources:
+  ARNLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: allowLambdaLogging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "autoscaling:DescribeAutoScalingGroups"
+                  - "logs:*"
+                Resource: "*"
+  ARNLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Timeout: 10
+      Role: !GetAtt "ARNLambdaRole.Arn"
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import boto3
+          def resourceList(listOfASGs):
+              client = boto3.client('autoscaling')
+              response = client.describe_auto_scaling_groups( AutoScalingGroupNames=listOfASGs)
+              return [asg['AutoScalingGroupARN'] for asg in response['AutoScalingGroups']]
+          def lambda_handler(event, context):
+            print(f"Data in event: {event}")
+            response_data = {}
+            if event["RequestType"] == "Create":
+              listOfASGs = event["ResourceProperties"]["listOfASGs"]
+              physicalResourceId="abc"
+              physicalResourceId = resourceList(listOfASGs)
+              response_data = { "arns": physicalResourceId }
+            cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data, "CustomResourcePhysicalID")
+  ARNconstructorForASG:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      listOfASGs: !Ref NodeAutoScalingGroup
+      ServiceToken: !GetAtt ARNLambdaFunction.Arn
+  # Policy to apply to NodeInstanceRole
+  ClusterAutoScalerPolicy:
+    DependsOn: ARNconstructorForASG
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${EksClusterName}-autoscaler-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - autoscaling:DescribeAutoScalingGroups
+              - autoscaling:DescribeAutoScalingInstances
+              - autoscaling:DescribeLaunchConfigurations
+              - autoscaling:DescribeTags
+              - ec2:DescribeLaunchTemplateVersions
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - autoscaling:SetDesiredCapacity
+              - autoscaling:TerminateInstanceInAutoScalingGroup
+            Resource: !GetAtt ARNconstructorForASG.arns
+      Roles:
+        - !Sub ['${Prefix}-ManagedNodeInstance', {Prefix: !FindInMap [Config, Prefix, Value]}]
+        - !Sub ['${Prefix}-UnManagedNodeInstance', {Prefix: !FindInMap [Config, Prefix, Value]}]
+  # Install auto-scaler helm chart
+  AutoScalerHelmChart:
+    DependsOn:
+      - ClusterAutoScalerPolicy
+    Type: "AWSQS::Kubernetes::Helm"
+    Metadata: { cfn-lint: { config: { ignore_checks: [ E3012 ] } } }
+    Properties:
+      ClusterID: !Ref EksClusterName
+      Namespace: kube-system
+      Chart: stable/cluster-autoscaler
+      Repository: 'https://charts.helm.sh/stable'
+      Values:
+        awsRegion: !Ref 'AWS::Region'
+        cloudProvider: aws
+        image.tag: !FindInMap
+          - K8sVersionMap
+          - !Ref KubernetesVersion
+          - ImageTag
+        image.repository: k8s.gcr.io/autoscaling/cluster-autoscaler
+        extraArgs.aws-use-static-instance-list: !If [NeedsStaticList, true, !Ref 'AWS::NoValue']
+        rbac.create: true
+        rbac.pspEnabled: true
+        autoDiscovery.clusterName: !Ref EksClusterName
+        sslCertPath: /etc/ssl/certs/ca-bundle.crt
+        extraArgs.balance-similar-node-groups: false
+        extraArgs.expander: least-waste
+        tolerations[0].key: 'system'
+        tolerations[0].operator: 'Exists'
+        tolerations[0].effect: 'NoSchedule'
+        affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key: 'system-worker'
+        affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].operator: 'Exists'
+Outputs:
+  AutoScalerReleaseName:
+    Value: !Ref AutoScalerHelmChart

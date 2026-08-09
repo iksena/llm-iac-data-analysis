@@ -1,0 +1,1330 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  CELLO M11 waitlist — Lambdas, API Gateway, schedules and the SES bounce topic.
+
+  Every function reaches the PORTAL RDS — cello-{env}-portal-db-* exports,
+  database cello_portal, user portal_admin. NEVER the directory instance
+  (cello-{env}-rds-*, database cello_{env}, user postgres): DOD-INV-SINGLE-DB
+  makes a connection string pointing there a blocking finding, and that instance
+  holds agent profiles under pgaudit.
+
+  The portal DB is PubliclyAccessible:false, so every function is VPC-attached to
+  the private subnets and reaches SES and the AWS APIs over the NAT gateway that
+  cello-vpc.yaml already provides.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [dev, staging, production]
+    Description: Deployment environment.
+
+  # No Default. A required value with an empty default silently disables the
+  # feature it configures — infra/CLAUDE.md's Required Config Anti-Pattern.
+  WaitlistDatabaseUrl:
+    Type: String
+    NoEcho: true
+    Description: >
+      Postgres connection string for the portal RDS instance. Read from Secrets
+      Manager by deploy.sh and passed at deploy time; never hardcoded.
+      KNOWN TRADEOFF, taken deliberately (M11-D25): this lands as a plaintext
+      Lambda environment variable, readable by anyone holding
+      lambda:GetFunctionConfiguration on this account. ECS avoids that with
+      ValueFrom; Lambda has no equivalent, so the alternative is a cold-start
+      Secrets Manager fetch inside all twelve handlers. Not taken for launch —
+      single-operator account, and the twelve connect() paths are the most
+      heavily tested surface in M11. Revisit before any second operator gets
+      IAM access.
+
+  ApiDomainName:
+    Type: String
+    Default: api.cello.mygentic.ai
+    Description: >
+      Custom domain for the waitlist API. Still the real home of every route, and
+      still where nginx forwards to — but browsers no longer address it directly.
+      They reach the same routes same-origin at https://{SiteDomainName}/api/waitlist,
+      which is what allows the session cookie to be host-only. Keep this off
+      execute-api.amazonaws.com regardless: SameSite=Lax is never attached to a
+      cross-SITE request, so a raw execute-api host breaks the proxy too.
+
+  SiteDomainName:
+    Type: String
+    Default: cello.mygentic.ai
+    Description: >
+      The site users actually visit, and therefore the ONLY origin that appears
+      in a browser. Both WAITLIST_SITE and WAITLIST_API_BASE derive from it so
+      the two can never drift: every link we mail and every fetch the page makes
+      must resolve to this one origin, or the session cookie stops travelling and
+      the sign-in loop returns.
+
+  HostedZoneId:
+    Type: String
+    Default: Z02692523DOH7NW521CL8
+    Description: Route53 zone for cello.mygentic.ai.
+
+  FromEmailAddress:
+    Type: String
+    Default: CELLO <noreply@mygentic.ai>
+    Description: Verified SES sender.
+
+Resources:
+
+  # ── Security group ──────────────────────────────────────────────────────────
+
+  WaitlistLambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "CELLO ${Environment} waitlist Lambdas"
+      VpcId: !ImportValue
+        Fn::Sub: "cello-${Environment}-vpc-id"
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !ImportValue
+            Fn::Sub: "cello-${Environment}-vpc-cidr"
+          Description: Postgres to the portal RDS
+        # 0.0.0.0/0, routed through the NAT gateway in cello-vpc.yaml. Scoped to
+        # the VPC CIDR in the first draft, which silently blocked SES entirely:
+        # boto3's SES client resolves email.<region>.amazonaws.com, a PUBLIC
+        # address, so every send would have hung until the Lambda timed out and
+        # the job cycled pending → sending → reclaimed forever.
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: "0.0.0.0/0"
+          Description: HTTPS to SES and the AWS APIs, via the NAT gateway
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  # NOTE TO A FUTURE EDITOR: the export names below are written with {env}
+  # rather than the real CFN syntax ON PURPOSE. verify-m11-invariants.sh greps
+  # this whole file for the directory SG name, so spelling it properly here —
+  # the natural tidy-up — makes the invariant check fail on a correct file.
+  #
+  # cello-{env}-portal-db-sg, NOT cello-{env}-rds-sg. Those two names are one
+  # word apart and point at different databases: the second is the DIRECTORY's
+  # instance (agent profiles, pgaudit), which this stack must never touch —
+  # DOD-INV-SINGLE-DB calls a connection to it a blocking finding, and its
+  # master credential is the one cello-rotation.yaml deliberately withholds from
+  # every task role. The first draft of this file imported the wrong one.
+  PortalDbIngressFromWaitlist:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !ImportValue
+        Fn::Sub: "cello-${Environment}-portal-db-sg"
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref WaitlistLambdaSecurityGroup
+      Description: Waitlist Lambdas
+
+  # ── No VPC endpoints, deliberately ────────────────────────────────────────
+  # The first draft created interface endpoints for SES and Secrets Manager,
+  # reasoning that hibernate deletes the NAT gateway and an email pipeline must
+  # not depend on one. The premise is true and the conclusion was wrong: hibernate
+  # also STOPS the RDS instance, so during hibernation these Lambdas have no
+  # email_jobs table to read. Endpoints would have bought the ability to reach SES
+  # while the queue they drain is unreachable — nothing — and they would have
+  # billed straight through every hibernation, since hibernate.sh only discovers
+  # the ssmmessages endpoint and would never have torn them down.
+  #
+  # M6B-014 stage 2 already removed six interface endpoints per region in favour
+  # of the NAT for exactly this cost reason. Reintroducing two here would have
+  # quietly reversed that decision for the least important service in the stack.
+
+  # ── Execution role ──────────────────────────────────────────────────────────
+
+  WaitlistLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "cello-waitlist-lambda-${Environment}-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: waitlist-send-email
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [ses:SendEmail, ses:SendRawEmail]
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    # Scoped to our own verified identity. Without this the role
+                    # can send as anything SES will accept, which is a spoofing
+                    # surface rather than a permission.
+                    ses:FromAddress: noreply@mygentic.ai
+        - PolicyName: waitlist-nudge-dispatcher
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Lets the interactive paths (signup, /auth/request, resend) invoke
+              # the email dispatcher the moment they enqueue, instead of waiting
+              # for its rate(1 minute) tick. Measured: a sign-in link enqueued at
+              # 05:30:33 was not sent until 05:31:30.
+              #
+              # Scoped to the ONE function it may invoke. A blanket
+              # lambda:InvokeFunction on "*" would let any waitlist handler call
+              # any function in the account.
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:cello-waitlist-email-${Environment}"
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── SES bounce + complaint notifications ────────────────────────────────────
+
+  BounceTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "cello-waitlist-bounces-${Environment}"
+      DisplayName: CELLO waitlist SES bounces and complaints
+
+  # WITHOUT THESE TWO, NOTHING PUBLISHES TO THE TOPIC. The first draft created the
+  # topic, the policy, the subscription and the Lambda permission — a complete
+  # delivery path with nothing at the top of it — and deferred "point SES at
+  # this" to a manual step that was never written down. The visible result would
+  # have been a bounce handler that never fires, so email_status is never set to
+  # bounced or complained, DOD-INV-EMAIL-SUPPRESS becomes unenforceable, and the
+  # sending domain's reputation degrades with nothing reporting it.
+  #
+  # SES emits events to THIS TOPIC only for mail sent with THIS configuration
+  # set. (Identity-level notifications via SetIdentityNotificationTopic are a
+  # separate mechanism that would cover all mail from the verified identity;
+  # the configuration set is chosen because it is scoped and IaC-managed.)
+  # The dispatcher must send WITH this configuration set for events to be
+  # emitted; waitlist-email passes ConfigurationSetName from WAITLIST_SES_CONFIG_SET.
+  SesConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Sub "cello-waitlist-${Environment}"
+
+  SesBounceDestination:
+    Type: AWS::SES::ConfigurationSetEventDestination
+    # CreateConfigurationSetEventDestination validates that SES may publish to
+    # the topic. !Ref BounceTopic orders this after the TOPIC but not after the
+    # POLICY that grants it, so a first deploy can lose the race and fail with
+    # InvalidSNSDestination — an error that reads as an SES problem and rolls
+    # back the stack.
+    DependsOn: BounceTopicPolicy
+    Properties:
+      ConfigurationSetName: !Ref SesConfigurationSet
+      EventDestination:
+        Name: bounces-and-complaints
+        Enabled: true
+        # Only the events that change deliverability state. Sends, opens and
+        # clicks would be volume the handler has to filter and a per-notification
+        # cost for data nothing reads.
+        MatchingEventTypes: [bounce, complaint, reject, renderingFailure]
+        SnsDestination:
+          TopicARN: !Ref BounceTopic
+
+  BounceTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref BounceTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ses.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref BounceTopic
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+
+  # ── HTTP API ────────────────────────────────────────────────────────────────
+  #
+  # The custom domain is the reason this section exists rather than letting the
+  # default execute-api hostname serve. A SameSite=Lax session cookie is never
+  # attached to a cross-SITE request, so an API on execute-api.amazonaws.com
+  # cannot authenticate a browser on cello.mygentic.ai — /status 401s, redirects
+  # to /auth, and the user loops forever. Same-site is a functional requirement
+  # here, not branding.
+
+  WaitlistApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "cello-waitlist-${Environment}"
+      ProtocolType: HTTP
+      # CORS is handled per-Lambda, not here. The reads are wildcard-public and
+      # the writes are origin-restricted, and expressing that split at the
+      # gateway would put the rule in two places that can disagree.
+      Tags:
+        Project: cello
+        Environment: !Ref Environment
+
+  WaitlistApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref WaitlistApi
+      StageName: $default
+      AutoDeploy: true
+      DefaultRouteSettings:
+        # A public, unauthenticated signup endpoint with 8-byte bearer codes
+        # behind it. The throttle is the only thing between a script and the
+        # whole code space.
+        ThrottlingRateLimit: 50
+        ThrottlingBurstLimit: 100
+
+  # CREATED HERE, not looked up. The first draft took the ARN as a parameter and
+  # had deploy.sh find it with `acm list-certificates` — but no template in this
+  # repo ever created a cert for api.*, so the lookup returned nothing on every
+  # run and the stack skipped itself permanently while the deploy still printed
+  # complete. A resource IaC owns cannot go missing that way.
+  #
+  # DNS-validated against HostedZoneId, the same pattern as PortalCertificate in
+  # cello-portal-data.yaml. CFN writes the validation record itself and blocks
+  # until ACM issues, so the first deploy of this stack is slower than later ones.
+  ApiCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref ApiDomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref ApiDomainName
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+        - Key: Project
+          Value: cello
+
+  WaitlistApiDomain:
+    Type: AWS::ApiGatewayV2::DomainName
+    Properties:
+      DomainName: !Ref ApiDomainName
+      DomainNameConfigurations:
+        - CertificateArn: !Ref ApiCertificate
+          EndpointType: REGIONAL
+          SecurityPolicy: TLS_1_2
+
+  WaitlistApiMapping:
+    Type: AWS::ApiGatewayV2::ApiMapping
+    Properties:
+      ApiId: !Ref WaitlistApi
+      DomainName: !Ref WaitlistApiDomain
+      Stage: !Ref WaitlistApiStage
+
+  WaitlistApiDnsRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref ApiDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt WaitlistApiDomain.RegionalDomainName
+        HostedZoneId: !GetAtt WaitlistApiDomain.RegionalHostedZoneId
+        EvaluateTargetHealth: false
+
+  SignupFunctionIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WaitlistApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt SignupFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  SignupFunctionApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SignupFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WaitlistApi}/*"
+
+  SignupRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "POST /waitlist/signup"
+      Target: !Sub "integrations/${SignupFunctionIntegration}"
+
+  # ── CORS preflight ──────────────────────────────────────────────────────────
+  #
+  # WITHOUT THESE, EVERY WRITE ENDPOINT IS DEAD IN A BROWSER. All four handlers
+  # implement `if method == "OPTIONS": return 204` — but the first draft routed
+  # no OPTIONS request to any of them and defined no $default, so API Gateway
+  # answered every preflight itself with 404 and no Access-Control-Allow-Origin,
+  # and the handler-side CORS code was dead by wiring.
+  #
+  # cello.mygentic.ai → api.cello.mygentic.ai is same-SITE, which is what keeps
+  # the Lax session cookie attached (see ApiDomainName). It is still cross-ORIGIN,
+  # and a POST carrying application/json is not CORS-safelisted, so it always
+  # preflights. Same shape of bug as the SameSite one: a property of the wiring
+  # that no handler test can see.
+  #
+  # EACH PREFIX GOES TO THE HANDLER THAT OWNS IT — not one catch-all. A single
+  # OPTIONS /waitlist/{proxy+} pointed at signup would have been worse than no
+  # route at all: signup's preflight response omits Access-Control-Allow-
+  # Credentials (it has no session), while /auth/* and the action endpoints are
+  # all credentialed. The browser rejects a credentialed request whose preflight
+  # lacks that header, so the catch-all would have broken precisely the calls the
+  # status page depends on, while appearing to fix CORS.
+  #
+  # HTTP API routes most-specific-first, so the exact and deeper-prefix keys win
+  # over the trailing {proxy+}, which catches survey / readiness /
+  # interview-commit / post-url / content-alerts and any endpoint added later.
+  SignupPreflightRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "OPTIONS /waitlist/signup"
+      Target: !Sub "integrations/${SignupFunctionIntegration}"
+
+  AuthPreflightRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "OPTIONS /waitlist/auth/{proxy+}"
+      Target: !Sub "integrations/${AuthFunctionIntegration}"
+
+  UnsubPreflightRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "OPTIONS /waitlist/unsubscribe"
+      Target: !Sub "integrations/${AuthFunctionIntegration}"
+
+  ActionsPreflightRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "OPTIONS /waitlist/{proxy+}"
+      Target: !Sub "integrations/${ActionsFunctionIntegration}"
+
+  GalleryPreflightRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "OPTIONS /gallery/{proxy+}"
+      Target: !Sub "integrations/${GalleryFunctionIntegration}"
+
+  AuthFunctionIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WaitlistApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AuthFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  AuthFunctionApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AuthFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WaitlistApi}/*"
+
+  AuthRequestRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "POST /waitlist/auth/request"
+      Target: !Sub "integrations/${AuthFunctionIntegration}"
+
+  AuthVerifyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "GET /waitlist/auth/verify"
+      Target: !Sub "integrations/${AuthFunctionIntegration}"
+
+  AuthSessionRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "GET /waitlist/auth/session"
+      Target: !Sub "integrations/${AuthFunctionIntegration}"
+
+  AuthLogoutRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "POST /waitlist/auth/logout"
+      Target: !Sub "integrations/${AuthFunctionIntegration}"
+
+  # The one button on the dead-link page. Posted by a real <form> served from
+  # this same API, so it is same-origin and never preflights — no OPTIONS route
+  # is needed or wanted here.
+  AuthResendRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "POST /waitlist/auth/resend"
+      Target: !Sub "integrations/${AuthFunctionIntegration}"
+
+  UnsubGetRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "GET /waitlist/unsubscribe"
+      Target: !Sub "integrations/${AuthFunctionIntegration}"
+
+  UnsubPostRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "POST /waitlist/unsubscribe"
+      Target: !Sub "integrations/${AuthFunctionIntegration}"
+
+  ActionsFunctionIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WaitlistApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt ActionsFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  ActionsFunctionApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ActionsFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WaitlistApi}/*"
+
+  SurveyRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "POST /waitlist/survey"
+      Target: !Sub "integrations/${ActionsFunctionIntegration}"
+
+  ReadinessRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "POST /waitlist/readiness"
+      Target: !Sub "integrations/${ActionsFunctionIntegration}"
+
+  InterviewRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "POST /waitlist/interview-commit"
+      Target: !Sub "integrations/${ActionsFunctionIntegration}"
+
+  PostUrlRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "POST /waitlist/post-url"
+      Target: !Sub "integrations/${ActionsFunctionIntegration}"
+
+  ContentAlertsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "POST /waitlist/content-alerts"
+      Target: !Sub "integrations/${ActionsFunctionIntegration}"
+
+  GalleryFunctionIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WaitlistApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt GalleryFunction.Arn
+      PayloadFormatVersion: "2.0"
+
+  GalleryFunctionApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt GalleryFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WaitlistApi}/*"
+
+  GalleryIndexRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "GET /gallery/receipts"
+      Target: !Sub "integrations/${GalleryFunctionIntegration}"
+
+  GalleryReceiptRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "GET /gallery/receipts/{hash}"
+      Target: !Sub "integrations/${GalleryFunctionIntegration}"
+
+  GalleryPublishRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WaitlistApi
+      RouteKey: "POST /gallery/publish"
+      Target: !Sub "integrations/${GalleryFunctionIntegration}"
+
+  # ── The functions ───────────────────────────────────────────────────────────
+  # All VPC-attached, because every one of them reaches the portal RDS.
+
+  SignupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-waitlist-signup-${Environment}"
+      Description: "Public signup endpoint. Behind API Gateway."
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt WaitlistLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-a"
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-b"
+        SecurityGroupIds:
+          - !Ref WaitlistLambdaSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref WaitlistDatabaseUrl
+          WAITLIST_API_BASE: !Sub "https://${SiteDomainName}/api/waitlist"
+          WAITLIST_SITE: !Sub "https://${SiteDomainName}"
+          WAITLIST_FROM_EMAIL: !Ref FromEmailAddress
+          # Lets this function drain the queue immediately instead of leaving a
+          # confirm or sign-in link to wait for the dispatcher's next tick.
+          # Absent, _dispatch logs nudge.unconfigured and the scheduled run
+          # still sends it — degraded, never lost.
+          WAITLIST_EMAIL_FUNCTION: !Sub "cello-waitlist-email-${Environment}"
+      Code:
+        ZipFile: |
+          # Placeholder. The authoritative source is infra/lambda/waitlist-signup/handler.py
+          # and CI replaces this on deploy. Raising rather than returning is
+          # deliberate: a stub that returned a plausible empty result would let a
+          # half-deployed stack look healthy.
+          def lambda_handler(event, context):
+              raise NotImplementedError(
+                  "Deploy via deploy-lambdas.sh — see infra/lambda/waitlist-signup/handler.py"
+              )
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  AuthFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-waitlist-auth-${Environment}"
+      Description: "Magic link, session, unsubscribe. Behind API Gateway."
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt WaitlistLambdaRole.Arn
+      # The response floor that flattens the enumeration timing channel is a
+      # SLEEP, so the timeout must comfortably exceed it or the guard turns
+      # into a 502 for exactly the addresses it protects.
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-a"
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-b"
+        SecurityGroupIds:
+          - !Ref WaitlistLambdaSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref WaitlistDatabaseUrl
+          WAITLIST_API_BASE: !Sub "https://${SiteDomainName}/api/waitlist"
+          WAITLIST_SITE: !Sub "https://${SiteDomainName}"
+          WAITLIST_FROM_EMAIL: !Ref FromEmailAddress
+          # Lets this function drain the queue immediately instead of leaving a
+          # confirm or sign-in link to wait for the dispatcher's next tick.
+          # Absent, _dispatch logs nudge.unconfigured and the scheduled run
+          # still sends it — degraded, never lost.
+          WAITLIST_EMAIL_FUNCTION: !Sub "cello-waitlist-email-${Environment}"
+      Code:
+        ZipFile: |
+          # Placeholder. The authoritative source is infra/lambda/waitlist-auth/handler.py
+          # and CI replaces this on deploy. Raising rather than returning is
+          # deliberate: a stub that returned a plausible empty result would let a
+          # half-deployed stack look healthy.
+          def lambda_handler(event, context):
+              raise NotImplementedError(
+                  "Deploy via deploy-lambdas.sh — see infra/lambda/waitlist-auth/handler.py"
+              )
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  ActionsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-waitlist-actions-${Environment}"
+      Description: "Survey, readiness, interview commit, post URL, content alerts."
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt WaitlistLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-a"
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-b"
+        SecurityGroupIds:
+          - !Ref WaitlistLambdaSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref WaitlistDatabaseUrl
+          WAITLIST_API_BASE: !Sub "https://${SiteDomainName}/api/waitlist"
+          WAITLIST_SITE: !Sub "https://${SiteDomainName}"
+          WAITLIST_FROM_EMAIL: !Ref FromEmailAddress
+          # Lets this function drain the queue immediately instead of leaving a
+          # confirm or sign-in link to wait for the dispatcher's next tick.
+          # Absent, _dispatch logs nudge.unconfigured and the scheduled run
+          # still sends it — degraded, never lost.
+          WAITLIST_EMAIL_FUNCTION: !Sub "cello-waitlist-email-${Environment}"
+      Code:
+        ZipFile: |
+          # Placeholder. The authoritative source is infra/lambda/waitlist-actions/handler.py
+          # and CI replaces this on deploy. Raising rather than returning is
+          # deliberate: a stub that returned a plausible empty result would let a
+          # half-deployed stack look healthy.
+          def lambda_handler(event, context):
+              raise NotImplementedError(
+                  "Deploy via deploy-lambdas.sh — see infra/lambda/waitlist-actions/handler.py"
+              )
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  EmailFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-waitlist-email-${Environment}"
+      Description: "Drains email_jobs and sends via SES."
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt WaitlistLambdaRole.Arn
+      # Longer: a batch of 25 makes 25 SES round trips. The delivery model
+      # commits the claim before each send, so a timeout mid-batch leaves
+      # 'sending' rows that are reclaimed rather than lost.
+      Timeout: 120
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-a"
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-b"
+        SecurityGroupIds:
+          - !Ref WaitlistLambdaSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref WaitlistDatabaseUrl
+          WAITLIST_API_BASE: !Sub "https://${SiteDomainName}/api/waitlist"
+          WAITLIST_SITE: !Sub "https://${SiteDomainName}"
+          WAITLIST_FROM_EMAIL: !Ref FromEmailAddress
+          # Lets this function drain the queue immediately instead of leaving a
+          # confirm or sign-in link to wait for the dispatcher's next tick.
+          # Absent, _dispatch logs nudge.unconfigured and the scheduled run
+          # still sends it — degraded, never lost.
+          WAITLIST_EMAIL_FUNCTION: !Sub "cello-waitlist-email-${Environment}"
+          # Only the dispatcher sends mail, so only the dispatcher needs this.
+          WAITLIST_SES_CONFIG_SET: !Ref SesConfigurationSet
+      Code:
+        ZipFile: |
+          # Placeholder. The authoritative source is infra/lambda/waitlist-email/handler.py
+          # and CI replaces this on deploy. Raising rather than returning is
+          # deliberate: a stub that returned a plausible empty result would let a
+          # half-deployed stack look healthy.
+          def lambda_handler(event, context):
+              raise NotImplementedError(
+                  "Deploy via deploy-lambdas.sh — see infra/lambda/waitlist-email/handler.py"
+              )
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  BounceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-waitlist-bounce-${Environment}"
+      Description: "SES bounce and complaint handler. SNS-triggered."
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt WaitlistLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-a"
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-b"
+        SecurityGroupIds:
+          - !Ref WaitlistLambdaSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref WaitlistDatabaseUrl
+          WAITLIST_API_BASE: !Sub "https://${SiteDomainName}/api/waitlist"
+          WAITLIST_SITE: !Sub "https://${SiteDomainName}"
+          WAITLIST_FROM_EMAIL: !Ref FromEmailAddress
+          # Lets this function drain the queue immediately instead of leaving a
+          # confirm or sign-in link to wait for the dispatcher's next tick.
+          # Absent, _dispatch logs nudge.unconfigured and the scheduled run
+          # still sends it — degraded, never lost.
+          WAITLIST_EMAIL_FUNCTION: !Sub "cello-waitlist-email-${Environment}"
+      Code:
+        ZipFile: |
+          # Placeholder. The authoritative source is infra/lambda/waitlist-bounce/handler.py
+          # and CI replaces this on deploy. Raising rather than returning is
+          # deliberate: a stub that returned a plausible empty result would let a
+          # half-deployed stack look healthy.
+          def lambda_handler(event, context):
+              raise NotImplementedError(
+                  "Deploy via deploy-lambdas.sh — see infra/lambda/waitlist-bounce/handler.py"
+              )
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  # DDL, applied by hand. NO schedule and no route, deliberately: a migration
+  # that runs on a timer applies itself at 3am to a database nobody is watching.
+  #
+  # This function exists because there was no other path from the SQL to the
+  # database. The migrations live in corp-cello-site, a static export with no
+  # server, so it can never run them the way the portal does at container boot;
+  # and the portal RDS is PubliclyAccessible:false in a VPC with no peering to
+  # anything a laptop can reach. DOD-SCHEMA-1 said "application to the portal
+  # RDS" was owed without saying how, and this is the how.
+  #
+  # Longer timeout and more memory than its siblings: it applies every migration
+  # in one invocation, and a table rewrite on a populated table is not fast.
+  MigrateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-waitlist-migrate-${Environment}"
+      Description: "Applies corp-cello-site migrations to the portal RDS. MANUAL INVOKE ONLY, never scheduled. Pass {\"dry_run\": true} first."
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt WaitlistLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-a"
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-b"
+        SecurityGroupIds:
+          - !Ref WaitlistLambdaSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref WaitlistDatabaseUrl
+      Code:
+        ZipFile: |
+          # Placeholder. The authoritative source is infra/lambda/waitlist-migrate/handler.py
+          # and deploy-lambdas.sh replaces this along with the .sql files it
+          # packages from the corp-cello-site checkout. Raising rather than
+          # returning is deliberate, and doubly so here: a migrate function that
+          # returned an empty result would report "nothing to apply" and look
+          # exactly like a database that is already up to date.
+          def lambda_handler(event, context):
+              raise NotImplementedError(
+                  "Deploy via deploy-lambdas.sh dev waitlist — see infra/lambda/waitlist-migrate/handler.py"
+              )
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  WavesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-waitlist-waves-${Environment}"
+      # The ops dashboard is not deployed yet and therefore holds no
+      # lambda:InvokeFunction grant on this function. Said plainly, because the
+      # sibling gate function's caller (the ops-agent) DOES have one now, and an
+      # inconsistent set of descriptions is worse than a uniformly honest one.
+      Description: "Wave assembly. Direct invoke by the ops dashboard; NEVER scheduled. CALLER NOT YET GRANTED."
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt WaitlistLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-a"
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-b"
+        SecurityGroupIds:
+          - !Ref WaitlistLambdaSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref WaitlistDatabaseUrl
+          WAITLIST_API_BASE: !Sub "https://${SiteDomainName}/api/waitlist"
+          WAITLIST_SITE: !Sub "https://${SiteDomainName}"
+          WAITLIST_FROM_EMAIL: !Ref FromEmailAddress
+          # Lets this function drain the queue immediately instead of leaving a
+          # confirm or sign-in link to wait for the dispatcher's next tick.
+          # Absent, _dispatch logs nudge.unconfigured and the scheduled run
+          # still sends it — degraded, never lost.
+          WAITLIST_EMAIL_FUNCTION: !Sub "cello-waitlist-email-${Environment}"
+      Code:
+        ZipFile: |
+          # Placeholder. The authoritative source is infra/lambda/waitlist-waves/handler.py
+          # and CI replaces this on deploy. Raising rather than returning is
+          # deliberate: a stub that returned a plausible empty result would let a
+          # half-deployed stack look healthy.
+          def lambda_handler(event, context):
+              raise NotImplementedError(
+                  "Deploy via deploy-lambdas.sh — see infra/lambda/waitlist-waves/handler.py"
+              )
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  GateFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-waitlist-gate-${Environment}"
+      # Grant lives in cello-iam.yaml, OpsAgentTaskRole / InvokeWaitlistGate.
+      Description: "Telegram admission gate. Invoked by the operations agent."
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt WaitlistLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-a"
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-b"
+        SecurityGroupIds:
+          - !Ref WaitlistLambdaSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref WaitlistDatabaseUrl
+          WAITLIST_API_BASE: !Sub "https://${SiteDomainName}/api/waitlist"
+          WAITLIST_SITE: !Sub "https://${SiteDomainName}"
+          WAITLIST_FROM_EMAIL: !Ref FromEmailAddress
+          # Lets this function drain the queue immediately instead of leaving a
+          # confirm or sign-in link to wait for the dispatcher's next tick.
+          # Absent, _dispatch logs nudge.unconfigured and the scheduled run
+          # still sends it — degraded, never lost.
+          WAITLIST_EMAIL_FUNCTION: !Sub "cello-waitlist-email-${Environment}"
+      Code:
+        ZipFile: |
+          # Placeholder. The authoritative source is infra/lambda/waitlist-gate/handler.py
+          # and CI replaces this on deploy. Raising rather than returning is
+          # deliberate: a stub that returned a plausible empty result would let a
+          # half-deployed stack look healthy.
+          def lambda_handler(event, context):
+              raise NotImplementedError(
+                  "Deploy via deploy-lambdas.sh — see infra/lambda/waitlist-gate/handler.py"
+              )
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  FirstWinFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-waitlist-firstwin-${Environment}"
+      # NO INVOKER EXISTS YET, and this description says so rather than implying
+      # one. The handler takes {agent_pubkey} by direct invoke; the seal event
+      # originates in the operator's daemon, which holds no AWS credentials and
+      # cannot call this. Closing that gap means either a public authenticated
+      # route or a portal-side relay — DOD-INV-NO-DIRECTORY-RELAY rules out
+      # doing it from the directory. Deliberately left unwired instead of given
+      # a schedule: a sweep would have to invent "which seal is new?", which is
+      # a harder question than the one the handler answers.
+      Description: "First-win detection. Direct invoke, {agent_pubkey}. CALL SITE NOT YET WIRED."
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt WaitlistLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-a"
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-b"
+        SecurityGroupIds:
+          - !Ref WaitlistLambdaSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref WaitlistDatabaseUrl
+          WAITLIST_API_BASE: !Sub "https://${SiteDomainName}/api/waitlist"
+          WAITLIST_SITE: !Sub "https://${SiteDomainName}"
+          WAITLIST_FROM_EMAIL: !Ref FromEmailAddress
+          # Lets this function drain the queue immediately instead of leaving a
+          # confirm or sign-in link to wait for the dispatcher's next tick.
+          # Absent, _dispatch logs nudge.unconfigured and the scheduled run
+          # still sends it — degraded, never lost.
+          WAITLIST_EMAIL_FUNCTION: !Sub "cello-waitlist-email-${Environment}"
+      Code:
+        ZipFile: |
+          # Placeholder. The authoritative source is infra/lambda/waitlist-firstwin/handler.py
+          # and CI replaces this on deploy. Raising rather than returning is
+          # deliberate: a stub that returned a plausible empty result would let a
+          # half-deployed stack look healthy.
+          def lambda_handler(event, context):
+              raise NotImplementedError(
+                  "Deploy via deploy-lambdas.sh — see infra/lambda/waitlist-firstwin/handler.py"
+              )
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  FeedbackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-waitlist-feedback-${Environment}"
+      Description: "High-activity detection sweep. Daily."
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt WaitlistLambdaRole.Arn
+      # A full-table sweep over session_telemetry. Generous, because a sweep
+      # that times out half way through is indistinguishable from a quiet
+      # week to everything downstream.
+      Timeout: 300
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-a"
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-b"
+        SecurityGroupIds:
+          - !Ref WaitlistLambdaSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref WaitlistDatabaseUrl
+          WAITLIST_API_BASE: !Sub "https://${SiteDomainName}/api/waitlist"
+          WAITLIST_SITE: !Sub "https://${SiteDomainName}"
+          WAITLIST_FROM_EMAIL: !Ref FromEmailAddress
+          # Lets this function drain the queue immediately instead of leaving a
+          # confirm or sign-in link to wait for the dispatcher's next tick.
+          # Absent, _dispatch logs nudge.unconfigured and the scheduled run
+          # still sends it — degraded, never lost.
+          WAITLIST_EMAIL_FUNCTION: !Sub "cello-waitlist-email-${Environment}"
+      Code:
+        ZipFile: |
+          # Placeholder. The authoritative source is infra/lambda/waitlist-feedback/handler.py
+          # and CI replaces this on deploy. Raising rather than returning is
+          # deliberate: a stub that returned a plausible empty result would let a
+          # half-deployed stack look healthy.
+          def lambda_handler(event, context):
+              raise NotImplementedError(
+                  "Deploy via deploy-lambdas.sh — see infra/lambda/waitlist-feedback/handler.py"
+              )
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  OutreachFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-waitlist-outreach-${Environment}"
+      Description: "Day-6 grants and the call-completed action."
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt WaitlistLambdaRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-a"
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-b"
+        SecurityGroupIds:
+          - !Ref WaitlistLambdaSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref WaitlistDatabaseUrl
+          WAITLIST_API_BASE: !Sub "https://${SiteDomainName}/api/waitlist"
+          WAITLIST_SITE: !Sub "https://${SiteDomainName}"
+          WAITLIST_FROM_EMAIL: !Ref FromEmailAddress
+          # Lets this function drain the queue immediately instead of leaving a
+          # confirm or sign-in link to wait for the dispatcher's next tick.
+          # Absent, _dispatch logs nudge.unconfigured and the scheduled run
+          # still sends it — degraded, never lost.
+          WAITLIST_EMAIL_FUNCTION: !Sub "cello-waitlist-email-${Environment}"
+      Code:
+        ZipFile: |
+          # Placeholder. The authoritative source is infra/lambda/waitlist-outreach/handler.py
+          # and CI replaces this on deploy. Raising rather than returning is
+          # deliberate: a stub that returned a plausible empty result would let a
+          # half-deployed stack look healthy.
+          def lambda_handler(event, context):
+              raise NotImplementedError(
+                  "Deploy via deploy-lambdas.sh — see infra/lambda/waitlist-outreach/handler.py"
+              )
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  UtmFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-waitlist-utm-${Environment}"
+      # As with waves: no grant exists until the dashboard is deployed.
+      Description: "UTM link generator. Direct invoke by the ops dashboard. CALLER NOT YET GRANTED."
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt WaitlistLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-a"
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-b"
+        SecurityGroupIds:
+          - !Ref WaitlistLambdaSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref WaitlistDatabaseUrl
+          WAITLIST_API_BASE: !Sub "https://${SiteDomainName}/api/waitlist"
+          WAITLIST_SITE: !Sub "https://${SiteDomainName}"
+          WAITLIST_FROM_EMAIL: !Ref FromEmailAddress
+          # Lets this function drain the queue immediately instead of leaving a
+          # confirm or sign-in link to wait for the dispatcher's next tick.
+          # Absent, _dispatch logs nudge.unconfigured and the scheduled run
+          # still sends it — degraded, never lost.
+          WAITLIST_EMAIL_FUNCTION: !Sub "cello-waitlist-email-${Environment}"
+      Code:
+        ZipFile: |
+          # Placeholder. The authoritative source is infra/lambda/waitlist-utm/handler.py
+          # and CI replaces this on deploy. Raising rather than returning is
+          # deliberate: a stub that returned a plausible empty result would let a
+          # half-deployed stack look healthy.
+          def lambda_handler(event, context):
+              raise NotImplementedError(
+                  "Deploy via deploy-lambdas.sh — see infra/lambda/waitlist-utm/handler.py"
+              )
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  GalleryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "cello-waitlist-gallery-${Environment}"
+      Description: "Gallery reads and the portal publish action."
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt WaitlistLambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      VpcConfig:
+        SubnetIds:
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-a"
+          - !ImportValue
+            Fn::Sub: "cello-${Environment}-private-subnet-b"
+        SecurityGroupIds:
+          - !Ref WaitlistLambdaSecurityGroup
+      Environment:
+        Variables:
+          DATABASE_URL: !Ref WaitlistDatabaseUrl
+          WAITLIST_API_BASE: !Sub "https://${SiteDomainName}/api/waitlist"
+          WAITLIST_SITE: !Sub "https://${SiteDomainName}"
+          WAITLIST_FROM_EMAIL: !Ref FromEmailAddress
+          # Lets this function drain the queue immediately instead of leaving a
+          # confirm or sign-in link to wait for the dispatcher's next tick.
+          # Absent, _dispatch logs nudge.unconfigured and the scheduled run
+          # still sends it — degraded, never lost.
+          WAITLIST_EMAIL_FUNCTION: !Sub "cello-waitlist-email-${Environment}"
+      Code:
+        ZipFile: |
+          # Placeholder. The authoritative source is infra/lambda/waitlist-gallery/handler.py
+          # and CI replaces this on deploy. Raising rather than returning is
+          # deliberate: a stub that returned a plausible empty result would let a
+          # half-deployed stack look healthy.
+          def lambda_handler(event, context):
+              raise NotImplementedError(
+                  "Deploy via deploy-lambdas.sh — see infra/lambda/waitlist-gallery/handler.py"
+              )
+      Tags:
+        - Key: Project
+          Value: cello
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── EventBridge schedules ───────────────────────────────────────────────────
+  #
+  # DELIBERATELY ABSENT: any schedule for wave assembly. DOD-INV-WAVE-GATE means
+  # admission is an operator action and never a calendar one, so that function
+  # must never be given a rule. Recorded here because the absence of a resource
+  # is invisible in a template and the next person to add one will be trying to
+  # be helpful.
+
+  EmailDispatchSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "cello-waitlist-email-${Environment}"
+      # Every minute. NOT a 60-second guarantee: a job enqueued just after a
+      # tick waits until the next one, then adds VPC cold start and the SES
+      # round trip, so the p99 exceeds 60s by construction (M11-D27). One
+      # minute is the polling interval, not a latency bound.
+      Description: Drains email_jobs. Polls every minute.
+      ScheduleExpression: "rate(1 minute)"
+      State: ENABLED
+      Targets:
+        - Id: dispatcher
+          Arn: !GetAtt EmailFunction.Arn
+
+  FeedbackSweepSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "cello-waitlist-feedback-${Environment}"
+      Description: High-activity detection (§5c). Daily.
+      ScheduleExpression: "cron(17 6 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Id: sweep
+          Arn: !GetAtt FeedbackFunction.Arn
+
+  OutreachSweepSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "cello-waitlist-outreach-${Environment}"
+      Description: Day-6 no-response invite grant. Daily, after the feedback sweep.
+      ScheduleExpression: "cron(47 6 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Id: sweep
+          Arn: !GetAtt OutreachFunction.Arn
+
+  # DAILY, and pointed at the same function as the per-minute drain but with an
+  # Input that selects a different action. The sweep scans every waiting user
+  # against three NOT EXISTS subqueries to answer a question whose answer can
+  # only change once a day; running that 1440 times a day to enqueue the same
+  # zero rows is work nobody asked for.
+  ReEngageSweepSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "cello-waitlist-re-engage-${Environment}"
+      # 06:23, which is AFTER the feedback sweep at 06:17 and before the
+      # outreach one at 06:47. An earlier version of this line said "before
+      # the feedback sweeps", which the crons contradicted — a wrong
+      # ordering claim on a resource where ordering was chosen deliberately.
+      Description: E-re 60-day re-engagement sweep. Daily, between the feedback and outreach sweeps.
+      ScheduleExpression: "cron(23 6 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Id: sweep
+          Arn: !GetAtt EmailFunction.Arn
+          # Without this the daily rule would just drain the queue a second
+          # time, and E-re would never be enqueued by anything.
+          Input: '{"action": "sweep_re_engagement"}'
+
+  EmailSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EmailFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EmailDispatchSchedule.Arn
+
+  # A SECOND permission, not a reuse of the one above. Lambda scopes each
+  # permission to a single SourceArn, so the drain rule's grant does not let the
+  # sweep rule invoke anything — the sweep would fail with AccessDenied at the
+  # EventBridge layer, where nothing in the function's own logs would show it.
+  ReEngageSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EmailFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReEngageSweepSchedule.Arn
+
+  FeedbackSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt FeedbackFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FeedbackSweepSchedule.Arn
+
+  OutreachSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt OutreachFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OutreachSweepSchedule.Arn
+
+  BounceSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref BounceTopic
+      Protocol: lambda
+      Endpoint: !GetAtt BounceFunction.Arn
+
+  BounceInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt BounceFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref BounceTopic
+
+Outputs:
+  ApiEndpoint:
+    Description: The raw execute-api endpoint. Use ApiDomain in anything a browser touches.
+    Value: !GetAtt WaitlistApi.ApiEndpoint
+
+  ApiDomain:
+    Description: >
+      The waitlist API origin. Must be same-site with the web app or the
+      SameSite=Lax session cookie is never sent.
+    Value: !Sub "https://${ApiDomainName}"
+    Export:
+      Name: !Sub "cello-${Environment}-waitlist-api-domain"
+
+  BounceTopicArn:
+    Description: Subscribe the SES configuration set's bounce and complaint destinations to this.
+    Value: !Ref BounceTopic
+    Export:
+      Name: !Sub "cello-${Environment}-waitlist-bounce-topic"
+
+  LambdaSecurityGroupId:
+    Value: !Ref WaitlistLambdaSecurityGroup
+    Export:
+      Name: !Sub "cello-${Environment}-waitlist-lambda-sg"

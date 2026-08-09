@@ -1,0 +1,328 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: '(SO9702) Guidance for EV Digital Twin - Lambda Proxy for AgentCore Runtime Integration with Frontend'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: ev-digital-twin
+    Description: Name of the project
+
+  AgentCoreRuntimeId:
+    Type: String
+    Description: AgentCore Runtime ID (e.g., vehicle_maintenance_agent-XXXXXXXXXX)
+
+  AgentCoreLogGroupSuffix:
+    Type: String
+    Default: DEFAULT
+    Description: Log group suffix for AgentCore Runtime
+
+  AllowedOrigins:
+    Type: CommaDelimitedList
+    Default: 'http://localhost:3000'
+    Description: Comma-separated list of allowed CORS origins (e.g., CloudFront domains)
+
+Resources:
+  # Lambda Execution Role
+  AgentCoreLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-agentcore-lambda-proxy-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AgentCoreInvokePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${AgentCoreRuntimeId}'
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${AgentCoreRuntimeId}/runtime-endpoint/${AgentCoreLogGroupSuffix}'
+              - Effect: Allow
+                Action:
+                  - logs:FilterLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/${AgentCoreRuntimeId}-${AgentCoreLogGroupSuffix}:*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/vehicle-appointment-slots'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/vehicle-genai-recs'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/tire-order-jobs'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/browser-session-tracking'
+
+  # Lambda Function
+  AgentCoreLambdaProxy:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-agentcore-proxy"
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt AgentCoreLambdaRole.Arn
+      Timeout: 900
+      MemorySize: 2048
+      Environment:
+        Variables:
+          AGENT_RUNTIME_ARN: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/${AgentCoreRuntimeId}'
+          LOG_GROUP_NAME: !Sub '/aws/bedrock-agentcore/runtimes/${AgentCoreRuntimeId}-${AgentCoreLogGroupSuffix}'
+          APPOINTMENTS_TABLE: 'vehicle-appointment-slots'
+          VEHICLE_GENAI_RECS_TABLE: 'vehicle-genai-recs'
+          TIRE_ORDER_JOBS_TABLE: 'tire-order-jobs'
+          BROWSER_SESSION_TRACKING_TABLE: 'browser-session-tracking'
+          TIRE_ORDER_WORKER_FUNCTION: !Sub '${ProjectName}-tire-order-worker'
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Initialize Bedrock AgentCore client
+          bedrock_agentcore = boto3.client('bedrock-agentcore')
+
+          def lambda_handler(event, context):
+              """Lambda proxy for Bedrock AgentCore Runtime - reads response from 'response' key"""
+              # Handle OPTIONS requests (CORS preflight)
+              if event.get('requestContext', {}).get('http', {}).get('method') == 'OPTIONS':
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                          'Access-Control-Allow-Methods': 'GET,POST,OPTIONS'
+                      },
+                      'body': ''
+                  }
+
+              try:
+                  agent_runtime_arn = os.environ.get('AGENT_RUNTIME_ARN')
+
+                  if not agent_runtime_arn:
+                      logger.error("AGENT_RUNTIME_ARN environment variable not set")
+                      return {
+                          'statusCode': 500,
+                          'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                          'body': json.dumps({'error': 'AgentCore Runtime ARN not configured'})
+                      }
+
+                  # Parse the incoming request
+                  if 'body' in event:
+                      body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+                  else:
+                      body = event
+
+                  prompt = body.get('prompt', body.get('message', ''))
+                  session_id = body.get('session_id')
+                  vin = body.get('vin')
+
+                  # Generate session ID if not provided
+                  if not session_id or session_id == 'null':
+                      session_id = f"session-{uuid.uuid4()}"
+
+                  logger.info(f"Processing request - Prompt: {prompt[:100]}..., VIN: {vin}")
+
+                  if not prompt:
+                      return {
+                          'statusCode': 400,
+                          'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                          'body': json.dumps({'error': 'prompt or message is required'})
+                      }
+
+                  payload_dict = {'prompt': prompt}
+
+                  logger.info(f"Calling AgentCore Runtime: {agent_runtime_arn}")
+                  logger.info(f"Session ID: {session_id}")
+
+                  # Call Bedrock AgentCore Runtime
+                  response = bedrock_agentcore.invoke_agent_runtime(
+                      agentRuntimeArn=agent_runtime_arn,
+                      runtimeSessionId=session_id,
+                      payload=json.dumps(payload_dict)
+                  )
+
+                  # CRITICAL: Extract response from 'response' key (not 'payload')
+                  response_text = ""
+
+                  if 'response' in response:
+                      streaming_body = response['response']
+                      response_bytes = streaming_body.read()
+
+                      if isinstance(response_bytes, bytes):
+                          response_text = response_bytes.decode('utf-8')
+                      else:
+                          response_text = str(response_bytes)
+
+                      # Try to parse as JSON and extract text
+                      try:
+                          response_json = json.loads(response_text)
+                          if isinstance(response_json, str):
+                              response_text = response_json
+                      except json.JSONDecodeError:
+                          pass
+
+                  logger.info(f"AgentCore response length: {len(response_text)}")
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                          'Access-Control-Allow-Methods': 'POST,OPTIONS'
+                      },
+                      'body': json.dumps({
+                          'response': response_text,
+                          'session_id': session_id
+                      })
+                  }
+
+              except Exception as e:
+                  logger.error(f"Lambda proxy error: {str(e)}")
+                  import traceback
+                  traceback.print_exc()
+
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*'},
+                      'body': json.dumps({'error': f'Proxy error: {str(e)}'})
+                  }
+
+  # HTTP API Gateway
+  AgentCoreHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${ProjectName}-agentcore-http-api"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins: !Ref AllowedOrigins
+        AllowMethods:
+          - POST
+          - OPTIONS
+          - GET
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        MaxAge: 300
+
+  # Lambda Integration
+  AgentCoreLambdaIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref AgentCoreHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AgentCoreLambdaProxy.Arn
+      PayloadFormatVersion: '2.0'
+
+  # Chat Route
+  AgentCoreChatRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AgentCoreHttpApi
+      RouteKey: 'POST /chat'
+      Target: !Sub 'integrations/${AgentCoreLambdaIntegration}'
+
+  # GenAI Recs Route
+  AgentCoreGenAIRecsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AgentCoreHttpApi
+      RouteKey: 'GET /genai-recs/{vin}'
+      Target: !Sub 'integrations/${AgentCoreLambdaIntegration}'
+
+  # Tire Order Start Route
+  TireOrderStartRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AgentCoreHttpApi
+      RouteKey: 'POST /tire-order/start'
+      Target: !Sub 'integrations/${AgentCoreLambdaIntegration}'
+
+  # Tire Order Status Route
+  TireOrderStatusRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AgentCoreHttpApi
+      RouteKey: 'GET /tire-order/status/{job_id}'
+      Target: !Sub 'integrations/${AgentCoreLambdaIntegration}'
+
+  # Browser Live View Route
+  BrowserLiveViewRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AgentCoreHttpApi
+      RouteKey: 'GET /browser-live-view/{job_id}'
+      Target: !Sub 'integrations/${AgentCoreLambdaIntegration}'
+
+  # Action Logs Route (for Action Details button)
+  ActionLogsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref AgentCoreHttpApi
+      RouteKey: 'GET /action-logs/{job_id}'
+      Target: !Sub 'integrations/${AgentCoreLambdaIntegration}'
+
+  # Default Stage
+  AgentCoreHttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref AgentCoreHttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  # Lambda Permission for API Gateway
+  ApiGatewayInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AgentCoreLambdaProxy
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${AgentCoreHttpApi}/*/*'
+
+Outputs:
+  ApiEndpoint:
+    Description: HTTP API Gateway endpoint URL
+    Value: !Sub 'https://${AgentCoreHttpApi}.execute-api.${AWS::Region}.amazonaws.com'
+    Export:
+      Name: !Sub "${ProjectName}-agentcore-http-api-endpoint"
+
+  ChatEndpoint:
+    Description: Chat endpoint URL for frontend
+    Value: !Sub 'https://${AgentCoreHttpApi}.execute-api.${AWS::Region}.amazonaws.com/chat'
+    Export:
+      Name: !Sub "${ProjectName}-agentcore-chat-endpoint"
+
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt AgentCoreLambdaProxy.Arn
+    Export:
+      Name: !Sub "${ProjectName}-agentcore-lambda-arn"
+
+  DeployLambdaCode:
+    Description: Deploy the complete Lambda code after stack creation
+    Value: !Sub |
+      zip lambda-proxy.zip lambda_complete.py
+      aws lambda update-function-code --function-name ${AgentCoreLambdaProxy} --zip-file fileb://lambda-proxy.zip
+
+  TestCommand:
+    Description: Test command
+    Value: !Sub |
+      curl -X POST https://${AgentCoreHttpApi}.execute-api.${AWS::Region}.amazonaws.com/chat \
+        -H "Content-Type: application/json" \
+        -d '{"prompt": "What is the tire condition for vehicle 1?"}'

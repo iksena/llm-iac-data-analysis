@@ -1,0 +1,577 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Lambda functions for Auto Insurance Fraud Detection.
+  Deploys 13 functions for fraud detection, ML training, and authentication.
+  Includes DLQ configuration, VPC integration for Neptune access, and reserved concurrency limits.
+
+Parameters:
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing Lambda deployment packages
+
+  LambdaCodeVersion:
+    Type: String
+    Description: Version identifier for Lambda code packages
+
+  LambdaSecurityGroup:
+    Type: String
+
+  PrivateSubnet1:
+    Type: String
+
+  PrivateSubnet2:
+    Type: String
+
+  LambdaExecutionRoleArn:
+    Type: String
+
+  TrainingLambdaRoleArn:
+    Type: String
+
+  NeptuneEndpoint:
+    Type: String
+
+  S3BucketName:
+    Type: String
+
+  UserPoolId:
+    Type: String
+    Description: Cognito User Pool ID
+
+  UserPoolClientId:
+    Type: String
+    Description: Cognito User Pool Client ID
+
+  NeptuneMLRoleArn:
+    Type: String
+
+  SageMakerMLRoleArn:
+    Type: String
+
+  NeptuneParameterGroupName:
+    Type: String
+
+  NeptuneInstanceId:
+    Type: String
+
+  BatchJobQueue:
+    Type: String
+
+  BatchJobDefinition:
+    Type: String
+
+  AllowedOrigin:
+    Type: String
+    Description: CloudFront URL for CORS Access-Control-Allow-Origin header
+
+Resources:
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-lambda-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+
+  PopulateGraphFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref LambdaExecutionRoleArn
+      Timeout: 900
+      MemorySize: 1024
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          NEPTUNE_ENDPOINT: !Ref NeptuneEndpoint
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/populate-graph.zip'
+
+  FraudDetectionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref LambdaExecutionRoleArn
+      Timeout: 900
+      MemorySize: 512
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          NEPTUNE_ENDPOINT: !Ref NeptuneEndpoint
+          POWERTOOLS_SERVICE_NAME: auto-insurance-fraud
+          LOG_LEVEL: INFO
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/fraud-detection.zip'
+
+  # Published version + alias with provisioned concurrency so the fraud-detection
+  # Lambda has no cold-start latency during interactive demos. API Gateway is
+  # pointed at the alias ARN (see FraudDetectionFunctionArn output below), so
+  # integrations transparently invoke the warm version. Note: AWS::Lambda::Version
+  # is immutable per logical ID — a clean undeploy/redeploy produces a fresh v1.
+  # If iterating on code without a redeploy, bump the Version logical ID.
+  FraudDetectionFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref FraudDetectionFunction
+      Description: !Sub 'Version for provisioned concurrency (code ${LambdaCodeVersion})'
+
+  FraudDetectionFunctionAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref FraudDetectionFunction
+      FunctionVersion: !GetAtt FraudDetectionFunctionVersion.Version
+      Name: live
+      ProvisionedConcurrencyConfig:
+        ProvisionedConcurrentExecutions: 1
+
+  AuthenticateUserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: fraud-detection-auth
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref LambdaExecutionRoleArn
+      Timeout: 30
+      MemorySize: 256
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPoolId
+          CLIENT_ID: !Ref UserPoolClientId
+          DEMO_USERS: 'user@example.com'
+          POWERTOOLS_SERVICE_NAME: auth
+          LOG_LEVEL: INFO
+          ALLOWED_ORIGIN: !Ref AllowedOrigin
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/authenticate-user.zip'
+
+  # Custom REQUEST authorizer that validates the __Host-fraud_detection_token cookie
+  # (set httpOnly by the authenticate-user Lambda). Replaces the former
+  # Cognito-native authorizer on API Gateway so the frontend no longer needs
+  # to read the JWT from JS-accessible sessionStorage — XSS-hardening measure.
+  JwtCookieAuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      # Pinned to python3.12 because the `cryptography` wheel dependency of
+      # PyJWT[crypto] only ships abi3 wheels compatible with CPython 3.12.
+      # The `pip install` step in deploy.sh targets this same version.
+      Runtime: python3.12
+      Handler: lambda_function.lambda_handler
+      Role: !Ref LambdaExecutionRoleArn
+      Timeout: 10
+      MemorySize: 256
+      ReservedConcurrentExecutions: 50
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPoolId
+          USER_POOL_CLIENT_ID: !Ref UserPoolClientId
+          COOKIE_NAME: __Host-fraud_detection_token
+          LOG_LEVEL: INFO
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/jwt-cookie-authorizer.zip'
+
+  RequestQuotasFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref TrainingLambdaRoleArn
+      Timeout: 60
+      MemorySize: 128
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/request-quotas.zip'
+
+  CheckQuotaStatusFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref TrainingLambdaRoleArn
+      Timeout: 60
+      MemorySize: 128
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/check-quota-status.zip'
+
+  StartNeptuneExportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref TrainingLambdaRoleArn
+      Timeout: 300
+      MemorySize: 128
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          NEPTUNE_ENDPOINT: !Ref NeptuneEndpoint
+          S3_BUCKET: !Ref S3BucketName
+          JOB_QUEUE: !Ref BatchJobQueue
+          JOB_DEFINITION: !Ref BatchJobDefinition
+          NEPTUNE_EXPORT_JAR_S3_URI: !Sub 's3://${LambdaCodeBucket}/neptune-export/neptune-export.jar'
+          MAX_FILE_DESCRIPTOR_COUNT: '10000'
+          JOB_VCPUS: '8'
+          JOB_MEMORY_GB: '8'
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/start-neptune-export.zip'
+
+  CheckNeptuneExportFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref TrainingLambdaRoleArn
+      Timeout: 300
+      MemorySize: 128
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/check-neptune-export.zip'
+
+  ProcessExportedDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref TrainingLambdaRoleArn
+      Timeout: 900
+      MemorySize: 512
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          NEPTUNE_ENDPOINT: !Ref NeptuneEndpoint
+          S3_BUCKET: !Ref S3BucketName
+          NEPTUNE_ML_ROLE_ARN: !Ref NeptuneMLRoleArn
+          SAGEMAKER_ML_ROLE_ARN: !Ref SageMakerMLRoleArn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/process-exported-data.zip'
+
+  CheckProcessingStatusFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref TrainingLambdaRoleArn
+      Timeout: 300
+      MemorySize: 128
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          NEPTUNE_ENDPOINT: !Ref NeptuneEndpoint
+          NEPTUNE_ML_ROLE_ARN: !Ref NeptuneMLRoleArn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/check-processing-status.zip'
+
+  TrainModelFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref TrainingLambdaRoleArn
+      Timeout: 900
+      MemorySize: 512
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          NEPTUNE_ENDPOINT: !Ref NeptuneEndpoint
+          NEPTUNE_ML_ROLE_ARN: !Ref NeptuneMLRoleArn
+          SAGEMAKER_ML_ROLE_ARN: !Ref SageMakerMLRoleArn
+          S3_BUCKET: !Ref S3BucketName
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/train-model.zip'
+
+  CheckTrainingStatusFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref TrainingLambdaRoleArn
+      Timeout: 300
+      MemorySize: 128
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          NEPTUNE_ENDPOINT: !Ref NeptuneEndpoint
+          NEPTUNE_ML_ROLE_ARN: !Ref NeptuneMLRoleArn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/check-training-status.zip'
+
+  DeployEndpointFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref TrainingLambdaRoleArn
+      Timeout: 300
+      MemorySize: 128
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          NEPTUNE_ENDPOINT: !Ref NeptuneEndpoint
+          PARAMETER_GROUP_NAME: !Ref NeptuneParameterGroupName
+          INSTANCE_IDENTIFIER: !Ref NeptuneInstanceId
+          NEPTUNE_ML_ROLE_ARN: !Ref NeptuneMLRoleArn
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/deploy-endpoint.zip'
+
+  UpdateFraudDetectionConfigFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref TrainingLambdaRoleArn
+      Timeout: 300
+      MemorySize: 128
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          NEPTUNE_ENDPOINT: !Ref NeptuneEndpoint
+          FRAUD_DETECTION_FUNCTION: !Ref FraudDetectionFunction
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/update-fraud-config.zip'
+
+  ValidateTrainingDataFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref TrainingLambdaRoleArn
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          S3_BUCKET: !Ref S3BucketName
+          POWERTOOLS_SERVICE_NAME: validate-training-data
+          LOG_LEVEL: INFO
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/validate-training-data.zip'
+
+  TestModelPerformanceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: lambda_function.lambda_handler
+      Role: !Ref TrainingLambdaRoleArn
+      Timeout: 300
+      MemorySize: 256
+      ReservedConcurrentExecutions: 50
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          POWERTOOLS_SERVICE_NAME: test-model-performance
+          LOG_LEVEL: INFO
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub 'lambda-code/${LambdaCodeVersion}/test-model-performance.zip'
+
+Outputs:
+  LambdaDLQArn:
+    Value: !GetAtt LambdaDLQ.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaDLQArn'
+
+  LambdaDLQUrl:
+    Value: !Ref LambdaDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaDLQUrl'
+
+  PopulateGraphFunctionArn:
+    Value: !GetAtt PopulateGraphFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-PopulateGraphFunctionArn'
+
+  PopulateGraphFunctionName:
+    Value: !Ref PopulateGraphFunction
+
+  FraudDetectionFunctionArn:
+    # Export the ALIAS ARN (not the function ARN) so API Gateway and Lambda
+    # permissions target the provisioned-concurrency-enabled alias. Alias ARNs
+    # have the form function:name:aliasname and are valid in every place the
+    # function ARN would be accepted.
+    Value: !Ref FraudDetectionFunctionAlias
+    Export:
+      Name: !Sub '${AWS::StackName}-FraudDetectionFunctionArn'
+
+  AuthenticateUserFunctionArn:
+    Value: !GetAtt AuthenticateUserFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AuthenticateUserFunctionArn'
+
+  JwtCookieAuthorizerFunctionArn:
+    Value: !GetAtt JwtCookieAuthorizerFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-JwtCookieAuthorizerFunctionArn'
+
+  RequestQuotasFunctionArn:
+    Value: !GetAtt RequestQuotasFunction.Arn
+
+  CheckQuotaStatusFunctionArn:
+    Value: !GetAtt CheckQuotaStatusFunction.Arn
+
+  StartNeptuneExportFunctionArn:
+    Value: !GetAtt StartNeptuneExportFunction.Arn
+
+  CheckNeptuneExportFunctionArn:
+    Value: !GetAtt CheckNeptuneExportFunction.Arn
+
+  ProcessExportedDataFunctionArn:
+    Value: !GetAtt ProcessExportedDataFunction.Arn
+
+  CheckProcessingStatusFunctionArn:
+    Value: !GetAtt CheckProcessingStatusFunction.Arn
+
+  TrainModelFunctionArn:
+    Value: !GetAtt TrainModelFunction.Arn
+
+  CheckTrainingStatusFunctionArn:
+    Value: !GetAtt CheckTrainingStatusFunction.Arn
+
+  DeployEndpointFunctionArn:
+    Value: !GetAtt DeployEndpointFunction.Arn
+
+  UpdateFraudDetectionConfigFunctionArn:
+    Value: !GetAtt UpdateFraudDetectionConfigFunction.Arn
+
+  ValidateTrainingDataFunctionArn:
+    Value: !GetAtt ValidateTrainingDataFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ValidateTrainingDataFunctionArn'
+
+  TestModelPerformanceFunctionArn:
+    Value: !GetAtt TestModelPerformanceFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TestModelPerformanceFunctionArn'

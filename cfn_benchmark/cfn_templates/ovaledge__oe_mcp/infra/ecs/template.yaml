@@ -1,0 +1,432 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  OvalEdge MCP Server on Amazon ECS Fargate behind an Application Load Balancer.
+  Uses Dockerfile.ecs (uvicorn). Auth: AUTH_MODE=remote_credentials (client headers)
+  or remote (Okta Connect). Requires an existing VPC with at least two subnets.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  ImageUri:
+    Type: String
+    Description: Full ECR image URI including tag (e.g. 123.dkr.ecr.region.amazonaws.com/oe-mcp-ecs:latest)
+  OvalEdgeBaseUrl:
+    Type: String
+    Description: OvalEdge tenant base URL (no trailing slash)
+  AuthMode:
+    Type: String
+    Default: remote_credentials
+    AllowedValues: [remote_credentials, remote]
+  OAuthIssuer:
+    Type: String
+    Default: ""
+    Description: (AUTH_MODE=remote) Okta/OIDC issuer base URL
+  OAuthAllowedIssuers:
+    Type: String
+    Default: ""
+  OAuthAudience:
+    Type: String
+    Default: ""
+  OAuthClientId:
+    Type: String
+    Default: ""
+  OAuthClientSecret:
+    Type: String
+    Default: ""
+    NoEcho: true
+  OAuthIntrospectionUrl:
+    Type: String
+    Default: ""
+  OAuthScopes:
+    Type: String
+    Default: "openid profile email"
+  OvalEdgeForwardIdpToken:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least two subnets in different AZs (ALB + tasks; public recommended for first deploy)
+  AssignPublicIp:
+    Type: String
+    Default: "ENABLED"
+    AllowedValues: ["ENABLED", "DISABLED"]
+    Description: ENABLED for public subnets without NAT; DISABLED when tasks run in private subnets with NAT
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 10
+  Cpu:
+    Type: String
+    Default: "512"
+    AllowedValues: ["256", "512", "1024", "2048", "4096"]
+  Memory:
+    Type: String
+    Default: "1024"
+    AllowedValues: ["512", "1024", "2048", "4096", "8192"]
+  ContainerPort:
+    Type: Number
+    Default: 8000
+  McpHttpStateless:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: false recommended for Cursor (GET /mcp SSE). true for strict stateless.
+  OvalEdgeHttpAuthScheme:
+    Type: String
+    Default: jwt
+  CredentialsCacheMaxEntries:
+    Type: String
+    Default: "10000"
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: Optional ACM certificate ARN for HTTPS listener (same region). Empty = HTTP :80 only.
+  AllowedCidr:
+    Type: String
+    Default: "0.0.0.0/0"
+    Description: CIDR allowed to reach the ALB (tighten for production)
+  TelemetryBackend:
+    Type: String
+    Default: none
+    AllowedValues: [none, phoenix, langfuse]
+  TelemetryServiceName:
+    Type: String
+    Default: oe-mcp
+  TelemetryProjectName:
+    Type: String
+    Default: ""
+  PhoenixHost:
+    Type: String
+    Default: ""
+  PhoenixApiKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+  LangfuseHost:
+    Type: String
+    Default: ""
+  LangfusePublicKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+  LangfuseSecretKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+  TelemetryOtlpEndpoint:
+    Type: String
+    Default: ""
+  TelemetryApiKey:
+    Type: String
+    Default: ""
+    NoEcho: true
+
+Conditions:
+  CreateHttpsListener:
+    Fn::Not:
+      - Fn::Equals:
+          - !Ref CertificateArn
+          - ""
+
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub oe-mcp-ecs-${Environment}
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Application
+          Value: oe-mcp
+        - Key: Component
+          Value: mcp-server
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /ecs/oe-mcp-${Environment}
+      RetentionInDays: 30
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: oe-mcp-ecs-task
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt LogGroup.Arn
+
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ALB for oe-mcp ECS ${Environment}
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedCidr
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedCidr
+      Tags:
+        - Key: Name
+          Value: !Sub oe-mcp-alb-sg-${Environment}
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ECS tasks for oe-mcp ${Environment}
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub oe-mcp-task-sg-${Environment}
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub oe-mcp-${Environment}
+      Scheme: internet-facing
+      Type: application
+      Subnets: !Ref SubnetIds
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      Tags:
+        - Key: Application
+          Value: oe-mcp
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub oe-mcp-tg-${Environment}
+      VpcId: !Ref VpcId
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: /health
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: "false"
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: CreateHttpsListener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub oe-mcp-${Environment}
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: oe-mcp
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Environment:
+            - Name: AUTH_MODE
+              Value: !Ref AuthMode
+            - Name: OVALEDGE_BASE_URL
+              Value: !Ref OvalEdgeBaseUrl
+            - Name: OVALEDGE_HTTP_AUTH_SCHEME
+              Value: !Ref OvalEdgeHttpAuthScheme
+            - Name: OAUTH_ISSUER
+              Value: !Ref OAuthIssuer
+            - Name: OAUTH_ALLOWED_ISSUERS
+              Value: !Ref OAuthAllowedIssuers
+            - Name: OAUTH_AUDIENCE
+              Value: !Ref OAuthAudience
+            - Name: OAUTH_CLIENT_ID
+              Value: !Ref OAuthClientId
+            - Name: OAUTH_CLIENT_SECRET
+              Value: !Ref OAuthClientSecret
+            - Name: OAUTH_INTROSPECTION_URL
+              Value: !Ref OAuthIntrospectionUrl
+            - Name: OAUTH_SCOPES
+              Value: !Ref OAuthScopes
+            - Name: OVALEDGE_REMOTE_FORWARD_IDP_TOKEN
+              Value: !Ref OvalEdgeForwardIdpToken
+            - Name: CREDENTIALS_CACHE_MAX_ENTRIES
+              Value: !Ref CredentialsCacheMaxEntries
+            - Name: MCP_HTTP_STATELESS
+              Value: !Ref McpHttpStateless
+            - Name: PORT
+              Value: !Sub "${ContainerPort}"
+            - Name: MCP_PUBLIC_BASE_URL
+              Value: !If
+                - CreateHttpsListener
+                - !Sub "https://${LoadBalancer.DNSName}"
+                - !Sub "http://${LoadBalancer.DNSName}"
+            - Name: TELEMETRY_BACKEND
+              Value: !Ref TelemetryBackend
+            - Name: TELEMETRY_SERVICE_NAME
+              Value: !Ref TelemetryServiceName
+            - Name: TELEMETRY_PROJECT_NAME
+              Value: !Ref TelemetryProjectName
+            - Name: PHOENIX_HOST
+              Value: !Ref PhoenixHost
+            - Name: PHOENIX_API_KEY
+              Value: !Ref PhoenixApiKey
+            - Name: LANGFUSE_HOST
+              Value: !Ref LangfuseHost
+            - Name: LANGFUSE_PUBLIC_KEY
+              Value: !Ref LangfusePublicKey
+            - Name: LANGFUSE_SECRET_KEY
+              Value: !Ref LangfuseSecretKey
+            - Name: TELEMETRY_OTLP_ENDPOINT
+              Value: !Ref TelemetryOtlpEndpoint
+            - Name: TELEMETRY_API_KEY
+              Value: !Ref TelemetryApiKey
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: oe-mcp
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub "curl -fsS http://127.0.0.1:${ContainerPort}/health || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - HttpListener
+    Properties:
+      ServiceName: !Sub oe-mcp-${Environment}
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: !Ref AssignPublicIp
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+          Subnets: !Ref SubnetIds
+      LoadBalancers:
+        - ContainerName: oe-mcp
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      HealthCheckGracePeriodSeconds: 60
+      Tags:
+        - Key: Application
+          Value: oe-mcp
+
+Outputs:
+  ClusterName:
+    Description: ECS cluster name
+    Value: !Ref Cluster
+  ServiceName:
+    Description: ECS service name
+    Value: !GetAtt Service.Name
+  LoadBalancerDnsName:
+    Description: ALB DNS name
+    Value: !GetAtt LoadBalancer.DNSName
+  McpEndpointUrl:
+    Description: MCP Streamable HTTP endpoint for clients
+    Value: !If
+      - CreateHttpsListener
+      - !Sub "https://${LoadBalancer.DNSName}/mcp"
+      - !Sub "http://${LoadBalancer.DNSName}/mcp"
+  McpPublicBaseUrl:
+    Description: Base URL for MCP branding / initialize (no /mcp suffix)
+    Value: !If
+      - CreateHttpsListener
+      - !Sub "https://${LoadBalancer.DNSName}"
+      - !Sub "http://${LoadBalancer.DNSName}"
+  HealthUrl:
+    Description: Health check URL
+    Value: !If
+      - CreateHttpsListener
+      - !Sub "https://${LoadBalancer.DNSName}/health"
+      - !Sub "http://${LoadBalancer.DNSName}/health"
+  BrandIconUrl:
+    Description: MCP brand icon
+    Value: !If
+      - CreateHttpsListener
+      - !Sub "https://${LoadBalancer.DNSName}/brand/ovaledge-mcp-icon.png"
+      - !Sub "http://${LoadBalancer.DNSName}/brand/ovaledge-mcp-icon.png"
+  LogGroupName:
+    Description: CloudWatch Logs group
+    Value: !Ref LogGroup

@@ -1,0 +1,344 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  SAP AI Agent (deployment) — AgentCore infrastructure.
+  Manages ECR, IAM, Cognito, S3, and CloudFront.
+  AgentCore runtime is deployed by deploy.sh (no CFN resource type yet).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: sapaiagent-deployment
+    Description: Prefix for all resource names.
+
+Resources:
+
+  # ===================================================================
+  # ECR Repository
+  # ===================================================================
+
+  AgentRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-ecr"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: KMS
+      LifecyclePolicy:
+        LifecyclePolicyText: '{"rules":[{"rulePriority":1,"description":"Keep last 5 images","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":5},"action":{"type":"expire"}}]}'
+
+  # ===================================================================
+  # IAM Execution Role for AgentCore Runtime
+  # ===================================================================
+
+  # checkov:skip=CKV_AWS_108:Workshop execution role requires permissions for AgentCore runtime operation
+  AgentCoreExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn-guard:
+        suppress:
+          - id: IAM_NO_INLINE_POLICY_CHECK
+            reason: "Inline policies required for workshop deployment; managed policies would add unnecessary complexity"
+    Properties:
+      RoleName: !Sub "${ProjectName}-execution-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AgentCoreRuntimePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # ECR auth token is account-level (per AWS docs: Resource must be "*")
+              - Sid: ECRTokenAccess
+                Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+              # ECR image pull scoped to this project's repository
+              - Sid: ECRImageAccess
+                Effect: Allow
+                Action:
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: !GetAtt AgentRepository.Arn
+              # Bedrock model invocation (per AWS docs: foundation-model/* + account resources)
+              - Sid: BedrockModelInvocation
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/*"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:*"
+              # CloudWatch Logs — scoped per official AgentCore docs
+              - Effect: Allow
+                Action:
+                  - logs:DescribeLogStreams
+                  - logs:CreateLogGroup
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*"
+              - Effect: Allow
+                Action:
+                  - logs:DescribeLogGroups
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/bedrock-agentcore/runtimes/*:log-stream:*"
+              # CloudWatch PutMetricData does not support resource-level permissions — Resource '*' required
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+              # X-Ray tracing actions require Resource '*' per AWS service design
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: "*"
+              # AgentCore Memory ID not known at CloudFormation deploy time — wildcard required
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:GetMemory
+                  - bedrock-agentcore:CreateEvent
+                  - bedrock-agentcore:ListEvents
+                  - bedrock-agentcore:GetEvent
+                  - bedrock-agentcore:DeleteEvent
+                  - bedrock-agentcore:RetrieveMemoryRecords
+                  - bedrock-agentcore:ListMemories
+                  - bedrock-agentcore:ListMemoryRecords
+                  - bedrock-agentcore:GetMemoryRecord
+                  - bedrock-agentcore:StartMemoryExtractionJob
+                  - bedrock-agentcore:ListMemoryExtractionJobs
+                Resource: "*"
+
+  # ===================================================================
+  # Cognito User Pool — end-user authentication for the GUI
+  # ===================================================================
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-user-pool"
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  AppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub "${ProjectName}-app-client"
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "${ProjectName}-${AWS::AccountId}"
+      UserPoolId: !Ref UserPool
+
+  # ===================================================================
+  # Logging Bucket — receives S3 access logs and CloudFront logs
+  # ===================================================================
+
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-logs-${AWS::AccountId}"
+      AccessControl: LogDeliveryWrite
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+
+  LoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonSSLRequests
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${LoggingBucket}"
+              - !Sub "arn:aws:s3:::${LoggingBucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # ===================================================================
+  # GUI: S3 Bucket + CloudFront Distribution
+  # ===================================================================
+
+  GuiBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn-guard:
+        suppress:
+          - id: S3_BUCKET_DEFAULT_LOCK_ENABLED
+            reason: "ObjectLock is incompatible with GUI bucket that requires object overwrites during deployments"
+          - id: S3_BUCKET_NO_PUBLIC_RW_ACL
+            reason: "No ACL is set; PublicAccessBlockConfiguration handles public access prevention"
+    Properties:
+      BucketName: !Sub "${ProjectName}-gui-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: s3-access-logs/
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  GuiBucketOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${ProjectName}-gui-oac"
+        Description: !Sub "OAC for ${ProjectName} GUI bucket"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  GuiBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref GuiBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "arn:aws:s3:::${GuiBucket}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceAccount: !Ref AWS::AccountId
+          - Sid: DenyNonSSLRequests
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !Sub "arn:aws:s3:::${GuiBucket}"
+              - !Sub "arn:aws:s3:::${GuiBucket}/*"
+            Condition:
+              Bool:
+                aws:SecureTransport: "false"
+
+  # checkov:skip=CKV_AWS_174:CloudFront uses TLSv1.2_2021 with default certificate
+  # checkov:skip=CKV_AWS_86:CloudFront access logging enabled via Logging property
+  GuiCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn: GuiBucketOAC
+    Metadata:
+      cfn-guard:
+        suppress:
+          - id: CLOUDFRONT_CUSTOM_SSL_CERTIFICATE
+            reason: "Workshop Studio does not provide a custom domain; CloudFrontDefaultCertificate with TLSv1.2_2021 is the only option"
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "${ProjectName} GUI"
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: !Sub "S3-${ProjectName}-gui"
+            DomainName: !GetAtt GuiBucket.RegionalDomainName
+            OriginAccessControlId: !Ref GuiBucketOAC
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: !Sub "S3-${ProjectName}-gui"
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponsePagePath: /index.html
+            ResponseCode: "200"
+            ErrorCachingMinTTL: 300
+        Logging:
+          Bucket: !GetAtt LoggingBucket.DomainName
+          IncludeCookies: false
+          Prefix: cloudfront-logs/
+        PriceClass: PriceClass_100
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+
+Outputs:
+  EcrRepositoryUri:
+    Description: 'ECR repository URI for agent container images'
+    Value: !GetAtt AgentRepository.RepositoryUri
+  ExecutionRoleArn:
+    Description: 'IAM role ARN for AgentCore runtime execution'
+    Value: !GetAtt AgentCoreExecutionRole.Arn
+  UserPoolId:
+    Description: 'Cognito User Pool ID for end-user authentication'
+    Value: !Ref UserPool
+  AppClientId:
+    Description: 'Cognito App Client ID for GUI authentication'
+    Value: !Ref AppClient
+  CognitoDiscoveryUrl:
+    Description: 'OpenID Connect discovery URL for Cognito'
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration"
+  GuiBucketName:
+    Description: 'S3 bucket name for GUI static assets'
+    Value: !Ref GuiBucket
+  CloudFrontDistributionId:
+    Description: 'CloudFront distribution ID for GUI'
+    Value: !Ref GuiCloudFrontDistribution
+  CloudFrontDomain:
+    Description: 'CloudFront domain name for GUI access'
+    Value: !GetAtt GuiCloudFrontDistribution.DomainName
+  LoggingBucketName:
+    Description: 'S3 bucket for access logs'
+    Value: !Ref LoggingBucket

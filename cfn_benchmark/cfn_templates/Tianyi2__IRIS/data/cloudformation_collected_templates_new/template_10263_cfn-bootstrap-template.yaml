@@ -1,0 +1,570 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Bootstrap EC2 Instance with Amazon Linux 2023 and latest tools'
+
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: Must be the name of an existing EC2 KeyPair.
+
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t4g.small
+    AllowedValues:
+      - t4g.small
+      - t4g.medium
+      - t4g.large
+    ConstraintDescription: Must be a valid EC2 instance type.
+
+  AllowedIP:
+    Description: The IP address range that can be used to SSH to the EC2 instance
+    Type: String
+    Default: 0.0.0.0/0
+    ConstraintDescription: Must be a valid IP CIDR range of the form x.x.x.x/x.
+
+  LatestAmiId:
+    Description: Latest Amazon Linux 2023 ARM64 AMI ID
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+
+  # インスタンス再作成用パラメータ（更新時にこの値を変更する）
+  InstanceVersion:
+    Description: Change this value to force instance recreation (e.g., v1, v2, v3, or timestamp)
+    Type: String
+    Default: 'v1'
+
+  # EC2インスタンス作成を制御するパラメータ
+  CreateEC2Instance:
+    Description: Whether to create EC2 instance (Yes/No)
+    Type: String
+    Default: 'No'
+    AllowedValues:
+      - 'Yes'
+      - 'No'
+    ConstraintDescription: Must be Yes or No
+
+Conditions:
+  # EC2インスタンスを作成するかどうかの条件
+  ShouldCreateEC2: !Equals [!Ref CreateEC2Instance, 'Yes']
+
+Resources:
+  # S3 Bucket for Pulumi Backend
+  PulumiStateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'pulumi-state-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: Pulumi-State-Bucket
+        - Key: Purpose
+          Value: Pulumi-Backend
+
+  # SSM Parameter Store に Pulumi S3 バケット名を保存
+  PulumiS3BucketParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /bootstrap/pulumi/s3bucket-name
+      Type: String
+      Value: !Ref PulumiStateBucket
+      Description: Pulumi state backend S3 bucket name
+      Tags:
+        Name: Pulumi-S3-Bucket-Name
+        Purpose: Pulumi-Backend
+
+  # SSM Parameter Store に Public IP を保存
+  WorkTerminalPublicIPParameter:
+    Type: AWS::SSM::Parameter
+    Condition: ShouldCreateEC2
+    DependsOn: BootstrapInstance
+    Properties:
+      Name: /bootstrap/workterminal/public-ip
+      Type: String
+      Value: !GetAtt BootstrapInstance.PublicIp
+      Description: Bootstrap instance public IP address
+      Tags:
+        Name: Bootstrap-Public-IP
+        Purpose: Work-Terminal
+
+  # S3 Bucket Policy
+  PulumiStateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref PulumiStateBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowBootstrapRolePulumiAccess
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt BootstrapIAMRole.Arn
+            Action:
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketVersions'
+              - 's3:GetBucketLocation'
+              - 's3:GetBucketVersioning'
+            Resource:
+              - !Sub '${PulumiStateBucket.Arn}'
+              - !Sub '${PulumiStateBucket.Arn}/*'
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub '${PulumiStateBucket.Arn}'
+              - !Sub '${PulumiStateBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: Bootstrap-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Bootstrap-IGW
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: Bootstrap-Public-Subnet
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: Bootstrap-Public-RT
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  BootstrapSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access and Jenkins agent connectivity
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedIP
+        - IpProtocol: tcp
+          FromPort: 50000
+          ToPort: 50000
+          CidrIp: !Ref AllowedIP
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: Bootstrap-SG
+
+  # S3 Access Policy for Pulumi State Bucket
+  PulumiS3AccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: PulumiS3Access
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:GetObject'
+              - 's3:GetObjectVersion'
+              - 's3:PutObject'
+              - 's3:DeleteObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketVersions'
+              - 's3:GetBucketLocation'
+              - 's3:GetBucketVersioning'
+            Resource:
+              - !Sub '${PulumiStateBucket.Arn}'
+              - !Sub '${PulumiStateBucket.Arn}/*'
+      Roles:
+        - !Ref BootstrapIAMRole
+
+  # SSM Parameter Store へのアクセス権限（PutParameterを追加）
+  SSMAccessPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: SSMParameterAccess
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'ssm:GetParameter'
+              - 'ssm:GetParameters'
+              - 'ssm:GetParametersByPath'
+              - 'ssm:PutParameter'
+            Resource:
+              - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/bootstrap/*'
+      Roles:
+        - !Ref BootstrapIAMRole
+
+  BootstrapIAMRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-BootstrapIAMRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      Tags:
+        - Key: Name
+          Value: Bootstrap-IAM-Role
+        - Key: Purpose
+          Value: Jenkins-Agent
+
+  BootstrapInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: ShouldCreateEC2
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref BootstrapIAMRole
+
+  # Launch Template でUserDataを共通化
+  BootstrapLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Condition: ShouldCreateEC2
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-LaunchTemplate'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyName
+        IamInstanceProfile:
+          Arn: !GetAtt BootstrapInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref BootstrapSecurityGroup
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+
+            # Instance Version: ${InstanceVersion}
+            echo "Instance Version: ${InstanceVersion}" > /tmp/deployment-info.txt
+            echo "Stack update time: $(date)" >> /tmp/deployment-info.txt
+
+            # システムの更新
+            dnf update -y
+            dnf install -y git python3 python3-pip jq tmux
+
+            # Amazon SSM Agent は Amazon Linux 2023 にプリインストール済み
+
+            # Ansible と必要なPythonパッケージのインストール
+            # Amazon Linux 2023では、システムのpipを直接アップグレードしない
+            python3 -m pip install --user --upgrade pip
+            export PATH="$HOME/.local/bin:$PATH"
+
+            # Ansibleと必要なパッケージをユーザー環境にインストール
+            python3 -m pip install --user ansible boto3 botocore
+
+            # rootユーザーの.local/binをPATHに追加
+            echo 'export PATH=$HOME/.local/bin:$PATH' >> /root/.bashrc
+
+            # ec2-userのためにもインストール
+            sudo -u ec2-user python3 -m pip install --user ansible boto3 botocore
+            echo 'export PATH=$HOME/.local/bin:$PATH' >> /home/ec2-user/.bashrc
+
+            # 環境設定
+            echo 'export PATH=$HOME/.local/bin:$HOME/.pulumi/bin:$PATH' >> /home/ec2-user/.bashrc
+            echo 'export AWS_DEFAULT_REGION=${AWS::Region}' >> /home/ec2-user/.bashrc
+
+            # Ansibleが正しくインストールされたか確認
+            sudo -u ec2-user bash -c 'source ~/.bashrc && which ansible || echo "Ansible not found in PATH"'
+
+            # Git リポジトリのクローン
+            cd /home/ec2-user
+            if [ ! -d "/home/ec2-user/infrastructure-as-code" ]; then
+              sudo -u ec2-user git clone https://github.com/tielec/infrastructure-as-code
+            fi
+
+            # スクリプトに実行権限を付与
+            if [ -d "/home/ec2-user/infrastructure-as-code/scripts" ]; then
+              find /home/ec2-user/infrastructure-as-code/scripts -name "*.sh" -type f -exec chmod +x {} \;
+            fi
+
+            if [ -d "/home/ec2-user/infrastructure-as-code/bootstrap" ]; then
+              find /home/ec2-user/infrastructure-as-code/bootstrap -name "*.sh" -type f -exec chmod +x {} \;
+            fi
+
+            # Public IPをSSM Parameter Storeに更新（バックアップとして）
+            # CloudFormationでも設定されますが、インスタンス内からも更新可能
+            PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+            if [ -n "$PUBLIC_IP" ]; then
+              aws ssm put-parameter --name /bootstrap/workterminal/public-ip --value "$PUBLIC_IP" --type String --overwrite --region ${AWS::Region} || true
+            fi
+
+            # セットアップガイド
+            cat > /home/ec2-user/SETUP_GUIDE.txt << 'EOF'
+            === Bootstrap Environment Setup Guide ===
+            Instance Version: ${InstanceVersion}
+            Amazon Linux 2023
+
+            1. Repository already cloned: ~/infrastructure-as-code
+            2. Run: ./infrastructure-as-code/bootstrap/setup-bootstrap.sh
+            3. Verify: ./infrastructure-as-code/bootstrap/verify-installation.sh
+
+            Pulumi Backend: s3://${PulumiStateBucket}
+
+            Public IP stored in SSM: /bootstrap/workterminal/public-ip
+            To retrieve: aws ssm get-parameter --name /bootstrap/workterminal/public-ip --query 'Parameter.Value' --output text
+
+            Note: Python packages are installed in user space (~/.local/bin)
+                  Make sure to source ~/.bashrc or re-login for PATH updates
+
+            To verify Ansible installation:
+              which ansible
+              ansible --version
+
+            To recreate this instance, update CloudFormation with new InstanceVersion parameter.
+            EOF
+
+            chown -R ec2-user:ec2-user /home/ec2-user/infrastructure-as-code
+            chown ec2-user:ec2-user /home/ec2-user/SETUP_GUIDE.txt
+            chown -R ec2-user:ec2-user /home/ec2-user/.local || true
+
+            # 最終確認
+            echo "Bootstrap setup complete!"
+            echo "Installed tools:"
+            sudo -u ec2-user bash -c 'source ~/.bashrc && which python3 && python3 --version'
+            sudo -u ec2-user bash -c 'source ~/.bashrc && which ansible && ansible --version || echo "Ansible not found"'
+
+  # SSM Maintenance Window用のIAMロール
+  MaintenanceWindowRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-MaintenanceWindowRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonSSMMaintenanceWindowRole
+      Policies:
+        - PolicyName: EC2StopPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:StopInstances
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInstanceStatus
+                Resource: '*'
+      Tags:
+        - Key: Name
+          Value: Maintenance-Window-Role
+
+  # SSM Maintenance Window (日本時間午前0時に停止)
+  StopInstanceMaintenanceWindow:
+    Type: AWS::SSM::MaintenanceWindow
+    Condition: ShouldCreateEC2
+    Properties:
+      Name: !Sub '${AWS::StackName}-StopInstance'
+      Description: 'Stop Bootstrap instance daily at 0:00 AM JST'
+      Schedule: 'cron(0 15 ? * * *)'  # 毎日UTC 15:00（日本時間午前0時）
+      Duration: 1  # 1時間のウィンドウ
+      Cutoff: 0    # ウィンドウ終了前に新しいタスクを開始しない
+      AllowUnassociatedTargets: false
+      Tags:
+        - Key: Name
+          Value: Stop-Instance-Window
+
+  # Maintenance Windowのターゲット（停止対象のインスタンス）
+  StopInstanceTarget:
+    Type: AWS::SSM::MaintenanceWindowTarget
+    Condition: ShouldCreateEC2
+    Properties:
+      Name: !Sub '${AWS::StackName}-StopTarget'
+      Description: 'Target for stopping bootstrap instance'
+      WindowId: !Ref StopInstanceMaintenanceWindow
+      ResourceType: INSTANCE
+      Targets:
+        - Key: InstanceIds
+          Values:
+            - !Ref BootstrapInstance
+
+  # Maintenance Windowのタスク（EC2停止コマンド）
+  StopInstanceTask:
+    Type: AWS::SSM::MaintenanceWindowTask
+    Condition: ShouldCreateEC2
+    Properties:
+      Name: !Sub '${AWS::StackName}-StopTask'
+      Description: 'Stop bootstrap EC2 instance'
+      WindowId: !Ref StopInstanceMaintenanceWindow
+      ServiceRoleArn: !GetAtt MaintenanceWindowRole.Arn
+      Priority: 1
+      MaxConcurrency: '1'  # 同時実行数（1つのインスタンスのみ）
+      MaxErrors: '0'       # エラー許容数（0 = エラーを許容しない）
+      TaskType: AUTOMATION
+      TaskArn: AWS-StopEC2Instance  # AWS提供の自動化ドキュメント
+      Targets:
+        - Key: WindowTargetIds
+          Values:
+            - !Ref StopInstanceTarget
+      TaskInvocationParameters:
+        MaintenanceWindowAutomationParameters:
+          Parameters:
+            InstanceId:
+              - !Ref BootstrapInstance
+
+  # EC2 Instance
+  BootstrapInstance:
+    Type: AWS::EC2::Instance
+    Condition: ShouldCreateEC2
+    DependsOn:
+      - PulumiStateBucketPolicy
+      - PulumiS3AccessPolicy
+      - SSMAccessPolicy
+      - PulumiS3BucketParameter
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref BootstrapLaunchTemplate
+        Version: !GetAtt BootstrapLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PublicSubnet
+      Tags:
+        - Key: Name
+          Value: Bootstrap-Jenkins-Agent
+        - Key: Purpose
+          Value: Jenkins-Agent
+        - Key: InstanceVersion
+          Value: !Ref InstanceVersion
+        - Key: OS
+          Value: AmazonLinux2023
+        - Key: AutoStop
+          Value: 'Enabled'
+
+Outputs:
+  # EC2インスタンスが作成された場合のみ出力
+  BootstrapInstanceId:
+    Condition: ShouldCreateEC2
+    Description: ID of the bootstrap EC2 instance
+    Value: !Ref BootstrapInstance
+
+  BootstrapPublicIP:
+    Condition: ShouldCreateEC2
+    Description: Public IP address of the bootstrap EC2 instance
+    Value: !GetAtt BootstrapInstance.PublicIp
+
+  SSHCommand:
+    Condition: ShouldCreateEC2
+    Description: SSH command to connect to the instance
+    Value: !Sub 'ssh -i <your-key.pem> ec2-user@${BootstrapInstance.PublicIp}'
+
+  # ネットワークとS3は常に出力
+  PulumiStateBucketName:
+    Description: Name of the S3 bucket for Pulumi state storage
+    Value: !Ref PulumiStateBucket
+
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  PublicSubnetId:
+    Description: Public Subnet ID
+    Value: !Ref PublicSubnet
+
+  SecurityGroupId:
+    Description: Security Group ID
+    Value: !Ref BootstrapSecurityGroup
+
+  # EC2インスタンス管理用のコマンド（常に表示）
+  CreateInstanceCommand:
+    Description: Command to create the EC2 instance
+    Value: !Sub 'aws cloudformation update-stack --stack-name ${AWS::StackName} --use-previous-template --parameters ParameterKey=CreateEC2Instance,ParameterValue=Yes ParameterKey=InstanceVersion,ParameterValue=$(date +%s) --capabilities CAPABILITY_NAMED_IAM --region ${AWS::Region}'
+
+  RemoveInstanceCommand:
+    Description: Command to remove the EC2 instance (keeping network and S3)
+    Value: !Sub 'aws cloudformation update-stack --stack-name ${AWS::StackName} --use-previous-template --parameters ParameterKey=CreateEC2Instance,ParameterValue=No --capabilities CAPABILITY_NAMED_IAM --region ${AWS::Region}'
+
+  # EC2インスタンスが作成された場合のみ出力
+  WorkTerminalPublicIPParameter:
+    Condition: ShouldCreateEC2
+    Description: SSM Parameter path for public IP
+    Value: /bootstrap/workterminal/public-ip
+
+  GetPublicIPCommand:
+    Condition: ShouldCreateEC2
+    Description: Command to retrieve public IP from SSM Parameter Store
+    Value: !Sub 'aws ssm get-parameter --name /bootstrap/workterminal/public-ip --query "Parameter.Value" --output text --region ${AWS::Region}'
+
+  StopScheduleStatus:
+    Condition: ShouldCreateEC2
+    Description: Daily stop schedule status
+    Value: !Sub 'Instance will be stopped daily at 0:00 AM JST (15:00 UTC) via SSM Maintenance Window'
+
+  ManualStartCommand:
+    Condition: ShouldCreateEC2
+    Description: Command to manually start the instance
+    Value: !Sub 'aws ec2 start-instances --instance-ids ${BootstrapInstance} --region ${AWS::Region}'

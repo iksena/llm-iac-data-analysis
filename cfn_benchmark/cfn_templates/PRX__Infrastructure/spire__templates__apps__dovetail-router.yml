@@ -1,0 +1,1495 @@
+# stacks/apps/dovetail-router.yml
+# 300A
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >-
+  Creates a dedicated load balancer and the ECS service for Dovetail Router
+  (i.e., Dovetail version 3). Also creates the stack for Dovetail version 2
+  resources, which run on the same ALB.
+
+Parameters:
+  kContainerName:
+    Type: String
+    Default: dovetail-router
+  kApplicationPort:
+    Type: Number
+    Default: 4000
+  kMetricFilterNamespace:
+    Type: String
+    Default: PRX/Dovetail/Router
+  kScalingPolicyTargetValue:
+    Type: Number
+    Default: 800
+  #######
+  NestedChangeSetScrubbingResourcesState: { Type: String }
+  EcsClusterArn: { Type: String }
+  EcsClusterName: { Type: String }
+  EnvironmentType: { Type: String }
+  EnvironmentTypeAbbreviation: { Type: String }
+  RegionMode: { Type: String }
+  RootStackName: { Type: String }
+  RootStackId: { Type: String }
+  VpcId: { Type: AWS::EC2::VPC::Id }
+  EcrImageTag: { Type: AWS::SSM::Parameter::Value<String> }
+  EchoServiceToken: { Type: String }
+  SharedEcsAsgInstanceSecurityGroupId: { Type: String }
+  VpcPublicSubnet1Id: { Type: AWS::EC2::Subnet::Id }
+  VpcPublicSubnet2Id: { Type: AWS::EC2::Subnet::Id }
+  VpcPublicSubnet3Id: { Type: AWS::EC2::Subnet::Id }
+  DovetailCountedKinesisStreamArn: { Type: String }
+  DovetailRedisReplicationGroupEndpointAddress: { Type: String }
+  DovetailRedisReplicationGroupEndpointPort: { Type: String }
+  SharedGlueDatabaseName: { Type: String }
+  FeedsS3BucketArn: { Type: AWS::SSM::Parameter::Value<String> }
+  AuguryHostname: { Type: String }
+  FeederHostname: { Type: String }
+  DovetailCdnHostname: { Type: String }
+  DovetailRouterHostname: { Type: String }
+  Aarch64AsgCapacityProviderName: { Type: String }
+  DovetailCdnRedirectPrefix: { Type: AWS::SSM::Parameter::Value<String> }
+  FrequencyDynamodbTableName: { Type: AWS::SSM::Parameter::Value<String> }
+  FrequencyDynamodbAccessRoleArn: { Type: AWS::SSM::Parameter::Value<String> }
+
+Conditions:
+  IsProduction: !Equals [!Ref EnvironmentType, Production]
+  IsPrimaryRegion: !Equals [!Ref RegionMode, Primary]
+  IsUsEast1: !Equals [!Ref "AWS::Region", us-east-1]
+  EnableNestedChangeSetScrubbingResources: !Equals [!Ref NestedChangeSetScrubbingResourcesState, Enabled]
+
+Resources:
+  NestedChangeSetScrubber: { Type: AWS::SNS::Topic, Condition: EnableNestedChangeSetScrubbingResources }
+
+  Constants:
+    Type: Custom::Echo
+    Properties:
+      ServiceToken: !Ref EchoServiceToken
+      # The ServiceDomain is the name used to create alias records in each region
+      # for the load balancer. Having multiple records with the same name in this
+      # way creates latency records. This is the domain responsible for both
+      # the multi-region latency-based routing policy, and health checks and
+      # failover. The health of any given DNS record (i.e., region) is based on
+      # the health of the load balancer being targeted by the alias. The health
+      # of the load balancer is in turn based on the health of its target groups.
+      # A load balancer is only considered healthy (and thus a possible return
+      # value of the service domain) if all target groups contain at least one
+      # healthy target.
+      # https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/routing-policy.html#routing-policy-latency
+      # https://docs.aws.amazon.com/Route53/latest/DeveloperGuide/resource-record-sets-values-latency-alias.html
+      ServiceDomain: !Sub dovetail-router-alb-latency-group.${EnvironmentTypeAbbreviation}.prx.tech
+      VanityDomain: !If [IsProduction, !Sub "dovetail-router.${AWS::Region}.prx.tech", !Sub "dovetail-router.staging.${AWS::Region}.prx.tech"]
+
+  Certificate:
+    # This certificate does not include an entry for the service domain, since
+    # that will generally be prx.tech, and there is some risk is serving user-
+    # generated content from the same domain as other apps. So even though the
+    # prx.tech service domain is used for DNS purposes, it should not be used
+    # for other purposes.
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !If [IsProduction, dovetail.prxu.org, dovetail.staging.prxu.org]
+      SubjectAlternativeNames:
+        - !If [IsProduction, dovetail-router.prxu.org, dovetail-router.staging.prxu.org]
+        - !GetAtt Constants.VanityDomain
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_dovetail_${Alb.LoadBalancerName}" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+      ValidationMethod: DNS
+
+  # The service failover domain is a domain that is the SAME FOR ALL REGIONS.
+  # This is the mechanism that Route 53 uses to add load balancers to a latancy
+  # group. All ALBs for a given environment type should use the exact same
+  # `Name` value for these records, but have unique `SetIdentifier` values.
+  # When ALIAS latency records target a load balancer, Route 53 automatically
+  # determines the health of the load balancer to determine if it should be
+  # included in the pool of possible responses. The domain name is largely
+  # immaterial, since it is used exclusively for DNS queries within Route 53.
+  ServiceFailoverRecordSetGroup:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      Comment: !Sub >-
+        Latency record for the Dovetail ${EnvironmentType} ALB
+      HostedZoneName: prx.tech.
+      RecordSets:
+        - AliasTarget:
+            DNSName: !GetAtt Alb.DNSName
+            EvaluateTargetHealth: true
+            HostedZoneId: !GetAtt Alb.CanonicalHostedZoneID
+          Name: !GetAtt Constants.ServiceDomain
+          Region: !Ref AWS::Region
+          SetIdentifier: !Ref AWS::StackName
+          Type: AAAA
+        - AliasTarget:
+            DNSName: !GetAtt Alb.DNSName
+            EvaluateTargetHealth: true
+            HostedZoneId: !GetAtt Alb.CanonicalHostedZoneID
+          Name: !GetAtt Constants.ServiceDomain
+          Region: !Ref AWS::Region
+          SetIdentifier: !Ref AWS::StackName
+          Type: A
+
+  VanityRecordSetGroup:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      Comment: Record sets for regional Dovetail Router ALBs
+      HostedZoneName: prx.tech.
+      RecordSets:
+        - AliasTarget:
+            DNSName: !GetAtt Alb.DNSName
+            EvaluateTargetHealth: true
+            HostedZoneId: !GetAtt Alb.CanonicalHostedZoneID
+          Name: !GetAtt Constants.VanityDomain
+          Type: AAAA
+        - AliasTarget:
+            DNSName: !GetAtt Alb.DNSName
+            EvaluateTargetHealth: true
+            HostedZoneId: !GetAtt Alb.CanonicalHostedZoneID
+          Name: !GetAtt Constants.VanityDomain
+          Type: A
+
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LifecycleConfiguration:
+        Rules:
+          - ExpirationInDays: !If
+              - IsProduction
+              - 3
+              - 1
+            Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+  AccessLogsBucketPolicy:
+    # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-access-logs.html#access-logging-bucket-permissions
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Statement:
+          - Action: s3:GetBucketAcl
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Resource: !GetAtt AccessLogsBucket.Arn
+          - Action: s3:PutObject
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Resource: !Sub ${AccessLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*
+          - Action: s3:PutObject
+            Effect: Allow
+            Principal:
+              Service: logdelivery.elasticloadbalancing.amazonaws.com
+            Resource: !Sub ${AccessLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*
+        Version: "2012-10-17"
+  AccessLogsGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref SharedGlueDatabaseName
+      TableInput:
+        Description: !Sub >-
+          ${EnvironmentType} Dovetail Router ALB logs
+        Name: dovetail-router-alb
+        Parameters:
+          projection.enabled: "true"
+          projection.date.type: date
+          projection.date.range: 2021/01/01,NOW
+          projection.date.format: yyyy/MM/dd
+          projection.date.interval: "1"
+          projection.date.interval.unit: DAYS
+          storage.location.template: !Sub s3://${AccessLogsBucket}/AWSLogs/${AWS::AccountId}/elasticloadbalancing/${AWS::Region}/${!date}
+        PartitionKeys:
+          - Name: date
+            Type: string
+        StorageDescriptor:
+          Columns:
+            - Name: type
+              Type: string
+            - Name: time
+              Type: string
+            - Name: elb
+              Type: string
+            - Name: client_ip
+              Type: string
+            - Name: client_port
+              Type: int
+            - Name: target_ip
+              Type: string
+            - Name: target_port
+              Type: int
+            - Name: request_processing_time
+              Type: double
+            - Name: target_processing_time
+              Type: double
+            - Name: response_processing_time
+              Type: double
+            - Name: elb_status_code
+              Type: string
+            - Name: target_status_code
+              Type: string
+            - Name: received_bytes
+              Type: bigint
+            - Name: sent_bytes
+              Type: bigint
+            - Name: request_method
+              Type: string
+            - Name: request_uri
+              Type: string
+            - Name: request_http_version
+              Type: string
+            - Name: user_agent
+              Type: string
+            - Name: ssl_cipher
+              Type: string
+            - Name: ssl_protocol
+              Type: string
+            - Name: target_group_arn
+              Type: string
+            - Name: trace_id
+              Type: string
+            - Name: domain_name
+              Type: string
+            - Name: chosen_cert_arn
+              Type: string
+            - Name: matched_rule_priority
+              Type: string
+            - Name: request_creation_time
+              Type: string
+            - Name: actions_executed
+              Type: string
+            - Name: redirect_url
+              Type: string
+            - Name: lambda_error_reason
+              Type: string
+            - Name: target_port_list
+              Type: string
+            - Name: target_status_code_list
+              Type: string
+            - Name: classification
+              Type: string
+            - Name: classification_reason
+              Type: string
+            - Name: conn_trace_id
+              Type: string
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          Location: !Sub s3://${AccessLogsBucket}/AWSLogs/${AWS::AccountId}/elasticloadbalancing/${AWS::Region}/
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            Parameters:
+              input.regex: >-
+                ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*):([0-9]*) ([^ ]*)[:-]([0-9]*) ([-.0-9]*) ([-.0-9]*) ([-.0-9]*) (|[-0-9]*) (-|[-0-9]*) ([-0-9]*) ([-0-9]*) \"([^ ]*) (.*) (- |[^ ]*)\" \"([^\"]*)\" ([A-Z0-9-_]+) ([A-Za-z0-9.-]*) ([^ ]*) \"([^\"]*)\" \"([^\"]*)\" \"([^\"]*)\" ([-.0-9]*) ([^ ]*) \"([^\"]*)\" \"([^\"]*)\" \"([^ ]*)\" \"([^\s]+?)\" \"([^\s]+)\" \"([^ ]*)\" \"([^ ]*)\" ?([^ ]*)?( .*)?
+              serialization.format: "1"
+            SerializationLibrary: org.apache.hadoop.hive.serde2.RegexSerDe
+        TableType: EXTERNAL_TABLE
+  AccessLogsRecentQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref SharedGlueDatabaseName
+      Description: >-
+        View recent ALB requests using the table's date partitions
+      Name: !Sub ${EnvironmentType} Dovetail Router ALB Recent Requests
+      QueryString: !Sub >-
+        SELECT *
+        FROM "${SharedGlueDatabaseName}"."${AccessLogsGlueTable}"
+        WHERE "date" > date_format(current_date - interval '1' day, '%Y/%m/%d')
+        ORDER BY time ASC
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub >-
+        Security group for the ${EnvironmentType} Dovetail; ALB. Only the ALB
+        should belong to it. Controls traffic into the ALB (i.e., internet) and
+        from the ALB to targets (EC2 instances, etc), By default, allows all
+        HTTP inbound traffic.
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: 80
+          IpProtocol: tcp
+          ToPort: 80
+        - CidrIpv6: ::/0
+          FromPort: 80
+          IpProtocol: tcp
+          ToPort: 80
+        - CidrIp: 0.0.0.0/0
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - CidrIpv6: ::/0
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_dovetail-alb_inbound_forwarding" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+      VpcId: !Ref VpcId
+  LoadBalancerSecurityGroupInstanceEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      Description: >-
+        Allow all egress traffic from the Dovetail LB SG to the instance SG.
+      # Based on the following recommednation
+      # https://aws.amazon.com/premiumsupport/knowledge-center/troubleshoot-unhealthy-checks-ecs/#Correctly_configure_the_security_groups_attached_to_your_load_balancer_and_container_instance
+      DestinationSecurityGroupId: !Ref SharedEcsAsgInstanceSecurityGroupId
+      FromPort: 0
+      GroupId: !GetAtt LoadBalancerSecurityGroup.GroupId
+      IpProtocol: tcp
+      ToPort: 65535
+
+  # This adds a rule to the instance security group defined in
+  # shared-ecs-asg.yml
+  InstanceSecurityGroupAlbDynamicPortIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: >-
+        Allow ingress traffic from the Dovetail LB SG to the instance SG on
+        ports used by ECS task dynamic port mapping.
+      FromPort: 32768
+      GroupId: !Ref SharedEcsAsgInstanceSecurityGroupId
+      IpProtocol: tcp
+      SourceSecurityGroupId: !GetAtt LoadBalancerSecurityGroup.GroupId
+      ToPort: 60999
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - AccessLogsBucketPolicy # Don't try to create the ALB until the bucket grants logging permissions
+    Properties:
+      IpAddressType: dualstack
+      LoadBalancerAttributes:
+        # https://docs.aws.amazon.com/elasticloadbalancing/latest/application/application-load-balancers.html#load-balancer-attributes
+        - Key: idle_timeout.timeout_seconds
+          Value: "150"
+        - Key: access_logs.s3.enabled
+          Value: "true"
+        - Key: access_logs.s3.bucket
+          Value: !Ref AccessLogsBucket
+      Scheme: internet-facing
+      SecurityGroups:
+        - !GetAtt LoadBalancerSecurityGroup.GroupId
+      Subnets:
+        - !Ref VpcPublicSubnet1Id
+        - !Ref VpcPublicSubnet2Id
+        - !Ref VpcPublicSubnet3Id
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+  Alb5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub ERROR [Dovetail-Router] Load balancer <${EnvironmentTypeAbbreviation}> RETURNING 5XX ERRORS (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Dovetail's dedicated application load balancer (ALB)
+        is returning 5XX errors to clients. The errors may or may not be
+        originating from applications behind the ALB.
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt Alb.LoadBalancerFullName
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 3
+      MetricName: HTTPCode_ELB_5XX_Count
+      Namespace: AWS/ApplicationELB
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:ops:cloudwatch-log-group-name, Value: !Ref TaskLogGroup }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+      Threshold: 2
+      TreatMissingData: notBreaching
+  AlbResponseTimeP95Alarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub ERROR [Dovetail-Router] Load balancer <${EnvironmentTypeAbbreviation}> RESPONDING SLOWLY (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Dovetail's dedicated application load balancer (ALB)
+        is seeing very slow response times for a significant percent of the
+        traffic it's handling.
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt Alb.LoadBalancerFullName
+      EvaluationPeriods: 2
+      ExtendedStatistic: p95
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Period: 300
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:ops:cloudwatch-log-group-name, Value: !Ref TaskLogGroup }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+      # TODO: Bring back to ~.2 once things are optimized
+      # TODO: 3rd party VAST requests are much slower outside us-east-1
+      Threshold: !If [IsUsEast1, 2.0, 3.5]
+      TreatMissingData: notBreaching
+      Unit: Seconds
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+  HttpsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Certificates:
+        - CertificateArn: !Ref Certificate
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref Alb
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+
+  # NOTE: eventually, dt-router will also get the non-underscored default path
+  HttpPathListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /_/*
+      ListenerArn: !Ref HttpListener
+      Priority: 50
+  HttpsPathListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      Conditions:
+        - Field: path-pattern
+          Values:
+            - /_/*
+      ListenerArn: !Ref HttpsListener
+      Priority: 50
+
+  HttpHostHeaderListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      Conditions:
+        - Field: host-header
+          Values:
+            - dovetail-router.*
+      ListenerArn: !Ref HttpListener
+      Priority: 150
+  HttpsHostHeaderListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      Conditions:
+        - Field: host-header
+          Values:
+            - dovetail-router.*
+      ListenerArn: !Ref HttpsListener
+      Priority: 150
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: Alb
+    Properties:
+      HealthCheckIntervalSeconds: 30
+      HealthCheckPath: /
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "15"
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_dovetail-router" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+      TargetType: instance
+      UnhealthyThresholdCount: 4
+      VpcId: !Ref VpcId
+  TargetGroupHttp5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub ERROR [Dovetail-Router] Web server <${EnvironmentTypeAbbreviation}> RETURNING 5XX ERRORS (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Dovetail Router's Elixir server is returning 5XX
+        errors from the ECS service to the load balancer.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt Alb.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+      EvaluationPeriods: 1
+      MetricName: HTTPCode_Target_5XX_Count
+      Namespace: AWS/ApplicationELB
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:ops:cloudwatch-log-group-name, Value: !Ref TaskLogGroup }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+      Threshold: 2
+      TreatMissingData: notBreaching
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - HttpListener
+      - HttpsListener
+    Properties:
+      CapacityProviderStrategy:
+        - Base: 0
+          CapacityProvider: !Ref Aarch64AsgCapacityProviderName
+          Weight: 1
+      Cluster: !Ref EcsClusterArn
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      DesiredCount: !If [IsProduction, 12, 2]
+      EnableECSManagedTags: true
+      EnableExecuteCommand: true
+      LoadBalancers:
+        - ContainerName: !Ref kContainerName
+          ContainerPort: !Ref kApplicationPort
+          TargetGroupArn: !Ref TargetGroup
+      PlacementConstraints:
+        - Type: memberOf
+          Expression: attribute:ecs.cpu-architecture == arm64
+      PropagateTags: TASK_DEFINITION
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+      TaskDefinition: !Ref TaskDefinition
+
+  TaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action: ssm:GetParameters
+                Effect: Allow
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Router/*
+                Sid: AllowAppParameterRead
+              - Action: ssm:GetParameters
+                Effect: Allow
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/global/Spire/*
+                Sid: AllowGlobalParameterRead
+            Version: "2012-10-17"
+          PolicyName: ContainerSecrets
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+        Version: "2012-10-17"
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Effect: Allow
+                Resource: "*"
+                Sid: AllowSsmChannels
+            Version: "2012-10-17"
+          PolicyName: EcsExec
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - dynamodb:BatchGetItem
+                  - dynamodb:ConditionCheck
+                  - dynamodb:DescribeTable
+                  - dynamodb:DescribeTimeToLive
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Effect: Allow
+                Resource:
+                  - !Sub "arn:aws:dynamodb:*:*:table/${FrequencyDynamodbTableName}"
+            Version: "2012-10-17"
+          PolicyName: FrequencyDdbActions
+        - PolicyDocument:
+            Statement:
+              - Action: sts:AssumeRole
+                Effect: Allow
+                Resource: !Ref FrequencyDynamodbAccessRoleArn
+            Version: "2012-10-17"
+          PolicyName: FrequencyDdbAssumeRole
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Command:
+            - web
+          Cpu: !If [IsProduction, 512, 128]
+          Environment:
+            - Name: APP_NAME
+              Value: dovetailrouter
+            - Name: APP_ENV
+              Value: !Ref EnvironmentTypeAbbreviation
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: REDIS_HOST
+              Value: !Ref DovetailRedisReplicationGroupEndpointAddress
+            - Name: REDIS_PORT
+              Value: !Ref DovetailRedisReplicationGroupEndpointPort
+            - Name: REDIS_NAMESPACE
+              Value: dovetail
+            - Name: REDIS_POOL_SIZE
+              Value: "20"
+            - Name: REDIS_TIMEOUT
+              Value: "2000"
+            - Name: REDIS_REQUEST_TIMEOUT
+              Value: "1000"
+            - Name: FINCH_POOL_COUNT
+              Value: "2"
+            - Name: FINCH_POOL_SIZE
+              Value: "100"
+            - Name: LOG_STATS
+              Value: "1"
+            - Name: PORT
+              Value: !Ref kApplicationPort
+            - Name: DOVETAIL_HOST
+              Value: !Ref DovetailRouterHostname
+            - Name: REDIRECT_HOST
+              Value: !Ref DovetailCdnHostname
+            - Name: REDIRECT_PREFIX
+              Value: !If [IsPrimaryRegion, !Ref "AWS::NoValue", !Ref DovetailCdnRedirectPrefix]
+            - Name: REDIRECT_TTL
+              Value: "86400"
+            - Name: AUGURY_HOST
+              Value: !Ref AuguryHostname
+            - Name: FEEDER_HOST
+              Value: !Ref FeederHostname
+            - Name: NEWRELIC_APP_NAME
+              Value: !If [IsProduction, Dovetail Router Production, Dovetail Router Staging]
+            - Name: AGENTS_URL
+              Value: https://raw.githubusercontent.com/PRX/prx-podagent/main/db/agents.lock.json
+            - Name: DDB_FREQUENCY_TABLE
+              Value: !Ref FrequencyDynamodbTableName
+            - Name: DDB_ROLE
+              Value: !Ref FrequencyDynamodbAccessRoleArn
+          Essential: true
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrImageTag}
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref TaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Memory: !If [IsProduction, 6000, 1000]
+          MemoryReservation: !If [IsProduction, 1000, 500]
+          Name: !Ref kContainerName
+          PortMappings:
+            - ContainerPort: !Ref kApplicationPort
+              HostPort: 0
+          Secrets:
+            - Name: SECRET_KEY_BASE
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Router/secret-key-base
+            - Name: ADMIN_SALT
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Router/admin-salt
+            - Name: ADMIN_USER
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Router/admin-user
+            - Name: ADMIN_PASS
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Router/admin-password
+            - Name: API_TOKEN
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Router/api-token
+            - Name: AUGURY_TOKEN
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Router/augury-token
+            - Name: FEEDER_TOKEN
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Dovetail-Router/feeder-token
+            - Name: PROXY_KEYS
+              ValueFrom: /prx/global/Spire/Dovetail-Router/proxy-keys
+            - Name: MAXMIND_ACCOUNT_ID
+              ValueFrom: /prx/global/Spire/maxmind/account-id
+            - Name: MAXMIND_LICENSE_KEY
+              ValueFrom: /prx/global/Spire/maxmind/license-key
+            - Name: NEW_RELIC_LICENSE_KEY
+              ValueFrom: /prx/global/Spire/new-relic-lite-api-key
+          Ulimits:
+            - HardLimit: 8192
+              Name: nofile
+              SoftLimit: 8192
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      NetworkMode: bridge
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+      TaskRoleArn: !GetAtt TaskRole.Arn
+
+  # Autoscaling
+  ScalingIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !If [IsProduction, !If [IsPrimaryRegion, 8, 6], 2]
+      MaxCapacity: !If [IsProduction, 24, 4]
+      ResourceId: !Sub service/${EcsClusterName}/${EcsService.Name}
+      RoleARN: !GetAtt ScalingIamRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+  ScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: RequestCountScaling
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub ${Alb.LoadBalancerFullName}/${TargetGroup.TargetGroupFullName}
+        ScaleInCooldown: 180
+        ScaleOutCooldown: 60
+        TargetValue: !Ref kScalingPolicyTargetValue
+
+  # New episode publish autoscaling
+  FeedScalerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: Scale out Dovetail Router when episodes drop in private feed
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref FeedScalerDynamodbTable
+          ECS_CLUSTER_NAME: !Ref EcsClusterName
+          ECS_SERVICE_NAME: !GetAtt EcsService.Name
+          NODE_OPTIONS: --experimental-detect-module
+      Events:
+        S3Event:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              detail:
+                object:
+                  key:
+                    - 815/feed-rss.xml
+                    - 70/feed-rss.xml
+                    - themoth/feed-rss.xml
+              detail-type:
+                - Object Created
+              source:
+                - aws.s3
+      Handler: index.handler
+      InlineCode: !Sub |
+        import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
+        import {
+          DynamoDBClient,
+          BatchGetItemCommand,
+          PutItemCommand,
+        } from '@aws-sdk/client-dynamodb';
+        import {
+          ECSClient,
+          DescribeServicesCommand,
+          UpdateServiceCommand,
+        } from '@aws-sdk/client-ecs';
+
+        const s3 = new S3Client();
+        const ddb = new DynamoDBClient({ region: '${AWS::Region}' });
+        const ecs = new ECSClient({ region: '${AWS::Region}' });
+
+        const TABLE_NAME = process.env.DYNAMODB_TABLE_NAME;
+        const CLUSTER_NAME = process.env.ECS_CLUSTER_NAME;
+        const SERVICE_NAME = process.env.ECS_SERVICE_NAME;
+        const SCALE_TO = {
+          '815/feed-rss.xml': 4,
+          '70/feed-rss.xml': 20,
+          'themoth/feed-rss.xml': 20,
+        };
+
+        export const handler = async (event) => {
+          console.log(JSON.stringify(event));
+
+          const Bucket = event.detail.bucket.name;
+          const Key = event.detail.object.key;
+          if (!SCALE_TO[Key]) {
+            return;
+          }
+
+          // read rss guids
+          const result = await s3.send(new GetObjectCommand({ Bucket, Key }));
+          const resultBody = await result.Body.transformToString();
+          const matches = resultBody.matchAll(/>([^<]+)<\/guid>/g);
+          const guids = [];
+          for (const match of matches) {
+            guids.push(match[1]);
+          }
+          console.info(`Read ${!guids.length} guids from s3://${!Bucket}/${!Key}`);
+
+          // break into chunks of 100
+          const allKeys = guids.map((g) => ({ guid: { S: g } }));
+          const chunkedKeys = [];
+          for (let i = 0; i < allKeys.length; i += 100) {
+            chunkedKeys.push(allKeys.slice(i, i + 100));
+          }
+
+          // scan DDB for already-seen guids
+          const found = {};
+          for (const Keys of chunkedKeys) {
+            const params = { RequestItems: { [TABLE_NAME]: { Keys } } };
+            const data = await ddb.send(new BatchGetItemCommand(params));
+            data.Responses[TABLE_NAME].forEach((r) => (found[r.guid.S] = true));
+          }
+          const newGuids = guids.filter((g) => !found[g]);
+          console.info(`Found ${!newGuids.length} new guids not in DDB`);
+
+          // scale ECS service
+          if (newGuids.length > 0) {
+            const params = { cluster: CLUSTER_NAME, services: [SERVICE_NAME] };
+            const res = await ecs.send(new DescribeServicesCommand(params));
+            const count = res.services[0].desiredCount;
+            const desiredCount = SCALE_TO[Key];
+            if (count < desiredCount) {
+              console.info(`Scaling from ${!count} to ${!desiredCount}`);
+              const updateParams = {
+                cluster: CLUSTER_NAME,
+                service: SERVICE_NAME,
+                desiredCount,
+              };
+              await ecs.send(new UpdateServiceCommand(updateParams));
+            } else {
+              console.info(`Already at ${!count}`);
+            }
+          }
+
+          // set new guids in DDB
+          for (const guid of newGuids) {
+            const params = { TableName: TABLE_NAME, Item: { guid: { S: guid } } };
+            await ddb.send(new PutItemCommand(params));
+          }
+        };
+      MemorySize: 512
+      Policies:
+        - Statement:
+            - Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+              Effect: Allow
+              Resource: !Sub ${FeedsS3BucketArn}/*
+          Version: "2012-10-17"
+        - Statement:
+            - Action:
+                - dynamodb:BatchGetItem
+                - dynamodb:DescribeTable
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+              Effect: Allow
+              Resource: !GetAtt FeedScalerDynamodbTable.Arn
+          Version: "2012-10-17"
+        - Statement:
+            - Action:
+                - ecs:DescribeServices
+                - ecs:UpdateService
+              Effect: Allow
+              Resource: !Sub arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${EcsClusterName}/${EcsService.Name}
+          Version: "2012-10-17"
+      Runtime: nodejs24.x
+      Tags:
+        prx:meta:tagging-version: "2021-04-07"
+        prx:cloudformation:stack-name: !Ref AWS::StackName
+        prx:cloudformation:stack-id: !Ref AWS::StackId
+        prx:cloudformation:root-stack-name: !Ref RootStackName
+        prx:cloudformation:root-stack-id: !Ref RootStackId
+        prx:ops:environment: !Ref EnvironmentType
+        prx:dev:family: Dovetail
+        prx:dev:application: Router
+      Timeout: 30
+  FeedScalerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${FeedScalerFunction}
+      RetentionInDays: 30
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+  FeedScalerDynamodbTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: guid
+          AttributeType: S
+      BillingMode: PAY_PER_REQUEST
+      KeySchema:
+        - AttributeName: guid
+          KeyType: HASH
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+
+  # Log metric filters
+  LogDownloadsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: '{ $.msg = "impression" }'
+      LogGroupName: !Ref TaskLogGroup
+      MetricTransformations:
+        - MetricName: !Sub Downloads${EnvironmentType}
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: "1"
+  LogImpressionsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: '{ $.msg = "impression" }'
+      LogGroupName: !Ref TaskLogGroup
+      MetricTransformations:
+        - MetricName: !Sub Impressions${EnvironmentType}
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: $.download.adCount
+  LogDepressionsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: '{ $.msg = "depression" }'
+      LogGroupName: !Ref TaskLogGroup
+      MetricTransformations:
+        - MetricName: !Sub Depressions${EnvironmentType}
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: "1"
+  LogRepressionsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: '{ $.msg = "repression" }'
+      LogGroupName: !Ref TaskLogGroup
+      MetricTransformations:
+        - MetricName: !Sub Repressions${EnvironmentType}
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: "1"
+  LogVanillasMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: '{ $.msg = "impression" && $.download.adCount = 0 }'
+      LogGroupName: !Ref TaskLogGroup
+      MetricTransformations:
+        - MetricName: !Sub Vanillas${EnvironmentType}
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: "1"
+  LogWarnsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: '{ $.level = "warn" }'
+      LogGroupName: !Ref TaskLogGroup
+      MetricTransformations:
+        - MetricName: !Sub Warns${EnvironmentType}
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: "1"
+  LogErrorsMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      FilterPattern: '{ $.level = "error" }'
+      LogGroupName: !Ref TaskLogGroup
+      MetricTransformations:
+        - MetricName: !Sub Errors${EnvironmentType}
+          MetricNamespace: !Ref kMetricFilterNamespace
+          MetricValue: "1"
+
+  # Log alarms
+  LogWarnsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub WARN [Dovetail-Router] Web server <${EnvironmentTypeAbbreviation}> LOGGING WARNINGS (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Dovetail Router's Elixir server has logged warnings,
+        which could be a missing placement, Augury timeout, read-behind, etc.
+        All requests were completed, but may have included unintended or
+        out-of-date arrangements.
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      MetricName: !Sub Warns${EnvironmentType}
+      Namespace: !Ref kMetricFilterNamespace
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:ops:cloudwatch-log-group-name, Value: !Ref TaskLogGroup }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+      Threshold: 0
+      TreatMissingData: notBreaching
+
+  LogErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ERROR [Dovetail-Router] Web server <${EnvironmentTypeAbbreviation}> LOGGING ERRORS (${RootStackName})
+      AlarmDescription: !Sub ${EnvironmentType} Dovetail Router's Elixir server logging errors
+      ComparisonOperator: GreaterThanThreshold
+      EvaluationPeriods: 1
+      MetricName: !Sub Errors${EnvironmentType}
+      Namespace: !Ref kMetricFilterNamespace
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:ops:cloudwatch-log-group-name, Value: !Ref TaskLogGroup }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+      Threshold: 1
+      TreatMissingData: notBreaching
+
+  # Subscription filter (send logged redirect data to Kinesis)
+  SubscriptionFilterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: !Sub logs.${AWS::Region}.amazonaws.com
+        Version: "2012-10-17"
+      Policies:
+        - PolicyName: DovetailRouterSubscriptionFilterPolicy
+          PolicyDocument:
+            Statement:
+              - Action:
+                  - kinesis:DescribeStream
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Effect: Allow
+                Resource: !Ref DovetailCountedKinesisStreamArn
+            Version: "2012-10-17"
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:family, Value: Dovetail }
+        - { Key: prx:dev:application, Value: Router }
+  SubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Properties:
+      DestinationArn: !Ref DovetailCountedKinesisStreamArn
+      FilterPattern: '{ $.msg = "impression" }'
+      LogGroupName: !Ref TaskLogGroup
+      RoleArn: !GetAtt SubscriptionFilterRole.Arn
+
+  RouterDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardBody: !Sub |-
+        {
+          "widgets": [
+            {
+              "height": 3,
+              "width": 12,
+              "y": 0,
+              "x": 0,
+              "type": "text",
+              "properties": {
+                "markdown": "# Dovetail Router\n## **${EnvironmentType}**\n"
+              }
+            },
+            {
+              "height": 6,
+              "width": 12,
+              "y": 3,
+              "x": 0,
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "HTTPCode_Target_3XX_Count", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "label": "3XX Redirects" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": true,
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 300,
+                "title": "HTTP Redirects"
+              }
+            },
+            {
+              "height": 6,
+              "width": 12,
+              "y": 0,
+              "x": 12,
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "RequestCount", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "label": "Target Group" } ],
+                  [ "AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "label": "Load Balancer" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 60,
+                "title": "Requests"
+              }
+            },
+            {
+              "height": 6,
+              "width": 12,
+              "y": 6,
+              "x": 12,
+              "type": "metric",
+              "properties": {
+                "metrics": [
+
+                  [ "AWS/ApplicationELB", "HTTPCode_Target_4XX_Count", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "label": "Target 4XX Errors", "id": "tg4XX", "visible": false } ],
+                  [ "AWS/ApplicationELB", "HTTPCode_ELB_4XX_Count", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "label": "ALB 4XX Errors", "id": "alb4XX", "visible": false } ],
+                  [ { "expression": "SUM([tg4XX, alb4XX])", "label": "4XX Errors", "color": "#bcbd22", "id": "sum4XX", "region": "${AWS::Region}" } ],
+
+                  [ "AWS/ApplicationELB", "HTTPCode_Target_5XX_Count", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "label": "Target 5XX Errors", "id": "tg5XX", "visible": false } ],
+                  [ "AWS/ApplicationELB", "HTTPCode_ELB_5XX_Count", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "label": "ALB 5XX Errors", "id": "alb5XX", "visible": false } ],
+                  [ { "expression": "SUM([tg5XX, alb5XX])", "label": "5XX Errors", "color": "#d62728", "id": "sum5XX", "region": "${AWS::Region}" } ],
+
+                  [ "${kMetricFilterNamespace}", "Errors${EnvironmentType}", { "label": "Logged Errors", "color": "#940026" } ],
+                  [ "${kMetricFilterNamespace}", "Warns${EnvironmentType}", { "label": "Logged Warnings", "color": "#ff7f0e" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": true,
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 300,
+                "title": "Errors"
+              }
+            },
+            {
+              "height": 6,
+              "width": 12,
+              "y": 9,
+              "x": 0,
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "TargetResponseTime", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "color": "#006400", "label": "Average", "stat": "Average" } ],
+                  [ "AWS/ApplicationELB", "TargetResponseTime", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "color": "#2ca02c", "label": "p90", "stat": "p90" } ],
+                  [ "AWS/ApplicationELB", "TargetResponseTime", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "color": "#98df8a", "label": "p95", "stat": "p95" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "p95",
+                "period": 300,
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                },
+                "title": "Response Times"
+              }
+            },
+            {
+              "height": 6,
+              "width": 12,
+              "y": 12,
+              "x": 12,
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "TargetResponseTime", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "color": "#ff9896", "label": "p99", "stat": "p99" } ],
+                  [ "AWS/ApplicationELB", "TargetResponseTime", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "color": "#d62728", "label": "Maximum", "stat": "Maximum" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Maximum",
+                "period": 300,
+                "yAxis": {
+                  "left": {
+                    "min": 0
+                  }
+                },
+                "title": "Slowest Responses"
+              }
+            },
+            {
+              "height": 6,
+              "width": 12,
+              "y": 15,
+              "x": 0,
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  [ "${kMetricFilterNamespace}", "Downloads${EnvironmentType}", { "label": "Downloads", "color": "#1f77b4" } ],
+                  [ "${kMetricFilterNamespace}", "Repressions${EnvironmentType}", { "label": "Repressions (digest-cache)", "color": "#ff7f0e" } ],
+                  [ "${kMetricFilterNamespace}", "Depressions${EnvironmentType}", { "label": "Depressions (non-listeners)", "color": "#2ca02c" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": true,
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 300,
+                "title": "Downloads",
+                "yAxis": {
+                  "left": {
+                    "showUnits": false
+                  }
+                }
+              }
+            },
+            {
+              "height": 6,
+              "width": 12,
+              "y": 18,
+              "x": 12,
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  [ "${kMetricFilterNamespace}", "Impressions${EnvironmentType}", { "label": "Impressions", "color": "#1f77b4" } ],
+                  [ "${kMetricFilterNamespace}", "Vanillas${EnvironmentType}", { "label": "Vanillas", "color": "#d62728" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": true,
+                "region": "${AWS::Region}",
+                "stat": "Sum",
+                "period": 300,
+                "title": "Impressions",
+                "yAxis": {
+                  "left": {
+                    "showUnits": false
+                  }
+                }
+              }
+            },
+            {
+              "height": 6,
+              "width": 12,
+              "y": 21,
+              "x": 0,
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApplicationELB", "RequestCountPerTarget", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "label": "Requests/Target", "stat": "Sum" } ],
+                  [ "AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "label": "Healthy hosts", "yAxis": "right", "color": "#2ca02c" } ],
+                  [ "AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", "${TargetGroup.TargetGroupFullName}", "LoadBalancer", "${Alb.LoadBalancerFullName}", { "label": "Unhealthy hosts", "yAxis": "right", "color": "#d62728" } ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "stat": "Average",
+                "period": 60,
+                "title": "Autoscaling",
+                "yAxis": {
+                  "left": {
+                    "showUnits": false,
+                    "label": ""
+                  },
+                  "right": {
+                    "showUnits": false
+                  }
+                },
+                "annotations": {
+                  "horizontal": [
+                    {
+                      "label": "TargetValue",
+                      "value": ${kScalingPolicyTargetValue}
+                    }
+                  ]
+                }
+              }
+            },
+            {
+              "height": 6,
+              "width": 24,
+              "y": 27,
+              "x": 0,
+              "type": "log",
+              "properties": {
+                "query": "SOURCE '${TaskLogGroup}' | fields @timestamp, msg | filter level = \"error\" | sort @timestamp desc | limit 40",
+                "region": "${AWS::Region}",
+                "stacked": false,
+                "title": "Logged Errors",
+                "view": "table"
+              }
+            }
+          ]
+        }
+      DashboardName: !Sub ${RootStackName}-${AWS::Region}-Dovetail-Router
+
+Outputs:
+  AlbArn:
+    Description: The Amazon Resource Name (ARN) of the load balancer
+    Value: !Ref Alb
+  AlbName:
+    Description: >-
+      The full name of the load balancer. For example, my-load-balancer
+    Value: !GetAtt Alb.LoadBalancerName
+  AlbFullName:
+    Description: >-
+      The full name of the load balancer. For example, my-load-balancer
+    Value: !GetAtt Alb.LoadBalancerFullName
+  TargetGroupFullName:
+    Value: !GetAtt TargetGroup.TargetGroupFullName

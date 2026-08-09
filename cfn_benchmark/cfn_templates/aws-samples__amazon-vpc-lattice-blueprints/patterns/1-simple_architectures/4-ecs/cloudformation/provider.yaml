@@ -1,0 +1,498 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: 2010-09-09
+Description: Provider VPC, ECS Fargate Cluster, and VPC Lattice service
+Transform: 'AWS::LanguageExtensions'
+
+Parameters:
+  ServiceNetworkId:
+    Type: String
+    Description: VPC Lattice service network ID.
+  ECRRepositoryUri:
+    Type: String
+    Description: ECR Repository URI for the container image.
+  ECSCpuArchitecture:
+    Type: String
+    Description: CPU architecture for ECS tasks (ARM64 or X86_64).
+    AllowedValues:
+      - ARM64
+      - X86_64
+    Default: X86_64
+
+Mappings:
+  SubnetToIndex:
+    Workloada:
+      Index: 0
+    Workloadb:
+      Index: 1
+    Endpointsa:
+      Index: 2
+    Endpointsb:
+      Index: 3
+
+Resources:
+  # ---------- VPC ----------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Join
+            - '-'
+            - - provider-vpc
+              - !Ref AWS::StackName
+
+  Ipv6Cidr:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      AmazonProvidedIpv6CidrBlock: true
+      VpcId: !Ref VPC
+
+  # For::Each iteration: per subnet type (Workload, Endpoints) and AZ (2 AZs)
+  # Resources to create: 4 subnets, 4 route tables, 4 route table associations - obtaining AZ affinity
+  'Fn::ForEach::SubnetTypes':
+    - SubnetType
+    - [Workload, Endpoints]
+    - '${SubnetType}':
+      'Fn::ForEach::AZ':
+        - AvailabilityZone
+        - [a, b]
+          # Subnets
+        - '${SubnetType}Subnet${AvailabilityZone}':
+            DependsOn:
+              - Ipv6Cidr
+            Type: AWS::EC2::Subnet
+            Properties:
+              VpcId: !Ref VPC
+              AvailabilityZone: !Sub ${AWS::Region}${AvailabilityZone}
+              CidrBlock: !Select
+                - !FindInMap [SubnetToIndex, !Sub "${SubnetType}${AvailabilityZone}", Index]
+                - !Cidr
+                  - !GetAtt VPC.CidrBlock
+                  - 256
+                  - 8
+              Ipv6CidrBlock: !Select
+                - !FindInMap [SubnetToIndex, !Sub "${SubnetType}${AvailabilityZone}", Index]
+                - !Cidr
+                  - !Select [0, !GetAtt VPC.Ipv6CidrBlocks]
+                  - 256
+                  - 64
+              AssignIpv6AddressOnCreation: true
+              Tags:
+                - Key: Name
+                  Value: !Join
+                    - '-'
+                    - - !Sub provider-subnet-${SubnetType}-AZ${AvailabilityZone}
+                      - !Ref AWS::StackName
+          # Route Tables
+          '${SubnetType}RouteTable${AvailabilityZone}':
+            Type: AWS::EC2::RouteTable
+            Properties:
+              VpcId: !Ref VPC
+              Tags:
+                - Key: Name
+                  Value: !Join
+                    - '-'
+                    - - !Sub provider-rt-${SubnetType}-AZ${AvailabilityZone}
+                      - !Ref AWS::StackName
+          # Route Table associations
+          '${SubnetType}RouteTableAssociation${AvailabilityZone}':
+            Type: AWS::EC2::SubnetRouteTableAssociation
+            Properties:
+              RouteTableId: !Ref
+                'Fn::Sub': '${SubnetType}RouteTable${AvailabilityZone}'
+              SubnetId: !Ref
+                'Fn::Sub': '${SubnetType}Subnet${AvailabilityZone}'
+
+  # ---------- VPC LATTICE SERVICE ----------
+  VpcLatticeService:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Sub service-${AWS::StackName}
+      AuthType: AWS_IAM
+
+  # Open (allow-all) auth policy.
+  VpcLatticeServiceAuthPolicy:
+    Type: AWS::VpcLattice::AuthPolicy
+    Properties:
+      ResourceIdentifier: !Ref VpcLatticeService
+      Policy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: "*"
+            Principal: "*"
+            Resource: "*"
+
+  VpcLatticeServiceNetworkAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceIdentifier: !Ref VpcLatticeService
+      ServiceNetworkIdentifier: !Ref ServiceNetworkId
+
+  VpcLatticeServiceHTTPSListener:
+    Type: AWS::VpcLattice::Listener
+    Properties:
+      Name: https-listener
+      ServiceIdentifier: !Ref VpcLatticeService
+      Port: 443
+      Protocol: HTTPS
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref VpcLatticeTargetGroup
+              Weight: 100
+
+  # ---------- VPC LATTICE TARGET GROUP ----------
+  VpcLatticeTargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: ecs-target-group
+      Type: IP
+      Config:
+        IpAddressType: IPV4
+        Port: 80
+        Protocol: HTTP
+        ProtocolVersion: HTTP1
+        VpcIdentifier: !Ref VPC
+        HealthCheck:
+          Enabled: true
+          Protocol: HTTP
+          Path: /
+          HealthCheckIntervalSeconds: 30
+          HealthCheckTimeoutSeconds: 5
+          HealthyThresholdCount: 2
+          UnhealthyThresholdCount: 2
+
+  # ---------- VPC ENDPOINTS ----------
+  # S3 Gateway Endpoint
+  S3GatewayEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.s3
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref WorkloadRouteTablea
+        - !Ref WorkloadRouteTableb
+
+  # ECR API Endpoint
+  ECRApiEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.api
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref EndpointsSubneta
+        - !Ref EndpointsSubnetb
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  # ECR DKR Endpoint
+  ECRDkrEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ecr.dkr
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref EndpointsSubneta
+        - !Ref EndpointsSubnetb
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  # CloudWatch Logs Endpoint
+  LogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.logs
+      VpcEndpointType: Interface
+      PrivateDnsEnabled: true
+      SubnetIds:
+        - !Ref EndpointsSubneta
+        - !Ref EndpointsSubnetb
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+
+  # ---------- ECS CLUSTER ----------
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub provider-cluster-${AWS::StackName}
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # ---------- ECS TASK DEFINITION ----------
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub provider-task-definition-${AWS::StackName}
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: !Ref ECSCpuArchitecture
+      ContainerDefinitions:
+        - Name: ecsapplication
+          Image: !Sub ${ECRRepositoryUri}:latest
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+              Name: ecsapplication
+
+  # ---------- ECS SERVICE ----------
+  ECSService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub provider-ecs-service-${AWS::StackName}
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref ECSTaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref WorkloadSubneta
+            - !Ref WorkloadSubnetb
+          SecurityGroups:
+            - !Ref ECSTaskSecurityGroup
+          AssignPublicIp: DISABLED
+      VpcLatticeConfigurations:
+        - RoleArn: !GetAtt ECSInfrastructureRole.Arn
+          TargetGroupArn: !Ref VpcLatticeTargetGroup
+          PortName: ecsapplication
+
+  # ---------- SECURITY GROUPS ----------
+  # Security Group for ECS Tasks
+  ECSTaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for ECS Tasks
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub provider-vpc-ecs-tasks-security-group-${AWS::StackName}
+
+  ECSTaskSecurityGroupIngressHTTPIPv4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      Description: Allowing HTTP from VPC Lattice (IPv4)
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourcePrefixListId: !GetAtt VpcLatticePrefixListIpv4.PrefixListId
+
+  ECSTaskSecurityGroupIngressHTTPIPv6:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      Description: Allowing HTTP from VPC Lattice (IPv6)
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourcePrefixListId: !GetAtt VpcLatticePrefixListIpv6.PrefixListId
+
+  ECSTaskSecurityGroupIngressHTTPSIPv4:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      Description: Allowing HTTPS from VPC Lattice (IPv4)
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourcePrefixListId: !GetAtt VpcLatticePrefixListIpv4.PrefixListId
+
+  ECSTaskSecurityGroupIngressHTTPSIPv6:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      Description: Allowing HTTPS from VPC Lattice (IPv6)
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourcePrefixListId: !GetAtt VpcLatticePrefixListIpv6.PrefixListId
+
+  ECSTaskSecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      Description: Allowing all egress (IPv4)
+      IpProtocol: -1
+      CidrIp: 0.0.0.0/0
+
+  ECSTaskSecurityGroupEgressIPv6:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ECSTaskSecurityGroup
+      Description: Allowing all egress (IPv6)
+      IpProtocol: -1
+      CidrIpv6: ::/0
+
+  # Security Group for VPC Endpoints
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for VPC Endpoints
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub provider-vpc-endpoints-security-group-${AWS::StackName}
+
+  VpcEndpointSecurityGroupIngressHTTPS:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref VpcEndpointSecurityGroup
+      Description: Allowing HTTPS from ECS tasks
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref ECSTaskSecurityGroup
+
+  VpcEndpointSecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref VpcEndpointSecurityGroup
+      Description: Allowing all egress
+      IpProtocol: -1
+      CidrIp: 0.0.0.0/0
+
+  # ---------- IAM ROLES ----------
+  # ECS Task Execution Role
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub provider-task-execution-role-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # ECS Task Role
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub provider-task-role-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonECSInfrastructureRolePolicyForVpcLattice
+
+  # ECS Infrastructure Role
+  ECSInfrastructureRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub provider-infrastructure-role-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonECSInfrastructureRolePolicyForVpcLattice
+
+  # ---------- CUSTOM RESOURCE: OBTAIN PREFIX LIST ID FROM NAME ----------
+  # VPC Lattice IPv4
+  VpcLatticePrefixListIpv4:
+    Type: Custom::PrefixListLookup
+    Properties:
+      ServiceToken: !GetAtt PrefixListLookupFunction.Arn
+      PrefixListName: !Sub "com.amazonaws.${AWS::Region}.vpc-lattice"
+
+  # VPC Lattice IPv6
+  VpcLatticePrefixListIpv6:
+    Type: Custom::PrefixListLookup
+    Properties:
+      ServiceToken: !GetAtt PrefixListLookupFunction.Arn
+      PrefixListName: !Sub "com.amazonaws.${AWS::Region}.ipv6.vpc-lattice"
+
+  # AWS Lambda function
+  PrefixListLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: index.handler
+      Role: !GetAtt PrefixListLookupRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+            if event['RequestType'] in ['Create', 'Update']:
+              try:
+                ec2 = boto3.client('ec2')
+                prefix_list_name = event['ResourceProperties']['PrefixListName']
+
+                # Get all managed prefix lists
+                response = ec2.describe_managed_prefix_lists(
+                  Filters=[{'Name': 'prefix-list-name', 'Values': [prefix_list_name]}]
+                )
+
+                if response['PrefixLists']:
+                  prefix_list_id = response['PrefixLists'][0]['PrefixListId']
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                  {'PrefixListId': prefix_list_id})
+                else:
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                  {'Error': f'Prefix list {prefix_list_name} not found'})
+              except Exception as e:
+                cfnresponse.send(event, context, cfnresponse.FAILED,
+                                {'Error': str(e)})
+            else:  # Delete
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  # IAM role for the Lambda function
+  PrefixListLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2PrefixListAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeManagedPrefixLists
+                Resource: '*'
+
+Outputs:
+  VpcLatticeServiceDomainName:
+    Description: VPC Lattice service domain name
+    Value: !GetAtt VpcLatticeService.DnsEntry.DomainName

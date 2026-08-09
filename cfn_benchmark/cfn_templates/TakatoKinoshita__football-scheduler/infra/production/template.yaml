@@ -1,0 +1,570 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  地域サッカー大会スケジューラーのMVP本番計算API。静的画面と同一origin proxyは
+  Cloudflare Pagesで配信する。作成前に
+  docs/operations/production-runbook.mdの事前確認と明示承認を必要とする。
+
+Parameters:
+  SolverImageUri:
+    Type: String
+    Description: digestで固定した本番solver container image URI
+    AllowedPattern: ".+@sha256:[0-9a-f]{64}$"
+  ReleaseId:
+    Type: String
+    Description: 静的assetとLambdaを対応付ける一意なrelease ID
+    AllowedPattern: "[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+  OriginVerifyValue:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    Description: Cloudflare Pages FunctionがAPIへ付与する推測困難な値
+  TurnstileSecretKey:
+    Type: String
+    NoEcho: true
+    MinLength: 20
+    Description: Cloudflare Turnstile Siteverify用secret
+  TurnstileExpectedHostname:
+    Type: String
+    AllowedPattern: "[A-Za-z0-9][A-Za-z0-9.-]{0,251}[A-Za-z0-9]|[A-Za-z0-9]"
+    Description: Turnstile検証で許可する本番フロントエンドhostname
+  PublicUsageApiKeyValue:
+    Type: String
+    NoEcho: true
+    MinLength: 20
+    Description: Pages Functionだけに保存する使用量計測用API key
+  EnableBudgetNotifications:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+  BudgetNotificationEmail:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: AWS BudgetsとCloudWatch alarmの通知先
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 2.84
+    MinValue: 1
+    MaxValue: 10
+
+Rules:
+  RequireBudgetEmailWhenEnabled:
+    RuleCondition: !Equals [!Ref EnableBudgetNotifications, "true"]
+    Assertions:
+      - Assert: !Not [!Equals [!Ref BudgetNotificationEmail, ""]]
+        AssertDescription: 予算通知を有効にする場合は通知先メールアドレスが必要です。
+
+Conditions:
+  BudgetNotificationsEnabled: !Equals [!Ref EnableBudgetNotifications, "true"]
+
+Globals:
+  Function:
+    Architectures: [x86_64]
+    Tracing: Active
+    Tags:
+      Project: football-scheduler
+      Environment: production
+      ReleaseId: !Ref ReleaseId
+
+Resources:
+  ApiAuthorizerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-authorizer-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AWSXrayWriteOnlyAccess"
+      Tags:
+        - Key: Project
+          Value: football-scheduler
+        - Key: Environment
+          Value: production
+        - Key: ReleaseId
+          Value: !Ref ReleaseId
+
+  ApiAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-authorizer"
+      Role: !GetAtt ApiAuthorizerFunctionRole.Arn
+      Runtime: python3.14
+      CodeUri: ../../src
+      Handler: football_scheduler.authorizer.lambda_handler
+      MemorySize: 128
+      Timeout: 5
+      ReservedConcurrentExecutions: 3
+      Environment:
+        Variables:
+          ORIGIN_VERIFY_VALUE: !Ref OriginVerifyValue
+          TURNSTILE_SECRET_KEY: !Ref TurnstileSecretKey
+          TURNSTILE_EXPECTED_HOSTNAME: !Ref TurnstileExpectedHostname
+
+  ApiAuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ApiAuthorizerFunction}"
+      RetentionInDays: 14
+
+  AuthorizerDeniedMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName: !Ref ApiAuthorizerLogGroup
+      FilterPattern: '{ $.event = "authorization" && $.result = "deny" }'
+      MetricTransformations:
+        - MetricNamespace: FootballScheduler
+          MetricName: AuthorizationDenied
+          MetricValue: "1"
+          Unit: Count
+
+  SolverFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-solver-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AWSXrayWriteOnlyAccess"
+      Tags:
+        - Key: Project
+          Value: football-scheduler
+        - Key: Environment
+          Value: production
+        - Key: ReleaseId
+          Value: !Ref ReleaseId
+
+  SolverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-solver"
+      Role: !GetAtt SolverFunctionRole.Arn
+      PackageType: Image
+      ImageUri: !Ref SolverImageUri
+      ImageConfig:
+        Command: [football_scheduler.api_handler.lambda_handler]
+      MemorySize: 2048
+      Timeout: 28
+      ReservedConcurrentExecutions: 3
+      AutoPublishAlias: live
+      Environment:
+        Variables:
+          SOLVER_MAX_TIME_SECONDS: "20"
+          RELEASE_ID: !Ref ReleaseId
+
+  SolverLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${SolverFunction}"
+      RetentionInDays: 14
+
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-apigateway-cloudwatch-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WriteApiExecutionLogs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: football-scheduler
+        - Key: Environment
+          Value: production
+        - Key: ReleaseId
+          Value: !Ref ReleaseId
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}"
+      RetentionInDays: 14
+
+  ProductionApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${AWS::StackName}-api"
+      Description: 大会データを保存しない同期日程生成API
+      DisableExecuteApiEndpoint: false
+      ApiKeySourceType: HEADER
+      EndpointConfiguration:
+        Types: [REGIONAL]
+      MinimumCompressionSize: 1024
+      Body:
+        swagger: "2.0"
+        info:
+          version: "0.1.0"
+          title: football-scheduler-production-api
+        schemes: [https]
+        x-amazon-apigateway-gateway-responses:
+          UNAUTHORIZED:
+            statusCode: 401
+            responseParameters:
+              gatewayresponse.header.Cache-Control: "'no-store'"
+              gatewayresponse.header.Content-Type: "'application/json; charset=utf-8'"
+            responseTemplates:
+              application/json: >-
+                {"status":"error","diagnostics":[{"code":"BOT_CHECK_REQUIRED","message":"安全確認を完了してから日程を生成してください。"}]}
+          ACCESS_DENIED:
+            statusCode: 403
+            responseParameters:
+              gatewayresponse.header.Cache-Control: "'no-store'"
+              gatewayresponse.header.Content-Type: "'application/json; charset=utf-8'"
+            responseTemplates:
+              application/json: >-
+                {"status":"error","diagnostics":[{"code":"BOT_CHECK_REJECTED","message":"安全確認を完了できませんでした。画面を更新してもう一度お試しください。"}]}
+          INVALID_API_KEY:
+            statusCode: 403
+            responseParameters:
+              gatewayresponse.header.Cache-Control: "'no-store'"
+              gatewayresponse.header.Content-Type: "'application/json; charset=utf-8'"
+            responseTemplates:
+              application/json: >-
+                {"status":"error","diagnostics":[{"code":"SERVICE_CONFIGURATION_ERROR","message":"現在、日程生成サービスを利用できません。時間をおいて再度お試しください。"}]}
+          QUOTA_EXCEEDED:
+            statusCode: 429
+            responseParameters:
+              gatewayresponse.header.Cache-Control: "'no-store'"
+              gatewayresponse.header.Content-Type: "'application/json; charset=utf-8'"
+              gatewayresponse.header.Retry-After: "'3600'"
+            responseTemplates:
+              application/json: >-
+                {"status":"error","diagnostics":[{"code":"MONTHLY_QUOTA_EXCEEDED","message":"今月の日程生成回数が上限に達しました。保存済みの日程は引き続き確認できます。"}]}
+          THROTTLED:
+            statusCode: 429
+            responseParameters:
+              gatewayresponse.header.Cache-Control: "'no-store'"
+              gatewayresponse.header.Content-Type: "'application/json; charset=utf-8'"
+              gatewayresponse.header.Retry-After: "'10'"
+            responseTemplates:
+              application/json: >-
+                {"status":"error","diagnostics":[{"code":"TOO_MANY_REQUESTS","message":"日程生成が混み合っています。少し待ってからもう一度お試しください。"}]}
+          INTEGRATION_TIMEOUT:
+            statusCode: 504
+            responseParameters:
+              gatewayresponse.header.Cache-Control: "'no-store'"
+              gatewayresponse.header.Content-Type: "'application/json; charset=utf-8'"
+            responseTemplates:
+              application/json: >-
+                {"status":"error","diagnostics":[{"code":"GENERATION_TIMEOUT","message":"30秒以内に日程を生成できませんでした。入力は保存されています。時間をおいて再度お試しください。"}]}
+        paths:
+          /api/v1/schedules:generate:
+            post:
+              consumes: [application/json]
+              produces: [application/json]
+              security:
+                - usage_key: []
+                  turnstile_authorizer: []
+              responses:
+                "200": {description: 日程生成結果}
+                "400": {description: 入力不正}
+                "413": {description: 入力または応答の上限超過}
+                "422": {description: 制約を満たす日程を生成不能}
+                "429": {description: 使用量または同時実行上限超過}
+                "500": {description: サーバー内部エラー}
+                "504": {description: 探索時間超過}
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                timeoutInMillis: 29000
+                uri: !Sub
+                  - "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AliasArn}/invocations"
+                  - AliasArn: !Ref SolverFunction.Alias
+        securityDefinitions:
+          usage_key:
+            type: apiKey
+            name: X-Api-Key
+            in: header
+          turnstile_authorizer:
+            type: apiKey
+            name: UnusedAuthorizerSchemaHeader
+            in: header
+            x-amazon-apigateway-authtype: custom
+            x-amazon-apigateway-authorizer:
+              type: request
+              authorizerResultTtlInSeconds: 0
+              identitySource: >-
+                method.request.header.X-Origin-Verify,method.request.header.Origin,method.request.header.X-Turnstile-Token,method.request.header.X-Turnstile-Action
+              authorizerUri: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiAuthorizerFunction.Arn}/invocations"
+
+  SolverInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref SolverFunction.Alias
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ProductionApi}/*/POST/api/v1/*"
+
+  AuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ApiAuthorizerFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ProductionApi}/authorizers/*"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SolverInvokePermission
+      - AuthorizerInvokePermission
+    Properties:
+      RestApiId: !Ref ProductionApi
+      Description: !Sub "release ${ReleaseId}"
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: ApiGatewayAccount
+    Properties:
+      RestApiId: !Ref ProductionApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","path":"$context.resourcePath","status":"$context.status","responseLatency":"$context.responseLatency","integrationLatency":"$context.integrationLatency","errorType":"$context.error.responseType"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          LoggingLevel: ERROR
+          DataTraceEnabled: false
+          MetricsEnabled: true
+          ThrottlingRateLimit: 0.2
+          ThrottlingBurstLimit: 3
+      Tags:
+        - Key: Project
+          Value: football-scheduler
+        - Key: ReleaseId
+          Value: !Ref ReleaseId
+
+  PublicUsageApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: ApiStage
+    Properties:
+      Name: !Sub "${AWS::StackName}-public-metering-key"
+      Description: Pages Functionからの全利用量を計測する。利用者認証には使用しない
+      Enabled: true
+      Value: !Ref PublicUsageApiKeyValue
+
+  PublicUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    Properties:
+      UsagePlanName: !Sub "${AWS::StackName}-monthly-quota"
+      Description: 全利用者合計のbest-effort月間生成上限
+      ApiStages:
+        - ApiId: !Ref ProductionApi
+          Stage: !Ref ApiStage
+          Throttle:
+            "/api/v1/schedules:generate/POST":
+              RateLimit: 0.2
+              BurstLimit: 3
+      Quota:
+        Limit: 3000
+        Period: MONTH
+      Throttle:
+        RateLimit: 0.2
+        BurstLimit: 3
+
+  PublicUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref PublicUsageApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref PublicUsagePlan
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Condition: BudgetNotificationsEnabled
+    Properties:
+      DisplayName: football-scheduler-production-alerts
+      Subscription:
+        - Endpoint: !Ref BudgetNotificationEmail
+          Protocol: email
+
+  SolverErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: BudgetNotificationsEnabled
+    Properties:
+      AlarmDescription: solver Lambdaでエラーが発生した
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SolverFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  SolverDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: BudgetNotificationsEnabled
+    Properties:
+      AlarmDescription: solver Lambdaの処理が25秒を超えた
+      Namespace: AWS/Lambda
+      MetricName: Duration
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SolverFunction
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 25000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  SolverThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: BudgetNotificationsEnabled
+    Properties:
+      AlarmDescription: solver Lambdaが同時実行上限に達した
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref SolverFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  AuthorizerDeniedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: BudgetNotificationsEnabled
+    Properties:
+      AlarmDescription: 5分間に20件以上のauthorizer拒否が発生した
+      Namespace: FootballScheduler
+      MetricName: AuthorizationDenied
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 20
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  ApiServerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: BudgetNotificationsEnabled
+    Properties:
+      AlarmDescription: API Gatewayで5xx応答が発生した
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiName
+          Value: !Sub "${AWS::StackName}-api"
+        - Name: Stage
+          Value: !Ref ApiStage
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      DatapointsToAlarm: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmTopic]
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Condition: BudgetNotificationsEnabled
+    Properties:
+      Budget:
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+        BudgetName: !Sub "${AWS::StackName}-monthly"
+        BudgetType: COST
+        TimeUnit: MONTHLY
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: FORECASTED
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref BudgetNotificationEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref BudgetNotificationEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref BudgetNotificationEmail
+              SubscriptionType: EMAIL
+
+Outputs:
+  ApiBaseUrl:
+    Description: Cloudflare Pages FunctionのAWS_API_ORIGINへ設定する値
+    Value: !Sub "https://${ProductionApi}.execute-api.${AWS::Region}.amazonaws.com/${ApiStage}/"
+  ApiId:
+    Value: !Ref ProductionApi
+  ApiStageName:
+    Value: !Ref ApiStage
+  SolverFunctionName:
+    Value: !Ref SolverFunction
+  SolverAliasArn:
+    Value: !Ref SolverFunction.Alias
+  ReleaseId:
+    Value: !Ref ReleaseId

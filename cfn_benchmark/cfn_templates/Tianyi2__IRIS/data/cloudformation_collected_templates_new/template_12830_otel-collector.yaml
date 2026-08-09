@@ -1,0 +1,546 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'OpenTelemetry Collector on ECS Fargate for Claude Code metrics - supports both VPC creation and existing VPC'
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: VPC ID where the collector will be deployed
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: Subnet IDs for the collector (at least 2 for ALB)
+
+  CollectorImage:
+    Type: String
+    Default: public.ecr.aws/aws-observability/aws-otel-collector:latest
+    Description: ADOT Collector container image
+
+  MetricsNamespace:
+    Type: String
+    Default: ClaudeCode
+    Description: CloudWatch metrics namespace
+
+  CustomDomainName:
+    Type: String
+    Default: ''
+    Description: Optional custom domain name for HTTPS (e.g., telemetry.company.com) - if provided, HTTPS will be enabled automatically
+
+  HostedZoneId:
+    Type: String
+    Default: ''
+    Description: Route53 hosted zone ID for custom domain (required if CustomDomainName is provided)
+
+Conditions:
+  HasCustomDomain: !Not [!Equals [!Ref CustomDomainName, '']]
+
+# Rules section removed - validation handled by deployment script
+
+Resources:
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: claude-code-otel-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+
+  # CloudWatch Log Groups
+  CollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/otel-collector
+      RetentionInDays: 7
+
+  MetricsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/claude-code/metrics
+      RetentionInDays: 30
+      Tags:
+        - Key: Purpose
+          Value: Claude Code Usage Metrics
+        - Key: Stack
+          Value: !Ref AWS::StackName
+
+  # Security Groups
+  # Security Groups
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for OTEL Collector ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access from anywhere
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access (redirects to HTTPS)
+      Tags:
+        - Key: Name
+          Value: otel-collector-alb-sg
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for OTEL Collector tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 4317
+          ToPort: 4318
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: OTLP ports from ALB
+      Tags:
+        - Key: Name
+          Value: otel-collector-task-sg
+
+  # ACM Certificate (created automatically when domain is provided)
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: HasCustomDomain
+    Properties:
+      DomainName: !Ref CustomDomainName
+      DomainValidationOptions:
+        - DomainName: !Ref CustomDomainName
+          HostedZoneId: !Ref HostedZoneId
+      ValidationMethod: DNS
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-certificate'
+
+  # Route53 Record for custom domain
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasCustomDomain
+    DependsOn: Certificate
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref CustomDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
+
+  # Application Load Balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !If
+        - HasCustomDomain
+        - otel-collector-https-alb
+        - otel-collector-alb
+      Type: application
+      IpAddressType: ipv4
+      Scheme: internet-facing
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: otel-collector-alb
+        - Key: Purpose
+          Value: HTTPS-enabled OTEL collector for Claude Code
+
+  # Target Group
+  HTTPTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-tg'
+      Port: 4318
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckEnabled: true
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200,404'
+
+  # Listeners
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: !If
+            - HasCustomDomain
+            - redirect
+            - forward
+          RedirectConfig: !If
+            - HasCustomDomain
+            - Protocol: HTTPS
+              Port: '443'
+              StatusCode: HTTP_301
+            - !Ref AWS::NoValue
+          TargetGroupArn: !If
+            - HasCustomDomain
+            - !Ref AWS::NoValue
+            - !Ref HTTPTargetGroup
+
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCustomDomain
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref Certificate
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref HTTPTargetGroup
+      SslPolicy: ELBSecurityPolicy-TLS-1-2-2017-01
+
+  # IAM Roles
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt CollectorLogGroup.Arn
+                  - !Sub '${CollectorLogGroup.Arn}:*'
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/claude-code-otel-config'
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+          # Remove overly permissive trust policy that allowed any AWS account
+      Policies:
+        - PolicyName: CloudWatchMetrics
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/claude-code/metrics'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/claude-code/metrics:*'
+        # We keep the CloudWatch permissions but remove the AssumeRole permission
+        # that was related to the overly permissive trust policy
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/claude-code-otel-config'
+
+  # SSM Parameter for Configuration
+  OTelConfig:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: claude-code-otel-config
+      Type: String
+      Tier: Advanced
+      Description: Custom OpenTelemetry configuration for Claude Code
+      Value: !Sub |
+        extensions:
+          health_check:
+            endpoint: 0.0.0.0:13133
+            path: /
+
+        receivers:
+          otlp:
+            protocols:
+              grpc:
+                endpoint: 0.0.0.0:4317
+                include_metadata: true
+              http:
+                endpoint: 0.0.0.0:4318
+                include_metadata: true
+
+        processors:
+          batch/metrics:
+            timeout: 60s
+          # Extract HTTP headers to resource attributes
+          # Note: Headers are normalized to lowercase in metadata
+          attributes:
+            actions:
+              # Extract user information from headers
+              - key: user.email
+                from_context: metadata.x-user-email
+                action: upsert
+              - key: user.id
+                from_context: metadata.x-user-id
+                action: upsert
+              - key: user.name
+                from_context: metadata.x-user-name
+                action: upsert
+              # Extract team/organization information
+              - key: department
+                from_context: metadata.x-department
+                action: upsert
+              - key: team.id
+                from_context: metadata.x-team-id
+                action: upsert
+              - key: cost_center
+                from_context: metadata.x-cost-center
+                action: upsert
+              - key: organization
+                from_context: metadata.x-organization
+                action: upsert
+              - key: location
+                from_context: metadata.x-location
+                action: upsert
+              - key: role
+                from_context: metadata.x-role
+                action: upsert
+              - key: manager
+                from_context: metadata.x-manager
+                action: upsert
+          # Add AWS account ID to all metrics
+          resource:
+            attributes:
+              - key: aws.account_id
+                value: "${AWS::AccountId}"
+                action: insert
+              - key: deployment.environment
+                value: "production"
+                action: insert
+
+        exporters:
+          awsemf:
+            namespace: ${MetricsNamespace}
+            log_group_name: /aws/claude-code/metrics
+            dimension_rollup_option: "ZeroAndSingleDimensionRollup"
+            region: ${AWS::Region}
+            output_destination: cloudwatch
+            log_retention: 7
+            resource_to_telemetry_conversion:
+              enabled: true
+            metric_declarations:
+              # Overall metrics
+              - dimensions: [[OTelLib]]
+                metric_name_selectors: [".*"]
+
+              # Department and team aggregates
+              - dimensions: [[department, OTelLib]]
+                metric_name_selectors: [".*"]
+              - dimensions: [[team.id, OTelLib]]
+                metric_name_selectors: [".*"]
+              - dimensions: [[organization, OTelLib]]
+                metric_name_selectors: [".*"]
+
+              # Model usage tracking
+              - dimensions: [[model, OTelLib]]
+                metric_name_selectors: [".*"]
+
+              # Cost center tracking
+              - dimensions: [[cost_center, OTelLib]]
+                metric_name_selectors: ["claude_code.cost.usage", "claude_code.token.usage"]
+
+              # Token and line types
+              - dimensions: [[type, OTelLib]]
+                metric_name_selectors: ["claude_code.token.usage", "claude_code.lines_of_code.count"]
+
+              # Tool and language usage
+              - dimensions: [[tool_name, OTelLib]]
+                metric_name_selectors: ["claude_code.code_edit_tool.*"]
+              - dimensions: [[language, OTelLib]]
+                metric_name_selectors: ["claude_code.code_edit_tool.*"]
+
+              # Code decision tracking
+              - dimensions: [[decision, OTelLib]]
+                metric_name_selectors: ["claude_code.code_edit_tool.decision"]
+
+        service:
+          extensions: [health_check]
+          telemetry:
+            logs:
+              level: debug
+              development: true
+              encoding: json
+              output_paths: [stdout]
+          pipelines:
+            metrics:
+              receivers: [otlp]
+              processors: [attributes, resource, batch/metrics]
+              exporters: [awsemf]
+
+  # ECS Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: otel-collector
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: '512'
+      Memory: '1024'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: aws-otel-collector
+          Image: !Ref CollectorImage
+          Essential: true
+          Memory: 512
+          Secrets:
+            - Name: AOT_CONFIG_CONTENT
+              ValueFrom: !Ref OTelConfig
+          PortMappings:
+            - ContainerPort: 4317
+              Protocol: tcp
+            - ContainerPort: 4318
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CollectorLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - HTTPListener
+    Properties:
+      ServiceName: otel-collector-service
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+          Subnets: !Ref SubnetIds
+      LoadBalancers:
+        - ContainerName: aws-otel-collector
+          ContainerPort: 4318
+          TargetGroupArn: !Ref HTTPTargetGroup
+      HealthCheckGracePeriodSeconds: 60
+
+  # Auto Scaling - Commented out due to service-linked role requirements
+  # Uncomment if you want auto-scaling and have the necessary service-linked role
+  #
+  # ServiceScalingTarget:
+  #   Type: AWS::ApplicationAutoScaling::ScalableTarget
+  #   DependsOn: ECSService
+  #   Properties:
+  #     MaxCapacity: 3
+  #     MinCapacity: 1
+  #     ResourceId: !Sub 'service/${ECSCluster}/otel-collector-service'
+  #     ScalableDimension: ecs:service:DesiredCount
+  #     ServiceNamespace: ecs
+  #
+  # ServiceScalingPolicy:
+  #   Type: AWS::ApplicationAutoScaling::ScalingPolicy
+  #   Properties:
+  #     PolicyName: otel-collector-cpu-scaling
+  #     PolicyType: TargetTrackingScaling
+  #     ScalingTargetId: !Ref ServiceScalingTarget
+  #     TargetTrackingScalingPolicyConfiguration:
+  #       PredefinedMetricSpecification:
+  #         PredefinedMetricType: ECSServiceAverageCPUUtilization
+  #       ScaleInCooldown: 60
+  #       ScaleOutCooldown: 60
+  #       TargetValue: 70
+
+Outputs:
+  VpcId:
+    Description: VPC ID used
+    Value: !Ref VpcId
+
+  SubnetIds:
+    Description: Subnet IDs used by the collector
+    Value: !Join [',', !Ref SubnetIds]
+
+  CollectorEndpoint:
+    Description: Endpoint for OTLP metrics
+    Value: !If
+      - HasCustomDomain
+      - !Sub 'https://${CustomDomainName}'
+      - !Sub 'http://${LoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-endpoint'
+
+  ALBEndpoint:
+    Description: ALB DNS name
+    Value: !GetAtt LoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-alb-dns'
+
+  ConfigParameterName:
+    Description: SSM Parameter containing collector configuration
+    Value: !Ref OTelConfig
+
+  LogGroupName:
+    Description: CloudWatch Log Group for metrics
+    Value: /aws/claude-code/metrics
+
+  Note:
+    Description: Important deployment information
+    Value: !If
+      - HasCustomDomain
+      - !Sub |
+        OTEL collector is available at: https://${CustomDomainName}
+        Certificate validation is automatic via Route53.
+        Claude Code settings will use this HTTPS endpoint.
+      - !Sub |
+        OTEL collector is available at: http://${LoadBalancer.DNSName}
+        WARNING: Using HTTP - data is not encrypted in transit.
+        For HTTPS, provide CustomDomainName and HostedZoneId parameters.

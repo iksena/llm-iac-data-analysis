@@ -1,0 +1,350 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  FSx for ONTAP Splunk Serverless Integration - Audit log shipping via HEC.
+  Serverless alternative to EC2-based syslog-ng + Universal Forwarder.
+
+Parameters:
+  S3AccessPointArn:
+    Type: String
+    Description: ARN of the S3 Access Point for FSx for ONTAP audit logs
+    AllowedPattern: 'arn:aws:s3:[a-z0-9-]+:\d{12}:accesspoint/.+'
+
+  SplunkHecTokenSecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing the Splunk HEC token
+    AllowedPattern: 'arn:aws:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+'
+
+  SplunkHecEndpoint:
+    Type: String
+    Description: Splunk HEC endpoint URL (e.g., https://splunk.example.com:8088)
+    AllowedPattern: 'https?://.+'
+
+  S3BucketName:
+    Type: String
+    Description: S3 bucket name for event notification
+
+  S3KeyPrefix:
+    Type: String
+    Default: ''
+
+  SplunkIndex:
+    Type: String
+    Default: fsxn_audit
+    Description: Splunk index for audit logs
+
+  SplunkSourcetype:
+    Type: String
+    Default: 'fsxn:ontap:audit'
+
+  VerifySSL:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Verify SSL certificates (set false for self-signed certs)
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 3008
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+
+  EmsApiKeySecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing the EMS webhook API key
+    AllowedPattern: 'arn:aws:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+'
+
+Resources:
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dlq'
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AccessPointRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub '${S3AccessPointArn}/object/*'
+        - PolicyName: SecretsManagerRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref SplunkHecTokenSecretArn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-shipper:*'
+        - PolicyName: SQSSendMessage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  LogShipperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-shipper'
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              raise NotImplementedError("Deploy actual handler code")
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          SPLUNK_HEC_ENDPOINT: !Ref SplunkHecEndpoint
+          API_KEY_SECRET_ARN: !Ref SplunkHecTokenSecretArn
+          S3_ACCESS_POINT_ARN: !Ref S3AccessPointArn
+          SPLUNK_INDEX: !Ref SplunkIndex
+          SPLUNK_SOURCETYPE: !Ref SplunkSourcetype
+          SPLUNK_SOURCE: fsxn-observability
+          VERIFY_SSL: !Ref VerifySSL
+          LOG_LEVEL: !Ref LogLevel
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-shipper'
+      RetentionInDays: 30
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-s3-event'
+      State: ENABLED
+      EventPattern:
+        source: [aws.s3]
+        detail-type: [Object Created]
+        detail:
+          bucket:
+            name: [!Ref S3BucketName]
+          object:
+            key:
+              - prefix: !Ref S3KeyPrefix
+      Targets:
+        - Id: LogShipperTarget
+          Arn: !GetAtt LogShipperFunction.Arn
+
+  LambdaEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LogShipperFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeRule.Arn
+
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LogShipperFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # ============================================================
+  # EMS Webhook Resources
+  # ============================================================
+
+  # Dead Letter Queue for EMS handler
+  EmsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-ems-dlq'
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+  # EMS Lambda Execution Role
+  EmsLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-ems-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsManagerRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref EmsApiKeySecretArn
+                  - !Ref SplunkHecTokenSecretArn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-ems-webhook:*'
+        - PolicyName: SQSSendMessage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt EmsDeadLetterQueue.Arn
+
+  # EMS Webhook Lambda Function
+  EmsWebhookFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-ems-webhook'
+      Runtime: python3.12
+      Handler: ems_handler.lambda_handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              raise NotImplementedError("Deploy actual EMS handler code")
+      Role: !GetAtt EmsLambdaExecutionRole.Arn
+      MemorySize: 256
+      Timeout: 30
+      DeadLetterConfig:
+        TargetArn: !GetAtt EmsDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          SPLUNK_HEC_ENDPOINT: !Ref SplunkHecEndpoint
+          EMS_API_KEY_SECRET_ARN: !Ref EmsApiKeySecretArn
+          HEC_TOKEN_SECRET_ARN: !Ref SplunkHecTokenSecretArn
+
+  # EMS Lambda CloudWatch Log Group
+  EmsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-ems-webhook'
+      RetentionInDays: 30
+
+  # API Gateway HTTP API for EMS Webhook
+  EmsHttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${AWS::StackName}-ems-api'
+      ProtocolType: HTTP
+      Description: HTTP API for receiving ONTAP EMS webhook events
+
+  EmsHttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref EmsHttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  EmsHttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref EmsHttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt EmsWebhookFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  EmsHttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref EmsHttpApi
+      RouteKey: 'POST /ems'
+      Target: !Sub 'integrations/${EmsHttpApiIntegration}'
+
+  # Lambda permission for API Gateway invocation
+  EmsLambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref EmsWebhookFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${EmsHttpApi}/*/*/ems'
+
+  # CloudWatch Alarm for EMS handler errors
+  EmsErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-ems-errors'
+      AlarmDescription: EMS webhook handler errors detected
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref EmsWebhookFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  LambdaFunctionArn:
+    Value: !GetAtt LogShipperFunction.Arn
+  DeadLetterQueueArn:
+    Value: !GetAtt DeadLetterQueue.Arn
+  EmsWebhookFunctionArn:
+    Description: ARN of the EMS webhook Lambda function
+    Value: !GetAtt EmsWebhookFunction.Arn
+  EmsApiEndpoint:
+    Description: EMS webhook API Gateway endpoint URL
+    Value: !Sub 'https://${EmsHttpApi}.execute-api.${AWS::Region}.amazonaws.com/ems'
+  EmsDeadLetterQueueArn:
+    Description: ARN of the EMS Dead Letter Queue
+    Value: !GetAtt EmsDeadLetterQueue.Arn
+  EmsErrorAlarmArn:
+    Description: ARN of the EMS error CloudWatch alarm
+    Value: !GetAtt EmsErrorAlarm.Arn
+  ArchitectureNote:
+    Description: Serverless alternative to EC2-based syslog-ng + Universal Forwarder
+    Value: 'FSx for ONTAP -> S3 AP -> EventBridge -> Lambda -> Splunk HEC'

@@ -1,0 +1,2015 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Standalone AgentCore Gateway sample: Cognito (PKCE) + Gateway (CUSTOM_JWT) +
+  per-user daily/monthly budget enforcement + spend rollover archive. Deploy
+  with one `aws cloudformation deploy` command — see README.md.
+
+Parameters:
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 1000
+    Description: Default per-user MONTHLY budget in USD. Falls back if user has no monthly_cap_usd override.
+  DailyBudgetUsd:
+    Type: Number
+    Default: 50
+    Description: Default per-user DAILY budget in USD. Falls back if user has no daily_cap_usd override.
+  RolloverTimezone:
+    Type: String
+    Default: Etc/UTC
+    Description: >
+      IANA timezone used by the rollover Lambda to decide when "midnight" is. `Etc/UTC` is
+      simplest and matches most FinOps tooling. Set to your org's primary timezone (e.g.
+      `America/Los_Angeles`, `Asia/Kolkata`) if you'd rather have local-midnight resets.
+      The rollover cron always fires at 00:00 in this timezone.
+  PriceTableJson:
+    Type: String
+    Default: '{"openai.gpt-5.4":{"in":0.0025,"out":0.015,"cache_read":0.00025,"cache_write_5m":0,"cache_write_1h":0},"openai.gpt-5.4-2026-03-05":{"in":0.0025,"out":0.015,"cache_read":0.00025,"cache_write_5m":0,"cache_write_1h":0},"openai.gpt-5.5":{"in":0.005,"out":0.03,"cache_read":0.0005,"cache_write_5m":0,"cache_write_1h":0},"openai.gpt-5.5-2026-04-23":{"in":0.005,"out":0.03,"cache_read":0.0005,"cache_write_5m":0,"cache_write_1h":0},"openai.gpt-oss-20b":{"in":0.00007,"out":0.0002,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0},"openai.gpt-oss-120b":{"in":0.00015,"out":0.0006,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0},"openai.gpt-oss-safeguard-20b":{"in":0.00007,"out":0.0002,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0},"openai.gpt-oss-safeguard-120b":{"in":0.00015,"out":0.0006,"cache_read":0,"cache_write_5m":0,"cache_write_1h":0},"anthropic.claude-fable-5":{"in":0.01,"out":0.05,"cache_read":0.001,"cache_write_5m":0.0125,"cache_write_1h":0.02},"anthropic.claude-haiku-4-5":{"in":0.001,"out":0.005,"cache_read":0.0001,"cache_write_5m":0.00125,"cache_write_1h":0.002},"anthropic.claude-haiku-4-5-20251001":{"in":0.001,"out":0.005,"cache_read":0.0001,"cache_write_5m":0.00125,"cache_write_1h":0.002},"anthropic.claude-opus-4-7":{"in":0.005,"out":0.025,"cache_read":0.0005,"cache_write_5m":0.00625,"cache_write_1h":0.01},"anthropic.claude-opus-4-8":{"in":0.005,"out":0.025,"cache_read":0.0005,"cache_write_5m":0.00625,"cache_write_1h":0.01},"anthropic.claude-sonnet-5":{"in":0.002,"out":0.01,"cache_read":0.0002,"cache_write_5m":0.0025,"cache_write_1h":0.004}}'
+    Description: >
+      JSON map of model -> {in, out, cache_read, cache_write_5m, cache_write_1h}
+      USD per 1K tokens. Default covers the models routable through Bedrock
+      Mantle on the sample gateway (14 total).
+
+      Cache pricing conventions:
+      - Anthropic: cache-read = 0.1x input, 5-min cache-write = 1.25x input,
+        1-hour cache-write = 2x input.
+      - OpenAI GPT-5 series: cache-read = 0.1x input, no cache-write concept.
+      - OpenAI gpt-oss series (AWS-hosted, Apache 2.0): no published cache
+        pricing yet — cache_read=0 keeps them counted-but-billed-at-input-rate.
+
+      Anthropic returns versioned model ids in the response body (e.g.
+      claude-haiku-4-5-20251001); include both bare and versioned forms so
+      RESPONSE-side pricing lookups don't miss. Same for OpenAI snapshots.
+
+      Doubles as the routable-model allowlist: REQUEST interceptor rejects any
+      inference call whose `model` field isn't a key here (HTTP 400
+      MODEL_NOT_PRICED) — this closes a budget-bypass hole where an unpriced
+      model would compute cost=0 and never move the spend counter.
+
+      Bedrock Mantle bills 3P models at 1:1 parity with the provider's list
+      price (no AWS uplift on gpt-5 / claude routes). gpt-oss models are
+      AWS-hosted and billed at Bedrock rates directly.
+
+      Sonnet-5 uses intro pricing ($2 in / $10 out); reverts to standard
+      ($3 in / $15 out) on 2026-09-01 — bump this parameter or accept the
+      new CFN default at redeploy.
+  UserClaim:
+    Type: String
+    Default: username
+    AllowedValues: [username, email, preferred_username, cognito:username, sub, client_id]
+    Description: >
+      JWT claim used as the user identity dimension.
+      Cognito human tokens (default): use `username` (the sign-in name).
+        Cognito access tokens do NOT contain `email`.
+      Okta / Auth0 / Entra human tokens: `email` or `preferred_username`.
+      Cognito M2M tokens (if you add M2M later): use `sub` (== client_id).
+      Interceptor also falls back through username→email→preferred_username
+      →cognito:username→sub→client_id if the pinned claim is absent.
+  EnforceBudget:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: If "false", the REQUEST interceptor only logs over-budget users (no 429).
+  ProvisionedConcurrency:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    Description: >
+      Number of provisioned concurrent executions per interceptor Lambda (each). Set to 0
+      to disable and use on-demand. Recommended prod value is 1-2; provisioned concurrency
+      eliminates the ~500ms cold start on both interceptors.
+  ReservedConcurrency:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    Description: >
+      Reserved concurrent executions per interceptor Lambda (each). Caps a traffic burst
+      so the interceptors can't exhaust account-wide Lambda concurrency and knock out
+      other functions. 100 is a reasonable default for typical gateway traffic — raise
+      via stack parameter if you expect higher sustained RPS.
+  DomainPrefix:
+    Type: String
+    Description: >
+      Globally-unique Cognito domain prefix (must be unique across all AWS Cognito
+      user pools in this region — pick something specific to your account/org, e.g.
+      "agentcore-inference-<acct-id>").
+  PkceCallbackUrl:
+    Type: String
+    Default: http://localhost:8400/callback
+    Description: >
+      Redirect URI for the PKCE client. Must match AGENTCORE_OIDC_CALLBACK_PORT
+      on the auth-helper (default 8400). Cognito rejects any mismatch.
+
+Conditions:
+  UseProvisionedConcurrency: !Not [!Equals [!Ref ProvisionedConcurrency, 0]]
+
+Resources:
+
+  # ==================================================================
+  # Cognito user pool + PKCE public client (identity for humans)
+  # ==================================================================
+  # Machine identities (CI, batch jobs) are out of scope. If needed, add a
+  # second AWS::Cognito::UserPoolClient with client_credentials grant and put
+  # its secret in AWS Secrets Manager.
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      # Admins provision users (either directly or by federating an external IdP).
+      # No self-signup for an internal-facing gateway.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref UserPool
+      Domain: !Ref DomainPrefix
+
+  # No client_secret — PKCE means the client_id is safe to distribute freely.
+  # Access tokens carry `username` and `sub` claims (NOT `email` — that's an
+  # id_token thing on Cognito); UserClaim=username (the default) resolves to
+  # the sign-in name.
+  HumanClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${AWS::StackName}-human"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlows: [code]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: [openid, profile, email]
+      CallbackURLs: [!Ref PkceCallbackUrl]
+      LogoutURLs: [!Ref PkceCallbackUrl]
+      SupportedIdentityProviders: [COGNITO]
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      # 30-day refresh, 24h access — humans see the browser sign-in at most
+      # monthly, and a single Claude Code / Codex session survives a full day
+      # without token expiry mid-conversation. (Access-token max on Cognito
+      # user-pool clients is 24h; refresh-token max is 3650d/10y. Auth helper
+      # silently refreshes when access token has < 60s of life left.)
+      AccessTokenValidity: 24
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        RefreshToken: days
+        AccessToken: hours
+        IdToken: hours
+
+  # ==================================================================
+  # AgentCore Gateway IAM role + Gateway (CUSTOM_JWT authorizer)
+  # ==================================================================
+
+  GatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # RoleName intentionally omitted so CFN auto-generates it. Setting a
+      # deterministic name triggers AWS::EarlyValidation::ResourceExistenceCheck
+      # in the AgentCore Gateway resource, which appears to eagerly resolve
+      # RoleArn.Sub and check for the physical role before the stack starts
+      # creating anything. Auto-generated name → validation defers → deploys.
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: agentcore-bedrock-mantle
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: BedrockInvoke
+                Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:bedrock:*::foundation-model/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:inference-profile/*"
+                  - !Sub "arn:${AWS::Partition}:bedrock:*:${AWS::AccountId}:application-inference-profile/*"
+              # ListModels is REQUIRED — the inference connector discovers its model
+              # list at target creation; without it the target goes FAILED with 401.
+              # Do NOT add an aws:RequestedRegion condition: these calls don't
+              # populate that key, so the condition causes an implicit deny.
+              - Sid: BedrockMantleInvoke
+                Effect: Allow
+                Action:
+                  - bedrock-mantle:CallWithBearerToken
+                  - bedrock-mantle:CreateInference
+                  - bedrock-mantle:GetInference
+                  - bedrock-mantle:ListModels
+                Resource: "*"
+              - Sid: ListBedrockResources
+                Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:ListInferenceProfiles
+                  - bedrock:GetFoundationModel
+                  - bedrock:GetInferenceProfile
+                Resource: "*"
+        # Interceptor invoke permission is INLINE on the role rather than a
+        # separate AWS::IAM::RolePolicy resource. Reason: the RolePolicy form
+        # triggers AWS::EarlyValidation::ResourceExistenceCheck which fails at
+        # changeset creation because CFN eagerly resolves the physical RoleName
+        # and checks IAM for it — but the role hasn't been created yet.
+        - PolicyName: InvokeInterceptors
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  # Both unqualified ARN and :live alias — gateway hits either
+                  # depending on attach mode. Aliases via !Sub because
+                  # AWS::Lambda::Alias.Arn isn't a direct !GetAtt.
+                  - !GetAtt RequestInterceptorFunction.Arn
+                  - !GetAtt ResponseInterceptorFunction.Arn
+                  - !Sub "${RequestInterceptorFunction.Arn}:live"
+                  - !Sub "${ResponseInterceptorFunction.Arn}:live"
+
+  Gateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      # Gateway name is derived from StackName so two sample deploys in the
+      # same account don't collide on `AWS::BedrockAgentCore::Gateway.Name`
+      # (which must be unique per account).
+      Name: !Ref AWS::StackName
+      Description: AgentCore Gateway with per-user budget enforcement
+      RoleArn: !GetAtt GatewayRole.Arn
+      ProtocolType: MCP
+      ProtocolConfiguration:
+        Mcp:
+          SupportedVersions: ["2025-06-18"]
+      AuthorizerType: CUSTOM_JWT
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration"
+          AllowedClients:
+            - !Ref HumanClient
+
+  # ==================================================================
+  # Interceptor plane below (existing CMK + DDB + Lambdas + rollover)
+  # ==================================================================
+
+  # Customer-managed KMS key used to encrypt both DynamoDB tables at rest.
+  # Buys: CloudTrail audit trail for every decrypt call (AWS-owned keys don't
+  # log this), and hard tenant isolation — if you disable/delete the key, the
+  # tables go unreadable rather than silently accessible.
+  # Retention: DeletionPolicy Retain — deleting the stack must not delete the key
+  # while historical PITR backups still reference it.
+  InterceptorDataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Description: Encryption key for AgentCore interceptor DynamoDB tables (spend + request-context)
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+          - Sid: AllowDynamoDBService
+            Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub dynamodb.${AWS::Region}.amazonaws.com
+
+  InterceptorDataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${AWS::StackName}-data"
+      TargetKeyId: !Ref InterceptorDataKey
+
+  SpendTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${AWS::StackName}-user-spend"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref InterceptorDataKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # Short-lived map: REQUEST_ID -> {user, team}. REQUEST interceptor writes;
+  # RESPONSE interceptor reads. TTL = 300s. Needed because HTTP/inference
+  # target RESPONSE interceptors get gatewayRequest=null + headers=null.
+  RequestContextTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-request-context"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: request_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: request_id
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref InterceptorDataKey
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  InterceptorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      # Scoped to StackName so two sample deploys in the same account don't
+      # collide on this fixed name (would fail early-validation).
+      RoleName: !Sub "${AWS::StackName}-interceptor-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: spend-and-context-rw
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource:
+                  - !GetAtt SpendTable.Arn
+                  - !GetAtt RequestContextTable.Arn
+              # DDB uses a customer-managed CMK for encryption at rest, so any
+              # DDB read/write from Lambda transitively requires kms:Decrypt /
+              # kms:GenerateDataKey on the caller's identity. Scoped to the
+              # specific key + only via DynamoDB in this region.
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt InterceptorDataKey.Arn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub dynamodb.${AWS::Region}.amazonaws.com
+              # cloudwatch:PutMetricData has no resource-level policy support (Resource: "*"
+              # is the only valid form). Scope down via the cloudwatch:namespace condition
+              # so the interceptors can only publish to our own namespace — this closes the
+              # cfn-nag W11 finding correctly.
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: AgentCore/InferenceUsage
+
+  RequestInterceptorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-budget-check"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt InterceptorRole.Arn
+      Timeout: 5
+      MemorySize: 256
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      Description: REQUEST interceptor — soft 429 when user is over monthly budget
+      Environment:
+        Variables:
+          SPEND_TABLE: !Ref SpendTable
+          CONTEXT_TABLE: !Ref RequestContextTable
+          MONTHLY_BUDGET_USD: !Ref MonthlyBudgetUsd
+          DAILY_BUDGET_USD: !Ref DailyBudgetUsd
+          ROLLOVER_TIMEZONE: !Ref RolloverTimezone
+          USER_CLAIM: !Ref UserClaim
+          ENFORCE: !Ref EnforceBudget
+          OVERRIDE_TTL_SECONDS: "60"
+          # PRICE_TABLE is passed to REQUEST as the allowlist of routable models.
+          # Any inbound request whose `model` field isn't a key here is rejected
+          # with HTTP 400 — prevents users from bypassing budget enforcement by
+          # picking an unpriced model (which would spend at cost=$0 forever).
+          PRICE_TABLE: !Ref PriceTableJson
+      Code:
+        ZipFile: |
+          # Inference-target envelope (verified live 2026-06-24 on agentcore-control 1.43.36):
+          #   event = {
+          #     "interceptorInputVersion": "1.0",
+          #     "http": {
+          #       "gatewayRequest":  {"path": "/v1/...", "httpMethod": "POST",
+          #                           "headers": {...}, "body": "<base64-str>"},
+          #       "gatewayResponse": null,
+          #     },
+          #   }
+          # Body is base64-encoded; pass-through must echo the same string back unchanged.
+          import base64
+          import json
+          import os
+          import time
+          from datetime import datetime, timezone
+
+          import boto3
+
+          ddb = boto3.client("dynamodb")
+          TABLE = os.environ["SPEND_TABLE"]
+          CONTEXT_TABLE = os.environ["CONTEXT_TABLE"]
+          MONTHLY_BUDGET_DEFAULT = float(os.environ["MONTHLY_BUDGET_USD"])
+          DAILY_BUDGET_DEFAULT = float(os.environ["DAILY_BUDGET_USD"])
+          CLAIM = os.environ["USER_CLAIM"]
+          ENFORCE = os.environ.get("ENFORCE", "true").lower() == "true"
+          OVERRIDE_TTL_SECONDS = int(os.environ.get("OVERRIDE_TTL_SECONDS", "60"))
+          ROLLOVER_TZ = os.environ.get("ROLLOVER_TIMEZONE", "Etc/UTC")
+          # Allowlist of routable models = keys of PRICE_TABLE. Reject inbound
+          # requests whose `model` isn't in this set — otherwise an unpriced
+          # model would spend at cost=$0 and bypass budget enforcement.
+          try:
+              _ALLOWED_MODELS = frozenset(json.loads(os.environ.get("PRICE_TABLE", "{}")).keys())
+          except Exception:
+              _ALLOWED_MODELS = frozenset()
+          COMPONENT = "budget-check"
+
+          # Schema v2 (this file):
+          #   pk = USER#<user>
+          #   attrs (all optional): daily_cap_usd, monthly_cap_usd,
+          #                         daily_spend_usd, monthly_spend_usd, updated_at
+          # Missing caps → fall back to CFN defaults (MONTHLY_BUDGET_USD / DAILY_BUDGET_USD).
+          # Missing spend attrs → treat as 0 (fresh user or just-rolled-over).
+
+          # In-Lambda cache of a user's full state row — 60s TTL. Trades DDB read cost vs
+          # how fast admin changes (cap adjustments) propagate.
+          _STATE_CACHE = {}  # {user: (state_dict, expires_at)}
+
+          def log(event, level="info", **fields):
+              """Emit a single JSON log line. Fields land as top-level keys in CloudWatch
+              so Logs Insights can filter/aggregate directly (`fields user, model | stats sum(cost_usd) by user`)."""
+              rec = {
+                  "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                  "level": level,
+                  "component": COMPONENT,
+                  "event": event,
+              }
+              for k, v in fields.items():
+                  if v is not None:
+                      rec[k] = v
+              print(json.dumps(rec, default=str))
+
+          def _request_id(context):
+              try:
+                  return (context.client_context.custom or {}).get("REQUEST_ID")
+              except Exception:
+                  return None
+
+          def _stash_context(req_id, user, team):
+              """Write (user, team) keyed by REQUEST_ID for the RESPONSE
+              interceptor to read back. Returns True on success. If this fails,
+              the RESPONSE side falls back to user='unknown' — spend gets
+              recorded against nobody. Caller MUST block the request on False
+              in enforce mode to avoid silent misattribution."""
+              if not req_id:
+                  return False
+              ttl = int(time.time()) + 300  # 5 min — request -> response gap is sub-second
+              try:
+                  ddb.put_item(
+                      TableName=CONTEXT_TABLE,
+                      Item={
+                          "request_id": {"S": req_id},
+                          "user": {"S": user},
+                          "team": {"S": team},
+                          "ttl": {"N": str(ttl)},
+                      },
+                  )
+                  return True
+              except Exception as e:
+                  log("ctx_stash_failed", level="error", request_id=req_id, user=user, error=str(e))
+                  return False
+
+          def _decode_jwt(token):
+              parts = token.split(".")
+              if len(parts) != 3:
+                  return {}
+              p = parts[1] + "=" * (-len(parts[1]) % 4)
+              return json.loads(base64.urlsafe_b64decode(p))
+
+          def _user_id(headers):
+              # Fallback chain covers all common OIDC + IdP variations we've seen:
+              #   Cognito user access token: `username`, `sub` (uuid), NO `email`
+              #   Cognito M2M access token: `client_id`, `sub` (== client_id)
+              #   Okta/Auth0/Entra user access tokens: `email` or `preferred_username`, `sub`
+              # UserClaim env var lets operators pin one; the ordering here is a safety net.
+              auth = (headers or {}).get("authorization") or (headers or {}).get("Authorization") or ""
+              if not auth.lower().startswith("bearer "):
+                  return "unknown", "default"
+              claims = _decode_jwt(auth.split(" ", 1)[1])
+              return (
+                  claims.get(CLAIM)
+                  or claims.get("email")
+                  or claims.get("username")
+                  or claims.get("preferred_username")
+                  or claims.get("cognito:username")
+                  or claims.get("sub")
+                  or claims.get("client_id")
+                  or "unknown",
+                  claims.get("custom:team") or claims.get("team") or "default",
+              )
+
+          def _user_pk(user):
+              return f"USER#{user}"
+
+          def _lookup_state(user):
+              """One GetItem. Returns (daily_spend, daily_cap, monthly_spend, monthly_cap).
+              Caps fall back to the CFN defaults if the row has no per-user override.
+              Spend attrs fall back to 0 if the row doesn't exist yet."""
+              now = time.time()
+              cached = _STATE_CACHE.get(user)
+              if cached and cached[1] > now:
+                  s = cached[0]
+                  return (s["daily_spend"], s["daily_cap"],
+                          s["monthly_spend"], s["monthly_cap"])
+
+              try:
+                  resp = ddb.get_item(TableName=TABLE, Key={"pk": {"S": _user_pk(user)}})
+                  item = resp.get("Item") or {}
+              except Exception as e:
+                  log("ddb_get_failed", level="error", user=user, error=str(e))
+                  if cached:
+                      # Use stale cache rather than fall back to zero-spend
+                      s = cached[0]
+                      return (s["daily_spend"], s["daily_cap"],
+                              s["monthly_spend"], s["monthly_cap"])
+                  return 0.0, DAILY_BUDGET_DEFAULT, 0.0, MONTHLY_BUDGET_DEFAULT
+
+              def _num(attr, default):
+                  v = item.get(attr, {}).get("N")
+                  return float(v) if v is not None else default
+
+              state = {
+                  "daily_spend":   _num("daily_spend_usd", 0.0),
+                  "daily_cap":     _num("daily_cap_usd",   DAILY_BUDGET_DEFAULT),
+                  "monthly_spend": _num("monthly_spend_usd", 0.0),
+                  "monthly_cap":   _num("monthly_cap_usd", MONTHLY_BUDGET_DEFAULT),
+              }
+              _STATE_CACHE[user] = (state, now + OVERRIDE_TTL_SECONDS)
+              return (state["daily_spend"], state["daily_cap"],
+                      state["monthly_spend"], state["monthly_cap"])
+
+          def _next_reset_iso(limit_hit):
+              """Best-effort 'when does this cap reset' for the 403 details field.
+              Falls back to midnight-UTC (or start-of-next-month UTC) if zoneinfo isn't
+              available. Not used for enforcement — purely informational."""
+              try:
+                  from zoneinfo import ZoneInfo
+                  tz = ZoneInfo(ROLLOVER_TZ)
+              except Exception:
+                  tz = timezone.utc
+              now = datetime.now(tz)
+              if limit_hit == "daily":
+                  from datetime import timedelta
+                  tomorrow = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+                  return tomorrow.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+              else:
+                  y, m = now.year, now.month
+                  if m == 12:
+                      y, m = y + 1, 1
+                  else:
+                      m += 1
+                  next_month = now.replace(year=y, month=m, day=1, hour=0, minute=0, second=0, microsecond=0)
+                  return next_month.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+          # HTTP-target interceptor contract (verified against AWS docs 2026-06-24):
+          #   REQUEST passthrough  -> {"http": {}}                 # gateway uses original request
+          #   REQUEST short-circuit -> {"http": {"transformedGatewayResponse":
+          #       {"statusCode": int, "headers": {...},
+          #        "body": "<base64>", "contentType": "application/json"}}}
+          # path/httpMethod are immutable — never include them in output.
+
+          def _passthrough():
+              return {"interceptorOutputVersion": "1.0", "http": {}}
+
+          def _service_unavailable(reason):
+              """503 — retriable transient failure. Used when the identity-
+              stash write to DDB fails: rather than let the call through and
+              misattribute the spend to 'unknown' on the RESPONSE side, block
+              here so the client retries and (probably) succeeds next time."""
+              body_str = json.dumps({"error": {
+                  "type": "service_unavailable",
+                  "code": "IDENTITY_STASH_FAILED",
+                  "message": f"Temporary error attributing this request. Retry. ({reason})",
+              }})
+              return {
+                  "interceptorOutputVersion": "1.0",
+                  "http": {"transformedGatewayResponse": {
+                      "statusCode": 503,
+                      "headers": {"content-type": "application/json", "retry-after": "1"},
+                      "body": base64.b64encode(body_str.encode()).decode(),
+                      "contentType": "application/json",
+                  }},
+              }
+
+          def _normalize_model(m):
+              """Match the RESPONSE Lambda's normalization so REQUEST checks the
+              same model IDs that RESPONSE will price against. Strip target
+              prefix and add provider prefix on bare names."""
+              if not m:
+                  return None
+              if "/" in m:
+                  m = m.split("/", 1)[1]
+              if "." not in m:
+                  if m.startswith("gpt-") or m.startswith("o"):
+                      m = f"openai.{m}"
+                  elif m.startswith("claude"):
+                      m = f"anthropic.{m}"
+              return m
+
+          def _extract_model_from_body(b64_body):
+              """Best-effort parse of a base64-encoded JSON request body to pull
+              the `model` field. Returns (normalized_model_or_None, decode_ok_bool).
+              decode_ok=False means we couldn't parse the body at all — caller
+              can decide whether to fail open or closed on that."""
+              if not b64_body:
+                  return None, False
+              try:
+                  raw = base64.b64decode(b64_body).decode("utf-8", errors="replace")
+                  data = json.loads(raw)
+              except Exception:
+                  return None, False
+              return _normalize_model(data.get("model")), True
+
+          def _reject_bad_model(code, message, model=None):
+              """400 — request rejected before it hits the model. Used when
+              `model` field is missing or not in PriceTable. Never charge the
+              user; log at warn."""
+              body_str = json.dumps({"error": {
+                  "type": "invalid_request_error",
+                  "code": code,
+                  "message": message,
+                  "details": {"model": model} if model else {},
+              }})
+              return {
+                  "interceptorOutputVersion": "1.0",
+                  "http": {"transformedGatewayResponse": {
+                      "statusCode": 400,
+                      "headers": {"content-type": "application/json"},
+                      "body": base64.b64encode(body_str.encode()).decode(),
+                      "contentType": "application/json",
+                  }},
+              }
+
+          def _deny(user, limit_hit, spent, limit_usd):
+              # limit_hit ∈ {"daily", "monthly"}. Client-facing message names which cap
+              # blocked the request and when it resets. OpenAI-shaped envelope so SDKs
+              # and CLIs (Codex, Anthropic SDK) surface it cleanly.
+              resets_at = _next_reset_iso(limit_hit)
+              friendly = (
+                  f"{limit_hit.capitalize()} usage budget exceeded — resets at "
+                  f"{resets_at}. Contact your admin to raise the limit sooner."
+              )
+              body_str = json.dumps({"error": {
+                  "type": "budget_exceeded",
+                  "code": "BUDGET_EXCEEDED",
+                  "message": friendly,
+                  "details": {
+                      "user": user,
+                      "limit_hit": limit_hit,
+                      "spent_usd": round(spent, 6),
+                      "limit_usd": limit_usd,
+                      "resets_at": resets_at,
+                  },
+              }})
+              body_b64 = base64.b64encode(body_str.encode()).decode()
+              return {
+                  "interceptorOutputVersion": "1.0",
+                  "http": {"transformedGatewayResponse": {
+                      # 403 (not 429) — Codex retries 429 as transient rate-limits,
+                      # swallowing our error body. 403 = permanently denied at this
+                      # identity for the current period.
+                      "statusCode": 403,
+                      "headers": {"content-type": "application/json"},
+                      "body": body_b64,
+                      "contentType": "application/json",
+                  }},
+              }
+
+          def lambda_handler(event, context):
+              t0 = time.perf_counter()
+              data = event.get("http") or {}
+              req = data.get("gatewayRequest", {})
+              headers = {k.lower(): v for k, v in (req.get("headers") or {}).items()}
+              req_id = _request_id(context)
+              path = req.get("path")
+              method = req.get("httpMethod")
+
+              user, team = _user_id(headers)
+              # Stash identity so the RESPONSE interceptor can find it (gatewayRequest
+              # is null in the RESPONSE event for HTTP/inference targets). If this
+              # fails and the user is known, block with 503 so the client retries —
+              # otherwise RESPONSE would attribute spend to 'unknown' (silent leak).
+              stashed = _stash_context(req_id, user, team)
+              if not stashed and req_id and user != "unknown" and ENFORCE:
+                  log("budget_check", level="error",
+                      request_id=req_id, path=path, http_method=method,
+                      user=user, team=team, outcome="block_stash_failed",
+                      latency_ms=round((time.perf_counter() - t0) * 1000, 2))
+                  return _service_unavailable("context stash write failed")
+
+              if user == "unknown":
+                  log("budget_check", request_id=req_id, path=path, http_method=method,
+                      user="unknown", outcome="allow_anonymous",
+                      latency_ms=round((time.perf_counter() - t0) * 1000, 2))
+                  return _passthrough()
+
+              # Model allowlist check. Skip paths that legitimately have no
+              # `model` field in their body: /v1/models (catalog listing) and
+              # anything similar. Gateway forwards these as POST regardless of
+              # the client's actual HTTP verb, so we can't just check method.
+              # Rejecting unknown models on inference paths closes a budget-
+              # bypass hole: an unpriced model would compute cost=0 in the
+              # RESPONSE Lambda and never move the spend counter, letting a
+              # user spend infinitely.
+              _CATALOG_PATHS = ("/v1/models",)
+              _is_catalog = any((path or "").endswith(p) for p in _CATALOG_PATHS)
+              if _ALLOWED_MODELS and not _is_catalog:
+                  model, ok = _extract_model_from_body(req.get("body"))
+                  if not ok:
+                      log("budget_check", level="warn",
+                          request_id=req_id, path=path, http_method=method,
+                          user=user, team=team, outcome="block_body_unparseable",
+                          latency_ms=round((time.perf_counter() - t0) * 1000, 2))
+                      if ENFORCE:
+                          return _reject_bad_model(
+                              "MODEL_MISSING",
+                              "Request body could not be parsed as JSON. Ensure Content-Type "
+                              "is application/json and body contains a `model` field.")
+                  elif not model:
+                      log("budget_check", level="warn",
+                          request_id=req_id, path=path, http_method=method,
+                          user=user, team=team, outcome="block_model_missing",
+                          latency_ms=round((time.perf_counter() - t0) * 1000, 2))
+                      if ENFORCE:
+                          return _reject_bad_model(
+                              "MODEL_MISSING",
+                              "Request is missing the `model` field. Every inference call "
+                              "must specify which model to route to.")
+                  elif model not in _ALLOWED_MODELS:
+                      log("budget_check", level="warn",
+                          request_id=req_id, path=path, http_method=method,
+                          user=user, team=team, model=model, outcome="block_model_unknown",
+                          latency_ms=round((time.perf_counter() - t0) * 1000, 2))
+                      if ENFORCE:
+                          return _reject_bad_model(
+                              "MODEL_NOT_PRICED",
+                              f"Model {model!r} is not in the operator's price table. "
+                              "Contact your admin to add it before use.",
+                              model=model)
+
+              daily_spend, daily_cap, monthly_spend, monthly_cap = _lookup_state(user)
+
+              # Daily check runs first — user hits daily cap before hitting monthly in
+              # any month where daily × 30 <= monthly. Order matters only for the
+              # "which one wins" log field; both are always evaluated.
+              limit_hit = None
+              spent = 0.0
+              limit = 0.0
+              if daily_spend >= daily_cap:
+                  limit_hit, spent, limit = "daily", daily_spend, daily_cap
+              elif monthly_spend >= monthly_cap:
+                  limit_hit, spent, limit = "monthly", monthly_spend, monthly_cap
+
+              log_common = dict(
+                  request_id=req_id, path=path, http_method=method,
+                  user=user, team=team,
+                  daily_spend_usd=round(daily_spend, 6),  daily_cap_usd=daily_cap,
+                  monthly_spend_usd=round(monthly_spend, 6), monthly_cap_usd=monthly_cap,
+                  enforce=ENFORCE,
+                  latency_ms=round((time.perf_counter() - t0) * 1000, 2),
+              )
+
+              if limit_hit and ENFORCE:
+                  log("budget_check", level="warn",
+                      outcome=f"block_{limit_hit}", limit_hit=limit_hit,
+                      **log_common)
+                  return _deny(user, limit_hit, spent, limit)
+
+              log("budget_check",
+                  outcome=("allow_over_budget" if limit_hit else "allow"),
+                  limit_hit=limit_hit,
+                  **log_common)
+              return _passthrough()
+
+  RequestInterceptorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RequestInterceptorFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock-agentcore.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+
+  # Initial version. Subsequent code rolls are done by scripts/publish_new_version.py,
+  # which publishes a new version and shifts the alias — CFN's inline-code + Version
+  # combo doesn't detect code changes reliably. PC on the alias means it follows.
+  RequestInterceptorVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: !Ref RequestInterceptorFunction
+      # Do not change this string — an AWS::Lambda::Version resource's Description
+      # is part of the resource identity, so any edit makes CFN try to publish a
+      # fresh Lambda version. The publish then fails with "A version for this
+      # Lambda function exists (N)" because the code is byte-identical to $LATEST.
+      # Code rolls happen via scripts/publish_new_version.py instead. The literal
+      # "code-rev v1" is preserved from an earlier `${LambdaCodeRevision}` !Sub —
+      # keeping it byte-identical avoids the republish trap.
+      Description: "Initial version — code-rev v1"
+
+  RequestInterceptorLiveAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref RequestInterceptorFunction
+      FunctionVersion: !GetAtt RequestInterceptorVersion.Version
+      Name: live
+      ProvisionedConcurrencyConfig:
+        Fn::If:
+          - UseProvisionedConcurrency
+          - ProvisionedConcurrentExecutions: !Ref ProvisionedConcurrency
+          - !Ref AWS::NoValue
+
+  RequestInterceptorAliasPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RequestInterceptorLiveAlias
+      Action: lambda:InvokeFunction
+      Principal: bedrock-agentcore.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+
+  ResponseInterceptorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-usage-record"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt InterceptorRole.Arn
+      Timeout: 5
+      MemorySize: 256
+      ReservedConcurrentExecutions: !Ref ReservedConcurrency
+      Description: RESPONSE interceptor — records tokens + $cost per user, emits EMF metrics
+      Environment:
+        Variables:
+          SPEND_TABLE: !Ref SpendTable
+          CONTEXT_TABLE: !Ref RequestContextTable
+          PRICE_TABLE: !Ref PriceTableJson
+      Code:
+        ZipFile: |
+          import base64
+          import json
+          import os
+          import time
+          from datetime import datetime, timezone
+
+          import boto3
+
+          ddb = boto3.client("dynamodb")
+          TABLE = os.environ["SPEND_TABLE"]
+          CONTEXT_TABLE = os.environ["CONTEXT_TABLE"]
+          PRICES = json.loads(os.environ["PRICE_TABLE"])
+          COMPONENT = "usage-record"
+
+          def log(event, level="info", **fields):
+              """Structured JSON log. See budget-check Lambda for the schema convention."""
+              rec = {
+                  "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                  "level": level,
+                  "component": COMPONENT,
+                  "event": event,
+              }
+              for k, v in fields.items():
+                  if v is not None:
+                      rec[k] = v
+              print(json.dumps(rec, default=str))
+
+          def _request_id(context):
+              try:
+                  return (context.client_context.custom or {}).get("REQUEST_ID")
+              except Exception:
+                  return None
+
+          def _fetch_context(req_id):
+              # RESPONSE interceptor cannot see request headers for HTTP/inference
+              # targets, so the REQUEST interceptor stashes (user, team) keyed by
+              # REQUEST_ID. Read it back here.
+              if not req_id:
+                  return "unknown", "default"
+              try:
+                  r = ddb.get_item(TableName=CONTEXT_TABLE, Key={"request_id": {"S": req_id}})
+                  item = r.get("Item") or {}
+                  return (
+                      item.get("user", {}).get("S", "unknown"),
+                      item.get("team", {}).get("S", "default"),
+                  )
+              except Exception as e:
+                  log("ctx_fetch_failed", level="warn", request_id=req_id, error=str(e))
+                  return "unknown", "default"
+
+          def _extract_usage(body):
+              """Return (uncached_in, out, cache_read, cache_write_5m, cache_write_1h).
+              Handles both usage shapes we see in the wild:
+
+              Anthropic Messages:
+                  {"input_tokens": N,               # already excludes cached reads+writes
+                   "output_tokens": M,
+                   "cache_read_input_tokens": R,
+                   "cache_creation_input_tokens": W,  # total writes this turn
+                   "cache_creation": {"ephemeral_5m_input_tokens": ..., "ephemeral_1h_input_tokens": ...}}
+
+              OpenAI Responses / Chat Completions:
+                  {"prompt_tokens": P,             # INCLUDES cached_tokens
+                   "completion_tokens": M,
+                   "prompt_tokens_details": {"cached_tokens": R}}
+                # OpenAI has no user-facing cache-write concept — cache_write_* = 0.
+
+              Callers get already-decomposed counts so _cost() just multiplies."""
+              u = (body or {}).get("usage") or {}
+              if not u:
+                  return 0, 0, 0, 0, 0
+
+              # Anthropic: input_tokens is the uncached portion; caches are separate fields.
+              if "input_tokens" in u:
+                  in_tok = int(u.get("input_tokens") or 0)
+                  out_tok = int(u.get("output_tokens") or 0)
+                  cache_read = int(u.get("cache_read_input_tokens") or 0)
+                  # Prefer the 5m/1h breakdown when present; fall back to lumped total.
+                  cc = u.get("cache_creation") or {}
+                  cw_5m = int(cc.get("ephemeral_5m_input_tokens") or 0)
+                  cw_1h = int(cc.get("ephemeral_1h_input_tokens") or 0)
+                  if not (cw_5m or cw_1h):
+                      # Fall back: whole cache_creation_input_tokens counts as 5m.
+                      cw_5m = int(u.get("cache_creation_input_tokens") or 0)
+                  return in_tok, out_tok, cache_read, cw_5m, cw_1h
+
+              # OpenAI: cached_tokens is a subset of prompt_tokens — subtract to get uncached.
+              if "prompt_tokens" in u:
+                  prompt = int(u.get("prompt_tokens") or 0)
+                  out_tok = int(u.get("completion_tokens") or 0)
+                  cache_read = int((u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0)
+                  uncached = max(prompt - cache_read, 0)
+                  return uncached, out_tok, cache_read, 0, 0
+
+              return 0, 0, 0, 0, 0
+
+          def _normalize_model(m):
+              if not m:
+                  return "unknown"
+              # Strip target prefix: "bedrock-mantle/openai.gpt-5.5" -> "openai.gpt-5.5"
+              if "/" in m:
+                  m = m.split("/", 1)[1]
+              # Add provider prefix when bare: "gpt-4o-mini" -> "openai.gpt-4o-mini"
+              if "." not in m:
+                  if m.startswith("gpt-") or m.startswith("o"):
+                      m = f"openai.{m}"
+                  elif m.startswith("claude"):
+                      m = f"anthropic.{m}"
+              return m
+
+          def _cost(model, in_tok, out_tok, cache_read, cache_write_5m, cache_write_1h):
+              """Sum: uncached_in * in + out * out + cache_read * cache_read
+                    + cache_write_5m * cache_write_5m + cache_write_1h * cache_write_1h.
+              Missing cache_* rates default to 0 so legacy PriceTable entries still work."""
+              p = PRICES.get(model)
+              if not p:
+                  return 0.0
+              return (
+                  (in_tok           / 1000.0) * p.get("in",             0.0) +
+                  (out_tok          / 1000.0) * p.get("out",            0.0) +
+                  (cache_read       / 1000.0) * p.get("cache_read",     0.0) +
+                  (cache_write_5m   / 1000.0) * p.get("cache_write_5m", 0.0) +
+                  (cache_write_1h   / 1000.0) * p.get("cache_write_1h", 0.0)
+              )
+
+          def _emf(user, team, model, in_tok, out_tok, cache_read, cache_write_5m, cache_write_1h, cost):
+              # Embedded Metric Format — no PutMetricData call needed when printed.
+              # Cache token counts are 0 for non-cache-aware models; that's fine — CloudWatch
+              # still accepts the metric points, they just always plot as zero.
+              print(json.dumps({
+                  "_aws": {
+                      "Timestamp": int(time.time() * 1000),
+                      "CloudWatchMetrics": [{
+                          "Namespace": "AgentCore/InferenceUsage",
+                          "Dimensions": [["User", "Team", "Model"]],
+                          "Metrics": [
+                              {"Name": "InputTokens",       "Unit": "Count"},
+                              {"Name": "OutputTokens",      "Unit": "Count"},
+                              {"Name": "CacheReadTokens",   "Unit": "Count"},
+                              {"Name": "CacheWrite5mTokens","Unit": "Count"},
+                              {"Name": "CacheWrite1hTokens","Unit": "Count"},
+                              {"Name": "EstimatedCostUSD",  "Unit": "None"},
+                          ],
+                      }],
+                  },
+                  "User": user, "Team": team, "Model": model,
+                  "InputTokens": in_tok, "OutputTokens": out_tok,
+                  "CacheReadTokens": cache_read,
+                  "CacheWrite5mTokens": cache_write_5m,
+                  "CacheWrite1hTokens": cache_write_1h,
+                  "EstimatedCostUSD": cost,
+              }))
+
+          def _bump_spend(user, cost):
+              # Schema v2: one row per user, both counters as attrs on that row.
+              # DDB's ADD creates attrs on first use, so no init step needed.
+              # daily_spend_usd + monthly_spend_usd are reset by the rollover Lambda
+              # (see cloudformation/rollover-lambda.yaml). Missing == 0.
+              ddb.update_item(
+                  TableName=TABLE,
+                  Key={"pk": {"S": f"USER#{user}"}},
+                  UpdateExpression="ADD daily_spend_usd :c, monthly_spend_usd :c SET updated_at = :ts",
+                  ExpressionAttributeValues={
+                      ":c":  {"N": f"{cost}"},
+                      ":ts": {"N": f"{int(time.time())}"},
+                  },
+              )
+
+          # RESPONSE interceptor for HTTP/inference targets:
+          #   passthrough -> {"http": {}}   (gateway uses original response)
+          # We never modify the body; usage is recorded out-of-band via EMF + DDB.
+          PASS = {"interceptorOutputVersion": "1.0", "http": {}}
+
+          def _decode_body(body, content_type=""):
+              """Decode gateway response body into a dict carrying `model` and `usage`.
+
+              Non-streaming (application/json): base64 -> JSON object.
+              Streaming (text/event-stream): the gateway buffers the whole SSE stream and
+              hands it to us as one base64 blob. We parse SSE events, walk from the tail
+              to find the terminal event that carries `usage`, and return that JSON. Works
+              for OpenAI Responses (`response.completed`), OpenAI Chat Completions
+              (final chunk with `usage`), and Anthropic Messages (`message_delta` +
+              `message_stop`) formats.
+              """
+              if isinstance(body, dict):
+                  return body
+              if not body:
+                  return {}
+
+              try:
+                  raw = base64.b64decode(body).decode("utf-8", errors="replace")
+              except Exception as e:
+                  log("body_b64_decode_failed", level="error", error=str(e))
+                  return {}
+
+              is_sse = "event-stream" in (content_type or "") or raw.lstrip().startswith("data:") or raw.lstrip().startswith("event:")
+
+              if not is_sse:
+                  try:
+                      return json.loads(raw)
+                  except Exception as e:
+                      log("body_json_parse_failed", level="error", error=str(e), body_head=raw[:80])
+                      return {}
+
+              # Parse SSE. Walk events; keep the last one that carries usage — that's the
+              # terminal event for both OpenAI Responses (`response.completed`) and
+              # Anthropic Messages streaming (`message_delta`).
+              merged = {}
+              model_seen = None
+              for chunk in raw.split("\n\n"):
+                  data_lines = [ln[5:].lstrip() for ln in chunk.split("\n") if ln.startswith("data:")]
+                  if not data_lines:
+                      continue
+                  payload = "\n".join(data_lines).strip()
+                  if payload in ("[DONE]", ""):
+                      continue
+                  try:
+                      obj = json.loads(payload)
+                  except Exception:
+                      continue
+
+                  # OpenAI Responses: {"response": {..., "usage": {...}}}
+                  inner_resp = obj.get("response") if isinstance(obj, dict) else None
+                  if isinstance(inner_resp, dict) and inner_resp.get("usage"):
+                      merged = inner_resp
+                      continue
+
+                  # OpenAI Chat Completions streaming: {"usage": {...}} on final chunk
+                  # Anthropic Messages `message_delta`: {"usage": {"output_tokens": ...}}
+                  # Anthropic `message_start`: {"message": {"usage": {"input_tokens": ...}}}
+                  if isinstance(obj, dict):
+                      if obj.get("usage") and isinstance(obj["usage"], dict):
+                          merged.setdefault("usage", {}).update(obj["usage"])
+                      msg = obj.get("message")
+                      if isinstance(msg, dict):
+                          if msg.get("usage"):
+                              merged.setdefault("usage", {}).update(msg["usage"])
+                          if msg.get("model"):
+                              model_seen = msg["model"]
+                      if obj.get("model"):
+                          model_seen = obj["model"]
+
+              if model_seen and not merged.get("model"):
+                  merged["model"] = model_seen
+              return merged
+
+          def lambda_handler(event, context):
+              t0 = time.perf_counter()
+              data = event.get("http") or {}
+              resp = data.get("gatewayResponse") or {}
+              status = resp.get("statusCode", 200)
+              req_id = _request_id(context)
+
+              if status >= 400:
+                  log("upstream_error", level="warn", request_id=req_id, status_code=status)
+                  return PASS
+
+              try:
+                  user, team = _fetch_context(req_id)
+                  content_type = (resp.get("contentType") or resp.get("headers", {}).get("content-type") or "") if isinstance(resp.get("headers"), dict) else (resp.get("contentType") or "")
+                  is_streaming = "event-stream" in (content_type or "")
+                  resp_body = _decode_body(resp.get("body"), content_type)
+
+                  model = _normalize_model(resp_body.get("model"))
+                  in_tok, out_tok, cache_read, cache_write_5m, cache_write_1h = _extract_usage(resp_body)
+                  total_in = in_tok + cache_read + cache_write_5m + cache_write_1h
+
+                  if total_in == 0 and out_tok == 0:
+                      log("no_usage_found", level="info", request_id=req_id, user=user, team=team,
+                          model=model, streaming=is_streaming, status_code=status,
+                          latency_ms=round((time.perf_counter() - t0) * 1000, 2))
+                      return PASS
+
+                  cost = _cost(model, in_tok, out_tok, cache_read, cache_write_5m, cache_write_1h)
+                  priced = model in PRICES
+
+                  # Bump spend FIRST (durable ledger), then emit EMF. If DDB
+                  # fails, emit a bump_failed log with the full snapshot so ops
+                  # can reconcile the missed charge from logs — otherwise the
+                  # user gets a free inference (billing leak).
+                  bumped = False
+                  if cost > 0 and user != "unknown":
+                      try:
+                          _bump_spend(user, cost)
+                          bumped = True
+                      except Exception as e:
+                          log("bump_failed", level="error",
+                              request_id=req_id, user=user, team=team, model=model,
+                              input_tokens=in_tok, output_tokens=out_tok,
+                              cache_read_tokens=cache_read,
+                              cache_write_5m_tokens=cache_write_5m,
+                              cache_write_1h_tokens=cache_write_1h,
+                              cost_usd=round(cost, 6), error=str(e))
+
+                  _emf(user, team, model, in_tok, out_tok, cache_read, cache_write_5m, cache_write_1h, cost)
+
+                  log("usage_recorded",
+                      request_id=req_id, user=user, team=team, model=model,
+                      input_tokens=in_tok, output_tokens=out_tok,
+                      cache_read_tokens=cache_read,
+                      cache_write_5m_tokens=cache_write_5m,
+                      cache_write_1h_tokens=cache_write_1h,
+                      cost_usd=round(cost, 6), priced=priced, spend_recorded=bumped,
+                      streaming=is_streaming, status_code=status,
+                      latency_ms=round((time.perf_counter() - t0) * 1000, 2))
+              except Exception as e:
+                  log("record_failed", level="error", request_id=req_id, error=str(e),
+                      latency_ms=round((time.perf_counter() - t0) * 1000, 2))
+
+              return PASS
+
+  ResponseInterceptorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ResponseInterceptorFunction
+      Action: lambda:InvokeFunction
+      Principal: bedrock-agentcore.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+
+  ResponseInterceptorVersion:
+    Type: AWS::Lambda::Version
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      FunctionName: !Ref ResponseInterceptorFunction
+      # Do not change this string — an AWS::Lambda::Version resource's Description
+      # is part of the resource identity, so any edit makes CFN try to publish a
+      # fresh Lambda version. The publish then fails with "A version for this
+      # Lambda function exists (N)" because the code is byte-identical to $LATEST.
+      # Code rolls happen via scripts/publish_new_version.py instead. The literal
+      # "code-rev v1" is preserved from an earlier `${LambdaCodeRevision}` !Sub —
+      # keeping it byte-identical avoids the republish trap.
+      Description: "Initial version — code-rev v1"
+
+  ResponseInterceptorLiveAlias:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref ResponseInterceptorFunction
+      FunctionVersion: !GetAtt ResponseInterceptorVersion.Version
+      Name: live
+      ProvisionedConcurrencyConfig:
+        Fn::If:
+          - UseProvisionedConcurrency
+          - ProvisionedConcurrentExecutions: !Ref ProvisionedConcurrency
+          - !Ref AWS::NoValue
+
+  ResponseInterceptorAliasPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ResponseInterceptorLiveAlias
+      Action: lambda:InvokeFunction
+      Principal: bedrock-agentcore.amazonaws.com
+      SourceArn: !Sub "arn:${AWS::Partition}:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:gateway/*"
+
+  # (GatewayInvokeInterceptorsPolicy was removed — the invoke grant now lives
+  # inline on GatewayRole.Policies to sidestep an early-validation issue.)
+
+  # ==========================================================================
+  # Rollover pipeline — resets daily/monthly counters, archives to S3.
+  # ==========================================================================
+  #
+  # Runs on a schedule (EventBridge Scheduler, timezone-aware). For each user's
+  # LIVE row: read the current counter, write {date, user, spend} to S3, then
+  # subtract-what-was-archived from DDB (preserves in-flight increments — no
+  # blind zero). Idempotent via last_*_rollover_ts fingerprints.
+  #
+  # DDB item stays fixed-size forever; long-tail history lives in S3 and is
+  # queryable via Athena.
+
+  RolloverArchiveBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Bucket name auto-generated by CFN so parallel deployments don't collide.
+      # Object layout: period=daily|monthly / year=YYYY / month=MM / day=DD (daily only) / users.jsonl
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt InterceptorDataKey.Arn
+            BucketKeyEnabled: true
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TieredArchive
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+              - StorageClass: DEEP_ARCHIVE
+                TransitionInDays: 365
+          - Id: ExpireNoncurrent
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 30
+
+  RolloverDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+
+  RolloverRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-rollover-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: rollover-permissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt SpendTable.Arn
+              # DDB CMK — same pattern as the interceptor role (see
+              # ddb_cmk_kms_caller_permissions memory).
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt InterceptorDataKey.Arn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub dynamodb.${AWS::Region}.amazonaws.com
+              # S3 write with the same CMK for at-rest encryption.
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${RolloverArchiveBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt InterceptorDataKey.Arn
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub s3.${AWS::Region}.amazonaws.com
+              # DLQ.
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt RolloverDLQ.Arn
+
+  RolloverFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-rollover"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt RolloverRole.Arn
+      Timeout: 300  # 5 min — scan of a few thousand users is easily bounded
+      MemorySize: 512
+      ReservedConcurrentExecutions: 2
+      Description: Rollover — reset daily/monthly counters, archive to S3
+      DeadLetterConfig:
+        TargetArn: !GetAtt RolloverDLQ.Arn
+      Environment:
+        Variables:
+          SPEND_TABLE: !Ref SpendTable
+          ARCHIVE_BUCKET: !Ref RolloverArchiveBucket
+          ROLLOVER_TIMEZONE: !Ref RolloverTimezone
+      Code:
+        ZipFile: |
+          """Rollover Lambda.
+
+          Invoked by two EventBridge Scheduler rules — one at local-midnight daily,
+          one at local-midnight on the 1st of the month. Payload: {"period": "daily"}
+          or {"period": "monthly"}.
+
+          For each user in SpendTable:
+            1. Read the current *_spend_usd counter.
+            2. Write {period, date, user, spend_usd, cap_usd} to S3.
+            3. Atomically subtract the archived amount from the counter — preserves
+               any concurrent RESPONSE-side increments. Skip if idempotency marker
+               (last_*_rollover_ts) is newer than the invocation window (this run
+               already happened).
+          """
+
+          import base64  # noqa: F401 (unused, kept for symmetry with interceptor style)
+          import gzip
+          import io
+          import json
+          import os
+          import time
+          from datetime import datetime, timezone
+          from decimal import Decimal
+
+          import boto3
+
+          TABLE = os.environ["SPEND_TABLE"]
+          BUCKET = os.environ["ARCHIVE_BUCKET"]
+          ROLLOVER_TZ = os.environ.get("ROLLOVER_TIMEZONE", "Etc/UTC")
+
+          ddb = boto3.client("dynamodb")
+          s3 = boto3.client("s3")
+
+          COMPONENT = "rollover"
+
+          def log(event, level="info", **fields):
+              rec = {
+                  "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
+                  "level": level,
+                  "component": COMPONENT,
+                  "event": event,
+              }
+              for k, v in fields.items():
+                  if v is not None:
+                      rec[k] = v
+              print(json.dumps(rec, default=str))
+
+          def _local_now():
+              try:
+                  from zoneinfo import ZoneInfo
+                  return datetime.now(ZoneInfo(ROLLOVER_TZ))
+              except Exception as e:
+                  log("timezone_fallback", level="warn",
+                      configured_tz=ROLLOVER_TZ, error=str(e))
+                  return datetime.now(timezone.utc)
+
+          def _period_key(period, now):
+              # For "daily" this key names YESTERDAY's date (the one we're archiving).
+              # For "monthly" it names the month we just closed.
+              from datetime import timedelta
+              if period == "daily":
+                  yday = now - timedelta(days=1)
+                  return yday.strftime("%Y-%m-%d")
+              else:
+                  # Monthly runs at 00:00 on the 1st — the month we're archiving is
+                  # the previous calendar month.
+                  y, m = now.year, now.month
+                  if m == 1:
+                      y, m = y - 1, 12
+                  else:
+                      m -= 1
+                  return f"{y:04d}-{m:02d}"
+
+          def _s3_prefix(period, key):
+              # Athena-friendly Hive partition layout.
+              if period == "daily":
+                  y, m, d = key.split("-")
+                  return f"period=daily/year={y}/month={m}/day={d}"
+              else:
+                  y, m = key.split("-")
+                  return f"period=monthly/year={y}/month={m}"
+
+          def _scan_users():
+              paginator = ddb.get_paginator("scan")
+              # Filter to LIVE rows only (v2 pk pattern USER#<user>). Old-shape rows
+              # (composite-key USER#<user>#YYYY-MM) will get filtered out by the
+              # attribute check — they don't have daily_spend_usd / monthly_spend_usd.
+              for page in paginator.paginate(TableName=TABLE):
+                  for item in page.get("Items", []):
+                      pk = item["pk"]["S"]
+                      if not pk.startswith("USER#") or "#" in pk[5:]:
+                          continue  # legacy row from v1 schema — skip
+                      yield item
+
+          def _archive_and_reset(item, period, key, run_ts):
+              user = item["pk"]["S"].split("#", 1)[1]
+              spend_attr = "daily_spend_usd" if period == "daily" else "monthly_spend_usd"
+              cap_attr   = "daily_cap_usd"   if period == "daily" else "monthly_cap_usd"
+              # Idempotency: track the *period key* we last archived (e.g. "2026-07-11"
+              # or "2026-07"), not a wallclock timestamp. A retry within the same
+              # period sees the same key and skips; a legitimate next-period run
+              # sees a different key and proceeds. Ts marker kept for observability.
+              period_attr = "last_daily_period" if period == "daily" else "last_monthly_period"
+              ts_attr     = "last_daily_rollover_ts" if period == "daily" else "last_monthly_rollover_ts"
+
+              spent = float(item.get(spend_attr, {}).get("N", "0"))
+              cap = item.get(cap_attr, {}).get("N")
+              cap = float(cap) if cap is not None else None
+              last_period = item.get(period_attr, {}).get("S", "")
+
+              if last_period == key:
+                  return None
+
+              record = {
+                  "period": period,
+                  "date": key,
+                  "user": user,
+                  "spend_usd": round(spent, 6),
+                  "cap_usd": cap,
+                  "archived_at": datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+              }
+
+              if spent == 0.0:
+                  # No-spend users don't need an S3 record, but we DO need to bump the
+                  # marker so a retry within the same period doesn't re-scan them.
+                  ddb.update_item(
+                      TableName=TABLE,
+                      Key={"pk": {"S": item["pk"]["S"]}},
+                      UpdateExpression=f"SET {period_attr} = :k, {ts_attr} = :ts",
+                      ExpressionAttributeValues={
+                          ":k":  {"S": key},
+                          ":ts": {"N": str(run_ts)},
+                      },
+                  )
+                  return record
+
+              # Subtract-what-we-archived (not blind zero) — preserves any in-flight
+              # RESPONSE-side increments that landed between the read and the write.
+              ddb.update_item(
+                  TableName=TABLE,
+                  Key={"pk": {"S": item["pk"]["S"]}},
+                  UpdateExpression=(
+                      f"ADD {spend_attr} :neg_archived "
+                      f"SET {period_attr} = :k, {ts_attr} = :ts, updated_at = :ts"
+                  ),
+                  ExpressionAttributeValues={
+                      ":neg_archived": {"N": str(-spent)},
+                      ":k":  {"S": key},
+                      ":ts": {"N": str(run_ts)},
+                  },
+              )
+              return record
+
+          def lambda_handler(event, context):
+              t0 = time.perf_counter()
+              period = (event or {}).get("period")
+              if period not in ("daily", "monthly"):
+                  log("bad_input", level="error", event=event)
+                  raise ValueError(f"period must be 'daily' or 'monthly', got {period!r}")
+
+              now = _local_now()
+              key = _period_key(period, now)
+              run_ts = int(time.time())
+
+              records = []
+              scanned = 0
+              archived = 0
+              for item in _scan_users():
+                  scanned += 1
+                  try:
+                      rec = _archive_and_reset(item, period, key, run_ts)
+                  except Exception as e:
+                      log("user_rollover_failed", level="error",
+                          user=item.get("pk", {}).get("S"), error=str(e))
+                      continue
+                  if rec:
+                      records.append(rec)
+                      archived += 1
+
+              # Write archive (JSONL, gzipped) if anything to archive.
+              s3_key = None
+              if records:
+                  s3_key = f"{_s3_prefix(period, key)}/users-{run_ts}.jsonl.gz"
+                  buf = io.BytesIO()
+                  with gzip.GzipFile(fileobj=buf, mode="w") as gz:
+                      for r in records:
+                          gz.write((json.dumps(r) + "\n").encode())
+                  s3.put_object(
+                      Bucket=BUCKET,
+                      Key=s3_key,
+                      Body=buf.getvalue(),
+                      ContentType="application/x-ndjson",
+                      ContentEncoding="gzip",
+                  )
+
+              log("rollover_complete",
+                  period=period, archive_date=key,
+                  users_scanned=scanned, users_archived=archived,
+                  s3_key=s3_key,
+                  duration_ms=round((time.perf_counter() - t0) * 1000, 2))
+              return {"period": period, "archived": archived, "s3_key": s3_key}
+
+  # EventBridge Scheduler (not classic EventBridge Rules) — supports IANA
+  # timezones natively including DST. `ScheduleExpressionTimezone` matches
+  # RolloverTimezone so cron fires at LOCAL midnight, whatever the offset.
+
+  RolloverSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke-rollover
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt RolloverFunction.Arn
+
+  RolloverDailySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-rollover-daily"
+      Description: Daily budget counter reset at local midnight
+      ScheduleExpression: cron(5 0 * * ? *)
+      ScheduleExpressionTimezone: !Ref RolloverTimezone
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt RolloverFunction.Arn
+        RoleArn: !GetAtt RolloverSchedulerRole.Arn
+        Input: '{"period":"daily"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+        DeadLetterConfig:
+          Arn: !GetAtt RolloverDLQ.Arn
+
+  RolloverMonthlySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${AWS::StackName}-rollover-monthly"
+      Description: Monthly budget counter reset at local midnight on the 1st
+      ScheduleExpression: cron(10 0 1 * ? *)
+      ScheduleExpressionTimezone: !Ref RolloverTimezone
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt RolloverFunction.Arn
+        RoleArn: !GetAtt RolloverSchedulerRole.Arn
+        Input: '{"period":"monthly"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+        DeadLetterConfig:
+          Arn: !GetAtt RolloverDLQ.Arn
+
+  RolloverErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Rollover Lambda invocation errors (any period)
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref RolloverFunction
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  RolloverDLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Messages arriving in the rollover DLQ (failed retries)
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt RolloverDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # ==================================================================
+  # Custom resource: attach interceptors + create inference target
+  # ==================================================================
+  # Two operations CFN can't yet express as native resources:
+  #   (a) UpdateGateway with interceptorConfigurations (control-plane API)
+  #   (b) create_gateway_target with target-type=inference — the
+  #       AWS::BedrockAgentCore::GatewayTarget resource currently only accepts
+  #       Mcp/Http, not Inference
+  # Both live on the same gateway, so we do them in one Lambda call to avoid
+  # ordering races on Delete.
+
+  GatewayWiringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: agentcore-gateway-wiring
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # The AgentCore control-plane APIs are split across two IAM
+              # service prefixes — bedrock-agentcore-control:* for the CFN
+              # resource type, bedrock-agentcore:* for the boto3 client (what
+              # this Lambda uses). Grant both.
+              - Sid: GatewayControlPlane
+                Effect: Allow
+                Action:
+                  - bedrock-agentcore-control:GetGateway
+                  - bedrock-agentcore-control:UpdateGateway
+                  - bedrock-agentcore-control:CreateGatewayTarget
+                  - bedrock-agentcore-control:DeleteGatewayTarget
+                  - bedrock-agentcore-control:ListGatewayTargets
+                  - bedrock-agentcore-control:GetGatewayTarget
+                  - bedrock-agentcore:GetGateway
+                  - bedrock-agentcore:UpdateGateway
+                  - bedrock-agentcore:CreateGatewayTarget
+                  - bedrock-agentcore:DeleteGatewayTarget
+                  - bedrock-agentcore:ListGatewayTargets
+                  - bedrock-agentcore:GetGatewayTarget
+                Resource: "*"
+              - Sid: PassGatewayRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt GatewayRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: bedrock-agentcore.amazonaws.com
+
+  GatewayWiringFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-gateway-wiring"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt GatewayWiringRole.Arn
+      # 600s max: Delete path polls up to ~4 min waiting for the inference
+      # target to fully drain (target can take 60–90s to leave DELETING state
+      # under normal conditions, longer on throttle).
+      Timeout: 600
+      # One-shot custom resource — CFN invokes it once on Create/Update/Delete.
+      # Cap concurrency so a runaway CFN retry loop can't burst-consume account-
+      # wide Lambda concurrency.
+      ReservedConcurrentExecutions: 5
+      Code:
+        ZipFile: |
+          """CFN custom resource: attach interceptors + create inference target.
+
+          Event ResourceProperties:
+            GatewayId, RequestArn, ResponseArn, TargetName, ConnectorId
+
+          Create/Update:
+            1. Ensure the inference target exists (create if missing, idempotent).
+            2. UpdateGateway with the two interceptor configs.
+          Delete:
+            1. UpdateGateway with interceptorConfigurations=[].
+            2. DeleteGatewayTarget.
+          Delete never fails the stack — a stuck gateway must not block teardown.
+
+          The `inference` variant of targetConfiguration is not in the older
+          boto3 shipped with the python3.12 Lambda runtime (1.42.x — only knows
+          `mcp`). So CreateGatewayTarget is called via raw SigV4-signed HTTP.
+          Every other control-plane op still uses boto3.
+          """
+          import json
+          import os
+          import urllib.request
+
+          import boto3
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+
+          REGION = os.environ["AWS_REGION"]
+          CONTROL_ENDPOINT = f"https://bedrock-agentcore-control.{REGION}.amazonaws.com"
+
+          control = boto3.client("bedrock-agentcore-control", region_name=REGION)
+          _creds = boto3.Session().get_credentials()
+
+          def _sigv4_request(method, path, body_obj=None):
+              """SigV4-signed HTTPS call to bedrock-agentcore-control. Returns parsed JSON body.
+              Bypasses boto3's client model so we can send targetConfiguration variants
+              (like `inference`) that the Lambda runtime's older botocore doesn't know."""
+              url = CONTROL_ENDPOINT + path
+              body_str = json.dumps(body_obj) if body_obj is not None else ""
+              aws_req = AWSRequest(method=method, url=url, data=body_str,
+                                    headers={"Content-Type": "application/json"} if body_obj else {})
+              SigV4Auth(_creds, "bedrock-agentcore", REGION).add_auth(aws_req)
+              req = urllib.request.Request(url, data=body_str.encode() if body_str else None,
+                                            method=method, headers=dict(aws_req.headers))
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  raw = resp.read()
+                  return json.loads(raw) if raw else {}
+
+          def _send(event, context, status, data=None, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"See CloudWatch logs: {context.log_stream_name}",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": data or {},
+              }).encode()
+              req = urllib.request.Request(
+                  event["ResponseURL"], data=body, method="PUT",
+                  headers={"Content-Type": "", "Content-Length": str(len(body))},
+              )
+              urllib.request.urlopen(req, timeout=15)
+
+          def _find_target(gw_id, name):
+              paginator = control.get_paginator("list_gateway_targets")
+              for page in paginator.paginate(gatewayIdentifier=gw_id):
+                  for t in page.get("items", []):
+                      if t.get("name") == name:
+                          return t
+              return None
+
+          def _ensure_target(gw_id, name, connector_id):
+              t = _find_target(gw_id, name)
+              if t:
+                  return t["targetId"]
+              resp = _sigv4_request(
+                  "POST", f"/gateways/{gw_id}/targets/",
+                  body_obj={
+                      "name": name,
+                      "targetConfiguration": {
+                          "inference": {"connector": {"source": {"connectorId": connector_id}}}
+                      },
+                      "credentialProviderConfigurations": [
+                          {"credentialProviderType": "GATEWAY_IAM_ROLE"}
+                      ],
+                  },
+              )
+              return resp["targetId"]
+
+          def _current_gw_body(gw_id):
+              # UpdateGateway is a PUT — must re-send the whole gateway spec.
+              # Use SigV4 for both get + put so we don't rely on boto3 knowing
+              # the interceptorConfigurations field (older 1.42 runtime doesn't).
+              gw = _sigv4_request("GET", f"/gateways/{gw_id}/")
+              body = {
+                  "name": gw["name"],
+                  "roleArn": gw["roleArn"],
+                  "protocolType": gw["protocolType"],
+                  "authorizerType": gw["authorizerType"],
+                  "authorizerConfiguration": gw["authorizerConfiguration"],
+              }
+              if gw.get("protocolConfiguration"):
+                  body["protocolConfiguration"] = gw["protocolConfiguration"]
+              if gw.get("exceptionLevel"):
+                  body["exceptionLevel"] = gw["exceptionLevel"]
+              return body
+
+          def _attach(gw_id, req_arn, resp_arn):
+              body = _current_gw_body(gw_id)
+              body["interceptorConfigurations"] = [
+                  {"interceptor": {"lambda": {"arn": req_arn}},
+                   "interceptionPoints": ["REQUEST"],
+                   "inputConfiguration": {"passRequestHeaders": True}},
+                  {"interceptor": {"lambda": {"arn": resp_arn}},
+                   "interceptionPoints": ["RESPONSE"],
+                   "inputConfiguration": {"passRequestHeaders": True}},
+              ]
+              _sigv4_request("PUT", f"/gateways/{gw_id}/", body)
+
+          def _detach(gw_id):
+              body = _current_gw_body(gw_id)
+              # Omit interceptorConfigurations entirely (empty array is rejected
+              # by the API — "value: 0, valid min length: 1"). Missing field
+              # clears the list server-side.
+              _sigv4_request("PUT", f"/gateways/{gw_id}/", body)
+
+          def handler(event, context):
+              try:
+                  props = event["ResourceProperties"]
+                  gw_id = props["GatewayId"]
+                  req_arn = props["RequestArn"]
+                  resp_arn = props["ResponseArn"]
+                  target_name = props.get("TargetName", "bedrock-mantle")
+                  connector_id = props.get("ConnectorId", "bedrock-mantle")
+                  rtype = event["RequestType"]
+
+                  if rtype in ("Create", "Update"):
+                      target_id = _ensure_target(gw_id, target_name, connector_id)
+                      _attach(gw_id, req_arn, resp_arn)
+                      _send(event, context, "SUCCESS",
+                            data={"TargetId": target_id, "GatewayId": gw_id})
+                      return
+
+                  if rtype == "Delete":
+                      # Detach first so in-flight requests don't hit a Lambda
+                      # that's about to be torn down.
+                      try:
+                          _detach(gw_id)
+                          print("detached interceptors")
+                      except Exception as e:
+                          print(f"detach ignored: {e}")
+
+                      # UpdateGateway briefly puts the gateway in UPDATING —
+                      # DeleteGatewayTarget rejects that state. Wait for READY.
+                      import time
+                      for _ in range(30):  # up to 60s
+                          try:
+                              g = _sigv4_request("GET", f"/gateways/{gw_id}/")
+                              if g.get("status") == "READY":
+                                  break
+                          except Exception:
+                              pass
+                          time.sleep(2)
+
+                      # Delete target(s). Then poll until list-targets is empty —
+                      # CFN's Gateway resource-handler fails Delete if any target
+                      # exists (including in DELETING state).
+                      try:
+                          t = _find_target(gw_id, target_name)
+                          if t:
+                              _sigv4_request("DELETE", f"/gateways/{gw_id}/targets/{t['targetId']}/")
+                              print(f"delete_target submitted: {t['targetId']}")
+                      except Exception as e:
+                          print(f"delete_target ignored: {e}")
+
+                      # Poll until target list is empty. CFN's Gateway resource
+                      # will fail its own Delete if any target still exists
+                      # (including in DELETING state), so we have to fully drain
+                      # here. Loop bounded only by Lambda timeout — the send-
+                      # SUCCESS below runs unconditionally so we don't wedge
+                      # the stack in DELETE_FAILED (per AWS custom-resource
+                      # guidance, Delete should be best-effort).
+                      deadline = time.time() + 240  # ~4 min; Lambda timeout is 600s
+                      targets_remaining = []
+                      while time.time() < deadline:
+                          try:
+                              lst = _sigv4_request("GET", f"/gateways/{gw_id}/targets/")
+                              targets_remaining = lst.get("items", [])
+                              if not targets_remaining:
+                                  print("all targets gone — Delete complete")
+                                  break
+                          except Exception as e:
+                              print(f"list-targets during drain: {e}")
+                          time.sleep(3)
+
+                      if targets_remaining:
+                          # Log loudly so an operator watching CloudWatch sees
+                          # this. Still send SUCCESS to unblock stack delete —
+                          # the next Gateway-delete may fail, but at that point
+                          # the operator can delete targets manually and retry,
+                          # instead of also having to salvage a stuck custom-
+                          # resource in DELETE_FAILED.
+                          ids = ",".join(t.get("targetId", "?") for t in targets_remaining)
+                          print(f"WARN: targets still present after drain: {ids}. "
+                                f"Gateway-delete will fail; run 'aws bedrock-agentcore-control "
+                                f"delete-gateway-target' manually then retry stack delete.")
+                      _send(event, context, "SUCCESS")
+                      return
+
+                  _send(event, context, "FAILED", reason=f"Unknown RequestType {rtype}")
+              except Exception as e:
+                  print(f"handler error: {e}")
+                  # Fail Create/Update loudly, but never block Delete.
+                  status = "SUCCESS" if event.get("RequestType") == "Delete" else "FAILED"
+                  _send(event, context, status, reason=str(e))
+
+  # Aliased ARNs must be resolvable before we attach. The invoke grant is
+  # inline on GatewayRole so no separate DependsOn is needed for it.
+  GatewayWiring:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - RequestInterceptorLiveAlias
+      - ResponseInterceptorLiveAlias
+    Properties:
+      ServiceToken: !GetAtt GatewayWiringFunction.Arn
+      GatewayId: !GetAtt Gateway.GatewayIdentifier
+      RequestArn: !Sub "${RequestInterceptorFunction.Arn}:live"
+      ResponseArn: !Sub "${ResponseInterceptorFunction.Arn}:live"
+      TargetName: bedrock-mantle
+      ConnectorId: bedrock-mantle
+
+Outputs:
+  # The three things a user needs to sign in and call the gateway:
+  InferenceBaseUrl:
+    Description: Base URL to configure in your OIDC client (e.g. ~/.codex/config.toml, apiKeyHelper)
+    Value: !Sub
+      - "https://${GwHost}/inference/v1"
+      - GwHost: !Select [2, !Split ["/", !GetAtt Gateway.GatewayUrl]]
+  DiscoveryUrl:
+    Description: AGENTCORE_OIDC_DISCOVERY_URL for auth-helper/oidc-token.py
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}/.well-known/openid-configuration"
+  ClientId:
+    Description: AGENTCORE_OIDC_CLIENT_ID for auth-helper/oidc-token.py
+    Value: !Ref HumanClient
+  HostedUIBaseUrl:
+    Description: Cognito Hosted UI URL — create users here (admin console) or sign in.
+    Value: !Sub "https://${DomainPrefix}.auth.${AWS::Region}.amazoncognito.com"
+  GatewayId:
+    Description: AgentCore gateway id
+    Value: !GetAtt Gateway.GatewayIdentifier
+
+  # Interceptor-plane details (mostly for debugging / dashboards):
+  RequestInterceptorArn:
+    Description: Unqualified ARN of the REQUEST interceptor Lambda (points at $LATEST)
+    Value: !GetAtt RequestInterceptorFunction.Arn
+  ResponseInterceptorArn:
+    Description: Unqualified ARN of the RESPONSE interceptor Lambda (points at $LATEST)
+    Value: !GetAtt ResponseInterceptorFunction.Arn
+  RequestInterceptorLiveArn:
+    Description: :live alias ARN — attach the gateway at this ARN for provisioned concurrency
+    Value: !Sub "${RequestInterceptorFunction.Arn}:live"
+  ResponseInterceptorLiveArn:
+    Description: :live alias ARN — attach the gateway at this ARN for provisioned concurrency
+    Value: !Sub "${ResponseInterceptorFunction.Arn}:live"
+  SpendTableName:
+    Description: DynamoDB table holding monthly per-user $ spend
+    Value: !Ref SpendTable
+  InterceptorDataKeyArn:
+    Description: KMS CMK ARN encrypting both DynamoDB tables — retained on stack delete
+    Value: !GetAtt InterceptorDataKey.Arn
+  InterceptorDataKeyAlias:
+    Description: KMS key alias for the DDB tables
+    Value: !Ref InterceptorDataKeyAlias

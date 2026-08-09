@@ -1,0 +1,178 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  OAuth-fronted MCP server wrapping the Tavily Search API.
+  Amazon Cognito = OAuth 2.1 authorization server (per-user identity + scopes).
+  API Gateway HTTP API JWT authorizer validates tokens at the edge.
+  Lambda re-checks scope and calls Tavily with a shared key kept in Secrets
+  Manager -- the shared key never reaches the client.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: tavily-mcp-oauth
+  CallbackUrl:
+    Type: String
+    Default: http://localhost:8765/callback
+    Description: Redirect URI for the per-user (auth code + PKCE) public client.
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: python3.13
+    Architectures: [arm64]
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Shared upstream credential. This is the single point of compromise; it is
+  # readable ONLY by the Lambda's execution role, never by clients.
+  # ---------------------------------------------------------------------------
+  TavilySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${ProjectName}/tavily-api-key"
+      Description: Shared Tavily API key used server-side by the MCP wrapper.
+
+  # ---------------------------------------------------------------------------
+  # Cognito: the OAuth 2.1 authorization server.
+  # ---------------------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${ProjectName}-pool"
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      # Must be globally unique. AccountId suffix keeps it stable + unique.
+      Domain: !Sub "${ProjectName}-${AWS::AccountId}"
+      UserPoolId: !Ref UserPool
+
+  # Custom resource server defines the OAuth scope that gates the MCP tool.
+  ResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: tavily-mcp
+      Name: Tavily MCP
+      Scopes:
+        - ScopeName: search
+          ScopeDescription: Permission to call the tavily_search tool.
+
+  # Machine-to-machine client (client_credentials) -- used for the curl-based
+  # end-to-end test and for trusted backend agents.
+  M2MClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      ClientName: !Sub "${ProjectName}-m2m"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      AllowedOAuthFlows: [client_credentials]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - tavily-mcp/search
+      SupportedIdentityProviders: [COGNITO]
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # Public client (auth code + PKCE) -- the per-user delegation story. A human
+  # logs in, consents, and gets a token bound to THEIR identity.
+  UserClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ResourceServer
+    Properties:
+      ClientName: !Sub "${ProjectName}-user"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      AllowedOAuthFlows: [code]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - openid
+        - tavily-mcp/search
+      CallbackURLs:
+        - !Ref CallbackUrl
+      SupportedIdentityProviders: [COGNITO]
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  # ---------------------------------------------------------------------------
+  # The MCP server Lambda.
+  # ---------------------------------------------------------------------------
+  McpFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-server"
+      CodeUri: src/
+      Handler: app.handler
+      Environment:
+        Variables:
+          TAVILY_SECRET_ARN: !Ref TavilySecret
+          REQUIRED_SCOPE: tavily-mcp/search
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref TavilySecret
+      Events:
+        Mcp:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /mcp
+            Method: POST
+
+  # ---------------------------------------------------------------------------
+  # HTTP API with a Cognito JWT authorizer. Validates signature/issuer/audience
+  # at the edge BEFORE the Lambda runs. (Cognito access tokens carry client_id
+  # not aud; the HTTP API authorizer falls back to client_id for the audience
+  # check, so we list both app client IDs.)
+  # ---------------------------------------------------------------------------
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      Auth:
+        DefaultAuthorizer: CognitoJwt
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: "$request.header.Authorization"
+            JwtConfiguration:
+              issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+              audience:
+                - !Ref M2MClient
+                - !Ref UserClient
+
+Outputs:
+  McpEndpoint:
+    Description: POST your JSON-RPC MCP messages here (Bearer access token required).
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/mcp"
+  TokenEndpoint:
+    Description: Cognito OAuth token endpoint.
+    Value: !Sub "https://${ProjectName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/oauth2/token"
+  AuthorizeEndpoint:
+    Description: Cognito OAuth authorize endpoint (for the per-user PKCE flow).
+    Value: !Sub "https://${ProjectName}-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/oauth2/authorize"
+  UserPoolId:
+    Value: !Ref UserPool
+  M2MClientId:
+    Description: client_credentials client id (secret retrieved via describe-user-pool-client).
+    Value: !Ref M2MClient
+  UserClientId:
+    Description: Public auth-code+PKCE client id (no secret).
+    Value: !Ref UserClient
+  TavilySecretArn:
+    Value: !Ref TavilySecret

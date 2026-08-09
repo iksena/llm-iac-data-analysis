@@ -1,0 +1,247 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EKS-FAIL-DEMO - FIS experiment templates (AZ disrupt, pod kill, EBS pause, attach hang)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: devops-agent-demo
+  ClusterName:
+    Type: String
+  ClusterArn:
+    Type: String
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet::Id
+  EbsCsiRoleArn:
+    Type: String
+  EbsCsiRoleName:
+    Type: String
+  LogsBucketName:
+    Type: String
+    Default: ''
+  AwsAccountId:
+    Type: String
+
+Conditions:
+  HasLogsBucket: !Not [!Equals [!Ref LogsBucketName, '']]
+
+Resources:
+  # ---------- FIS execution role ----------
+  FisRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-fis-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: fis.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AwsAccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:fis:${AWS::Region}:${AwsAccountId}:experiment/*
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSFaultInjectionSimulatorNetworkAccess
+        - arn:aws:iam::aws:policy/service-role/AWSFaultInjectionSimulatorEKSAccess
+        - arn:aws:iam::aws:policy/service-role/AWSFaultInjectionSimulatorEC2Access
+      Policies:
+        - PolicyName: EbsPauseVolumeIo
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Permissions for aws:ebs:pause-volume-io action.
+              # Not covered by the managed FIS policies.
+              - Effect: Allow
+                Action:
+                  - ec2:PauseVolumeIO
+                  - ebs:PauseVolumeIO
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVolumes
+                Resource: '*'
+        - PolicyName: ApiThrottle
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # inject-api-internal-error / throttle-error needs IAM permissions
+              # to attach a deny-style policy to the target role
+              - Effect: Allow
+                Action:
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:GetRole
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                Resource: !Ref EbsCsiRoleArn
+        - PolicyName: LogDelivery
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:PutResourcePolicy
+                  - logs:DescribeLogGroups
+                  - logs:DescribeResourcePolicies
+                Resource: '*'
+      Tags:
+        - {Key: auto-delete, Value: never}
+
+  ExperimentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/fis/${ProjectName}
+      RetentionInDays: 7
+      Tags:
+        - {Key: auto-delete, Value: never}
+
+  # ---------- Experiment 1: AZ network disruption ----------
+  # Disrupts all traffic in/out of one private subnet, stranding the
+  # Postgres pod whose EBS PV lives in that AZ.
+  AzDisruptExperiment:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: Disrupt all network connectivity to one private subnet (AZ-a)
+      RoleArn: !GetAtt FisRole.Arn
+      StopConditions:
+        - Source: none
+      LogConfiguration:
+        LogSchemaVersion: 2
+        CloudWatchLogsConfiguration:
+          LogGroupArn: !GetAtt ExperimentLogGroup.Arn
+      Targets:
+        Subnet:
+          ResourceType: aws:ec2:subnet
+          ResourceArns:
+            - !Sub arn:aws:ec2:${AWS::Region}:${AwsAccountId}:subnet/${PrivateSubnetA}
+          SelectionMode: ALL
+      Actions:
+        DisruptAz:
+          ActionId: aws:network:disrupt-connectivity
+          Parameters:
+            duration: PT45M
+            scope: all
+          Targets:
+            Subnets: Subnet
+      Tags:
+        Name: !Sub ${ProjectName}-az-disrupt
+        auto-delete: never
+
+  # ---------- Experiment 2: Pod kill ----------
+  # Deletes a random Postgres pod. The target is aws:eks:pod (not the
+  # cluster); the cluster/namespace/selector live in the target's
+  # Parameters block, and the action only takes kubernetesServiceAccount.
+  PodKillExperiment:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: Delete a random Postgres pod via the EKS pod-delete action
+      RoleArn: !GetAtt FisRole.Arn
+      StopConditions:
+        - Source: none
+      LogConfiguration:
+        LogSchemaVersion: 2
+        CloudWatchLogsConfiguration:
+          LogGroupArn: !GetAtt ExperimentLogGroup.Arn
+      Targets:
+        Pods:
+          ResourceType: aws:eks:pod
+          SelectionMode: COUNT(1)
+          Parameters:
+            clusterIdentifier: !Ref ClusterName
+            namespace: default
+            selectorType: labelSelector
+            selectorValue: app=postgres
+      Actions:
+        DeletePod:
+          ActionId: aws:eks:pod-delete
+          Parameters:
+            kubernetesServiceAccount: fis-experiment
+          Targets:
+            Pods: Pods
+      Tags:
+        Name: !Sub ${ProjectName}-pod-kill
+        auto-delete: never
+
+  # ---------- Experiment 3: EBS volume I/O pause ----------
+  # Pauses I/O on EBS volumes tagged with our project tag.
+  # Pods stay scheduled, but reads/writes hang. Subtle failure mode.
+  EbsPauseIoExperiment:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: Pause I/O on Postgres EBS volumes
+      RoleArn: !GetAtt FisRole.Arn
+      StopConditions:
+        - Source: none
+      LogConfiguration:
+        LogSchemaVersion: 2
+        CloudWatchLogsConfiguration:
+          LogGroupArn: !GetAtt ExperimentLogGroup.Arn
+      Targets:
+        EbsVolumes:
+          ResourceType: aws:ec2:ebs-volume
+          ResourceTags:
+            ebs.csi.aws.com/cluster: !Ref ClusterName
+          SelectionMode: COUNT(1)
+      Actions:
+        PauseIo:
+          ActionId: aws:ebs:pause-volume-io
+          Parameters:
+            duration: PT45M
+          Targets:
+            Volumes: EbsVolumes
+      Tags:
+        Name: !Sub ${ProjectName}-ebs-pause-io
+        auto-delete: never
+
+  # ---------- Experiment 4: EBS attach API hang ----------
+  # Throttles ec2:AttachVolume calls made via the EBS CSI controller's IAM
+  # role. New pods that need a volume attached sit in ContainerCreating
+  # with FailedAttachVolume events — looks like an attach "hang".
+  # Trigger by scaling the StatefulSet up while this experiment runs.
+  EbsAttachHangExperiment:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: Throttle ec2:AttachVolume on the EBS CSI IRSA role to simulate hung attaches
+      RoleArn: !GetAtt FisRole.Arn
+      StopConditions:
+        - Source: none
+      LogConfiguration:
+        LogSchemaVersion: 2
+        CloudWatchLogsConfiguration:
+          LogGroupArn: !GetAtt ExperimentLogGroup.Arn
+      Targets:
+        EbsCsiRole:
+          ResourceType: aws:iam:role
+          ResourceArns: [!Ref EbsCsiRoleArn]
+          SelectionMode: ALL
+      Actions:
+        ThrottleAttach:
+          ActionId: aws:fis:inject-api-throttle-error
+          Parameters:
+            duration: PT45M
+            service: ec2
+            operations: AttachVolume
+            percentage: '100'
+          Targets:
+            Roles: EbsCsiRole
+      Tags:
+        Name: !Sub ${ProjectName}-ebs-attach-hang
+        auto-delete: never
+
+Outputs:
+  FisRoleArn:
+    Value: !GetAtt FisRole.Arn
+  AzDisruptId:
+    Value: !Ref AzDisruptExperiment
+  PodKillId:
+    Value: !Ref PodKillExperiment
+  EbsPauseIoId:
+    Value: !Ref EbsPauseIoExperiment
+  EbsAttachHangId:
+    Value: !Ref EbsAttachHangExperiment
+  ExperimentLogGroup:
+    Value: !Ref ExperimentLogGroup

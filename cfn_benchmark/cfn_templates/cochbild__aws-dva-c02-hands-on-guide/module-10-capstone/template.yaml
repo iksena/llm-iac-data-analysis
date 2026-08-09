@@ -1,0 +1,472 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  Module 10 Capstone — End-to-end pizza-order serverless app.
+  Exercises Lambda, DynamoDB + Streams, S3, Cognito, API Gateway HTTP API + JWT,
+  EventBridge, SNS, SQS DLQ, Step Functions Express, KMS, Secrets Manager,
+  CloudWatch (Logs + dashboard + alarms), X-Ray.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 15
+    MemorySize: 256
+    Tracing: Active
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: dva-capstone
+
+Resources:
+  ## ─────────────── Cognito ───────────────
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: dva-capstone-pool
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: dva-capstone-cli
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  ## ─────────────── KMS + Secrets ───────────────
+  AppKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: DVA capstone application key
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root" }
+            Action: "kms:*"
+            Resource: "*"
+
+  StripeSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: dva-capstone/stripe-key
+      Description: Mock Stripe API key for the capstone
+      SecretString: '{"api_key":"sk_test_FAKE_DVA_LAB"}'
+
+  ## ─────────────── DynamoDB ───────────────
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: dva-capstone-orders
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: by-customer
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  ## ─────────────── S3 archive bucket ───────────────
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub "dva-capstone-archive-${AWS::AccountId}-${AWS::Region}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  ## ─────────────── EventBridge custom bus + DLQ ───────────────
+  OrdersBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: dva-capstone-orders-bus
+
+  EbDlq:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: dva-capstone-eb-dlq
+      MessageRetentionPeriod: 1209600
+
+  ## ─────────────── SNS confirmation topic ───────────────
+  ConfirmationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: dva-capstone-confirmations
+
+  ## ─────────────── Lambdas ───────────────
+  SharedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+      Policies:
+        - PolicyName: CapstonePerms
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt OrdersTable.Arn
+                  - !Sub "${OrdersTable.Arn}/index/*"
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt OrdersBus.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref ConfirmationTopic
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref StripeSecret
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${ArchiveBucket.Arn}/*"
+              - Effect: Allow
+                Action: kms:GenerateDataKey
+                Resource: !GetAtt AppKey.Arn
+
+  StreamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaDynamoDBExecutionRole
+      Policies:
+        - PolicyName: ArchiveAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${ArchiveBucket.Arn}/*"
+
+  CreateOrderFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: dva-capstone-create-order
+      Handler: handler.create_order
+      Role: !GetAtt SharedRole.Arn
+      CodeUri: src/
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+          BUS_NAME: !Ref OrdersBus
+
+  ChargeCustomerFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: dva-capstone-charge
+      Handler: handler.charge_customer
+      Role: !GetAtt SharedRole.Arn
+      CodeUri: src/
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref OrdersTable
+          STRIPE_SECRET_ARN: !Ref StripeSecret
+          CONFIRMATION_TOPIC_ARN: !Ref ConfirmationTopic
+
+  AuditLogFn:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: dva-capstone-audit
+      Handler: handler.audit_log
+      Role: !GetAtt StreamRole.Arn
+      CodeUri: src/
+      Environment:
+        Variables:
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+
+  AuditEsm:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt OrdersTable.StreamArn
+      FunctionName: !Ref AuditLogFn
+      StartingPosition: LATEST
+      BatchSize: 10
+      MaximumBatchingWindowInSeconds: 5
+
+  ## ─────────────── EventBridge → ChargeCustomer ───────────────
+  ChargeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: dva-capstone-charge-rule
+      EventBusName: !Ref OrdersBus
+      EventPattern:
+        source: [ "dva-capstone.orders" ]
+        detail-type: [ "OrderCreated" ]
+      Targets:
+        - Id: ToCharge
+          Arn: !GetAtt ChargeCustomerFn.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt EbDlq.Arn
+
+  ChargePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ChargeCustomerFn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ChargeRule.Arn
+
+  EbDlqPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EbDlq]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sqs:SendMessage
+            Resource: !GetAtt EbDlq.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt ChargeRule.Arn
+
+  ## ─────────────── HTTP API + JWT auth ───────────────
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: dva-capstone-api
+      ProtocolType: HTTP
+
+  JwtAuthorizer:
+    Type: AWS::ApiGatewayV2::Authorizer
+    Properties:
+      ApiId: !Ref HttpApi
+      Name: cognito-jwt
+      AuthorizerType: JWT
+      IdentitySource:
+        - $request.header.Authorization
+      JwtConfiguration:
+        Audience: [!Ref UserPoolClient]
+        Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+
+  CreateOrderIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt CreateOrderFn.Arn
+      PayloadFormatVersion: "2.0"
+
+  CreateOrderRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /orders
+      AuthorizationType: JWT
+      AuthorizerId: !Ref JwtAuthorizer
+      Target: !Sub "integrations/${CreateOrderIntegration}"
+
+  ApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CreateOrderFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*"
+
+  ApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  ## ─────────────── Step Functions Express (premium tier) ───────────────
+  PremiumWorkflowRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: states.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: invoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt ChargeCustomerFn.Arn
+
+  PremiumWorkflow:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: dva-capstone-premium
+      StateMachineType: EXPRESS
+      RoleArn: !GetAtt PremiumWorkflowRole.Arn
+      DefinitionSubstitutions:
+        ChargeArn: !GetAtt ChargeCustomerFn.Arn
+      DefinitionString: |-
+        {
+          "StartAt": "ParallelChecks",
+          "States": {
+            "ParallelChecks": {
+              "Type": "Parallel",
+              "Branches": [
+                {
+                  "StartAt": "Charge",
+                  "States": {
+                    "Charge": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": { "FunctionName": "${ChargeArn}", "Payload.$": "$" },
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "LoyaltyPoints",
+                  "States": {
+                    "LoyaltyPoints": {
+                      "Type": "Pass",
+                      "Result": { "loyalty_points_added": 100 },
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "End": true
+            }
+          }
+        }
+
+  ## ─────────────── CloudWatch Dashboard + Alarms ───────────────
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: dva-capstone
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            { "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": { "title": "Lambda Invocations",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${CreateOrderFn}"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${ChargeCustomerFn}"],
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${AuditLogFn}"]
+                ],
+                "period": 60, "stat": "Sum", "region": "${AWS::Region}"
+              }
+            },
+            { "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": { "title": "Lambda Errors",
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${CreateOrderFn}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${ChargeCustomerFn}"]
+                ],
+                "period": 60, "stat": "Sum", "region": "${AWS::Region}"
+              }
+            },
+            { "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": { "title": "DynamoDB Capacity",
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${OrdersTable}"],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${OrdersTable}"]
+                ],
+                "period": 60, "stat": "Sum", "region": "${AWS::Region}"
+              }
+            },
+            { "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": { "title": "EventBridge Matched Events",
+                "metrics": [
+                  ["AWS/Events", "MatchedEvents", "EventBusName", "${OrdersBus}"]
+                ],
+                "period": 60, "stat": "Sum", "region": "${AWS::Region}"
+              }
+            }
+          ]
+        }
+
+  CreateOrderErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: dva-capstone-create-order-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref CreateOrderFn
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      DatapointsToAlarm: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  TableName:
+    Value: !Ref OrdersTable
+  BusName:
+    Value: !Ref OrdersBus
+  ConfirmationTopicArn:
+    Value: !Ref ConfirmationTopic
+  ArchiveBucket:
+    Value: !Ref ArchiveBucket
+  PremiumWorkflowArn:
+    Value: !Ref PremiumWorkflow
+  DashboardUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=dva-capstone"
+  KmsKeyArn:
+    Value: !GetAtt AppKey.Arn
+  StripeSecretArn:
+    Value: !Ref StripeSecret
+  EbDlqUrl:
+    Value: !Ref EbDlq

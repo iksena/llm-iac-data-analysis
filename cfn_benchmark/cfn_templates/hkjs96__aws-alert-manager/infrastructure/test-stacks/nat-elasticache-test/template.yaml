@@ -1,0 +1,198 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  NAT Gateway + ElastiCache Redis dynamic alarm E2E test.
+  EC2 in private subnet routes through NAT GW to generate traffic metrics.
+  EC2 uses redis-cli to generate ElastiCache metrics.
+  Delete stack after testing to save cost.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Public subnet for NAT GW
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Amazon Linux 2023 AMI
+
+Resources:
+  # ============================================================
+  # Private Subnet + Route Table (NAT GW routing)
+  # ============================================================
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VpcId
+      CidrBlock: 172.31.128.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-private-subnet'
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-private-rt'
+
+  PrivateSubnetRtAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref PublicSubnetId
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-natgw'
+        - Key: Threshold_PacketsDropCount
+          Value: '5'
+
+  NatRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  # ============================================================
+  # Security Groups
+  # ============================================================
+  Ec2Sg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${Environment}-e2e-ec2-private-sg'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 172.31.0.0/16
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  RedisSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${Environment}-e2e-redis-sg'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref Ec2Sg
+
+  # ============================================================
+  # ElastiCache Redis
+  # ============================================================
+  RedisSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub '${Environment}-e2e-redis-sg'
+      Description: Redis test subnet group
+      SubnetIds:
+        - !Ref PrivateSubnet
+
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      ClusterName: !Sub '${Environment}-e2e-redis'
+      Engine: redis
+      CacheNodeType: cache.t3.micro
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref RedisSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref RedisSg
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-redis'
+        - Key: Threshold_CurrConnections
+          Value: '300'
+        - Key: Threshold_StringGetLatency
+          Value: '0.005'
+
+  # ============================================================
+  # IAM Role for EC2 (SSM access)
+  # ============================================================
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-e2e-nat-redis-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2Role
+
+  # ============================================================
+  # EC2 in Private Subnet (traffic generator)
+  # ============================================================
+  TrafficGenerator:
+    Type: AWS::EC2::Instance
+    DependsOn: NatRoute
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref AmiId
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref Ec2Sg
+      UserData:
+        Fn::Base64: !Sub
+          - |
+            #!/bin/bash -xe
+            # Install redis-cli
+            dnf install -y redis6
+            # Generate NAT traffic (outbound HTTP via NAT GW)
+            for i in $(seq 1 50); do curl -s -o /dev/null https://aws.amazon.com/; sleep 1; done &
+            # Generate Redis traffic
+            REDIS_EP="${RedisEndpoint}"
+            for i in $(seq 1 100); do
+              redis6-cli -h $REDIS_EP SET "key$i" "value$i" > /dev/null 2>&1
+              redis6-cli -h $REDIS_EP GET "key$i" > /dev/null 2>&1
+            done &
+          - RedisEndpoint: !GetAtt RedisCluster.RedisEndpoint.Address
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-traffic-gen'
+
+Outputs:
+  NatGatewayId:
+    Value: !Ref NatGateway
+  RedisClusterId:
+    Value: !Ref RedisCluster
+  RedisEndpoint:
+    Value: !GetAtt RedisCluster.RedisEndpoint.Address
+  TrafficGeneratorId:
+    Value: !Ref TrafficGenerator
+  SsmCommand:
+    Value: !Sub 'aws ssm start-session --target ${TrafficGenerator} --region ap-northeast-2 --profile jordy_poc'

@@ -1,0 +1,416 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Pricing Assistant - ECS Services and Task Definitions'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: aws-pricing-assistant
+    Description: Name of the project for resource naming
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name
+
+  BackendImage:
+    Type: String
+    Default: ''
+    Description: Backend container image URI (defaults to ECR repo in deploying account if empty)
+
+  FrontendImage:
+    Type: String
+    Default: ''
+    Description: Frontend container image URI (defaults to ECR repo in deploying account if empty)
+
+  AuthEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable Cognito auth on the API + WS. When false, the app runs in open-access mode (current behavior).
+
+  DomainName:
+    Type: String
+    Default: your-domain.example.com
+    Description: Public domain of the deployed app — used for backend CORS allowlist (FRONTEND_ORIGIN).
+      User Pool / Client IDs are read from the cognito stack via Fn::ImportValue.
+
+Conditions:
+  UseDefaultBackendImage: !Equals [!Ref BackendImage, '']
+  UseDefaultFrontendImage: !Equals [!Ref FrontendImage, '']
+  AuthIsEnabled: !Equals [!Ref AuthEnabled, 'true']
+
+Resources:
+  # S3 Bucket for file storage
+  FileStorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-files-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Suspended
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldFiles
+            Status: Enabled
+            ExpirationInDays: 7
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE, HEAD]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+      MetricsConfigurations:
+        - Id: EntireBucket
+
+  # DynamoDB table for passkey nicknames. Cognito's WebAuthn API does not
+  # currently expose a way for the client to attach a friendly name at
+  # registration time, so we store nicknames keyed by (userId, credentialId)
+  # alongside the credentials. Empty rows just fall back to "Unnamed passkey"
+  # in the UI. Pay-per-request because traffic is one tiny request per
+  # registration / rename / delete.
+  PasskeyNicknamesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-${Environment}-passkey-nicknames
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: credentialId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: credentialId
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # ECS Task Execution Role
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-ecs-execution-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: '*'
+
+  # ECS Task Role (for application permissions)
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Environment}-ecs-task-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Converse
+                Resource: '*'
+        - PolicyName: S3FileAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${FileStorageBucket.Arn}/*'
+                  - !GetAtt FileStorageBucket.Arn
+              - Effect: Allow
+                Action:
+                  - pricing:GetProducts
+                  - pricing:DescribeServices
+                  - pricing:GetAttributeValues
+                  - savingsplans:DescribeSavingsPlansOfferings
+                  - savingsplans:DescribeSavingsPlansOfferingRates
+                Resource: '*'
+        - PolicyName: PasskeyNicknamesAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Backend uses the userId derived from the caller's JWT to
+              # constrain reads/writes at the application layer; we don't
+              # rely on per-row IAM here.
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                Resource: !GetAtt PasskeyNicknamesTable.Arn
+        # Cognito admin operations — only used when AuthEnabled=true and an admin
+        # invokes /api/admin/users. Scoped to this app's user pool only.
+        - !If
+          - AuthIsEnabled
+          - PolicyName: CognitoAdmin
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - cognito-idp:AdminCreateUser
+                    - cognito-idp:AdminDeleteUser
+                    - cognito-idp:AdminGetUser
+                    - cognito-idp:AdminListGroupsForUser
+                    - cognito-idp:AdminAddUserToGroup
+                    - cognito-idp:AdminRemoveUserFromGroup
+                    - cognito-idp:AdminResetUserPassword
+                    - cognito-idp:AdminUpdateUserAttributes
+                    - cognito-idp:AdminDeleteUserAttributes
+                    - cognito-idp:AdminUserGlobalSignOut
+                    - cognito-idp:ListUsers
+                    - cognito-idp:DescribeUserPool
+                    - cognito-idp:SetUserPoolMfaConfig
+                  Resource:
+                    Fn::Sub:
+                      - 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${PoolId}'
+                      - PoolId:
+                          # The Cognito stack deploys before Services in the pipeline, so
+                          # this export resolves at change-set time when AuthIsEnabled.
+                          Fn::ImportValue: !Sub ${ProjectName}-${Environment}-cognito-user-pool-id
+          - !Ref AWS::NoValue
+
+  # Backend Task Definition
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-${Environment}-backend
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 512
+      Memory: 1024
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !If
+            - UseDefaultBackendImage
+            - !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-${Environment}-backend:latest
+            - !Ref BackendImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 3001
+              Protocol: tcp
+          Environment:
+            - Name: NODE_ENV
+              Value: production
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: PORT
+              Value: '3001'
+            - Name: FRONTEND_ORIGIN
+              Value: !Sub https://${DomainName}
+            # Inference Profile for Sonnet 5
+            - Name: BEDROCK_INFERENCE_PROFILE_SONNET_ARN
+              Value: 'us.anthropic.claude-sonnet-5'
+            # Inference Profile for Opus 5
+            - Name: BEDROCK_INFERENCE_PROFILE_OPUS_ARN
+              Value: 'us.anthropic.claude-opus-5'
+            # S3 Configuration
+            - Name: S3_BUCKET_NAME
+              Value: !Ref FileStorageBucket
+            - Name: S3_REGION
+              Value: !Ref AWS::Region
+            - Name: USE_S3
+              Value: 'true'
+            - Name: PASSKEY_NICKNAMES_TABLE
+              Value: !Ref PasskeyNicknamesTable
+            - Name: AUTH_ENABLED
+              Value: !Ref AuthEnabled
+            - Name: COGNITO_USER_POOL_ID
+              Value: !If
+                - AuthIsEnabled
+                - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-cognito-user-pool-id
+                - ''
+            - Name: COGNITO_CLIENT_ID
+              Value: !If
+                - AuthIsEnabled
+                - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-cognito-client-id
+                - ''
+            - Name: COGNITO_REGION
+              Value: !Ref AWS::Region
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub /ecs/${ProjectName}-${Environment}-backend
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost:3001/health || exit 1
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  # Frontend Task Definition
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub ${ProjectName}-${Environment}-frontend
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 256
+      Memory: 512
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !If
+            - UseDefaultFrontendImage
+            - !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-${Environment}-frontend:latest
+            - !Ref FrontendImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub /ecs/${ProjectName}-${Environment}-frontend
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -f http://localhost:8080/health || exit 1
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+  # Backend ECS Service
+  BackendService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${ProjectName}-${Environment}-backend
+      Cluster:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ecs-cluster-name
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ECSSecurityGroup
+          Subnets:
+            - !Select
+              - 0
+              - !Split
+                - ','
+                - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnets
+            - !Select
+              - 1
+              - !Split
+                - ','
+                - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnets
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: 3001
+          TargetGroupArn:
+            Fn::ImportValue: !Sub ${ProjectName}-${Environment}-backend-tg-arn
+      HealthCheckGracePeriodSeconds: 120
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+
+  # Frontend ECS Service
+  FrontendService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub ${ProjectName}-${Environment}-frontend
+      Cluster:
+        Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ecs-cluster-name
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: 2
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-ECSSecurityGroup
+          Subnets:
+            - !Select
+              - 0
+              - !Split
+                - ','
+                - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnets
+            - !Select
+              - 1
+              - !Split
+                - ','
+                - Fn::ImportValue: !Sub ${ProjectName}-${Environment}-PrivateSubnets
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: frontend
+          ContainerPort: 8080
+          TargetGroupArn:
+            Fn::ImportValue: !Sub ${ProjectName}-${Environment}-frontend-tg-arn
+      HealthCheckGracePeriodSeconds: 180
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+
+Outputs:
+  FileStorageBucketName:
+    Description: Name of the S3 bucket for file storage
+    Value: !Ref FileStorageBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-file-storage-bucket-name'
+
+  BackendServiceArn:
+    Description: ARN of the backend ECS service
+    Value: !Ref BackendService
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-backend-service-arn
+
+  FrontendServiceArn:
+    Description: ARN of the frontend ECS service
+    Value: !Ref FrontendService
+    Export:
+      Name: !Sub ${ProjectName}-${Environment}-frontend-service-arn

@@ -1,0 +1,197 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deployment of EC2 instances in a VPC with public and private subnets, and an Elastic Load Balancer
+Resources:
+  NLBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable TCP access via port 80
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: '80'
+          IpProtocol: tcp
+          ToPort: '80'
+      VpcId: !ImportValue network:VPC
+  ECSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable TCP access via port 5000 and 22 (SSH)
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: '5000'
+          IpProtocol: tcp
+          ToPort: '5000'
+        - CidrIp: 0.0.0.0/0
+          FromPort: '22'
+          IpProtocol: tcp
+          ToPort: '22'
+      VpcId: !ImportValue network:VPC
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: EC2LaunchTemplate
+      LaunchTemplateData:
+        ImageId: ami-0b8aeb1889f1a812a
+        InstanceType: t2.micro
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: true
+            DeviceIndex: 0
+            Groups:
+              - !Ref ECSecurityGroup
+        IamInstanceProfile:
+          Name: LabInstanceProfile
+        KeyName: vockey
+        Monitoring:
+          Enabled: true
+        UserData:
+          Fn::Base64: !Sub
+          - |
+            #!/bin/bash
+            set -ex  # Exit immediately on error
+
+            EFS="${EFS}"
+
+            echo "EFS: $EFS"
+
+            sudo yum -y install amazon-efs-utils
+
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+            echo "INSTANCE_ID: $INSTANCE_ID"
+
+            mkdir /mnt/efs
+
+            sudo mount -t efs -o tls $EFS:/ /mnt/efs
+
+            mkdir -p /mnt/efs/logs/$INSTANCE_ID
+
+            exec > /var/log/userdata.log 2>&1  # Capture all output to userdata.log
+
+            sudo yum install -y git
+
+            export DOTNET_CLI_HOME=/tmp
+
+            DB_USER="${DB_USER1}"
+            DB_PASS="${DB_PASS1}"
+            DB_HOST="${RDSENDPOINT}"
+
+            echo "DB_USER: $DB_USER"
+            echo "DB_PASS: $DB_PASS"
+            echo "DB_HOST: $DB_HOST"
+            echo "EFS: $EFS"
+
+            # Clone the repository
+            sudo git clone https://github.com/looking4ward/CloudShirt.git /opt/CloudShirt || { echo "Git clone failed"; exit 1; }
+
+            # Ensure appsettings.json exists before editing
+            if [[ -f "/opt/CloudShirt/src/Web/appsettings.json" ]]; then
+              sed -i "s|Server.*CatalogDb;|Server=$DB_HOST,1433;User ID=$DB_USER;Password=$DB_PASS;Initial Catalog=Microsoft.eShopOnWeb.CatalogDb;|" /opt/CloudShirt/src/Web/appsettings.json
+              sed -i "s|Server.*Identity;|Server=$DB_HOST,1433;User ID=$DB_USER;Password=$DB_PASS;Initial Catalog=Microsoft.eShopOnWeb.Identity;|" /opt/CloudShirt/src/Web/appsettings.json
+            else
+              echo "ERROR: appsettings.json not found!" >> /var/log/userdata.log
+              exit 1
+            fi
+
+            # Build and run .NET application
+            cd /opt/CloudShirt/src/Web
+            dotnet restore || { echo "dotnet restore failed"; exit 1; }
+            dotnet publish Web.csproj -o /opt/release || { echo "dotnet publish failed"; exit 1; }
+
+            cd /opt/release
+            ls -l  # Verify files exist
+
+            nohup dotnet Web.dll --urls "http://0.0.0.0:5000" > /mnt/efs/logs/$INSTANCE_ID/dotnet.log 2>&1 &
+          - RDSENDPOINT: !ImportValue DBEndpoint
+            DB_USER1: !ImportValue DBUsername
+            DB_PASS1: !ImportValue DBPassword
+            EFS: !ImportValue EFS
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+        - !ImportValue network:PublicSubnet1
+        - !ImportValue network:PublicSubnet2
+      MinSize: 2
+      MaxSize: 2
+      DesiredCapacity: 2
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 600
+      Tags:
+        - Key: Name
+          Value: ASGInstance
+          PropagateAtLaunch: true
+
+  ScalePolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      Cooldown: 120
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageNetworkOut
+        TargetValue: 10
+
+  ScaleOutSchedule:
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      MinSize: 2
+      MaxSize: 4
+      DesiredCapacity: 2
+      Recurrence: "0 18 * * *"
+      TimeZone: "America/New_York"
+
+  ScaleInSchedule:
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      MinSize: 2
+      MaxSize: 2
+      DesiredCapacity: 2
+      Recurrence: "0 20 * * *"
+      TimeZone: "America/New_York"
+
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+        - !ImportValue network:PublicSubnet1
+        - !ImportValue network:PublicSubnet2
+      SecurityGroups:
+        - !Ref NLBSecurityGroup
+      IpAddressType: ipv4
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: 'true'
+      Type: application
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 5000
+      Protocol: HTTP
+      TargetType: instance
+      VpcId: !ImportValue network:VPC
+      HealthCheckIntervalSeconds: 300
+      HealthCheckPath : "/"
+      HealthCheckPort: "traffic-port"
+      HealthCheckProtocol: "HTTP"
+      UnhealthyThresholdCount: 10
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+Outputs:
+  ELB:
+    Description: DNS name of the Elastic Load Balancer.
+    Value: !GetAtt ALB.DNSName

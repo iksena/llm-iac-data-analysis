@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+    Last Modified: 2025/11/07 14:43:07
+    "RADx SageMaker stack"
+
+Parameters:
+  Environment:
+    Type: String
+    Description: The Project Environment
+    AllowedValues:
+      - dev
+      - test
+      - prod
+      - shared
+  ProjectName:
+    Type: String
+    Description: The Project name
+    Default: radx
+    AllowedValues:
+      - radx
+Resources:
+
+    SageMakerSecurityGroup:
+        Type: AWS::EC2::SecurityGroup
+        Properties:
+            VpcId:
+              Fn::ImportValue: !Sub "RADx-Networking-${Environment}-VPC-ID"
+            GroupDescription: Security Group for the SageMaker Environment
+            SecurityGroupIngress:
+                # Allow access from anywhere to SageMaker
+                - CidrIp: 0.0.0.0/0
+                  IpProtocol: -1
+            Tags:
+                - Key: Name
+                  Value: !Sub "${ProjectName}-SageMaker-${Environment}"
+
+    SageMakerLifecycleConfig:
+        Type: "AWS::SageMaker::StudioLifecycleConfig"
+        Properties:
+            StudioLifecycleConfigName: !Sub "${ProjectName}-jupyter-lifecycle-${Environment}"
+            StudioLifecycleConfigAppType: "JupyterLab"
+            StudioLifecycleConfigContent:
+                Fn::Base64: |
+                    #!/bin/bash
+
+                    # setup env
+                    ENV="test"
+                    METADATA_JSON="/opt/ml/metadata/resource-metadata.json"
+                    METADATA_DIR="/home/sagemaker-user/.metadata"
+                    S3SYNC_SCRIPT="/home/sagemaker-user/s3sync.sh"
+                    R_FLAG_FILE="/tmp/r_env_created.flag"
+
+                    # check jq install
+                    if ! command -v jq &> /dev/null; then
+                        sudo apt-get update && sudo apt-get -y install jq
+                    fi
+
+                    # get domain and space name
+                    DOMAIN_ID=$(jq -r ".DomainId" "$METADATA_JSON")
+                    SPACE_NAME=$(jq -r ".SpaceName" "$METADATA_JSON")
+
+                    # create metadata directory
+                    mkdir -p "$METADATA_DIR"
+
+                    # get space metadata and user profile
+                    SPACE_METADATA=$(aws sagemaker describe-space --domain-id "$DOMAIN_ID" --space-name "$SPACE_NAME")
+                    NOTEBOOK_USER=$(echo "$SPACE_METADATA" | jq -r ".OwnershipSettings.OwnerUserProfileName")
+                    echo "Notebook user: $NOTEBOOK_USER"
+
+                    # define s3 bucket
+                    BUCKET="sagemaker-${ENV}-${NOTEBOOK_USER}"
+
+                    # Delete user-default-efs directory if it exists
+                    USER_EFS_DIR="/home/sagemaker-user/user-default-efs"
+                    if [ -d "$USER_EFS_DIR" ]; then
+                        echo "Removing stale directory: $USER_EFS_DIR"
+                        rm -rf "$USER_EFS_DIR"
+                    fi
+
+                    # sync user files data from s3
+                    echo "Syncing files from s3://${BUCKET}/ to /home/sagemaker-user/ ..."
+                    aws s3 sync "s3://${BUCKET}/" /home/sagemaker-user/ --only-show-errors &
+                    SYNC_PID=$!
+
+                    # download and prepare idle shutdown script
+                    # change idle timeout time to 1800 seconds (30 mins)
+                    curl -sS https://raw.githubusercontent.com/aws-samples/sagemaker-studio-apps-lifecycle-config-examples/main/jupyterlab/auto-stop-idle/on-start.sh -o "$METADATA_DIR/on-start.sh" \
+                        && chmod +x "$METADATA_DIR/on-start.sh" \
+                        && sed -i 's/IDLE_TIME_IN_SECONDS=[0-9]*/IDLE_TIME_IN_SECONDS=1800/' "$METADATA_DIR/on-start.sh" &
+                    IDLE_SCRIPT_PID=$!
+
+                    # create s3sync.sh script
+                    if [ ! -f "$S3SYNC_SCRIPT" ]; then
+                        echo "Creating s3sync.sh script..."
+                        cat <<EOF > "$S3SYNC_SCRIPT"
+                    #!/bin/bash
+                    ENV="test"
+                    NOTEBOOK_USER="$NOTEBOOK_USER"
+                    BUCKET="sagemaker-\${ENV}-\${NOTEBOOK_USER}"
+                    echo "Syncing files from s3://\${BUCKET}/ to /home/sagemaker-user/ ..."
+                    aws s3 sync s3://\${BUCKET}/ /home/sagemaker-user/ --only-show-errors
+                    echo "Done."
+                    EOF
+                        chmod 511 "$S3SYNC_SCRIPT"
+                    fi
+
+                    # wait for background tasks
+                    wait $SYNC_PID
+                    wait $IDLE_SCRIPT_PID
+
+                    # run idle shutdown script
+                    bash "$METADATA_DIR/on-start.sh"
+
+                    # setup R kernel env
+                    sudo -u sagemaker-user -i <<EOF
+                    eval "\$(micromamba shell hook --shell bash)"
+                    if ! micromamba env list | grep -q r_env; then
+                        echo "Creating R environment..."
+                        micromamba create -n r_env r-essentials r-base -c conda-forge -y
+                        micromamba activate r_env
+                        R -e "install.packages(c('IRkernel'), repos='https://cloud.r-project.org')"
+                        R -e "IRkernel::installspec(name = 'ir', displayname = 'R')"
+                        micromamba deactivate
+                        touch "$R_FLAG_FILE"
+                    else
+                        echo "R environment already exists."
+                    fi
+                    EOF
+
+                    # restart jupyter server if r installed
+                    if [ -f "$R_FLAG_FILE" ]; then
+                        echo "Restarting Jupyter server due to new R environment..."
+                        restart-jupyter-server
+                        rm -f "$R_FLAG_FILE"
+                    else
+                        echo "No restart needed."
+                    fi
+
+    SageMakerDomain:
+        Type: "AWS::SageMaker::Domain"
+        Properties:
+            DomainName: !Sub "${ProjectName}-sagemaker-domain-${Environment}"
+            AuthMode: "IAM"
+            VpcId:
+              Fn::ImportValue: !Sub "RADx-Networking-${Environment}-VPC-ID"
+            AppNetworkAccessType: "VpcOnly"
+            SubnetIds:
+                - Fn::ImportValue: !Sub "RADx-Networking-${Environment}-Private-Subnet-AZ1"
+                - Fn::ImportValue: !Sub "RADx-Networking-${Environment}-Private-Subnet-AZ2"
+            DefaultUserSettings:
+                ExecutionRole: !Sub "arn:aws:iam::${AWS::AccountId}:role/SagemakerExecutionRole"
+                SecurityGroups:
+                  - !Ref SageMakerSecurityGroup
+                KernelGatewayAppSettings: {}
+                RSessionAppSettings: {}
+                JupyterServerAppSettings:
+                    DefaultResourceSpec:
+                        SageMakerImageArn: !Sub "arn:aws:sagemaker:${AWS::Region}:081325390199:image/jupyter-server-3"
+                        InstanceType: "system"
+                JupyterLabAppSettings:
+                    DefaultResourceSpec: {}
+                    LifecycleConfigArns:
+                      - !GetAtt SageMakerLifecycleConfig.StudioLifecycleConfigArn
+                CodeEditorAppSettings: {}
+                SpaceStorageSettings:
+                    DefaultEbsStorageSettings:
+                        DefaultEbsVolumeSizeInGb: 5
+                        MaximumEbsVolumeSizeInGb: 100
+                DefaultLandingUri: "studio::"
+                StudioWebPortal: "ENABLED"
+
+Outputs:
+  SageMakerDomainId:
+    Description: "SageMaker Domain ID"
+    Value: !GetAtt SageMakerDomain.DomainId
+    Export:
+      Name: !Sub "${ProjectName}-SageMaker-DomainId-${Environment}"
+
+  SageMakerDomainArn:
+    Description: "SageMaker Domain ARN"
+    Value: !GetAtt SageMakerDomain.DomainArn
+    Export:
+      Name: !Sub "${ProjectName}-SageMaker-DomainArn-${Environment}"

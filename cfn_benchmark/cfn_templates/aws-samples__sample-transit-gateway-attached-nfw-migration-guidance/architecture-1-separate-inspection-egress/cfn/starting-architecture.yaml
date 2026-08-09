@@ -1,0 +1,1055 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Starting architecture with separate inspection and egress VPCs for TGW-attached Network Firewall migration (uksb-kel1jgq0uo)(tag:arch1-starting)"
+
+Metadata:
+  "AWS::CloudFormation::Interface":
+    ParameterGroups:
+      - Label:
+          default: "VPC Parameters"
+        Parameters:
+          - AvailabilityZoneSelection
+          - DeleteDefaultVPC
+      - Label:
+          default: "EC2 Parameters"
+        Parameters:
+          - LatestAmiId
+      - Label:
+          default: "Migration Parameters (only used during migration)"
+        Parameters:
+          - MigrationPhase
+          - NewFirewallAttachmentId
+
+Parameters:
+  AvailabilityZoneSelection:
+    Description: Availability Zone
+    Type: AWS::EC2::AvailabilityZone::Name
+    Default: us-east-1a
+
+  DeleteDefaultVPC:
+    Description: Delete the default VPC to stay within the default 5 VPC per region quota. Set to false if you have resources in the default VPC or have already increased your VPC quota.
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+
+  LatestAmiId:
+    Description: Latest EC2 AMI from Systems Manager Parameter Store
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+
+  MigrationPhase:
+    Description: |
+      Controls migration state of this stack:
+      - none: No migration in progress (default)
+      - test-spoke: Spoke B disassociated from spoke RT (being migrated to new firewall)
+      - all-spokes: Spoke RT default route points to new TGW-attached firewall
+    Type: String
+    Default: "none"
+    AllowedValues:
+      - "none"
+      - "test-spoke"
+      - "all-spokes"
+
+  NewFirewallAttachmentId:
+    Description: TGW attachment ID of the new TGW-attached Network Firewall (required for all-spokes phase). Get from migration stack outputs.
+    Type: String
+    Default: ""
+
+Conditions:
+  ShouldDeleteDefaultVPC: !Equals [!Ref DeleteDefaultVPC, "true"]
+  SpokeBOnOldRT: !Not [!Equals [!Ref MigrationPhase, "test-spoke"]]
+  RouteToNewFirewall: !Equals [!Ref MigrationPhase, "all-spokes"]
+
+Resources:
+
+# Delete default VPC - This stack creates 4 VPCs and the migration requires a 5th.
+# The default region limit is 5 VPCs. While this limit can be increased, we delete the
+# default VPC to work within the default quota since this is typically deployed in
+# lab/POC accounts that may not have quota increases configured.
+
+  DeleteDefaultVPCRole:
+    Type: AWS::IAM::Role
+    Condition: ShouldDeleteDefaultVPC
+    Properties:
+      RoleName: !Sub "delete-default-vpc-role-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: DeleteDefaultVPC
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeInternetGateways
+                  - ec2:DetachInternetGateway
+                  - ec2:DeleteInternetGateway
+                  - ec2:DescribeSubnets
+                  - ec2:DeleteSubnet
+                  - ec2:DescribeRouteTables
+                  - ec2:DeleteRouteTable
+                  - ec2:DescribeNetworkAcls
+                  - ec2:DeleteNetworkAcl
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DeleteSecurityGroup
+                  - ec2:DeleteVpc
+                Resource: "*"
+
+  DeleteDefaultVPCFunction:
+    Type: AWS::Lambda::Function
+    Condition: ShouldDeleteDefaultVPC
+    Properties:
+      FunctionName: !Sub "delete-default-vpc-${AWS::StackName}"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 120
+      Role: !GetAtt DeleteDefaultVPCRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+              try:
+                  ec2 = boto3.client('ec2')
+                  vpcs = ec2.describe_vpcs(Filters=[{'Name': 'isDefault', 'Values': ['true']}])
+                  if not vpcs['Vpcs']:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'No default VPC found'})
+                      return
+                  vpc_id = vpcs['Vpcs'][0]['VpcId']
+                  # Delete IGWs
+                  for igw in ec2.describe_internet_gateways(Filters=[{'Name': 'attachment.vpc-id', 'Values': [vpc_id]}])['InternetGateways']:
+                      ec2.detach_internet_gateway(InternetGatewayId=igw['InternetGatewayId'], VpcId=vpc_id)
+                      ec2.delete_internet_gateway(InternetGatewayId=igw['InternetGatewayId'])
+                  # Delete subnets
+                  for subnet in ec2.describe_subnets(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])['Subnets']:
+                      ec2.delete_subnet(SubnetId=subnet['SubnetId'])
+                  # Delete non-main route tables
+                  for rt in ec2.describe_route_tables(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])['RouteTables']:
+                      if not any(a['Main'] for a in rt['Associations']):
+                          ec2.delete_route_table(RouteTableId=rt['RouteTableId'])
+                  # Delete non-default NACLs
+                  for acl in ec2.describe_network_acls(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])['NetworkAcls']:
+                      if not acl['IsDefault']:
+                          ec2.delete_network_acl(NetworkAclId=acl['NetworkAclId'])
+                  # Delete non-default security groups
+                  for sg in ec2.describe_security_groups(Filters=[{'Name': 'vpc-id', 'Values': [vpc_id]}])['SecurityGroups']:
+                      if sg['GroupName'] != 'default':
+                          ec2.delete_security_group(GroupId=sg['GroupId'])
+                  ec2.delete_vpc(VpcId=vpc_id)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': f'Deleted default VPC {vpc_id}'})
+              except Exception as e:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Message': str(e)})
+
+  DeleteDefaultVPCCustomResource:
+    Type: Custom::DeleteDefaultVPC
+    Condition: ShouldDeleteDefaultVPC
+    Properties:
+      ServiceToken: !GetAtt DeleteDefaultVPCFunction.Arn
+
+# spoke-a VPC
+  VPCA:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: "10.1.0.0/16"
+      EnableDnsSupport: "true"
+      EnableDnsHostnames: "true"
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub "spoke-a-${AWS::StackName}"
+
+  SubnetAWorkload:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: VPCA
+      CidrBlock: "10.1.1.0/24"
+      AvailabilityZone:
+        Ref: AvailabilityZoneSelection
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "spoke-a-workload-${AWS::StackName}"
+
+  SubnetATGW:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: VPCA
+      CidrBlock: "10.1.0.0/28"
+      AvailabilityZone:
+        Ref: AvailabilityZoneSelection
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "spoke-a-tgw-${AWS::StackName}"
+
+  VPCAEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+        GroupDescription: Allow instances to get to SSM Systems Manager
+        VpcId: !Ref VPCA
+        SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.1.0.0/16
+
+  VPCASSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+        PrivateDnsEnabled: true
+        SecurityGroupIds:
+          - !Ref VPCAEndpointSecurityGroup
+        ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+        SubnetIds:
+          - !Ref SubnetAWorkload
+        VpcEndpointType: Interface
+        VpcId: !Ref VPCA
+
+  VPCAEC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+        PrivateDnsEnabled: true
+        SecurityGroupIds:
+          - !Ref VPCAEndpointSecurityGroup
+        ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
+        SubnetIds:
+          - !Ref SubnetAWorkload
+        VpcEndpointType: Interface
+        VpcId: !Ref VPCA
+
+  VPCASSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+        PrivateDnsEnabled: true
+        SecurityGroupIds:
+          - !Ref VPCAEndpointSecurityGroup
+        ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+        SubnetIds:
+          - !Ref SubnetAWorkload
+        VpcEndpointType: Interface
+        VpcId: !Ref VPCA
+
+  SpokeARole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "spoke-a-role-${AWS::StackName}"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  SpokeAInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref SpokeARole
+
+  SpokeASecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "ICMP acess from 10.0.0.0/8"
+      GroupName: !Sub "spoke-a-sec-group-${AWS::StackName}"
+      VpcId: !Ref VPCA
+      SecurityGroupIngress:
+        - IpProtocol: icmp
+          CidrIp: 10.0.0.0/8
+          Description: "Allow ICMP from private networks"
+          FromPort: "-1"
+          ToPort: "-1"
+
+  SpokeAInstance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref SubnetAWorkload
+      InstanceType: t2.micro
+      SecurityGroupIds:
+        - !Ref SpokeASecurityGroup
+      IamInstanceProfile: !Ref SpokeAInstanceProfile
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub "spoke-a-${AWS::StackName}"
+
+# spoke-b VPC
+  VPCB:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: "10.2.0.0/16"
+      EnableDnsSupport: "true"
+      EnableDnsHostnames: "true"
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub "spoke-b-${AWS::StackName}"
+
+  SubnetBWorkload:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: VPCB
+      CidrBlock: "10.2.1.0/24"
+      AvailabilityZone:
+        Ref: AvailabilityZoneSelection
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "spoke-b-workload-${AWS::StackName}"
+
+  SubnetBTGW:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: VPCB
+      CidrBlock: "10.2.0.0/28"
+      AvailabilityZone:
+        Ref: AvailabilityZoneSelection
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "spoke-b-tgw-${AWS::StackName}"
+
+  VPCBEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+        GroupDescription: Allow instances to get to SSM Systems Manager
+        VpcId: !Ref VPCB
+        SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.2.0.0/16
+
+  VPCBSSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+        PrivateDnsEnabled: true
+        SecurityGroupIds:
+          - !Ref VPCBEndpointSecurityGroup
+        ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+        SubnetIds:
+          - !Ref SubnetBWorkload
+        VpcEndpointType: Interface
+        VpcId: !Ref VPCB
+
+  VPCBEC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+        PrivateDnsEnabled: true
+        SecurityGroupIds:
+          - !Ref VPCBEndpointSecurityGroup
+        ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
+        SubnetIds:
+          - !Ref SubnetBWorkload
+        VpcEndpointType: Interface
+        VpcId: !Ref VPCB
+
+  VPCBSSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+        PrivateDnsEnabled: true
+        SecurityGroupIds:
+          - !Ref VPCBEndpointSecurityGroup
+        ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+        SubnetIds:
+          - !Ref SubnetBWorkload
+        VpcEndpointType: Interface
+        VpcId: !Ref VPCB
+
+  SpokeBRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "spoke-b-role-${AWS::StackName}"
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  SpokeBInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref SpokeBRole
+
+  SpokeBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "ICMP acess from 10.0.0.0/8"
+      GroupName: !Sub "spoke-b-sec-group-${AWS::StackName}"
+      VpcId: !Ref VPCB
+      SecurityGroupIngress:
+        - IpProtocol: icmp
+          CidrIp: 10.0.0.0/8
+          Description: "Allow ICMP from private networks"
+          FromPort: "-1"
+          ToPort: "-1"
+
+  SpokeBInstance:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      ImageId: !Ref LatestAmiId
+      SubnetId: !Ref SubnetBWorkload
+      InstanceType: t2.micro
+      SecurityGroupIds:
+        - !Ref SpokeBSecurityGroup
+      IamInstanceProfile: !Ref SpokeBInstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub "spoke-b-${AWS::StackName}"
+
+# inspection VPC
+  InspectionVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: "100.64.0.0/16"
+      EnableDnsSupport: "true"
+      EnableDnsHostnames: "true"
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub "inspection-${AWS::StackName}"
+
+  InspectionFirewallSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: InspectionVPC
+      CidrBlock: "100.64.0.16/28"
+      AvailabilityZone:
+        Ref: AvailabilityZoneSelection
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "inspection-firewall-${AWS::StackName}"
+
+  InspectionTGWSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: InspectionVPC
+      CidrBlock: "100.64.0.0/28"
+      AvailabilityZone:
+        Ref: AvailabilityZoneSelection
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "inspection-tgw-${AWS::StackName}"
+
+# egress VPC
+  EgressVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: "100.65.0.0/16"
+      EnableDnsSupport: "true"
+      EnableDnsHostnames: "true"
+      InstanceTenancy: default
+      Tags:
+        - Key: Name
+          Value: !Sub "egress-${AWS::StackName}"
+
+  EgressTGWSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: EgressVPC
+      CidrBlock: "100.65.0.0/28"
+      AvailabilityZone:
+        Ref: AvailabilityZoneSelection
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub "egress-tgw-${AWS::StackName}"
+
+  EgressPublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId:
+        Ref: EgressVPC
+      CidrBlock: "100.65.1.0/24"
+      AvailabilityZone:
+        Ref: AvailabilityZoneSelection
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "egress-public-${AWS::StackName}"
+
+  EgressInternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "egress-igw-${AWS::StackName}"
+
+  EgressIGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId:
+        !Ref EgressVPC
+      InternetGatewayId:
+        !Ref EgressInternetGateway
+
+  EgressNATEIP:
+    Type: "AWS::EC2::EIP"
+    Properties:
+      Domain: vpc
+
+  EgressNATGateway:
+    Type: "AWS::EC2::NatGateway"
+    Properties:
+      AllocationId:
+        Fn::GetAtt:
+          - EgressNATEIP
+          - AllocationId
+      SubnetId:
+        Ref: EgressPublicSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub "egress-natgw-${AWS::StackName}"
+
+# Transit Gateway
+  TransitGateway:
+    Type: "AWS::EC2::TransitGateway"
+    Properties:
+      AmazonSideAsn: 65000
+      Description: "TGW Network Firewall Demo"
+      AutoAcceptSharedAttachments: "disable"
+      DefaultRouteTableAssociation: "disable"
+      DefaultRouteTablePropagation: "disable"
+      DnsSupport: "enable"
+      VpnEcmpSupport: "enable"
+      Tags:
+        - Key: Name
+          Value: !Sub "tgw-${AWS::StackName}"
+
+  SpokeAAttachment:
+    Type: "AWS::EC2::TransitGatewayAttachment"
+    Properties:
+      SubnetIds:
+        - !Ref SubnetATGW
+      Tags:
+        - Key: Name
+          Value: !Sub "spoke-a-attach-${AWS::StackName}"
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref VPCA
+
+  SpokeBAttachment:
+    Type: "AWS::EC2::TransitGatewayAttachment"
+    Properties:
+      SubnetIds:
+        - !Ref SubnetBTGW
+      Tags:
+        - Key: Name
+          Value: !Sub "spoke-b-attach-${AWS::StackName}"
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref VPCB
+
+  InspectionAttachment:
+    Type: "AWS::EC2::TransitGatewayAttachment"
+    Properties:
+      SubnetIds:
+        - !Ref InspectionTGWSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub "inspection-attach-${AWS::StackName}"
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref InspectionVPC
+
+  EgressAttachment:
+    Type: "AWS::EC2::TransitGatewayAttachment"
+    Properties:
+      SubnetIds:
+        - !Ref EgressTGWSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub "egress-attach-${AWS::StackName}"
+      TransitGatewayId: !Ref TransitGateway
+      VpcId: !Ref EgressVPC
+
+# Firewalls
+
+  EgressAllowListExampleRuleGroup:
+    Type: 'AWS::NetworkFirewall::RuleGroup'
+    Properties:
+      RuleGroupName: egress-allow-list-example-rule-group
+      Type: STATEFUL
+      RuleGroup:
+        RulesSource:
+          RulesString: |
+            # This is a "Strict rule ordering" egress security template meant only for the egress use case.
+            # Do NOT use with "Drop All" or "Drop Established"
+            # Visit https://aws.github.io/aws-security-services-best-practices/guides/network-firewall/ for all the best practices
+
+            # Block, but do not log any ingress traffic
+            drop ip any any -> $HOME_NET any (msg:"Ingress traffic to HOME_NET Blocked"; flow:to_server; sid:98228398;)
+
+            # Silently allow TCP 3-way handshake to be setup by $HOME_NET clients
+            pass tcp $HOME_NET any -> any any (flow:not_established, to_server; msg:"pass rules do not alert/log"; sid:9918156;)
+            pass tcp any any -> $HOME_NET any (flow:not_established, to_client; msg:"pass rules do not alert/log"; sid:9918199;)
+
+            # Silently (do not log) allow low risk protocols out to anywhere
+            pass ntp $HOME_NET any -> any 123 (flow:to_server; msg:"pass rules do not alert/log"; sid:9829158;)
+
+            # Alert on risky geos
+            alert ip $HOME_NET any -> any any (msg:"Egress traffic to RU"; flow:to_server; geoip:dst,RU; metadata:geo RU; sid:8733172;)
+            alert ip $HOME_NET any -> any any (msg:"Egress traffic to CN"; flow:to_server; geoip:dst,CN; metadata:geo CN; sid:873381;)
+
+            # Block high risk TLDs
+            reject tls $HOME_NET any -> any any (tls.sni; content:".ru"; nocase; msg:"High risk TLD blocked"; flow:to_server; sid:20233181;)
+            reject http $HOME_NET any -> any any (http.host; content:".ru"; msg:"High risk TLD blocked"; flow:to_server; sid:20235181;)
+            reject tls $HOME_NET any -> any any (tls.sni; content:".xyz"; nocase; msg:"High risk TLD blocked"; flow:to_server; sid:20232181;)
+            reject http $HOME_NET any -> any any (http.host; content:".xyz"; msg:"High risk TLD blocked"; flow:to_server; sid:20235281;)
+            reject tls $HOME_NET any -> any any (tls.sni; content:".info"; nocase; msg:"High risk TLD blocked"; flow:to_server; sid:10233181;)
+            reject http $HOME_NET any -> any any (http.host; content:".info"; msg:"High risk TLD blocked"; flow:to_server; sid:10235181;)
+            reject tls $HOME_NET any -> any any (tls.sni; content:".onion"; nocase; msg:"High risk TLD blocked"; flow:to_server; sid:23233181;)
+            reject http $HOME_NET any -> any any (http.host; content:".onion"; msg:"High risk TLD blocked"; flow:to_server; sid:20335181;)
+
+            # Silently (do not log) allow AWS public service endpoints that we have not setup VPC endpoints for yet
+            # VPC endpoints are highly encouraged. They reduce NFW data processing costs and allow for additional security features like VPC endpoint policies.
+            pass tls $HOME_NET any -> any any (tls.sni; content:"ec2messages."; startswith; nocase; content:".amazonaws.com"; endswith; nocase; flow:to_server; sid:20231181;)
+            pass tls $HOME_NET any -> any any (tls.sni; content:"ssm."; startswith; nocase; content:".amazonaws.com"; endswith; nocase; flow:to_server; sid:2023116132;)
+            pass tls $HOME_NET any -> any any (tls.sni; content:"ssmmessages."; startswith; nocase; content:".amazonaws.com"; endswith; nocase; flow:to_server; sid:2021110133;)
+
+            # Allow-list of strict FQDNs to silently allow
+            pass tls $HOME_NET any -> any any (tls.sni; content:"checkip.amazonaws.com"; startswith; nocase; endswith; flow:to_server; sid:202311893;)
+            pass http $HOME_NET any -> any any (http.host; content:"checkip.amazonaws.com"; startswith; endswith; flow:to_server; sid:20236893;)
+
+            # Allow-List of strict FQDNs, but still alert on them
+            alert tls $HOME_NET any -> any any (tls.sni; content:"www.example.com"; startswith; nocase; endswith; flow:to_server; msg:"TLS SNI Allowed"; sid:202315893;)
+            pass tls $HOME_NET any -> any any (tls.sni; content:"www.example.com"; startswith; nocase; endswith; flow:to_server; msg:"pass rules do not alert/log"; sid:202315873;)
+
+            # Block and log any egress traffic not already allowed above
+            # reject TCP traffic for a more graceful block
+            reject tls $HOME_NET any -> any any (msg:"Default Egress HTTPS Reject"; ssl_state:client_hello; ja4.hash; content:"_"; flowbits:set,blocked; flow:to_server; sid:999991;)
+            alert tls $HOME_NET any -> any any (msg:"X25519Kyber768"; flowbits:isnotset,blocked; flowbits:set,X25519Kyber768; noalert; flow:to_server; sid:999993;)
+            reject http $HOME_NET any -> any any (msg:"Default Egress HTTP Reject"; flowbits:set,blocked; flow:to_server; sid:999992;)
+            reject tcp $HOME_NET any -> any any (msg:"Default Egress TCP Reject"; flowbits:isnotset,blocked; flowbits:isnotset,X25519Kyber768; flow:to_server; sid:999994;)
+            drop udp $HOME_NET any -> any any (msg:"Default Egress UDP Drop"; flow:to_server; sid:999995;)
+            drop icmp $HOME_NET any -> any any (msg:"Default Egress ICMP Drop"; flow:to_server; sid:999996;)
+            drop ip $HOME_NET any -> any any (msg:"Default Egress IP Drop"; ip_proto:!TCP; ip_proto:!UDP; ip_proto:!ICMP; flow:to_server; sid:999997;)
+      Capacity: 1000
+      Description: Example best practice egress allow list rule group
+
+  LogOnlyRuleGroup:
+    Type: 'AWS::NetworkFirewall::RuleGroup'
+    Properties:
+      RuleGroupName: basic-log-rules
+      Type: STATEFUL
+      RuleGroup:
+        RulesSource:
+          RulesString: |
+            # Visit https://aws.github.io/aws-security-services-best-practices/guides/network-firewall/ for all the best practices
+
+            # Alert on risky geos
+            alert ip $HOME_NET any -> any any (msg:"Egress traffic to RU"; flow:to_server; geoip:dst,RU; metadata:geo RU; sid:100001;)
+            alert ip $HOME_NET any -> any any (msg:"Egress traffic to CN"; flow:to_server; geoip:dst,CN; metadata:geo CN; sid:100002;)
+
+            # Alert on high risk TLDs
+            alert tls $HOME_NET any -> any any (tls.sni; content:".ru"; nocase; msg:"High risk TLD blocked"; flow:to_server; sid:100003;)
+            alert http $HOME_NET any -> any any (http.host; content:".ru"; msg:"High risk TLD blocked"; flow:to_server; sid:100004;)
+            alert tls $HOME_NET any -> any any (tls.sni; content:".xyz"; nocase; msg:"High risk TLD blocked"; flow:to_server; sid:100005;)
+            alert http $HOME_NET any -> any any (http.host; content:".xyz"; msg:"High risk TLD blocked"; flow:to_server; sid:100006;)
+            alert tls $HOME_NET any -> any any (tls.sni; content:".info"; nocase; msg:"High risk TLD blocked"; flow:to_server; sid:100007;)
+            alert http $HOME_NET any -> any any (http.host; content:".info"; msg:"High risk TLD blocked"; flow:to_server; sid:100008;)
+            alert tls $HOME_NET any -> any any (tls.sni; content:".onion"; nocase; msg:"High risk TLD blocked"; flow:to_server; sid:100009;)
+            alert http $HOME_NET any -> any any (http.host; content:".onion"; msg:"High risk TLD blocked"; flow:to_server; sid:1000010;)
+
+            # Alert on specific protocols
+            alert icmp any any -> any any (msg:"Alert on ping"; sid:1000011;)
+            alert http any any -> any any (msg:"Alert on http"; sid:1000012;)
+            alert tls any any -> any any (msg:"Alert on tls (https)"; sid:1000013;)
+            alert ssh any any -> any any (msg:"Alert on ssh"; sid:1000014;)
+        StatefulRuleOptions:
+          RuleOrder: STRICT_ORDER
+      Capacity: 100
+      Description: Simple rule group to log specific protocols, used to showcase default firewall behavior without any drop/pass rules.
+
+  InspectionFirewallPolicy:
+    Type: AWS::NetworkFirewall::FirewallPolicy
+    Properties:
+      FirewallPolicyName: !Sub "inspection-firewall-policy-${AWS::StackName}"
+      FirewallPolicy:
+        StatelessDefaultActions:
+          - 'aws:forward_to_sfe'
+        StatelessFragmentDefaultActions:
+          - 'aws:forward_to_sfe'
+        StatefulRuleGroupReferences:
+          - ResourceArn: !Ref LogOnlyRuleGroup
+            Priority: 100
+        StatefulEngineOptions:
+          RuleOrder: STRICT_ORDER
+          StreamExceptionPolicy: REJECT
+        PolicyVariables:
+          RuleVariables:
+            HOME_NET:
+              Definition:
+                - 10.0.0.0/8
+                - 172.16.0.0/12
+                - 192.168.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Sub "inspection-firewall-policy-${AWS::StackName}"
+
+  InspectionFirewall:
+    Type: AWS::NetworkFirewall::Firewall
+    Properties:
+      FirewallName: !Sub "inspection-firewall-${AWS::StackName}"
+      FirewallPolicyArn: !Ref InspectionFirewallPolicy
+      VpcId: !Ref InspectionVPC
+      SubnetMappings:
+        - SubnetId: !Ref InspectionFirewallSubnet
+      Tags:
+        - Key: Name
+          Value: !Sub "inspection-firewall-${AWS::StackName}"
+
+  InspectionFirewallLogFlowGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${AWS::StackName}/inspection-fw/flow"
+      RetentionInDays: 7
+
+  InspectionFirewallLogAlertGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/${AWS::StackName}/inspection-fw/alert"
+      RetentionInDays: 7
+
+  InspectionFirewallLog:
+    Type: AWS::NetworkFirewall::LoggingConfiguration
+    Properties:
+      FirewallArn: !Ref InspectionFirewall
+      LoggingConfiguration:
+        LogDestinationConfigs:
+          - LogType: FLOW
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Sub "/${AWS::StackName}/inspection-fw/flow"
+          - LogType: ALERT
+            LogDestinationType: CloudWatchLogs
+            LogDestination:
+              logGroup: !Sub "/${AWS::StackName}/inspection-fw/alert"
+
+# Route Tables
+  SubnetAWorkloadRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPCA
+      Tags:
+        - Key: Name
+          Value: !Sub "spoke-a-workload-route-table-${AWS::StackName}"
+
+  SubnetAWorkloadRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: SubnetAWorkload
+    Properties:
+      RouteTableId: !Ref SubnetAWorkloadRouteTable
+      SubnetId: !Ref SubnetAWorkload
+
+  SubnetAWorkloadDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: SpokeAAttachment
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      TransitGatewayId: !Ref TransitGateway
+      RouteTableId: !Ref SubnetAWorkloadRouteTable
+
+  SubnetBWorkloadRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPCB
+      Tags:
+        - Key: Name
+          Value: !Sub "spoke-b-workload-route-table-${AWS::StackName}"
+
+  SubnetBWorkloadRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: SubnetBWorkload
+    Properties:
+      RouteTableId: !Ref SubnetBWorkloadRouteTable
+      SubnetId: !Ref SubnetBWorkload
+
+  SubnetBWorkloadInternalRoute:
+    Type: AWS::EC2::Route
+    DependsOn: SpokeBAttachment
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      TransitGatewayId: !Ref TransitGateway
+      RouteTableId: !Ref SubnetBWorkloadRouteTable
+
+  InspectionFirewallRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "inspection-firewall-route-table-${AWS::StackName}"
+
+  InspectionTGWRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref InspectionVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "inspection-tgw-route-table-${AWS::StackName}"
+
+  InspectionFirewallRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: InspectionFirewallSubnet
+    Properties:
+      RouteTableId: !Ref InspectionFirewallRouteTable
+      SubnetId: !Ref InspectionFirewallSubnet
+
+  InspectionTGWRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: InspectionTGWSubnet
+    Properties:
+      RouteTableId: !Ref InspectionTGWRouteTable
+      SubnetId: !Ref InspectionTGWSubnet
+
+  InspectionFirewallDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InspectionAttachment
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      TransitGatewayId: !Ref TransitGateway
+      RouteTableId: !Ref InspectionFirewallRouteTable
+
+  InspectionTGWDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InspectionFirewall
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      VpcEndpointId: !Select [1, !Split [":", !Select [0, !GetAtt InspectionFirewall.EndpointIds]]]
+      RouteTableId: !Ref InspectionTGWRouteTable
+
+  EgressTGWRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EgressVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "egress-tgw-route-table-${AWS::StackName}"
+
+  EgressTGWCorpRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InspectionAttachment
+    Properties:
+      DestinationCidrBlock: "10.0.0.0/8"
+      TransitGatewayId: !Ref TransitGateway
+      RouteTableId: !Ref EgressTGWRouteTable
+
+  EgressTGWDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InspectionAttachment
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref EgressNATGateway
+      RouteTableId: !Ref EgressTGWRouteTable
+
+  EgressPublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EgressVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "egress-public-route-table-${AWS::StackName}"
+
+  EgressPublicCorpRoute:
+    Type: AWS::EC2::Route
+    DependsOn: EgressAttachment
+    Properties:
+      DestinationCidrBlock: "10.0.0.0/8"
+      TransitGatewayId: !Ref TransitGateway
+      RouteTableId: !Ref EgressPublicRouteTable
+
+  EgressPublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: EgressAttachment
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref EgressInternetGateway
+      RouteTableId: !Ref EgressPublicRouteTable
+
+  EgressTGWRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: EgressTGWSubnet
+    Properties:
+      RouteTableId: !Ref EgressTGWRouteTable
+      SubnetId: !Ref EgressTGWSubnet
+
+  EgressPublicRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    DependsOn: EgressPublicSubnet
+    Properties:
+      RouteTableId: !Ref EgressPublicRouteTable
+      SubnetId: !Ref EgressPublicSubnet
+
+  SpokeRouteTable:
+    Type: "AWS::EC2::TransitGatewayRouteTable"
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "spoke-route-table-${AWS::StackName}"
+      TransitGatewayId: !Ref TransitGateway
+
+  FirewallRouteTable:
+    Type: "AWS::EC2::TransitGatewayRouteTable"
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "firewall-route-table-${AWS::StackName}"
+      TransitGatewayId: !Ref TransitGateway
+
+  EgressRouteTable:
+    Type: "AWS::EC2::TransitGatewayRouteTable"
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "egress-route-table-${AWS::StackName}"
+      TransitGatewayId: !Ref TransitGateway
+
+  # Spoke VPCs associated with Spoke RT
+  SpokeARouteTableAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SpokeAAttachment
+      TransitGatewayRouteTableId: !Ref SpokeRouteTable
+
+  SpokeBRouteTableAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Condition: SpokeBOnOldRT
+    Properties:
+      TransitGatewayAttachmentId: !Ref SpokeBAttachment
+      TransitGatewayRouteTableId: !Ref SpokeRouteTable
+
+  # Inspection VPC associated with Firewall RT
+  InspectionRouteTableAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref InspectionAttachment
+      TransitGatewayRouteTableId: !Ref FirewallRouteTable
+
+  # Egress VPC associated with dedicated Egress RT
+  EgressRouteTableAssociation:
+    Type: AWS::EC2::TransitGatewayRouteTableAssociation
+    Properties:
+      TransitGatewayAttachmentId: !Ref EgressAttachment
+      TransitGatewayRouteTableId: !Ref EgressRouteTable
+
+  # Propagate spoke routes to Firewall RT (so firewall can route inspected traffic back to spokes)
+  SpokeAPropagation:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SpokeAAttachment
+      TransitGatewayRouteTableId: !Ref FirewallRouteTable
+
+  SpokeBPropagation:
+    Type: AWS::EC2::TransitGatewayRouteTablePropagation
+    Properties:
+      TransitGatewayAttachmentId: !Ref SpokeBAttachment
+      TransitGatewayRouteTableId: !Ref FirewallRouteTable
+
+  # Spoke RT: all traffic → Inspection VPC
+  SpokeInspectionRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      TransitGatewayAttachmentId: !If
+        - RouteToNewFirewall
+        - !Ref NewFirewallAttachmentId
+        - !Ref InspectionAttachment
+      TransitGatewayRouteTableId: !Ref SpokeRouteTable
+
+  # Firewall RT: internet-bound traffic → Egress VPC
+  FirewallEgressRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      TransitGatewayAttachmentId: !Ref EgressAttachment
+      TransitGatewayRouteTableId: !Ref FirewallRouteTable
+
+  # Egress RT: return traffic → Inspection VPC (for stateful inspection on the return path)
+  EgressInspectionRoute:
+    Type: AWS::EC2::TransitGatewayRoute
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      TransitGatewayAttachmentId: !Ref InspectionAttachment
+      TransitGatewayRouteTableId: !Ref EgressRouteTable
+
+Outputs:
+  TransitGatewayId:
+    Description: Transit Gateway ID
+    Value: !Ref TransitGateway
+    Export:
+      Name: !Sub "${AWS::StackName}-TransitGatewayId"
+
+  SpokeAAttachmentId:
+    Description: Spoke A TGW Attachment ID
+    Value: !Ref SpokeAAttachment
+    Export:
+      Name: !Sub "${AWS::StackName}-SpokeAAttachmentId"
+
+  SpokeBAttachmentId:
+    Description: Spoke B TGW Attachment ID
+    Value: !Ref SpokeBAttachment
+    Export:
+      Name: !Sub "${AWS::StackName}-SpokeBAttachmentId"
+
+  SpokeRouteTableId:
+    Description: Spoke TGW Route Table ID
+    Value: !Ref SpokeRouteTable
+    Export:
+      Name: !Sub "${AWS::StackName}-SpokeRouteTableId"
+
+  InspectionAttachmentId:
+    Description: Inspection VPC TGW Attachment ID
+    Value: !Ref InspectionAttachment
+    Export:
+      Name: !Sub "${AWS::StackName}-InspectionAttachmentId"
+
+  EgressAttachmentId:
+    Description: Egress VPC TGW Attachment ID
+    Value: !Ref EgressAttachment
+    Export:
+      Name: !Sub "${AWS::StackName}-EgressAttachmentId"
+
+  SpokeAInstanceId:
+    Description: Spoke A EC2 Instance ID
+    Value: !Ref SpokeAInstance
+
+  SpokeBInstanceId:
+    Description: Spoke B EC2 Instance ID
+    Value: !Ref SpokeBInstance

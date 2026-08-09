@@ -1,0 +1,454 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Microsoft AD Server Infrastructure using Windows Server 2022
+
+Parameters:
+  ProjectName:
+    Description: An environment name that is prefixed to resource names
+    Type: String
+    Default: KerberosEMRonEKS
+
+  VPCID:
+    Description: Please enter the IP range (CIDR notation) for this VPC
+    Type: AWS::EC2::VPC::Id
+
+  VpcCIDR:
+    Description: VPC CIDR block for security group rules
+    Type: String
+    Default: 10.0.0.0/24
+
+  PrivateSubnet1Id:
+    Description: ID of the first private subnet
+    Type: AWS::EC2::Subnet::Id
+
+  PrivateSubnet2Id:
+    Description: ID of the second private subnet
+    Type: AWS::EC2::Subnet::Id
+
+  ADServerInstanceType:
+    Description: EC2 instance type for the AD server
+    Type: String
+
+  LatestWindowsAmiId:
+    Description: Latest Windows Server 2022 Full Base AMI ID from SSM Parameter Store
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-windows-latest/Windows_Server-2022-English-Full-Base
+
+  DomainName:
+    Description: Fully qualified domain name (FQDN) for the Active Directory domain
+    Type: String
+
+  DomainNetBIOSName:
+    Description: NetBIOS name for the Active Directory domain (up to 15 characters)
+    Type: String
+
+  DomainAdminPassword:
+    Description: Password for the domain administrator account
+    Type: String
+    NoEcho: true
+
+Resources:
+  # Store domain admin password in Secrets Manager to avoid plaintext in UserData
+  DomainAdminPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "/microsoft-ad/${ProjectName}/domain-admin-password"
+      Description: Domain administrator password for AD setup
+      SecretString: !Ref DomainAdminPassword
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+
+  ADServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W40
+            reason: "Egress rules explicitly defined for least privilege access"
+          - id: W9
+            reason: "VPC CIDR blocks required for dynamic pod/node IPs in EKS and AD communication"
+          - id: W27
+            reason: "Port ranges required for Active Directory: RPC dynamic ports (49152-65535) for AD replication and services, Global Catalog ports (3268-3269) for GC and GC over SSL"
+          - id: W5
+            reason: "HTTPS egress to 0.0.0.0/0 required for AWS API endpoints, Windows Updates, and AWS CLI downloads from CloudFront"
+    Properties:
+      GroupDescription: Security group for AD server
+      VpcId: !Ref VPCID
+      SecurityGroupIngress:
+        # DNS
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCIDR
+          Description: DNS TCP
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCIDR
+          Description: DNS UDP
+        # Kerberos
+        - IpProtocol: tcp
+          FromPort: 88
+          ToPort: 88
+          CidrIp: !Ref VpcCIDR
+          Description: Kerberos TCP
+        - IpProtocol: udp
+          FromPort: 88
+          ToPort: 88
+          CidrIp: !Ref VpcCIDR
+          Description: Kerberos UDP
+        # RPC Endpoint Mapper
+        - IpProtocol: tcp
+          FromPort: 135
+          ToPort: 135
+          CidrIp: !Ref VpcCIDR
+          Description: RPC Endpoint Mapper
+        # LDAP
+        - IpProtocol: tcp
+          FromPort: 389
+          ToPort: 389
+          CidrIp: !Ref VpcCIDR
+          Description: LDAP TCP
+        - IpProtocol: udp
+          FromPort: 389
+          ToPort: 389
+          CidrIp: !Ref VpcCIDR
+          Description: LDAP UDP
+        # SMB
+        - IpProtocol: tcp
+          FromPort: 445
+          ToPort: 445
+          CidrIp: !Ref VpcCIDR
+          Description: SMB/CIFS
+        # LDAPS
+        - IpProtocol: tcp
+          FromPort: 636
+          ToPort: 636
+          CidrIp: !Ref VpcCIDR
+          Description: LDAPS
+        # Global Catalog
+        - IpProtocol: tcp
+          FromPort: 3268
+          ToPort: 3269
+          CidrIp: !Ref VpcCIDR
+          Description: Global Catalog
+        # WinRM (for SSM)
+        - IpProtocol: tcp
+          FromPort: 5985
+          ToPort: 5986
+          CidrIp: !Ref VpcCIDR
+          Description: WinRM HTTP/HTTPS
+        # RPC Dynamic Ports
+        - IpProtocol: tcp
+          FromPort: 49152
+          ToPort: 65535
+          CidrIp: !Ref VpcCIDR
+          Description: RPC Dynamic Ports
+      SecurityGroupEgress:
+        # HTTPS for AWS services and downloads
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS for AWS API endpoints and CloudFront downloads
+        # DNS to VPC resolver
+        - IpProtocol: tcp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCIDR
+          Description: DNS TCP to VPC resolver
+        - IpProtocol: udp
+          FromPort: 53
+          ToPort: 53
+          CidrIp: !Ref VpcCIDR
+          Description: DNS UDP to VPC resolver
+
+  ADServerRole:
+    Type: AWS::IAM::Role
+    # SECURITY NOTE: The EC2ReadOnly statement uses Resource: '*' because AWS EC2 Describe API
+    # operations (ec2:DescribeInstances, ec2:DescribeTags) do not support resource-level permissions.
+    # This is a documented AWS API limitation. See: https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonec2.html
+    # Similarly, SSM List/Describe operations require wildcard resources per AWS API requirements.
+    # These are read-only operations and pose minimal security risk.
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit policy name required for demonstration purposes and consistent reference"
+          - id: W11
+            reason: "EC2 Describe and SSM List operations require wildcard resources per AWS API requirements - these APIs do not support resource-level permissions. TerminateSession wildcard is restricted by condition to user's own sessions only."
+      guard:
+        SuppressedRules:
+          - CFN_NO_EXPLICIT_RESOURCE_NAMES: "Explicit role name required for demo purposes to enable consistent cross-stack references and easier identification."
+          - IAM_NO_INLINE_POLICY_CHECK: "Inline policy acceptable for demo purposes. For production, extract to a managed policy."
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-SecretsManagerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # AD server needs to create/update/delete secrets for:
+              # - Service principal passwords: /microsoft-ad/service-principals/*
+              # - Kerberos keytabs: /eks/kerberos/keytabs/*
+              - Sid: SecretsManagerWrite
+                Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:UpdateSecret
+                Resource:
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/microsoft-ad/*"
+                  - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/eks/kerberos/keytabs/*"
+        - PolicyName: !Sub ${ProjectName}-SSMInstancePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # AWS API LIMITATION: EC2 Describe operations do not support resource-level permissions.
+              # Resource: '*' is required per AWS documentation. These are read-only operations.
+              # Reference: https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazonec2.html
+              - Sid: EC2ReadOnly
+                Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeTags
+                Resource: '*'
+              - Sid: EC2Tags
+                Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DeleteTags
+                Resource: !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/ProjectName: !Ref ProjectName
+              # AWS API LIMITATION: AWS Systems Manager Describe/List/Get operations do not support
+              # resource-level permissions. Resource: '*' is required per AWS documentation.
+              # These are read-only operations used for instance management and compliance reporting.
+              # Reference: https://docs.aws.amazon.com/service-authorization/latest/reference/list_awssystemsmanager.html
+              - Sid: SSMReadOnly
+                Effect: Allow
+                Action:
+                  - ssm:DescribeInstanceAssociationsStatus
+                  - ssm:DescribeInstancePatches
+                  - ssm:DescribeInstancePatchStates
+                  - ssm:DescribeInstanceProperties
+                  - ssm:GetCommandInvocation
+                  - ssm:GetServiceSetting
+                  - ssm:GetInventorySchema
+                  - ssm:ListComplianceItems
+                  - ssm:ListInventoryEntries
+                  - ssm:ListCommandInvocations
+                  - ssm:ListAssociations
+                Resource: '*'
+              - Sid: SSMTags
+                Effect: Allow
+                Action:
+                  - ssm:AddTagsToResource
+                  - ssm:ListTagsForResource
+                  - ssm:RemoveTagsFromResource
+                Resource:
+                  - !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:managed-instance/*
+                  - !Sub arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*
+              - Sid: SendCommand
+                Effect: Allow
+                Action:
+                  - ssm:GetDocument
+                  - ssm:SendCommand
+                  - ssm:StartSession
+                Resource:
+                  - !Sub arn:aws:ec2:*:${AWS::AccountId}:instance/*
+                  - !Sub arn:aws:ssm:*:${AWS::AccountId}:managed-instance/*
+                  - !Sub arn:aws:ssm:*:${AWS::AccountId}:document/SSM-SessionManagerRunShell
+                  # AWS-managed SSM documents - restricted to current region for least privilege
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWS-PasswordReset
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-AddUsersToGroups
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-AWSFleetManager-CopyFileSystemItem
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-CreateDirectory
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-CreateGroup
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-CreateUser
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-CreateUserInteractive
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-CreateWindowsRegistryKey
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-DeleteGroup
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-DeleteUser
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-DeleteWindowsRegistryKey
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-DeleteWindowsRegistryValue
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-GetFileContent
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-GetFileSystemContent
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-GetGroups
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-GetPerformanceCounters
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-GetProcessDetails
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-GetUsers
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-GetWindowsEvents
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-GetWindowsRegistryContent
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-MoveFileSystemItem
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-RemoveUsersFromGroups
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-RenameFileSystemItem
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-SetWindowsRegistryValue
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-StartProcess
+                  - !Sub arn:aws:ssm:${AWS::Region}::document/AWSFleetManager-TerminateProcess
+                Condition:
+                  BoolIfExists:
+                    ssm:SessionDocumentAccessCheck: 'true'
+              # SECURITY NOTE: While Resource: '*' is used, the IAM condition below restricts
+              # ssm:TerminateSession to only sessions owned by the calling user (via session-id tag).
+              # This is the AWS-recommended pattern for session self-management.
+              # Reference: https://docs.aws.amazon.com/systems-manager/latest/userguide/getting-started-restrict-access-examples.html
+              - Sid: TerminateSession
+                Effect: Allow
+                Action:
+                  - ssm:TerminateSession
+                Resource: '*'
+                Condition:
+                  StringLike:
+                    ssm:resourceTag/aws:ssmmessages:session-id:
+                      - ${aws:userid}
+      RoleName: !Sub ${ProjectName}-ADServerRole
+
+  ADServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ADServerRole
+
+  ADServerInstancev3:
+    Type: AWS::EC2::Instance
+    Metadata:
+      guard:
+        SuppressedRules:
+          - EC2_INSTANCE_DETAILED_MONITORING_ENABLED: "Detailed monitoring not required for demo purposes. Basic monitoring (5-minute intervals) is sufficient. Enable for production deployments."
+    Properties:
+      ImageId: !Ref LatestWindowsAmiId
+      InstanceType: !Ref ADServerInstanceType
+      EbsOptimized: true
+      IamInstanceProfile: !Ref ADServerInstanceProfile
+      NetworkInterfaces:
+        - AssociatePublicIpAddress: 'false'
+          DeviceIndex: '0'
+          GroupSet:
+            - !Ref ADServerSecurityGroup
+          SubnetId: !Ref PrivateSubnet1Id
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-ADServer
+      UserData: !Base64
+        Fn::Sub: |
+          <powershell>
+          # Enable verbose logging
+          $VerbosePreference = "Continue"
+
+          # Function to log messages
+          function Log-Message {
+              param([string]$message)
+              Write-Verbose "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $message"
+          }
+
+          try {
+              Log-Message "Starting user data script execution"
+
+              # Install AWS CLI
+              Log-Message "Installing AWS CLI"
+              $url = "https://awscli.amazonaws.com/AWSCLIV2.msi"
+              $output = "$env:TEMP\AWSCLIV2.msi"
+              Invoke-WebRequest -Uri $url -OutFile $output
+              Start-Process -FilePath msiexec -ArgumentList "/i $output /qn" -Wait
+
+              # Install AD DS role
+              Log-Message "Installing AD DS role"
+              Install-WindowsFeature -Name AD-Domain-Services -IncludeManagementTools
+
+              $computersystem = Get-WmiObject -Class Win32_ComputerSystem
+              Log-Message "Current domain: $($computersystem.Domain)"
+
+              if ($computersystem.Domain -ne "${DomainName}") {
+                  Log-Message "Promoting server to domain controller"
+                  # Retrieve password from Secrets Manager (avoids plaintext in UserData)
+                  $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine")
+                  $passwordText = aws secretsmanager get-secret-value --secret-id "/microsoft-ad/${ProjectName}/domain-admin-password" --query SecretString --output text --region ${AWS::Region}
+                  $securePassword = ConvertTo-SecureString $passwordText -AsPlainText -Force
+                  Remove-Variable passwordText
+                  Install-ADDSForest `
+                      -CreateDnsDelegation:$false `
+                      -DatabasePath "C:\Windows\NTDS" `
+                      -DomainMode "WinThreshold" `
+                      -DomainName "${DomainName}" `
+                      -DomainNetbiosName "${DomainNetBIOSName}" `
+                      -ForestMode "WinThreshold" `
+                      -InstallDns:$true `
+                      -LogPath "C:\Windows\NTDS" `
+                      -NoRebootOnCompletion:$true `
+                      -SysvolPath "C:\Windows\SYSVOL" `
+                      -Force:$true `
+                      -SafeModeAdministratorPassword $securePassword
+
+                  New-Item -Path C:\ADDSInstalled.flag -ItemType File -Force
+                  Log-Message "AD DS installation complete. Server will reboot."
+                  Restart-Computer -Force
+              }
+              elseif (Test-Path C:\ADDSInstalled.flag) {
+                  Log-Message "Performing post-reboot configuration"
+
+                  # Wait for AD Web Services
+                  $maxAttempts = 30
+                  $attemptCount = 0
+                  $adwsReady = $false
+
+                  while (-not $adwsReady -and $attemptCount -lt $maxAttempts) {
+                      try {
+                          $null = Get-ADDomain
+                          $adwsReady = $true
+                          Log-Message "AD Web Services are now available"
+                      }
+                      catch {
+                          $attemptCount++
+                          Log-Message ("Attempt {0} of {1}: AD Web Services not yet ready. Waiting 30 seconds..." -f $attemptCount, $maxAttempts)
+                          Start-Sleep -Seconds 30
+                      }
+                  }
+
+                  if (-not $adwsReady) {
+                      throw "AD Web Services did not become available within the expected time"
+                  }
+
+                  # AD Domain Controller setup is complete
+                  # Service principals will be created separately using the manage-service-principals.sh script
+                  Remove-Item C:\ADDSInstalled.flag -Force
+                  Log-Message "AD Domain Controller setup complete. Use manage-service-principals.sh to create Kerberos service accounts."
+              }
+              else {
+                  Log-Message "Domain is already set up and post-reboot configuration is complete"
+              }
+          }
+          catch {
+              Log-Message ("An error occurred: " + $_.Exception.Message)
+              throw
+          }
+          </powershell>
+          <persist>true</persist>
+
+Outputs:
+
+  ADServerPrivateIP:
+    Description: Private IP address of the AD server
+    Value: !GetAtt ADServerInstancev3.PrivateIp
+
+  ADServerInstanceId:
+    Description: Instance ID of the AD server
+    Value: !Ref ADServerInstancev3
+
+  ADServerSecurityGroup:
+    Description: Security Group ID for AD Server
+    Value: !Ref ADServerSecurityGroup
+    Export:
+      Name: !Sub ${ProjectName}-AD-SecurityGroup

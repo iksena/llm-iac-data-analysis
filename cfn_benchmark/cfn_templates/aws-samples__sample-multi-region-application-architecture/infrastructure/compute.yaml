@@ -1,0 +1,879 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AirportHub Compute - ECS Fargate, ALB, CloudFront, ECR'
+
+Parameters:
+  StackPrefix:
+    Type: String
+  IsPrimaryRegion:
+    Type: String
+    AllowedValues: ['true', 'false']
+  SecondaryRegion:
+    Type: String
+    Default: 'us-east-2'
+    Description: Secondary region for ECR replication
+  PrimaryRegion:
+    Type: String
+    Default: 'us-east-1'
+    Description: Primary region (always us-east-1)
+  VpcId:
+    Type: String
+  PrivateSubnet1Id:
+    Type: String
+  PrivateSubnet2Id:
+    Type: String
+  EcsSecurityGroupId:
+    Type: String
+  AlbSecurityGroupId:
+    Type: String
+  ContainerImageUri:
+    Type: String
+    Default: ''
+  CognitoUserPoolId:
+    Type: String
+  CognitoUserPoolArn:
+    Type: String
+  CognitoAppClientId:
+    Type: String
+  DocDbEndpoint:
+    Type: String
+  DocDbSecretArn:
+    Type: String
+
+  # Secondary VPC Origin ID - passed from secondary region stack for origin group failover
+  SecondaryVpcOriginId:
+    Type: String
+    Default: ''
+    Description: VPC Origin ID from us-east-2 for CloudFront origin group failover
+
+Conditions:
+  IsPrimary: !Equals [!Ref IsPrimaryRegion, 'true']
+  HasContainerImage: !Not [!Equals [!Ref ContainerImageUri, '']]
+  HasSecondaryVpcOrigin: !Not [!Equals [!Ref SecondaryVpcOriginId, '']]
+
+Resources:
+
+  # ============================================================
+  # FlightAware API Key (Secrets Manager)
+  # Created in primary region only — replicates to secondary automatically.
+  # deploy.py updates the key value via put-secret-value in primary only.
+  # ============================================================
+  FlightAwareSecret:
+    Type: AWS::SecretsManager::Secret
+    Condition: IsPrimary
+    Properties:
+      Name: !Sub '${StackPrefix}/flightaware/api-key'
+      Description: FlightAware AeroAPI key for live flight data refresh - updated by deploy.py
+      SecretString: '{"api_key":"PLACEHOLDER-UPDATE-VIA-DEPLOY"}'
+      ReplicaRegions:
+        - Region: !Ref SecondaryRegion
+
+  # ============================================================
+  # ECR Repository
+  # ============================================================
+  # ECR repo created only in primary - replication auto-creates it in secondary
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Condition: IsPrimary
+    Properties:
+      RepositoryName: !Sub '${StackPrefix}-app'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      EncryptionConfiguration:
+        EncryptionType: AES256
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ECR Replication - automatically copies images to secondary region
+  # This is an account-level setting; only created in primary region
+  EcrReplicationConfiguration:
+    Type: AWS::ECR::ReplicationConfiguration
+    Condition: IsPrimary
+    Properties:
+      ReplicationConfiguration:
+        Rules:
+          - Destinations:
+              - Region: !Ref SecondaryRegion
+                RegistryId: !Ref 'AWS::AccountId'
+            RepositoryFilters:
+              - Filter: !Sub '${StackPrefix}-'
+                FilterType: PREFIX_MATCH
+
+  # ============================================================
+  # ECS Cluster - FARGATE + FARGATE_SPOT
+  # ============================================================
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${StackPrefix}-cluster'
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
+          Base: !If [IsPrimary, 2, 0]
+        - CapacityProvider: FARGATE_SPOT
+          Weight: 1
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enhanced
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # CloudWatch Log Group - 90 day retention (SECURITY-14)
+  # ============================================================
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${StackPrefix}'
+      RetentionInDays: 90
+
+  # ============================================================
+  # CloudWatch Agent Config (SSM Parameter) — Application Signals
+  # ============================================================
+  CwAgentConfigParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '${StackPrefix}-cwagent-config'
+      Type: String
+      Value: '{"traces":{"traces_collected":{"application_signals":{}}},"logs":{"metrics_collected":{"application_signals":{}}}}'
+
+  # CW agent sidecar log group
+  CwAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${StackPrefix}-cwagent'
+      RetentionInDays: 90
+
+  # ============================================================
+  # IAM Roles
+  # ============================================================
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackPrefix}-ecs-exec-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${StackPrefix}/docdb/credentials-*'
+              - Effect: Allow
+                Action: ssm:GetParameters
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${StackPrefix}-cwagent-config'
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackPrefix}-ecs-task-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: AppPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${StackPrefix}/docdb/credentials-*'
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+
+  # ============================================================
+  # Task Definition - Flask app + CW agent sidecar + ADOT init
+  # ============================================================
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${StackPrefix}-app'
+      Cpu: '1024'
+      Memory: '2048'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      # Bind mount for Python auto-instrumentation files shared between init and app containers
+      Volumes:
+        - Name: opentelemetry-auto-instrumentation-python
+      ContainerDefinitions:
+        # --- Flask application container ---
+        - Name: app
+          Image: !If [HasContainerImage, !Ref ContainerImageUri, !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${StackPrefix}-app:latest']
+          PortMappings:
+            - ContainerPort: 5000
+              Protocol: tcp
+          Environment:
+            - Name: DOCDB_ENDPOINT
+              Value: !Ref DocDbEndpoint
+            - Name: DOCDB_SECRET_NAME
+              Value: !Ref DocDbSecretArn
+            - Name: USE_SECRETS_MANAGER
+              Value: 'true'
+            - Name: COGNITO_USER_POOL_ID
+              Value: !Ref CognitoUserPoolId
+            - Name: COGNITO_APP_CLIENT_ID
+              Value: !Ref CognitoAppClientId
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref 'AWS::Region'
+            # --- OpenTelemetry / Application Signals env vars ---
+            - Name: OTEL_RESOURCE_ATTRIBUTES
+              Value: !Sub 'service.name=${StackPrefix}-app,aws.log.group.names=/ecs/${StackPrefix}'
+            - Name: OTEL_AWS_APPLICATION_SIGNALS_ENABLED
+              Value: 'true'
+            - Name: OTEL_METRICS_EXPORTER
+              Value: none
+            - Name: OTEL_LOGS_EXPORTER
+              Value: none
+            - Name: OTEL_EXPORTER_OTLP_PROTOCOL
+              Value: http/protobuf
+            - Name: OTEL_AWS_APPLICATION_SIGNALS_EXPORTER_ENDPOINT
+              Value: http://localhost:4316/v1/metrics
+            - Name: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+              Value: http://localhost:4316/v1/traces
+            - Name: OTEL_TRACES_SAMPLER
+              Value: xray
+            - Name: OTEL_TRACES_SAMPLER_ARG
+              Value: endpoint=http://localhost:2000
+            - Name: OTEL_PROPAGATORS
+              Value: tracecontext,baggage,b3,xray
+            - Name: OTEL_PYTHON_DISTRO
+              Value: aws_distro
+            - Name: OTEL_PYTHON_CONFIGURATOR
+              Value: aws_configurator
+            - Name: PYTHONPATH
+              Value: /otel-auto-instrumentation-python/opentelemetry/instrumentation/auto_instrumentation:/app:/otel-auto-instrumentation-python
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: app
+          Essential: true
+          # Wait for init container to copy instrumentation files before starting
+          DependsOn:
+            - ContainerName: init
+              Condition: SUCCESS
+          MountPoints:
+            - SourceVolume: opentelemetry-auto-instrumentation-python
+              ContainerPath: /otel-auto-instrumentation-python
+              ReadOnly: false
+          HealthCheck:
+            Command: ["CMD-SHELL", "curl -f http://localhost:5000/api/health || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+
+        # --- ADOT Python auto-instrumentation init container ---
+        # Copies instrumentation files to shared volume, then exits
+        - Name: init
+          Image: public.ecr.aws/aws-observability/adot-autoinstrumentation-python:v0.17.0
+          Essential: false
+          Command:
+            - cp
+            - '-a'
+            - /autoinstrumentation/.
+            - /otel-auto-instrumentation-python
+          MountPoints:
+            - SourceVolume: opentelemetry-auto-instrumentation-python
+              ContainerPath: /otel-auto-instrumentation-python
+              ReadOnly: false
+
+        # --- CloudWatch agent sidecar for Application Signals ---
+        # Receives traces and metrics from app via OTLP, exports to X-Ray and CloudWatch
+        - Name: ecs-cwagent
+          Image: public.ecr.aws/cloudwatch-agent/cloudwatch-agent:latest
+          Essential: true
+          Secrets:
+            - Name: CW_CONFIG_CONTENT
+              ValueFrom: !Ref CwAgentConfigParameter
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref CwAgentLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: ecs
+
+  # ============================================================
+  # ALB - internal, accessed only via CloudFront VPC Origins
+  # ============================================================
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${StackPrefix}-alb'
+      Type: application
+      Scheme: internal
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '120'
+        - Key: routing.http.drop_invalid_header_fields.enabled
+          Value: 'true'
+      Subnets:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      SecurityGroups:
+        - !Ref AlbSecurityGroupId
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${StackPrefix}-ecs-tg'
+      Port: 5000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 30
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  # HTTP listener - internal ALB, only reachable via CloudFront VPC Origins
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ============================================================
+  # ECS Service - primary: 2 tasks, secondary: 0 (pilot light)
+  # ============================================================
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn: HttpListener
+    Properties:
+      ServiceName: !Sub '${StackPrefix}-service'
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      # Always start at 0 - deploy.py calls force_ecs_deployment after CodeBuild pushes the image
+      DesiredCount: 0
+      # Grace period: ALB health checks won't mark targets unhealthy during startup.
+      # Flask app + ADOT init container take ~60-90s to become healthy.
+      HealthCheckGracePeriodSeconds: 120
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnet1Id
+            - !Ref PrivateSubnet2Id
+          SecurityGroups:
+            - !Ref EcsSecurityGroupId
+      LoadBalancers:
+        - ContainerName: app
+          ContainerPort: 5000
+          TargetGroupArn: !Ref TargetGroup
+
+  # ============================================================
+  # CloudFront - primary region only
+  # Security headers policy (SECURITY-04)
+  # ============================================================
+  ResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Condition: IsPrimary
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${StackPrefix}-security-headers'
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+          ContentSecurityPolicy:
+            ContentSecurityPolicy: "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://cognito-idp.us-east-1.amazonaws.com"
+            Override: true
+
+  # ============================================================
+  # CloudFront VPC Origin - private connectivity to internal ALB
+  # Deployed in BOTH regions so ARC failover can swap VpcOriginId
+  # ============================================================
+  VpcOrigin:
+    Type: AWS::CloudFront::VpcOrigin
+    Properties:
+      VpcOriginEndpointConfig:
+        Arn: !Ref LoadBalancer
+        HTTPPort: 80
+        OriginProtocolPolicy: http-only
+        Name: !Sub '${StackPrefix}-vpc-origin-${AWS::Region}'
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Condition: IsPrimary
+    DependsOn: VpcOrigin
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultCacheBehavior:
+          # Default behavior handles read traffic (GET/HEAD/OPTIONS).
+          # When origin group is active, reads auto-failover on 502/503/504.
+          # When no origin group, all methods go to primary origin directly.
+          TargetOriginId: !If [HasSecondaryVpcOrigin, alb-origin-group, alb-primary]
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          AllowedMethods: !If
+            - HasSecondaryVpcOrigin
+            - [GET, HEAD, OPTIONS]
+            - [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # AllViewer
+          ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+        # When origin group is active, write operations (POST/PUT/DELETE) need a separate
+        # cache behavior pointing directly to the primary origin (not the origin group).
+        # CloudFront does not allow write methods on behaviors using origin groups.
+        # Writes fail during DR until ARC scales up secondary ECS — documented tradeoff.
+        CacheBehaviors: !If
+          - HasSecondaryVpcOrigin
+          - - PathPattern: '/api/flights'
+              TargetOriginId: alb-primary
+              ViewerProtocolPolicy: redirect-to-https
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+              ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            - PathPattern: '/api/flights/*'
+              TargetOriginId: alb-primary
+              ViewerProtocolPolicy: redirect-to-https
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+              ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            - PathPattern: '/api/airports'
+              TargetOriginId: alb-primary
+              ViewerProtocolPolicy: redirect-to-https
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+              ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            - PathPattern: '/api/airports/*'
+              TargetOriginId: alb-primary
+              ViewerProtocolPolicy: redirect-to-https
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+              ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            - PathPattern: '/api/crew'
+              TargetOriginId: alb-primary
+              ViewerProtocolPolicy: redirect-to-https
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+              ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+            - PathPattern: '/api/crew/*'
+              TargetOriginId: alb-primary
+              ViewerProtocolPolicy: redirect-to-https
+              AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+              CachedMethods: [GET, HEAD]
+              CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+              OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+              ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+          - !Ref 'AWS::NoValue'
+        Origins:
+          - Id: alb-primary
+            DomainName: !GetAtt LoadBalancer.DNSName
+            VpcOriginConfig:
+              VpcOriginId: !GetAtt VpcOrigin.Id
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+          - !If
+            - HasSecondaryVpcOrigin
+            - Id: alb-secondary
+              DomainName: !GetAtt LoadBalancer.DNSName
+              VpcOriginConfig:
+                VpcOriginId: !Ref SecondaryVpcOriginId
+                OriginReadTimeout: 30
+                OriginKeepaliveTimeout: 5
+            - !Ref 'AWS::NoValue'
+        OriginGroups: !If
+          - HasSecondaryVpcOrigin
+          - Quantity: 1
+            Items:
+              - Id: alb-origin-group
+                FailoverCriteria:
+                  StatusCodes:
+                    Items: [500, 502, 503, 504]
+                    Quantity: 4
+                Members:
+                  Quantity: 2
+                  Items:
+                    - OriginId: alb-primary
+                    - OriginId: alb-secondary
+          - !Ref 'AWS::NoValue'
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          # NOTE: MinimumProtocolVersion is IGNORED when using the default CloudFront certificate.
+          # TLSv1 is enforced by AWS and cannot be changed without a custom domain + ACM cert.
+          # SSLSupportMethod is also not permitted with CloudFrontDefaultCertificate: true.
+          # To enforce TLSv1.2, add a custom domain, ACM cert, and set SSLSupportMethod: sni-only.
+          MinimumProtocolVersion: TLSv1.2_2021
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # CodeBuild - builds container from source, pushes to ECR
+  # Eliminates Finch/Docker as operator prerequisite
+  # ============================================================
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Condition: IsPrimary
+    Properties:
+      RoleName: !Sub '${StackPrefix}-codebuild-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !GetAtt EcrRepository.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetBucketLocation
+                Resource: '*'
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Condition: IsPrimary
+    Properties:
+      Name: !Sub '${StackPrefix}-container-build'
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO_URI
+            Value: !GetAtt EcrRepository.RepositoryUri
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref 'AWS::AccountId'
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref 'AWS::Region'
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            pre_build:
+              commands:
+                - echo Logging in to ECR...
+                - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+                - echo Downloading source from S3...
+                - aws s3 cp s3://$SOURCE_BUCKET/$SOURCE_KEY source.zip
+                - unzip source.zip -d source
+            build:
+              commands:
+                - echo Building container image...
+                - cd source
+                - docker build -t $ECR_REPO_URI:latest -f app/Dockerfile .
+            post_build:
+              commands:
+                - echo Pushing to ECR...
+                - docker push $ECR_REPO_URI:latest
+                - echo Build completed on $(date)
+      TimeoutInMinutes: 15
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # Custom Resource Lambda to trigger CodeBuild
+  CodeBuildTriggerRole:
+    Type: AWS::IAM::Role
+    Condition: IsPrimary
+    Properties:
+      RoleName: !Sub '${StackPrefix}-codebuild-trigger-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TriggerPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt CodeBuildProject.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+
+  CodeBuildTriggerFunction:
+    Type: AWS::Lambda::Function
+    Condition: IsPrimary
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-codebuild-trigger'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 900
+      MemorySize: 128
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt CodeBuildTriggerRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import time
+          import urllib.request
+          import boto3
+
+          codebuild = boto3.client('codebuild')
+
+          def send_response(event, context, status, data=None, reason=''):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f'See CloudWatch Log Stream: {context.log_stream_name}',
+                  'PhysicalResourceId': event.get('PhysicalResourceId', f"build-{event.get('StackId','').split('/')[-1]}"),
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data or {},
+              })
+              req = urllib.request.Request(event['ResponseURL'], data=body.encode('utf-8'), headers={'Content-Type': ''}, method='PUT')
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              print(json.dumps(event))
+              if event['RequestType'] in ('Create', 'Update'):
+                  try:
+                      props = event['ResourceProperties']
+                      resp = codebuild.start_build(
+                          projectName=props['ProjectName'],
+                          environmentVariablesOverride=[
+                              {'name': 'SOURCE_BUCKET', 'value': props['SourceBucket']},
+                              {'name': 'SOURCE_KEY', 'value': props['SourceKey']},
+                          ]
+                      )
+                      build_id = resp['build']['id']
+                      print(f'Started build: {build_id}')
+
+                      # Poll until complete
+                      while True:
+                          time.sleep(15)
+                          builds = codebuild.batch_get_builds(ids=[build_id])
+                          status = builds['builds'][0]['buildStatus']
+                          print(f'Build status: {status}')
+                          if status == 'SUCCEEDED':
+                              send_response(event, context, 'SUCCESS', {'BuildId': build_id})
+                              return
+                          elif status in ('FAILED', 'FAULT', 'STOPPED', 'TIMED_OUT'):
+                              send_response(event, context, 'FAILED', reason=f'Build {status}: {build_id}')
+                              return
+                  except Exception as e:
+                      print(f'Error: {e}')
+                      send_response(event, context, 'FAILED', reason=str(e))
+              else:
+                  send_response(event, context, 'SUCCESS')
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # ARC Helper Lambda: CloudFront origin switch - REMOVED
+  # Origin group failover handles this via data plane (no control plane call needed)
+  # ============================================================
+
+  # ============================================================
+  # ARC Helper Lambda: ECS scale down (source region to 0 tasks)
+  # ============================================================
+  EcsScaleDownRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StackPrefix}-ecs-scale-down-role-${AWS::Region}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ECSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:UpdateService
+                  - ecs:DescribeServices
+                Resource: '*'
+
+  EcsScaleDownFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-ecs-scale-down'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt EcsScaleDownRole.Arn
+      Timeout: 120
+      MemorySize: 128
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Sub '${StackPrefix}-cluster'
+          SERVICE_NAME: !Sub '${StackPrefix}-service'
+          PRIMARY_REGION: !Ref PrimaryRegion
+          SECONDARY_REGION: !Ref SecondaryRegion
+      Code:
+        ZipFile: |
+          """Scale ECS service to 0 in the source (deactivating) region.
+          Bug #68: Logs full ARC event, accepts targetRegion override."""
+          import boto3, os, json, logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          def handler(event, context):
+              logger.info(f"Full ARC event: {json.dumps(event)}")
+              # Accept targetRegion override, fall back to activatingRegion
+              activating = event.get('targetRegion', event.get('activatingRegion', os.environ['AWS_REGION']))
+              source = os.environ['PRIMARY_REGION'] if activating == os.environ['SECONDARY_REGION'] else os.environ['SECONDARY_REGION']
+              logger.info(f"ECS scale-down: activating={activating}, scaling down={source}")
+              ecs = boto3.client('ecs', region_name=source)
+              ecs.update_service(cluster=os.environ['CLUSTER_NAME'], service=os.environ['SERVICE_NAME'], desiredCount=0)
+              return {'status': 'SUCCESS', 'region': source, 'desiredCount': 0}
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: resilience-tier
+          Value: mission-critical
+
+Outputs:
+  EcsClusterArn:
+    Value: !GetAtt EcsCluster.Arn
+  EcsClusterName:
+    Value: !Ref EcsCluster
+  EcsServiceArn:
+    Value: !Ref EcsService
+  EcsServiceName:
+    Value: !GetAtt EcsService.Name
+  AlbArn:
+    Value: !Ref LoadBalancer
+  AlbDnsName:
+    Value: !GetAtt LoadBalancer.DNSName
+  AlbFullName:
+    Value: !GetAtt LoadBalancer.LoadBalancerFullName
+  AlbTargetGroupFullName:
+    Value: !GetAtt TargetGroup.TargetGroupFullName
+  HttpListenerArn:
+    Value: !Ref HttpListener
+  CloudFrontDistributionId:
+    Condition: IsPrimary
+    Value: !Ref CloudFrontDistribution
+  CloudFrontDomainName:
+    Condition: IsPrimary
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  EcrRepositoryUri:
+    Condition: IsPrimary
+    Value: !GetAtt EcrRepository.RepositoryUri
+  CodeBuildProjectName:
+    Condition: IsPrimary
+    Value: !Ref CodeBuildProject
+  CodeBuildTriggerFunctionArn:
+    Condition: IsPrimary
+    Value: !GetAtt CodeBuildTriggerFunction.Arn
+  EcsScaleDownFunctionArn:
+    Value: !GetAtt EcsScaleDownFunction.Arn
+  FlightAwareSecretArn:
+    # Primary: full ARN from created secret. Secondary: secret name works as SecretId
+    # because Secrets Manager resolves names to the local replica automatically.
+    Value: !If
+      - IsPrimary
+      - !Ref FlightAwareSecret
+      - !Sub '${StackPrefix}/flightaware/api-key'
+  VpcOriginId:
+    Value: !GetAtt VpcOrigin.Id

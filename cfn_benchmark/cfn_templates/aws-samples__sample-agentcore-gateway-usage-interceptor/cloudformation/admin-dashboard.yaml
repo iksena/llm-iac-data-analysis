@@ -1,0 +1,876 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Admin spend dashboard for the AgentCore Gateway usage interceptor. Reads the
+  rollover Lambda's S3 archive (gzipped JSONL, Hive-partitioned) through Glue +
+  Athena and surfaces it in Amazon Quick Sight (formerly QuickSight) as a
+  dashboard: spend per user over time, month-over-month, cap-vs-actual, and
+  top spenders.
+
+  Deployed as a SEPARATE stack from standalone.yaml on purpose — Quick Sight is
+  a per-user subscription that must already exist in the account, so wiring it
+  into the main stack would make the sample undeployable for anyone without it.
+
+  Prerequisites:
+    1. An active Amazon Quick / Quick Sight subscription in this account+region.
+    2. Quick Sight granted access to Athena and the archive bucket
+       (Quick Sight console -> Manage Quick Sight -> Security & permissions).
+    3. At least one completed rollover (i.e. objects exist under period=daily/).
+
+Parameters:
+  ArchiveKmsKeyArn:
+    Type: String
+    Default: ""
+    Description: >
+      ARN of the CMK encrypting the archive bucket (the stack's
+      InterceptorDataKeyArn output). S3 read permission alone is NOT enough for
+      a CMK-encrypted bucket — the reader also needs kms:Decrypt, or Athena
+      fails with an opaque AccessDenied. Leave empty only if the archive bucket
+      uses SSE-S3 rather than a CMK. Find it with:
+      aws cloudformation describe-stacks --stack-name <stack>
+      --query "Stacks[0].Outputs[?OutputKey=='InterceptorDataKeyArn'].OutputValue"
+  ArchiveBucketName:
+    Type: String
+    Description: >
+      Name of the rollover archive bucket created by standalone.yaml. Find it in
+      that stack's resources (logical id RolloverArchiveBucket) or via:
+      aws cloudformation describe-stack-resources --stack-name <stack>
+      --query "StackResources[?LogicalResourceId=='RolloverArchiveBucket'].PhysicalResourceId"
+  QuickSightPrincipalArn:
+    Type: String
+    Description: >
+      Quick Sight user/group ARN that will own the dataset, analysis, and
+      dashboard. Get it with:
+      aws quicksight list-users --aws-account-id <acct> --namespace default
+      --region <region> --query "UserList[].Arn"
+      e.g. arn:aws:quicksight:us-east-1:123456789012:user/default/Admin/alice
+  ProjectionStartYear:
+    Type: String
+    Default: "2026"
+    AllowedPattern: "^[0-9]{4}$"
+    Description: >
+      First year to scan for partitions. Partition projection needs a bounded
+      range; set this to the year you first deployed the interceptor so Athena
+      doesn't probe years of empty prefixes.
+  AthenaResultsExpirationDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    Description: Days before Athena query results in the results bucket expire.
+
+Conditions:
+  HasArchiveCmk: !Not [!Equals [!Ref ArchiveKmsKeyArn, ""]]
+
+Resources:
+
+  # ==================================================================
+  # Athena query-results bucket
+  # ==================================================================
+  # Athena needs somewhere to write results. Separate from the archive bucket so
+  # query output can be expired aggressively without touching the ledger.
+  AthenaResultsBucket:
+    Type: AWS::S3::Bucket
+    # Retain: S3 refuses to delete a non-empty bucket, and Athena writes result
+    # objects as soon as the first query runs — so a Delete policy wedges the
+    # stack in ROLLBACK_FAILED on any later failure. Results expire on their own
+    # via the lifecycle rule below; delete the bucket by hand if you want it gone.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      # Name MUST start with aws-athena-query-results- : the managed
+      # AWSQuicksightAthenaAccess policy only grants Quick Sight S3 access to
+      # buckets matching that prefix. Rename it and Quick Sight can't write
+      # query results, and every visual fails with an opaque S3 error.
+      # Prefix is load-bearing (see above). Kept short deliberately: the
+      # required prefix is 25 chars, so prefix + stack name + account id
+      # overruns S3's 63-char limit on any realistically-named stack.
+      BucketName: !Sub "aws-athena-query-results-${AWS::AccountId}-${AWS::Region}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireResults
+            Status: Enabled
+            ExpirationInDays: !Ref AthenaResultsExpirationDays
+
+  # Quick Sight reaches the archive through Athena using its own service role
+  # (aws-quicksight-service-role-v0). The managed AWSQuicksightAthenaAccess
+  # policy only grants S3 on aws-athena-query-results-* buckets, so the archive
+  # bucket itself is not readable by default. Granting it resource-side keeps
+  # the fix inside this stack rather than mutating Quick Sight's account-level
+  # security settings (which CloudFormation can't manage).
+  ArchiveReadPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ArchiveBucketName
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowQuickSightAthenaRead
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:role/service-role/aws-quicksight-service-role-v0"
+            Action: [s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
+            Resource:
+              - !Sub "arn:aws:s3:::${ArchiveBucketName}"
+              - !Sub "arn:aws:s3:::${ArchiveBucketName}/*"
+
+  # The archive CMK's key policy delegates to IAM (EnableIAMUserPermissions),
+  # so an identity-based grant on Quick Sight's service role is enough — no
+  # key-policy edit needed. Attaching to the existing role rather than creating
+  # one, because Quick Sight only ever assumes aws-quicksight-service-role-v0.
+  QuickSightArchiveAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${AWS::StackName}-quicksight-archive-access"
+      Description: Lets Quick Sight read the CMK-encrypted spend archive via Athena
+      Roles:
+        - aws-quicksight-service-role-v0
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: [s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
+            Resource:
+              - !Sub "arn:aws:s3:::${ArchiveBucketName}"
+              - !Sub "arn:aws:s3:::${ArchiveBucketName}/*"
+          - !If
+            - HasArchiveCmk
+            - Effect: Allow
+              Action: [kms:Decrypt, kms:DescribeKey]
+              Resource: !Ref ArchiveKmsKeyArn
+            - !Ref AWS::NoValue
+          # Glue catalog reads for the table/views Athena resolves.
+          - Effect: Allow
+            Action: [glue:GetDatabase, glue:GetDatabases, glue:GetTable, glue:GetTables, glue:GetPartition, glue:GetPartitions]
+            Resource:
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}"
+              - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*"
+
+  # ==================================================================
+  # Glue catalog: database + table over the archive
+  # ==================================================================
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub "${AWS::StackName}_spend"
+        Description: Per-user inference spend archive written by the rollover Lambda
+
+  # The rollover Lambda writes newline-delimited JSON, gzipped, to
+  #   period=<daily|monthly>/year=YYYY/month=MM[/day=DD]/users-<epoch>.jsonl.gz
+  #
+  # Two things worth noting:
+  #  - `date` is a reserved word in Athena/Presto, so the record's "date" field
+  #    is mapped to a column named spend_date via the SerDe mapping below.
+  #  - Partition projection (enabled via table properties) means no crawler and
+  #    no MSCK REPAIR — Athena computes partitions from the ranges declared
+  #    here. `day` is projected 1-31 and simply misses for monthly rows, which
+  #    is why period is its own partition key rather than an inferred column.
+  SpendArchiveTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: spend_archive
+        Description: Raw rollover records — one row per user per archived period
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          compressionType: gzip
+          # --- partition projection ---
+          projection.enabled: "true"
+          projection.period.type: enum
+          projection.period.values: "daily,monthly"
+          projection.year.type: integer
+          projection.year.range: !Sub "${ProjectionStartYear},2035"
+          projection.year.digits: "4"
+          projection.month.type: integer
+          projection.month.range: "1,12"
+          projection.month.digits: "2"
+          projection.day.type: integer
+          projection.day.range: "1,31"
+          projection.day.digits: "2"
+          storage.location.template:
+            !Sub "s3://${ArchiveBucketName}/period=${!period}/year=${!year}/month=${!month}/day=${!day}"
+        PartitionKeys:
+          - Name: period
+            Type: string
+          - Name: year
+            Type: string
+          - Name: month
+            Type: string
+          - Name: day
+            Type: string
+        StorageDescriptor:
+          Location: !Sub "s3://${ArchiveBucketName}/"
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          Compressed: true
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              # Map the reserved word `date` onto spend_date.
+              mapping.spend_date: date
+              ignore.malformed.json: "true"
+          Columns:
+            # `period` is intentionally NOT declared here even though it exists
+            # in the JSON: it's already a partition key, and Glue rejects a
+            # table whose descriptor repeats a partition column
+            # ("Table descriptor contains duplicate columns"). The partition
+            # key shadows the field, and its value is identical either way.
+            - Name: spend_date
+              Type: string
+              Comment: Period key — YYYY-MM-DD for daily, YYYY-MM for monthly
+            - Name: user
+              Type: string
+            - Name: spend_usd
+              Type: double
+              Comment: Estimated USD spend for the period (interceptor estimate, not the invoice)
+            - Name: cap_usd
+              Type: double
+              Comment: Cap in force when archived; null if the stack default applied
+            - Name: archived_at
+              Type: string
+
+  # ==================================================================
+  # Athena workgroup + the view Quick Sight reads
+  # ==================================================================
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-wg"
+      Description: Queries over the interceptor spend archive
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${AthenaResultsBucket}/results/"
+          EncryptionConfiguration:
+            EncryptionOption: SSE_S3
+
+  # AWS::Athena::NamedQuery only SAVES sql — it never runs it. The Quick Sight
+  # dataset below reads v_daily_spend, so the view has to physically exist
+  # before that resource is created. This custom resource executes the DDL and
+  # blocks until the queries succeed, giving us a real dependency edge.
+  ViewBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-view-builder"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: build-views
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource: !Sub "arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkGroup}"
+              # Glue perms cover creating/dropping the view objects themselves.
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                Resource:
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}"
+                  - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*"
+              # Athena reads the source data and writes query results.
+              - Effect: Allow
+                Action: [s3:GetObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !Sub "arn:aws:s3:::${ArchiveBucketName}"
+                  - !Sub "arn:aws:s3:::${ArchiveBucketName}/*"
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket, s3:GetBucketLocation]
+                Resource:
+                  - !Sub "arn:aws:s3:::${AthenaResultsBucket}"
+                  - !Sub "arn:aws:s3:::${AthenaResultsBucket}/*"
+              # The archive is CMK-encrypted; S3 read alone yields AccessDenied
+              # without kms:Decrypt on the key that wraps the objects.
+              - !If
+                - HasArchiveCmk
+                - Effect: Allow
+                  Action: [kms:Decrypt, kms:DescribeKey]
+                  Resource: !Ref ArchiveKmsKeyArn
+                - !Ref AWS::NoValue
+
+  ViewBuilderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${AWS::StackName}-view-builder"
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 300
+      Role: !GetAtt ViewBuilderRole.Arn
+      Environment:
+        Variables:
+          DATABASE: !Ref GlueDatabase
+          WORKGROUP: !Ref AthenaWorkGroup
+      Code:
+        ZipFile: |
+          # Runs CREATE OR REPLACE VIEW statements via Athena on stack
+          # create/update, and DROPs them on delete so the stack tears down
+          # cleanly (Glue won't delete a database that still has tables).
+          import json, os, time, urllib.request
+          import boto3
+
+          athena = boto3.client("athena")
+          DATABASE = os.environ["DATABASE"]
+          WORKGROUP = os.environ["WORKGROUP"]
+
+          # cap_usd is nullable in the archive (null = "stack default applied").
+          # COALESCE is deliberately NOT applied — a null cap is meaningfully
+          # different from a cap of 0, so utilization stays null and Quick Sight
+          # shows "no cap set" instead of a misleading 100%.
+          DAILY_VIEW = f'''
+          CREATE OR REPLACE VIEW "{DATABASE}"."v_daily_spend" AS
+          SELECT
+            "user"                                           AS user_name,
+            CAST(date_parse(spend_date, '%Y-%m-%d') AS date)  AS spend_day,
+            spend_usd,
+            cap_usd,
+            CASE WHEN cap_usd IS NULL OR cap_usd = 0 THEN NULL
+                 ELSE spend_usd / cap_usd END                AS cap_utilization,
+            year  AS partition_year,
+            month AS partition_month
+          FROM "{DATABASE}"."spend_archive"
+          WHERE period = 'daily' AND spend_date IS NOT NULL
+          '''
+
+          MONTHLY_VIEW = f'''
+          CREATE OR REPLACE VIEW "{DATABASE}"."v_monthly_spend" AS
+          SELECT
+            user_name,
+            date_trunc('month', spend_day) AS spend_month,
+            SUM(spend_usd)                 AS spend_usd,
+            COUNT(*)                       AS active_days,
+            AVG(spend_usd)                 AS avg_daily_spend
+          FROM "{DATABASE}"."v_daily_spend"
+          GROUP BY user_name, date_trunc('month', spend_day)
+          '''
+
+          def _run(sql):
+              qid = athena.start_query_execution(
+                  QueryString=sql,
+                  QueryExecutionContext={"Database": DATABASE},
+                  WorkGroup=WORKGROUP,
+              )["QueryExecutionId"]
+              # Athena DDL is fast but not synchronous — poll to completion so a
+              # failure surfaces as a stack failure rather than a silent no-op.
+              deadline = time.time() + 240
+              while time.time() < deadline:
+                  ex = athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]
+                  state = ex["Status"]["State"]
+                  if state in ("SUCCEEDED",):
+                      return
+                  if state in ("FAILED", "CANCELLED"):
+                      raise RuntimeError(
+                          f"{state}: {ex['Status'].get('StateChangeReason')} | sql={sql[:200]}")
+                  time.sleep(2)
+              raise RuntimeError(f"timed out waiting for query {qid}")
+
+          def _send(event, context, status, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or f"see CloudWatch log {context.log_stream_name}",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {},
+              }).encode()
+              req = urllib.request.Request(
+                  event["ResponseURL"], data=body, method="PUT",
+                  headers={"content-type": "", "content-length": str(len(body))})
+              urllib.request.urlopen(req)
+
+          def lambda_handler(event, context):
+              try:
+                  rt = event.get("RequestType")
+                  if rt == "Delete":
+                      # Best-effort: let the stack delete even if these fail.
+                      for v in ("v_monthly_spend", "v_daily_spend"):
+                          try:
+                              _run(f'DROP VIEW IF EXISTS "{DATABASE}"."{v}"')
+                          except Exception as e:
+                              print(f"drop {v} failed (ignored): {e}")
+                  else:
+                      # Daily first — monthly selects from it.
+                      _run(DAILY_VIEW)
+                      _run(MONTHLY_VIEW)
+                  _send(event, context, "SUCCESS")
+              except Exception as e:
+                  print(f"error: {e}")
+                  status = "SUCCESS" if event.get("RequestType") == "Delete" else "FAILED"
+                  _send(event, context, status, reason=str(e))
+
+  SpendViews:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - SpendArchiveTable
+      - AthenaWorkGroup
+    Properties:
+      ServiceToken: !GetAtt ViewBuilderFunction.Arn
+      # Bump to force the views to be rebuilt on a template change.
+      ViewVersion: "1"
+
+  # ==================================================================
+  # Quick Sight: data source -> dataset -> analysis -> dashboard
+  # ==================================================================
+  # Quick Sight must already have Athena + S3 access granted in its own
+  # security settings; that's an account-level toggle CFN can't set.
+  QuickSightAthenaSource:
+    Type: AWS::QuickSight::DataSource
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSourceId: !Sub "${AWS::StackName}-athena"
+      Name: !Sub "${AWS::StackName} spend archive (Athena)"
+      Type: ATHENA
+      DataSourceParameters:
+        AthenaParameters:
+          WorkGroup: !Ref AthenaWorkGroup
+      SslProperties:
+        DisableSsl: false
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSource
+            - quicksight:DescribeDataSourcePermissions
+            - quicksight:PassDataSource
+            - quicksight:UpdateDataSource
+            - quicksight:DeleteDataSource
+            - quicksight:UpdateDataSourcePermissions
+
+  # SPICE import rather than DIRECT_QUERY: the archive is small (one row per
+  # user per day) and refreshed once daily, so importing keeps the dashboard
+  # snappy and avoids an Athena scan per visual interaction.
+  DailySpendDataSet:
+    Type: AWS::QuickSight::DataSet
+    # SpendViews must have run — the physical table below is an Athena view.
+    DependsOn:
+      - QuickSightAthenaSource
+      - SpendViews
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${AWS::StackName}-daily-spend"
+      Name: !Sub "${AWS::StackName} daily spend"
+      ImportMode: SPICE
+      PhysicalTableMap:
+        DailyTable:
+          RelationalTable:
+            DataSourceArn: !GetAtt QuickSightAthenaSource.Arn
+            Catalog: AwsDataCatalog
+            Schema: !Ref GlueDatabase
+            Name: v_daily_spend
+            InputColumns:
+              - Name: user_name
+                Type: STRING
+              - Name: spend_day
+                Type: DATETIME
+              - Name: spend_usd
+                Type: DECIMAL
+              - Name: cap_usd
+                Type: DECIMAL
+              - Name: cap_utilization
+                Type: DECIMAL
+              - Name: partition_year
+                Type: STRING
+              - Name: partition_month
+                Type: STRING
+      LogicalTableMap:
+        DailyLogical:
+          Alias: daily_spend
+          Source:
+            PhysicalTableId: DailyTable
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDataSet
+            - quicksight:DescribeDataSetPermissions
+            - quicksight:PassDataSet
+            - quicksight:DescribeIngestion
+            - quicksight:ListIngestions
+            - quicksight:UpdateDataSet
+            - quicksight:DeleteDataSet
+            - quicksight:CreateIngestion
+            - quicksight:CancelIngestion
+            - quicksight:UpdateDataSetPermissions
+
+  # Refresh shortly after the rollover Lambda writes (rollover fires at 00:00 in
+  # the stack's timezone; 02:00 UTC leaves room for it to finish).
+  DailySpendRefresh:
+    Type: AWS::QuickSight::RefreshSchedule
+    DependsOn: DailySpendDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DataSetId: !Sub "${AWS::StackName}-daily-spend"
+      Schedule:
+        ScheduleId: daily-after-rollover
+        RefreshType: FULL_REFRESH
+        ScheduleFrequency:
+          Interval: DAILY
+          # Note the capital Z — the property is TimeZone, not Timezone, and
+          # both it and TimeOfTheDay live under ScheduleFrequency.
+          TimeOfTheDay: "02:00"
+          TimeZone: Etc/UTC
+
+  AdminAnalysis:
+    Type: AWS::QuickSight::Analysis
+    DependsOn: DailySpendDataSet
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      AnalysisId: !Sub "${AWS::StackName}-admin"
+      Name: !Sub "${AWS::StackName} — inference spend (admin)"
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeAnalysis
+            - quicksight:DescribeAnalysisPermissions
+            - quicksight:UpdateAnalysis
+            - quicksight:UpdateAnalysisPermissions
+            - quicksight:DeleteAnalysis
+            - quicksight:QueryAnalysis
+            - quicksight:RestoreAnalysis
+      Definition:
+        DataSetIdentifierDeclarations:
+          - Identifier: daily_spend
+            DataSetArn: !GetAtt DailySpendDataSet.Arn
+        Sheets:
+          - SheetId: overview
+            Name: Overview
+            Visuals:
+              # --- KPI: total estimated spend ---
+              - KPIVisual:
+                  VisualId: kpi-total-spend
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: Total estimated spend (USD)
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: total_spend
+                            Column:
+                              DataSetIdentifier: daily_spend
+                              ColumnName: spend_usd
+                            AggregationFunction:
+                              SimpleNumericalAggregation: SUM
+              # --- Spend over time, stacked by user ---
+              - BarChartVisual:
+                  VisualId: spend-over-time
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: Daily spend by user
+                  ChartConfiguration:
+                    Orientation: VERTICAL
+                    BarsArrangement: STACKED
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField:
+                              FieldId: day
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: spend_day
+                              DateGranularity: DAY
+                        Colors:
+                          - CategoricalDimensionField:
+                              FieldId: user_color
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: user_name
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: spend_by_day
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: spend_usd
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+              # --- Top spenders ---
+              - BarChartVisual:
+                  VisualId: top-spenders
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: Top spenders
+                  ChartConfiguration:
+                    Orientation: HORIZONTAL
+                    BarsArrangement: CLUSTERED
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: user_cat
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: user_name
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: spend_by_user
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: spend_usd
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort:
+                            FieldId: spend_by_user
+                            Direction: DESC
+              # --- Cap utilization: who is close to their limit ---
+              - TableVisual:
+                  VisualId: cap-utilization
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: Cap utilization (spend / cap, latest days)
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField:
+                              FieldId: util_user
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: user_name
+                          - DateDimensionField:
+                              FieldId: util_day
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: spend_day
+                              DateGranularity: DAY
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: util_spend
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: spend_usd
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                          - NumericalMeasureField:
+                              FieldId: util_cap
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: cap_usd
+                              AggregationFunction:
+                                SimpleNumericalAggregation: MAX
+                          - NumericalMeasureField:
+                              FieldId: util_ratio
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: cap_utilization
+                              AggregationFunction:
+                                SimpleNumericalAggregation: MAX
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort:
+                            FieldId: util_ratio
+                            Direction: DESC
+
+  AdminDashboard:
+    Type: AWS::QuickSight::Dashboard
+    DependsOn: AdminAnalysis
+    Properties:
+      AwsAccountId: !Ref AWS::AccountId
+      DashboardId: !Sub "${AWS::StackName}-admin"
+      Name: !Sub "${AWS::StackName} — inference spend (admin)"
+      DashboardPublishOptions:
+        AdHocFilteringOption:
+          AvailabilityStatus: ENABLED
+        ExportToCSVOption:
+          AvailabilityStatus: ENABLED
+      Permissions:
+        - Principal: !Ref QuickSightPrincipalArn
+          Actions:
+            - quicksight:DescribeDashboard
+            - quicksight:DescribeDashboardPermissions
+            - quicksight:ListDashboardVersions
+            - quicksight:QueryDashboard
+            - quicksight:UpdateDashboard
+            - quicksight:UpdateDashboardPermissions
+            - quicksight:UpdateDashboardPublishedVersion
+            - quicksight:DeleteDashboard
+      # SourceEntity/SourceTemplate would need a QuickSight *template* ARN (an
+      # analysis ARN is not valid there), so the dashboard carries its own
+      # definition. Same visuals as the analysis above: the analysis is the
+      # editable workspace, this is the published read-only view.
+      Definition:
+        DataSetIdentifierDeclarations:
+          - Identifier: daily_spend
+            DataSetArn: !GetAtt DailySpendDataSet.Arn
+        Sheets:
+          - SheetId: overview
+            Name: Overview
+            Visuals:
+              - KPIVisual:
+                  VisualId: kpi-total-spend
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: Total estimated spend (USD)
+                  ChartConfiguration:
+                    FieldWells:
+                      Values:
+                        - NumericalMeasureField:
+                            FieldId: total_spend
+                            Column:
+                              DataSetIdentifier: daily_spend
+                              ColumnName: spend_usd
+                            AggregationFunction:
+                              SimpleNumericalAggregation: SUM
+              - BarChartVisual:
+                  VisualId: spend-over-time
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: Daily spend by user
+                  ChartConfiguration:
+                    Orientation: VERTICAL
+                    BarsArrangement: STACKED
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - DateDimensionField:
+                              FieldId: day
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: spend_day
+                              DateGranularity: DAY
+                        Colors:
+                          - CategoricalDimensionField:
+                              FieldId: user_color
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: user_name
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: spend_by_day
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: spend_usd
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+              - BarChartVisual:
+                  VisualId: top-spenders
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: Top spenders
+                  ChartConfiguration:
+                    Orientation: HORIZONTAL
+                    BarsArrangement: CLUSTERED
+                    FieldWells:
+                      BarChartAggregatedFieldWells:
+                        Category:
+                          - CategoricalDimensionField:
+                              FieldId: user_cat
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: user_name
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: spend_by_user
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: spend_usd
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                    SortConfiguration:
+                      CategorySort:
+                        - FieldSort:
+                            FieldId: spend_by_user
+                            Direction: DESC
+              - TableVisual:
+                  VisualId: cap-utilization
+                  Title:
+                    Visibility: VISIBLE
+                    FormatText:
+                      PlainText: Cap utilization (spend / cap, latest days)
+                  ChartConfiguration:
+                    FieldWells:
+                      TableAggregatedFieldWells:
+                        GroupBy:
+                          - CategoricalDimensionField:
+                              FieldId: util_user
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: user_name
+                          - DateDimensionField:
+                              FieldId: util_day
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: spend_day
+                              DateGranularity: DAY
+                        Values:
+                          - NumericalMeasureField:
+                              FieldId: util_spend
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: spend_usd
+                              AggregationFunction:
+                                SimpleNumericalAggregation: SUM
+                          - NumericalMeasureField:
+                              FieldId: util_cap
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: cap_usd
+                              AggregationFunction:
+                                SimpleNumericalAggregation: MAX
+                          - NumericalMeasureField:
+                              FieldId: util_ratio
+                              Column:
+                                DataSetIdentifier: daily_spend
+                                ColumnName: cap_utilization
+                              AggregationFunction:
+                                SimpleNumericalAggregation: MAX
+                    SortConfiguration:
+                      RowSort:
+                        - FieldSort:
+                            FieldId: util_ratio
+                            Direction: DESC
+
+Outputs:
+  GlueDatabaseName:
+    Description: Glue database holding the spend archive table + views
+    Value: !Ref GlueDatabase
+  AthenaWorkGroupName:
+    Description: Run the named queries in this workgroup to create the views
+    Value: !Ref AthenaWorkGroup
+  DailyViewName:
+    Description: Athena view Quick Sight reads
+    Value: !Sub "${GlueDatabase}.v_daily_spend"
+  DashboardUrl:
+    Description: Amazon Quick Sight admin dashboard
+    Value: !Sub "https://${AWS::Region}.quicksight.aws.amazon.com/sn/dashboards/${AWS::StackName}-admin"
+  AthenaResultsBucketName:
+    Description: Bucket holding Athena query results
+    Value: !Ref AthenaResultsBucket

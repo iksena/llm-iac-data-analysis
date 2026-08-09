@@ -1,0 +1,2537 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Semantic Lakehouse Demo - Customer 360 data analytics on a lakehouse architecture
+  with semantic ontology visualization, NLP queries, and graph-based exploration.
+
+# =============================================================================
+# Parameters (Task 4.3)
+# =============================================================================
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: demo
+    Description: Environment name used for resource naming and tagging
+    AllowedPattern: '[a-z0-9-]+'
+    ConstraintDescription: Must contain only lowercase letters, numbers, and hyphens
+
+  DemoUserEmail:
+    Type: String
+    Default: ''
+    Description: Email address for the auto-created demo Cognito user. Leave empty to skip user creation.
+
+  CognitoCallbackURLs:
+    Type: CommaDelimitedList
+    Default: 'http://localhost:3000'
+    Description: Initial callback URLs (auto-updated with CloudFront domain after deploy)
+
+  NeptuneInstanceSize:
+    Type: String
+    Default: db.t3.medium
+    Description: Neptune DB instance class
+    AllowedValues:
+      - db.t3.medium
+      - db.r5.large
+      - db.r5.xlarge
+      - db.r5.2xlarge
+
+  ContainerImageUri:
+    Type: String
+    Default: ''
+    Description: ECR image URI for the API Fargate container. Leave empty to auto-build from SourceRepoUrl.
+
+  SourceRepoUrl:
+    Type: String
+    Default: ''
+    Description: Git repository URL to clone for building. Required if ContainerImageUri is empty.
+
+Conditions:
+  HasDemoUser: !Not [!Equals [!Ref DemoUserEmail, '']]
+  HasSourceRepo: !Not [!Equals [!Ref SourceRepoUrl, '']]
+  NeedsBuild: !And
+    - !Equals [!Ref ContainerImageUri, '']
+    - !Not [!Equals [!Ref SourceRepoUrl, '']]
+  HasContainerImage: !Not [!Equals [!Ref ContainerImageUri, '']]
+
+Resources:
+
+  # ===========================================================================
+  # VPC and Networking (Task 4.1)
+  # ===========================================================================
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vpc'
+
+  VPCFlowLog:
+    Type: AWS::EC2::FlowLog
+    Properties:
+      ResourceId: !Ref VPC
+      ResourceType: VPC
+      TrafficType: ALL
+      LogDestinationType: cloud-watch-logs
+      LogGroupName: !Sub '/vpc/${EnvironmentName}/flow-logs'
+      DeliverLogsPermissionArn: !GetAtt VPCFlowLogRole.Arn
+
+  VPCFlowLogRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: vpc-flow-logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FlowLogWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/vpc/${EnvironmentName}/*'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # --- Public Subnets (2 AZs) ---
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-a'
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-b'
+
+  # --- Private Subnets (2 AZs) ---
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-a'
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-b'
+
+  # --- NAT Gateway ---
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-nat'
+
+  # --- Route Tables ---
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-rt'
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-rt'
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ===========================================================================
+  # Security Groups (Task 4.1)
+  # ===========================================================================
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the Application Load Balancer
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTP from internet (use HTTPS with ACM cert in production)
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-alb-sg'
+
+  # Egress rule added separately to avoid circular dependency with FargateSecurityGroup
+  ALBSecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ALBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8000
+      ToPort: 8000
+      DestinationSecurityGroupId: !Ref FargateSecurityGroup
+      Description: Allow traffic to Fargate API tasks
+
+  FargateSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Fargate API tasks
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Allow traffic from ALB
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS outbound for AWS API calls
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-fargate-sg'
+
+  # Egress rule added separately to avoid circular dependency with NeptuneSecurityGroup
+  FargateToNeptuneEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref FargateSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8182
+      ToPort: 8182
+      DestinationSecurityGroupId: !Ref NeptuneSecurityGroup
+      Description: Allow traffic to Neptune
+
+  AgentCoreSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for AgentCore Runtime MCP servers (VPC mode)
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: Allow HTTPS outbound for AWS API calls
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-agentcore-sg'
+
+  # Egress rule added separately to avoid circular dependency with NeptuneSecurityGroup
+  AgentCoreToNeptuneEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AgentCoreSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8182
+      ToPort: 8182
+      DestinationSecurityGroupId: !Ref NeptuneSecurityGroup
+      Description: Allow traffic to Neptune from AgentCore MCP servers
+
+  NeptuneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Neptune cluster
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8182
+          ToPort: 8182
+          SourceSecurityGroupId: !Ref FargateSecurityGroup
+          Description: Allow Gremlin connections from Fargate tasks
+        - IpProtocol: tcp
+          FromPort: 8182
+          ToPort: 8182
+          SourceSecurityGroupId: !Ref AgentCoreSecurityGroup
+          Description: Allow Gremlin connections from AgentCore MCP servers
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 127.0.0.1/32
+          Description: Deny all outbound (Neptune does not need egress)
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-neptune-sg'
+
+  # ===========================================================================
+  # Cognito Authentication (Task 4.1)
+  # ===========================================================================
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${EnvironmentName}-user-pool'
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${EnvironmentName}-app-client'
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_SRP_AUTH
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 1
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      EnableTokenRevocation: true
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs: !Ref CognitoCallbackURLs
+      LogoutURLs: !Ref CognitoCallbackURLs
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${EnvironmentName}-semantic-lakehouse-${AWS::AccountId}'
+      UserPoolId: !Ref CognitoUserPool
+
+  # --- Resource Server for AgentCore Gateway OAuth scopes ---
+  CognitoGatewayResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Identifier: !Sub '${EnvironmentName}-gateway'
+      Name: !Sub '${EnvironmentName}-gateway'
+      Scopes:
+        - ScopeName: invoke
+          ScopeDescription: Invoke AgentCore Gateway MCP tools
+
+  # --- Machine-to-machine app client for agents to authenticate to Gateway ---
+  CognitoGatewayClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: CognitoGatewayResourceServer
+    Properties:
+      ClientName: !Sub '${EnvironmentName}-gateway-m2m-client'
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: true
+      ExplicitAuthFlows: []
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - !Sub '${EnvironmentName}-gateway/invoke'
+      AllowedOAuthFlowsUserPoolClient: true
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # ===========================================================================
+  # Cognito Identity Pool + per-persona IAM roles
+  # (Lake Formation Identity Propagation feature — see
+  #  .kiro/specs/lakeformation-identity-propagation/design.md §Components and
+  #  Interfaces items 3 and 4.)
+  #
+  # The Identity Pool federates the User Pool and, with Token-based role
+  # mapping + AmbiguousRoleResolution: Deny, delegates role selection to the
+  # caller's `cognito:preferred_role` claim. AdminRole and BiRole share an
+  # identical IAM policy surface — the data-plane differentiation between
+  # personas is enforced by Lake Formation grants applied post-deploy by
+  # scripts/lf_setup.py, NOT by IAM.
+  # ===========================================================================
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub '${EnvironmentName}-lakehouse-idp'
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref CognitoUserPoolClient
+          ProviderName: !GetAtt CognitoUserPool.ProviderName
+          ServerSideTokenCheck: true
+
+  # --- AdminRole — LF data lake admin persona (Requirements 2.7, 9.1) ---
+  AdminRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-admin-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref IdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: LakehouseDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Athena query execution in the primary workgroup.
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:StopQueryExecution
+                  - athena:GetQueryResults
+                Resource: !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/primary'
+              # Athena query-results staging prefix on the data bucket.
+              # NOTE: s3:GetBucketLocation is a bucket-level action and MUST
+              # target the bucket ARN, not an object prefix. Keeping it on
+              # `${DataBucket.Arn}/athena_results/*` produced "The S3 output
+              # bucket cannot be verified or accessed" from Athena because
+              # GetBucketLocation (called before any query runs) got denied.
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                Resource: !GetAtt DataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListBucketMultipartUploads
+                Resource: !Sub '${DataBucket.Arn}/athena_results/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+                Condition:
+                  StringLike:
+                    's3:prefix':
+                      - 'athena_results/*'
+              # Iceberg data read (LF uses caller's role for S3 access when
+              # data-cell filters are in play — no SLR fast path).
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DataBucket.Arn}/iceberg/*'
+              # Glue Catalog read — LF post-filters `GetTable` for columns.
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*'
+              # Lake Formation data-plane authorization. LF grants live in
+              # scripts/lf_setup.py; this role never Grants/Revokes.
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: '*'
+
+  # --- BiRole — LF-restricted BI persona (Requirements 2.8, 9.2) ---
+  # Inline policy is identical to AdminRole by design; LF enforces the
+  # persona boundary (see scripts/lf_setup.py).
+  BiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-bi-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                'cognito-identity.amazonaws.com:aud': !Ref IdentityPool
+              'ForAnyValue:StringLike':
+                'cognito-identity.amazonaws.com:amr': authenticated
+      Policies:
+        - PolicyName: LakehouseDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:StopQueryExecution
+                  - athena:GetQueryResults
+                Resource: !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/primary'
+              # See AdminRole above for why GetBucketLocation needs the
+              # bucket-level ARN.
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                Resource: !GetAtt DataBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListBucketMultipartUploads
+                Resource: !Sub '${DataBucket.Arn}/athena_results/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !GetAtt DataBucket.Arn
+                Condition:
+                  StringLike:
+                    's3:prefix':
+                      - 'athena_results/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${DataBucket.Arn}/iceberg/*'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*'
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: '*'
+
+  # --- Role attachment with Token-based role mapping ---
+  # Type: Token tells the Identity Pool to pick a role from the JWT's
+  # `cognito:preferred_role` claim. AmbiguousRoleResolution: Deny means the
+  # exchange fails closed if the claim is missing/invalid — the
+  # `authenticated` fallback below is only present to satisfy the CFN schema
+  # and is never chosen at runtime (Requirements 2.2, 9.3).
+  #
+  # The `RoleMappings` key is a CFN-only label; the authoritative provider
+  # identifier is the `IdentityProvider` field inside the mapping value. Per
+  # the AWS docs, "If the identity provider property isn't provided, the key
+  # of the entry in the RoleMappings map is used as the identity provider."
+  # Since we set `IdentityProvider` explicitly, the key is free to be a
+  # static label (using a YAML-intrinsic-function key would make cfn-lint
+  # and pyyaml choke on an unhashable dict).
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt BiRole.Arn
+      RoleMappings:
+        CognitoUserPoolProvider:
+          Type: Token
+          AmbiguousRoleResolution: Deny
+          IdentityProvider: !Sub 'cognito-idp.${AWS::Region}.amazonaws.com/${CognitoUserPool}:${CognitoUserPoolClient}'
+
+  # --- Cognito User Pool groups (Requirements 1.3, 1.4, 2.5, 2.6) ---
+  # The Identity Pool's Token-based role mapping reads `cognito:preferred_role`
+  # from the user's ID token; Cognito populates that claim with the RoleArn of
+  # the group with the LOWEST numeric `Precedence` the user is a member of.
+  # AdminGroup uses Precedence: 1 and BiGroup uses Precedence: 10, so any user
+  # that is a member of both (not expected for the demo) deterministically
+  # resolves to AdminRole. The spread between 1 and 10 leaves room for future
+  # group insertions without re-numbering.
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      GroupName: admin
+      Description: Lake Formation admin persona — full access to customer360
+      RoleArn: !GetAtt AdminRole.Arn
+      Precedence: 1
+
+  BiGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      GroupName: bi
+      Description: BI persona — LF-restricted access to customer360
+      RoleArn: !GetAtt BiRole.Arn
+      Precedence: 10
+
+  # --- Persona Cognito users (Requirements 1.1, 1.2, 1.3, 1.4) -------------
+  # Created with MessageAction: SUPPRESS so Cognito does not email anyone; the
+  # email attribute is pre-verified so the accounts can authenticate without
+  # going through the verification flow. Permanent passwords are applied by
+  # the UserPasswordSetter custom resource below (task 1.5) using random
+  # values from the SecretsManager GenerateSecretString resources.
+  AdminUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Username: admin@unicornsells.com
+      MessageAction: SUPPRESS
+      UserAttributes:
+        - Name: email
+          Value: admin@unicornsells.com
+        - Name: email_verified
+          Value: 'true'
+
+  BiUser:
+    Type: AWS::Cognito::UserPoolUser
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Username: biuser@unicornsells.com
+      MessageAction: SUPPRESS
+      UserAttributes:
+        - Name: email
+          Value: biuser@unicornsells.com
+        - Name: email_verified
+          Value: 'true'
+
+  # Group attachments — required so the ID token carries `cognito:groups` and
+  # `cognito:preferred_role` when the user authenticates. The UserPasswordSetter
+  # custom resource DependsOn these so the mapping exists before passwords are
+  # set (i.e. the first sign-in already yields a role-scoped token).
+  AdminUserGroupAttachment:
+    Type: AWS::Cognito::UserPoolUserToGroupAttachment
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      GroupName: !Ref AdminGroup
+      Username: !Ref AdminUser
+
+  BiUserGroupAttachment:
+    Type: AWS::Cognito::UserPoolUserToGroupAttachment
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      GroupName: !Ref BiGroup
+      Username: !Ref BiUser
+
+  # ===========================================================================
+  # User password secrets (Lake Formation Identity Propagation feature)
+  # ===========================================================================
+  # Two SecretsManager secrets generate 20-character random passwords that
+  # satisfy the Cognito password policy (lower/upper/digit/symbol, min 8).
+  # ExcludeCharacters strips characters that make shell/JSON echoing of the
+  # passwords painful: `"` breaks JSON literals, `/` confuses path parsing,
+  # `\` is the escape character, `@` is used in ssh-style hostnames, and a
+  # backtick triggers command substitution in shells that receive the value.
+  AdminUserPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentName}-admin-user-password'
+      Description: Random password for admin@unicornsells.com (Lake Formation admin persona)
+      GenerateSecretString:
+        PasswordLength: 20
+        ExcludePunctuation: false
+        RequireEachIncludedType: true
+        ExcludeCharacters: '"/\@`'
+
+  BiUserPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${EnvironmentName}-bi-user-password'
+      Description: Random password for biuser@unicornsells.com (Lake Formation BI persona)
+      GenerateSecretString:
+        PasswordLength: 20
+        ExcludePunctuation: false
+        RequireEachIncludedType: true
+        ExcludeCharacters: '"/\@`'
+
+  # --- UserPasswordSetter custom resource (Requirements 1.5-1.8, 1.10) -----
+  # Reads each SecretsManager secret, calls cognito-idp:AdminSetUserPassword
+  # with Permanent=True so the user can log in immediately without a forced
+  # password change, and returns both plaintext passwords via cfnresponse so
+  # the stack outputs can surface them. Modelled on DemoUserCreatorFunction
+  # further down in this file — kept separate so the legacy DemoUserEmail
+  # path (old `Demo1234!` behaviour) stays untouched.
+  UserPasswordSetterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-user-password-setter-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CognitoAdminSetPassword
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminSetUserPassword
+                Resource: !GetAtt CognitoUserPool.Arn
+        - PolicyName: SecretsManagerReadPasswords
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                # `!Ref` on an AWS::SecretsManager::Secret returns the secret
+                # ARN, so this scopes the permission to exactly the two
+                # secrets created above.
+                Resource:
+                  - !Ref AdminUserPasswordSecret
+                  - !Ref BiUserPasswordSecret
+
+  UserPasswordSetterFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-user-password-setter'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt UserPasswordSetterRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import boto3
+          import cfnresponse
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def _read_secret(secrets_client, secret_arn):
+              """Return the plaintext password stored in SecretsManager."""
+              resp = secrets_client.get_secret_value(SecretId=secret_arn)
+              # GenerateSecretString stores the password directly in
+              # SecretString (no JSON wrapping when SecretStringTemplate is
+              # absent).
+              return resp["SecretString"]
+
+          def handler(event, context):
+              request_type = event.get("RequestType", "")
+              logger.info("UserPasswordSetter invoked: RequestType=%s", request_type)
+
+              # Delete is a no-op — the users and secrets are torn down by
+              # their own CFN resources; we only ever set passwords on
+              # Create/Update.
+              if request_type == "Delete":
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  props = event["ResourceProperties"]
+                  user_pool_id = props["UserPoolId"]
+                  admin_username = props["AdminUsername"]
+                  bi_username = props["BiUsername"]
+                  admin_secret_arn = props["AdminSecretArn"]
+                  bi_secret_arn = props["BiSecretArn"]
+
+                  secrets_client = boto3.client("secretsmanager")
+                  cognito_idp = boto3.client("cognito-idp")
+
+                  admin_password = _read_secret(secrets_client, admin_secret_arn)
+                  bi_password = _read_secret(secrets_client, bi_secret_arn)
+
+                  # Permanent=True so the user doesn't get stuck in the
+                  # FORCE_CHANGE_PASSWORD state on first login.
+                  cognito_idp.admin_set_user_password(
+                      UserPoolId=user_pool_id,
+                      Username=admin_username,
+                      Password=admin_password,
+                      Permanent=True,
+                  )
+                  logger.info("Set permanent password for %s", admin_username)
+
+                  cognito_idp.admin_set_user_password(
+                      UserPoolId=user_pool_id,
+                      Username=bi_username,
+                      Password=bi_password,
+                      Permanent=True,
+                  )
+                  logger.info("Set permanent password for %s", bi_username)
+
+                  # Passwords are returned via cfnresponse Data so the stack
+                  # outputs (AdminUserPassword / BiUserPassword) can reference
+                  # them with !GetAtt. DO NOT log them.
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.SUCCESS,
+                      {
+                          "AdminPassword": admin_password,
+                          "BiPassword": bi_password,
+                      },
+                  )
+              except Exception as exc:  # noqa: BLE001 — custom resource contract
+                  logger.exception("UserPasswordSetter failed")
+                  cfnresponse.send(
+                      event,
+                      context,
+                      cfnresponse.FAILED,
+                      {"Error": str(exc)},
+                  )
+
+  UserPasswordSetter:
+    Type: AWS::CloudFormation::CustomResource
+    # DependsOn the group attachments so that by the time passwords are set,
+    # each user is already a member of their persona group — the first sign
+    # in already yields a token carrying `cognito:preferred_role`.
+    DependsOn:
+      - AdminUserGroupAttachment
+      - BiUserGroupAttachment
+    Properties:
+      ServiceToken: !GetAtt UserPasswordSetterFn.Arn
+      UserPoolId: !Ref CognitoUserPool
+      AdminUsername: !Ref AdminUser
+      BiUsername: !Ref BiUser
+      AdminSecretArn: !Ref AdminUserPasswordSecret
+      BiSecretArn: !Ref BiUserPasswordSecret
+
+  # ===========================================================================
+  # S3 Buckets (Task 4.1)
+  # ===========================================================================
+  DataBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-data-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-data-bucket'
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${EnvironmentName}-frontend-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-frontend-bucket'
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOAIAccess
+            Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+
+  # ===========================================================================
+  # CloudFront Distribution (Task 4.1)
+  # ===========================================================================
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for ${EnvironmentName} frontend bucket'
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3FrontendOrigin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOAI}'
+          - Id: ALBApiOrigin
+            DomainName: !GetAtt ALB.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+              # Long-running agent invocations (NLP → Athena → Neptune)
+              # routinely exceed the 30s CloudFront default. Max allowed
+              # without a service-quota increase is 60s; request a quota
+              # bump if agents need longer.
+              OriginReadTimeout: 60
+              OriginKeepaliveTimeout: 60
+        DefaultCacheBehavior:
+          TargetOriginId: S3FrontendOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          ForwardedValues:
+            QueryString: false
+            Cookies:
+              Forward: none
+          Compress: true
+        CacheBehaviors:
+          - PathPattern: '/api/*'
+            TargetOriginId: ALBApiOrigin
+            ViewerProtocolPolicy: https-only
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachedMethods: [GET, HEAD]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled
+            OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3  # AllViewer
+        # SPA routing: serve index.html for 404s
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+        Comment: !Sub '${EnvironmentName} Semantic Lakehouse Frontend'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-cloudfront'
+
+  # ===========================================================================
+  # CloudWatch Log Groups (Task 4.1)
+  # ===========================================================================
+  APILogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${EnvironmentName}/api'
+      RetentionInDays: 30
+
+  # ===========================================================================
+  # Neptune Cluster (Task 4.2)
+  # ===========================================================================
+  NeptuneSubnetGroup:
+    Type: AWS::Neptune::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub 'Subnet group for ${EnvironmentName} Neptune cluster'
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-neptune-subnet-group'
+
+  NeptuneCluster:
+    Type: AWS::Neptune::DBCluster
+    Properties:
+      DBClusterIdentifier: !Sub '${EnvironmentName}-neptune'
+      EngineVersion: '1.3.2.1'
+      DBSubnetGroupName: !Ref NeptuneSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref NeptuneSecurityGroup
+      StorageEncrypted: true
+      IamAuthEnabled: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-neptune-cluster'
+
+  NeptuneInstance:
+    Type: AWS::Neptune::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref NeptuneCluster
+      DBInstanceClass: !Ref NeptuneInstanceSize
+      DBInstanceIdentifier: !Sub '${EnvironmentName}-neptune-instance'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-neptune-instance'
+
+  # ===========================================================================
+  # Glue Database (Task 4.2)
+  # ===========================================================================
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${EnvironmentName}_customer360'
+        Description: Glue Catalog database for Customer 360 Iceberg tables
+
+  # ===========================================================================
+  # Glue Iceberg Conversion Job
+  # Reads Parquet landing files from s3://<DataBucket>/raw/<table>/ and writes
+  # them as Iceberg tables via the Glue Iceberg catalog binding. This produces
+  # proper `metadata_location` entries on each Glue table so Athena can query
+  # them as Iceberg — which the plain `upload_data.py` pathway does not do.
+  # ===========================================================================
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-glue-iceberg-job-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: DataBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+        - PolicyName: GlueCatalogWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:BatchCreatePartition
+                  - glue:CreatePartition
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:UpdatePartition
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*'
+        # Once scripts/lf_setup.py registers the data bucket with Lake
+        # Formation and grants named-principal permissions to AdminRole /
+        # BiRole, LF stops honouring this role's raw glue:* / s3:*
+        # permissions — every Iceberg commit now has to go through LF
+        # authorization. The companion LF grant for this role lives in
+        # scripts/lf_setup.py::ensure_glue_job_role_permissions (database +
+        # table-wildcard ALL with grant option). LF-side authorization
+        # requires this role to be able to call lakeformation:GetDataAccess
+        # to obtain the credentials-vendor tokens LF hands back for S3
+        # reads/writes against the registered bucket.
+        - PolicyName: LakeFormationDataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                Resource: '*'
+
+  IcebergConvertJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub '${EnvironmentName}-iceberg-convert'
+      Role: !GetAtt GlueJobRole.Arn
+      # Glue 5.1 — Spark 3.5.4 + Python 3.11 + Iceberg 1.7.x baked in.
+      GlueVersion: '5.1'
+      WorkerType: G.1X
+      NumberOfWorkers: 2
+      Timeout: 30
+      DefaultArguments:
+        # Enable Iceberg datalake format + point Glue at the data bucket as
+        # the warehouse location. We also disable bookmarking (each deploy
+        # rebuilds from the latest landing Parquet) and enable the
+        # auto-scaling Spark UI for easier debugging.
+        '--datalake-formats': 'iceberg'
+        '--conf': !Sub >-
+          spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions
+          --conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog
+          --conf spark.sql.catalog.glue_catalog.warehouse=s3://${DataBucket}/iceberg/
+          --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog
+          --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
+        '--DATA_BUCKET': !Ref DataBucket
+        '--GLUE_DATABASE': !Ref GlueDatabase
+        '--job-bookmark-option': 'job-bookmark-disable'
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+      Command:
+        Name: glueetl
+        PythonVersion: '3'
+        ScriptLocation: !Sub 's3://${DataBucket}/glue-scripts/iceberg_convert.py'
+
+  # ===========================================================================
+  # ECS Cluster and Fargate Service (Task 4.2)
+  # ===========================================================================
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${EnvironmentName}-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  FargateTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentName}-api'
+      Cpu: '512'
+      Memory: '1024'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt FargateExecutionRole.Arn
+      TaskRoleArn: !GetAtt FargateTaskRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !If
+            - HasContainerImage
+            - !Ref ContainerImageUri
+            - !If
+              - HasSourceRepo
+              - !Sub '${ECRRepository.RepositoryUri}:latest'
+              - 'public.ecr.aws/nginx/nginx:alpine-slim'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: COGNITO_USER_POOL_ID
+              Value: !Ref CognitoUserPool
+            - Name: COGNITO_APP_CLIENT_ID
+              Value: !Ref CognitoUserPoolClient
+            - Name: NEPTUNE_ENDPOINT
+              Value: !GetAtt NeptuneCluster.Endpoint
+            - Name: S3_TABLE_BUCKET
+              Value: !Ref DataBucket
+            - Name: GLUE_DATABASE
+              Value: !Ref GlueDatabase
+            - Name: AGENTCORE_GATEWAY_URL
+              Value: ''  # Set after creating the AgentCore Gateway post-deploy
+            - Name: AGENTCORE_RUNTIME_AGENT_ARN
+              Value: ''  # Set by setup script after deploying unified agent to AgentCore Runtime
+            - Name: AGENTCORE_ONTOLOGY_AGENT_ARN
+              Value: ''  # Set by setup script after deploying ontology builder to AgentCore Runtime
+            - Name: API_ROOT_PATH
+              Value: '/api'
+            - Name: AGENTCORE_GATEWAY_AUTH_TYPE
+              Value: 'IAM'
+            - Name: AGENT_TIMEOUT_SECONDS
+              Value: '180'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref APILogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub '${EnvironmentName}-api-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref FargateTaskDefinition
+      DesiredCount: 0  # Starts at 0 — deploy script pushes image then scales to 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref PrivateSubnetA
+            - !Ref PrivateSubnetB
+          SecurityGroups:
+            - !Ref FargateSecurityGroup
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 8000
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ===========================================================================
+  # Application Load Balancer (Task 4.2)
+  # ===========================================================================
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${EnvironmentName}-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        # Default is 60s; agent invocations routinely run longer than
+        # that end-to-end. Must be >= API AGENT_TIMEOUT_SECONDS so the
+        # ALB never drops the connection before the API responds.
+        - Key: idle_timeout.timeout_seconds
+          Value: '240'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-alb'
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-api-tg'
+      Port: 8000
+      Protocol: HTTP
+      VpcId: !Ref VPC
+      TargetType: ip
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  # NOTE: For production, use HTTPS (port 443) with an ACM certificate.
+  # Replace Protocol: HTTP with HTTPS and add Certificates property with the ACM ARN.
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+
+  # ===========================================================================
+  # IAM Roles (Task 4.2)
+  # ===========================================================================
+
+  # --- Fargate Execution Role (pulls images, writes logs) ---
+  FargateExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-fargate-execution-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # --- Fargate Task Role (used by the running container) ---
+  FargateTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-fargate-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: NeptuneAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - neptune-db:connect
+                  - neptune-db:ReadDataViaQuery
+                  - neptune-db:WriteDataViaQuery
+                Resource: !Sub 'arn:aws:neptune-db:${AWS::Region}:${AWS::AccountId}:${NeptuneCluster.ClusterResourceId}/*'
+        - PolicyName: S3DataBucketRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+        - PolicyName: GlueCatalogRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*'
+        - PolicyName: AgentCoreGatewayInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeGateway
+                Resource: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*gateway*'
+        - PolicyName: BedrockModelInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-*'
+        - PolicyName: AgentCoreInvokeAgent
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgent
+                  - bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*agent*'
+                  - !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*'
+
+  # --- Ontology Builder Agent Role (Glue read + Neptune write) ---
+  OntologyBuilderAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-oba-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GlueCatalogRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*'
+        - PolicyName: NeptuneWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - neptune-db:connect
+                  - neptune-db:ReadDataViaQuery
+                  - neptune-db:WriteDataViaQuery
+                  - neptune-db:DeleteDataViaQuery
+                Resource: !Sub 'arn:aws:neptune-db:${AWS::Region}:${AWS::AccountId}:${NeptuneCluster.ClusterResourceId}/*'
+
+  # --- AgentCore Runtime Agent Execution Role (Task 6.1) ---
+  # Used by agents running on AgentCore Runtime (unified agent + ontology builder)
+  AgentCoreRuntimeAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-agentcore-runtime-agent-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockModelInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-*'
+        - PolicyName: AgentCoreGatewayInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeGateway
+                Resource: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:*gateway*'
+        - PolicyName: GlueCatalogRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*'
+        - PolicyName: NeptuneReadWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - neptune-db:connect
+                  - neptune-db:ReadDataViaQuery
+                  - neptune-db:WriteDataViaQuery
+                Resource: !Sub 'arn:aws:neptune-db:${AWS::Region}:${AWS::AccountId}:${NeptuneCluster.ClusterResourceId}/*'
+        - PolicyName: S3DataRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+
+  # ===========================================================================
+  # Custom Resource: Update Cognito callbacks with CloudFront domain
+  # ===========================================================================
+  CognitoCallbackUpdaterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-cognito-callback-updater-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CognitoUpdateClient
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:UpdateUserPoolClient
+                  - cognito-idp:DescribeUserPoolClient
+                Resource: !GetAtt CognitoUserPool.Arn
+
+  CognitoCallbackUpdaterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-cognito-callback-updater'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt CognitoCallbackUpdaterRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  props = event['ResourceProperties']
+                  user_pool_id = props['UserPoolId']
+                  client_id = props['ClientId']
+                  cloudfront_url = props['CloudFrontURL']
+                  cognito = boto3.client('cognito-idp')
+                  # Get current client config
+                  resp = cognito.describe_user_pool_client(
+                      UserPoolId=user_pool_id, ClientId=client_id
+                  )
+                  client_config = resp['UserPoolClient']
+                  # Build updated callback URLs: keep localhost for dev + add CloudFront
+                  callback_urls = list(set(
+                      client_config.get('CallbackURLs', []) + [cloudfront_url]
+                  ))
+                  logout_urls = list(set(
+                      client_config.get('LogoutURLs', []) + [cloudfront_url]
+                  ))
+                  cognito.update_user_pool_client(
+                      UserPoolId=user_pool_id,
+                      ClientId=client_id,
+                      CallbackURLs=callback_urls,
+                      LogoutURLs=logout_urls,
+                      SupportedIdentityProviders=client_config.get('SupportedIdentityProviders', ['COGNITO']),
+                      AllowedOAuthFlows=client_config.get('AllowedOAuthFlows', ['code']),
+                      AllowedOAuthScopes=client_config.get('AllowedOAuthScopes', ['openid', 'email', 'profile']),
+                      AllowedOAuthFlowsUserPoolClient=True,
+                      ExplicitAuthFlows=client_config.get('ExplicitAuthFlows', []),
+                  )
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'CallbackURLs': ','.join(callback_urls)
+                  })
+              except Exception as e:
+                  print(f'Error: {e}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  CognitoCallbackUpdate:
+    Type: Custom::CognitoCallbackUpdate
+    DependsOn:
+      - CloudFrontDistribution
+      - CognitoUserPoolClient
+    Properties:
+      ServiceToken: !GetAtt CognitoCallbackUpdaterFunction.Arn
+      UserPoolId: !Ref CognitoUserPool
+      ClientId: !Ref CognitoUserPoolClient
+      CloudFrontURL: !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  # ===========================================================================
+  # Custom Resource: Auto-create a demo Cognito user
+  # ===========================================================================
+  DemoUserCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-demo-user-creator-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CognitoAdminUser
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                Resource: !GetAtt CognitoUserPool.Arn
+
+  DemoUserCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvironmentName}-demo-user-creator'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt DemoUserCreatorRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import secrets
+          import string
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  props = event['ResourceProperties']
+                  email = props.get('Email', '')
+                  if not email:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'Message': 'No email provided, skipping user creation'
+                      })
+                      return
+                  user_pool_id = props['UserPoolId']
+                  # Generate a random temporary password
+                  alphabet = string.ascii_letters + string.digits + '!@#$%'
+                  temp_password = ''.join(secrets.choice(alphabet) for _ in range(16))
+                  cognito = boto3.client('cognito-idp')
+                  try:
+                      cognito.admin_create_user(
+                          UserPoolId=user_pool_id,
+                          Username=email,
+                          TemporaryPassword=temp_password,
+                          UserAttributes=[
+                              {'Name': 'email', 'Value': email},
+                              {'Name': 'email_verified', 'Value': 'true'},
+                          ],
+                          MessageAction='SUPPRESS',
+                      )
+                      # Set a permanent password so user doesn't need to change it
+                      permanent_password = 'Demo1234!'
+                      cognito.admin_set_user_password(
+                          UserPoolId=user_pool_id,
+                          Username=email,
+                          Password=permanent_password,
+                          Permanent=True,
+                      )
+                  except cognito.exceptions.UsernameExistsException:
+                      pass  # User already exists, that's fine
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Username': email,
+                      'Password': 'Demo1234!',
+                      'Message': f'Demo user {email} created with password Demo1234!'
+                  })
+              except Exception as e:
+                  print(f'Error: {e}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  DemoUserCreation:
+    Type: Custom::DemoUserCreation
+    DependsOn: CognitoUserPool
+    Properties:
+      ServiceToken: !GetAtt DemoUserCreatorFunction.Arn
+      UserPoolId: !Ref CognitoUserPool
+      Email: !Ref DemoUserEmail
+
+  # ===========================================================================
+  # Admin Instance — persistent EC2 for management via Session Manager
+  # Replaces CloudShell: private subnet, no SSH, connect via SSM
+  # ===========================================================================
+  AdminInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Admin instance (egress only, no SSH)
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (NAT Gateway provides internet access)
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-admin-sg'
+
+  AdminToNeptuneEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref AdminInstanceSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8182
+      ToPort: 8182
+      DestinationSecurityGroupId: !Ref NeptuneSecurityGroup
+      Description: Allow traffic to Neptune from Admin instance
+
+  NeptuneFromAdminIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NeptuneSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8182
+      ToPort: 8182
+      SourceSecurityGroupId: !Ref AdminInstanceSecurityGroup
+      Description: Allow Gremlin connections from Admin instance
+
+  AdminInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-admin-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ECRAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !GetAtt ECRRepository.Arn
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+                  - !GetAtt FrontendBucket.Arn
+                  - !Sub '${FrontendBucket.Arn}/*'
+        - PolicyName: GlueAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:CreateDatabase
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*'
+        - PolicyName: ECSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:UpdateService
+                  - ecs:DescribeServices
+                  - ecs:DescribeTaskDefinition
+                  - ecs:RegisterTaskDefinition
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                  - ecs:StopTask
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt FargateExecutionRole.Arn
+                  - !GetAtt FargateTaskRole.Arn
+                  - !GetAtt AgentCoreGatewayRole.Arn
+                  - !GetAtt AgentCoreRuntimeAgentRole.Arn
+        - PolicyName: NeptuneAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - neptune-db:connect
+                  - neptune-db:ReadDataViaQuery
+                  - neptune-db:WriteDataViaQuery
+                  - neptune-db:DeleteDataViaQuery
+                Resource: !Sub 'arn:aws:neptune-db:${AWS::Region}:${AWS::AccountId}:${NeptuneCluster.ClusterResourceId}/*'
+              # Control-plane describe so deploy scripts can resolve the cluster resource ID
+              - Effect: Allow
+                Action:
+                  - neptune:DescribeDBClusters
+                Resource: '*'
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:ListFoundationModels
+                Resource:
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/anthropic.claude-*'
+                  - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-embed-*'
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:*
+                Resource: '*'
+        - PolicyName: CloudFormationAndCDKBootstrap
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                  - iam:*Role*
+                  - iam:*Policy*
+                  - iam:GetPolicy*
+                  - iam:ListPolicy*
+                  - ssm:PutParameter
+                  - ssm:GetParameter
+                  - ssm:DeleteParameter
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:*
+                Resource: !Sub 'arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/cdk-*'
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub 'arn:aws:s3:::cdk-*-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:aws:s3:::cdk-*-${AWS::AccountId}-${AWS::Region}/*'
+        - PolicyName: CognitoReadSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:DescribeUserPool
+                  - cognito-idp:DescribeUserPoolClient
+                  - cognito-idp:ListUserPoolClients
+                Resource: !GetAtt CognitoUserPool.Arn
+        - PolicyName: CloudFrontInvalidate
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudfront:ListDistributions
+                  - cloudfront:GetDistribution
+                  - cloudfront:CreateInvalidation
+                Resource: '*'
+        - PolicyName: AthenaAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                Resource: !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/athena_results/*'
+        # Admin EC2 runs scripts/lf_setup.py during deploy (invoked by
+        # scripts/infra.sh via scripts/lf-setup.sh). Lake Formation
+        # grant/revoke and data-cell-filter operations require
+        # Resource: "*" because LF does not support resource-level IAM
+        # scoping for data-catalog grants. See
+        # .kiro/specs/lakeformation-identity-propagation/design.md
+        # §Open Questions — "Does this feature require the Admin EC2's
+        # inline policies to grow new lakeformation:* actions?" — and the
+        # matching cfn-nag W11 suppression in infra/.cfn_nag_suppress.yaml.
+        - PolicyName: LakeFormationSetup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataLakeSettings
+                  - lakeformation:PutDataLakeSettings
+                  - lakeformation:GrantPermissions
+                  - lakeformation:RevokePermissions
+                  - lakeformation:RegisterResource
+                  - lakeformation:DeregisterResource
+                  - lakeformation:CreateDataCellsFilter
+                  - lakeformation:DeleteDataCellsFilter
+                  - lakeformation:GetDataCellsFilter
+                  - lakeformation:ListDataCellsFilters
+                  - lakeformation:ListPermissions
+                  - lakeformation:ListResources
+                Resource: '*'
+              # PutDataLakeSettings registers AdminRole / BiRole as LF
+              # DataLakeAdmins; LF validates the caller can pass those
+              # roles.
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource:
+                  - !GetAtt AdminRole.Arn
+                  - !GetAtt BiRole.Arn
+
+  AdminInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref AdminInstanceRole
+
+  AdminInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - NatGateway
+      - PrivateRoute
+    Properties:
+      InstanceType: t3.medium
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroupIds:
+        - !Ref AdminInstanceSecurityGroup
+      IamInstanceProfile: !Ref AdminInstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-admin-instance'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+
+          # Install essential tools
+          dnf install -y docker git nodejs20 python3.12 python3.12-pip unzip
+          systemctl start docker
+          systemctl enable docker
+
+          # Install uv (Python package manager)
+          curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="/usr/local/bin" sh
+
+          # Install AgentCore CLI
+          npm install -g @aws/agentcore
+
+          # Create a welcome script with stack info
+          cat > /etc/profile.d/semantic-lakehouse.sh << PROFILE
+          echo "=============================================="
+          echo "  Semantic Lakehouse Admin Instance"
+          echo "  Region: ${AWS::Region}"
+          echo "  Stack:  ${AWS::StackName}"
+          echo "=============================================="
+          echo ""
+          echo "Tools installed: docker, git, node, python3.12, uv, agentcore"
+          echo ""
+          echo "NOTE: Session Manager lands you as 'ssm-user', which cannot"
+          echo "      write to /usr/lib/nodejs*/lib/node_modules and will fail"
+          echo "      npm install -g during deploy. Elevate to root first:"
+          echo ""
+          echo "  sudo -i"
+          echo ""
+          echo "Then download the project from S3 and deploy AgentCore:"
+          echo "  DATA_BUCKET=\\\$(aws cloudformation describe-stacks \\\\"
+          echo "    --stack-name ${AWS::StackName} --region ${AWS::Region} \\\\"
+          echo "    --query \"Stacks[0].Outputs[?OutputKey=='DataBucketName'].OutputValue\" --output text)"
+          echo "  aws s3 cp s3://\\\$DATA_BUCKET/bootstrap/project.zip ~/project.zip --region ${AWS::Region}"
+          echo "  rm -rf ~/semantic-demo && mkdir ~/semantic-demo"
+          echo "  unzip -oq ~/project.zip -d ~/semantic-demo"
+          echo "  cd ~/semantic-demo"
+          echo "  bash scripts/deploy.sh agentcore --region ${AWS::Region}"
+          echo ""
+          export AWS_REGION=${AWS::Region}
+          export STACK_NAME=${AWS::StackName}
+          PROFILE
+
+  # ===========================================================================
+  # Build Instance — ephemeral EC2 for building and deploying
+  # ===========================================================================
+  BuildInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: NeedsBuild
+    Properties:
+      GroupDescription: Security group for the ephemeral build instance (egress only)
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-build-sg'
+
+  BuildInstanceRole:
+    Type: AWS::IAM::Role
+    Condition: NeedsBuild
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-build-instance-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ECRPush
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !GetAtt ECRRepository.Arn
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+                  - !GetAtt FrontendBucket.Arn
+                  - !Sub '${FrontendBucket.Arn}/*'
+        - PolicyName: GlueAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetDatabase
+                  - glue:CreateDatabase
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*'
+        - PolicyName: ECSUpdateService
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:UpdateService
+                  - ecs:DescribeServices
+                Resource: !Sub 'arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:service/${ECSCluster}/${EnvironmentName}-api-service'
+        - PolicyName: CloudFormationSignal
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:SignalResource
+                Resource: !Sub 'arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*'
+        - PolicyName: SelfTerminate
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:TerminateInstances
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    ec2:ResourceTag/Name: !Sub '${EnvironmentName}-build-instance'
+
+  BuildInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Condition: NeedsBuild
+    Properties:
+      Roles:
+        - !Ref BuildInstanceRole
+
+  BuildInstance:
+    Type: AWS::EC2::Instance
+    Condition: NeedsBuild
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+    DependsOn:
+      - ECRRepository
+      - DataBucket
+      - FrontendBucket
+      - GlueDatabase
+      - CloudFrontDistribution
+      - CognitoCallbackUpdate
+      - ECSService
+    Properties:
+      InstanceType: t3.medium
+      ImageId: !Sub '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroupIds:
+        - !Ref BuildInstanceSecurityGroup
+      IamInstanceProfile: !Ref BuildInstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-build-instance'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euo pipefail
+          exec > /var/log/build-instance.log 2>&1
+
+          STACK_NAME="${AWS::StackName}"
+          REGION="${AWS::Region}"
+          ACCOUNT_ID="${AWS::AccountId}"
+          ECR_REPO="${ECRRepository.RepositoryUri}"
+          DATA_BUCKET="${DataBucket}"
+          FRONTEND_BUCKET="${FrontendBucket}"
+          GLUE_DB="${GlueDatabase}"
+          CF_DOMAIN="${CloudFrontDistribution.DomainName}"
+          API_URL="http://${ALB.DNSName}"
+          POOL_ID="${CognitoUserPool}"
+          CLIENT_ID="${CognitoUserPoolClient}"
+          COGNITO_DOMAIN="${EnvironmentName}-semantic-lakehouse-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com"
+          REPO_URL="${SourceRepoUrl}"
+          ECS_CLUSTER="${ECSCluster}"
+          ECS_SERVICE="${EnvironmentName}-api-service"
+          INSTANCE_ID=$(ec2-metadata -i | cut -d' ' -f2)
+
+          signal_and_terminate() {
+            local status=$1
+            aws cloudformation signal-resource \
+              --stack-name "$STACK_NAME" \
+              --logical-resource-id BuildInstance \
+              --unique-id "$INSTANCE_ID" \
+              --status "$status" \
+              --region "$REGION" || true
+            # Self-terminate
+            aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$REGION" || true
+          }
+
+          trap 'signal_and_terminate FAILURE' ERR
+
+          echo "=== Installing build tools ==="
+          dnf install -y docker git nodejs20 python3.12 python3.12-pip
+          systemctl start docker
+          systemctl enable docker
+
+          # Install uv
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+
+          echo "=== Cloning repository ==="
+          cd /tmp
+          git clone "$REPO_URL" project
+          cd project
+
+          echo "=== Building and pushing API Docker image ==="
+          aws ecr get-login-password --region "$REGION" | \
+            docker login --username AWS --password-stdin "$ACCOUNT_ID.dkr.ecr.$REGION.amazonaws.com"
+          docker build -t semantic-lakehouse-api ./api
+          docker tag semantic-lakehouse-api:latest "$ECR_REPO:latest"
+          docker push "$ECR_REPO:latest"
+
+          echo "=== Force-deploying new ECS task ==="
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --desired-count 1 \
+            --force-new-deployment \
+            --region "$REGION"
+
+          echo "=== Generating sample data ==="
+          uv sync
+          uv run python scripts/generate_data.py
+
+          echo "=== Uploading data to S3 and registering Glue tables ==="
+          uv run python scripts/upload_data.py \
+            --bucket "$DATA_BUCKET" \
+            --region "$REGION" \
+            --database "$GLUE_DB"
+
+          echo "=== Building frontend ==="
+          cd frontend
+          cat > .env.production << ENVEOF
+          VITE_API_URL=$API_URL
+          VITE_COGNITO_USER_POOL_ID=$POOL_ID
+          VITE_COGNITO_APP_CLIENT_ID=$CLIENT_ID
+          VITE_COGNITO_DOMAIN=$COGNITO_DOMAIN
+          VITE_COGNITO_REDIRECT_URI=https://$CF_DOMAIN
+          ENVEOF
+
+          npm ci
+          npm run build
+
+          echo "=== Deploying frontend to S3 ==="
+          aws s3 sync dist/ "s3://$FRONTEND_BUCKET/" --delete --region "$REGION"
+
+          echo "=== Build complete ==="
+          cd /tmp
+          signal_and_terminate SUCCESS
+
+  # ===========================================================================
+  # ECR Repository for the API container image
+  # ===========================================================================
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${EnvironmentName}-semantic-lakehouse-api'
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      ImageTagMutability: MUTABLE
+      EncryptionConfiguration:
+        EncryptionType: AES256
+
+  # ===========================================================================
+  # AgentCore Gateway IAM Role
+  # ===========================================================================
+  AgentCoreGatewayRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-agentcore-gateway-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3TablesAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3tables:GetTable
+                  - s3tables:ListTables
+                  - s3tables:GetTableData
+                Resource:
+                  - !Sub 'arn:aws:s3tables:${AWS::Region}:${AWS::AccountId}:bucket/*'
+        - PolicyName: AthenaQueryAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                Resource: !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/athena_results/*'
+        - PolicyName: GlueCatalogAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:GetTable
+                  - glue:GetTables
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*'
+        - PolicyName: NeptuneAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - neptune-db:connect
+                  - neptune-db:ReadDataViaQuery
+                  - neptune-db:WriteDataViaQuery
+                Resource: !Sub 'arn:aws:neptune-db:${AWS::Region}:${AWS::AccountId}:${NeptuneCluster.ClusterResourceId}/*'
+        - PolicyName: AgentCoreInvokeRuntime
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:InvokeAgentRuntime
+                Resource: !Sub 'arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*'
+
+# =============================================================================
+# Outputs (Task 4.3)
+# =============================================================================
+Outputs:
+  CloudFrontURL:
+    Description: URL of the CloudFront distribution serving the frontend
+    Value: !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${EnvironmentName}-CloudFrontURL'
+
+  APIEndpointURL:
+    Description: URL of the ALB endpoint for the API service
+    Value: !Sub 'http://${ALB.DNSName}'
+    Export:
+      Name: !Sub '${EnvironmentName}-APIEndpointURL'
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID for authentication configuration
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub '${EnvironmentName}-CognitoUserPoolId'
+
+  CognitoAppClientId:
+    Description: Cognito App Client ID for frontend authentication
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub '${EnvironmentName}-CognitoAppClientId'
+
+  NeptuneEndpoint:
+    Description: Neptune cluster endpoint
+    Value: !GetAtt NeptuneCluster.Endpoint
+
+  NeptuneClusterResourceId:
+    Description: >
+      Neptune cluster resource ID (the `cluster-XXXXXXXXXXXX` form used as
+      the resource portion of `arn:aws:neptune-db:...` IAM policies). Deploy
+      scripts read this from stack outputs instead of calling
+      `neptune:DescribeDBClusters`, which avoids a control-plane permission
+      on every caller that wants to grant Neptune IAM access.
+    Value: !GetAtt NeptuneCluster.ClusterResourceId
+
+  DataBucketName:
+    Description: S3 data bucket name
+    Value: !Ref DataBucket
+
+  GlueDatabaseName:
+    Description: Glue database name for Iceberg table catalog
+    Value: !Ref GlueDatabase
+
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+
+  ECRRepositoryUri:
+    Description: ECR repository URI for the API container image
+    Value: !GetAtt ECRRepository.RepositoryUri
+
+  CognitoDomain:
+    Description: Cognito hosted UI domain
+    Value: !Sub '${EnvironmentName}-semantic-lakehouse-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com'
+
+  DemoUserCredentials:
+    Description: Demo user login (if DemoUserEmail was provided)
+    Value: !If
+      - HasDemoUser
+      - !Sub 'Email: ${DemoUserEmail} / Password: Demo1234!'
+      - 'No demo user created (DemoUserEmail was empty)'
+
+  AgentCoreGatewayRoleArn:
+    Description: IAM role ARN for the AgentCore Gateway (use when creating the Gateway)
+    Value: !GetAtt AgentCoreGatewayRole.Arn
+
+  AgentCoreRuntimeAgentRoleArn:
+    Description: IAM role ARN for AgentCore Runtime agent execution
+    Value: !GetAtt AgentCoreRuntimeAgentRole.Arn
+
+  CognitoGatewayClientId:
+    Description: Cognito M2M client ID for AgentCore Gateway OAuth (client_credentials)
+    Value: !Ref CognitoGatewayClient
+
+  CognitoGatewayTokenEndpoint:
+    Description: Cognito token endpoint for AgentCore Gateway OAuth
+    Value: !Sub 'https://${EnvironmentName}-semantic-lakehouse-${AWS::AccountId}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+
+  CognitoGatewayScope:
+    Description: OAuth scope for AgentCore Gateway invocation
+    Value: !Sub '${EnvironmentName}-gateway/invoke'
+
+  PrivateSubnetAId:
+    Description: Private subnet A ID (for AgentCore VPC mode)
+    Value: !Ref PrivateSubnetA
+
+  PrivateSubnetBId:
+    Description: Private subnet B ID (for AgentCore VPC mode)
+    Value: !Ref PrivateSubnetB
+
+  AgentCoreSecurityGroupId:
+    Description: Security group ID for AgentCore Runtime MCP servers (VPC mode)
+    Value: !Ref AgentCoreSecurityGroup
+
+  AdminInstanceId:
+    Description: EC2 Instance ID for the admin instance (connect via Session Manager)
+    Value: !Ref AdminInstance
+
+  AdminInstanceSSMCommand:
+    Description: AWS CLI command to connect to the admin instance via Session Manager
+    Value: !Sub 'aws ssm start-session --target ${AdminInstance} --region ${AWS::Region}'
+
+  # ===========================================================================
+  # Lake Formation Identity Propagation outputs
+  # See .kiro/specs/lakeformation-identity-propagation/design.md §Data Models
+  # for the authoritative output list. These outputs are consumed by
+  # scripts/lf_setup.py (role ARNs, database, data bucket) and by
+  # scripts/infra.sh for printing the admin/BI passwords at deploy time.
+  # ===========================================================================
+  AdminRoleArn:
+    Description: IAM role ARN assumed by the Lake Formation admin persona
+    Value: !GetAtt AdminRole.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-AdminRoleArn'
+
+  BiRoleArn:
+    Description: IAM role ARN assumed by the Lake Formation BI persona
+    Value: !GetAtt BiRole.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-BiRoleArn'
+
+  # The Iceberg ETL Glue job's execution role. Once Lake Formation is
+  # registered on the data bucket, this role needs an explicit LF grant
+  # (issued by scripts/lf_setup.py::ensure_glue_job_role_permissions) to
+  # create / alter / drop Iceberg tables — without the grant, Glue commits
+  # fail with "Cannot commit glue_catalog.<db>.<table> because Glue cannot
+  # access the requested resources".
+  GlueJobRoleArn:
+    Description: IAM role ARN used by the Iceberg ETL Glue job (LF writer principal)
+    Value: !GetAtt GlueJobRole.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}-GlueJobRoleArn'
+
+  IdentityPoolId:
+    Description: Cognito Identity Pool ID used to exchange User Pool JWTs for STS credentials
+    Value: !Ref IdentityPool
+    Export:
+      Name: !Sub '${EnvironmentName}-IdentityPoolId'
+
+  AdminUserPassword:
+    Description: Randomly generated password for admin@unicornsells.com (surfaced by UserPasswordSetter)
+    Value: !GetAtt UserPasswordSetter.AdminPassword
+
+  BiUserPassword:
+    Description: Randomly generated password for biuser@unicornsells.com (surfaced by UserPasswordSetter)
+    Value: !GetAtt UserPasswordSetter.BiPassword
+
+  # -------------------------------------------------------------------------
+  # Lake Formation identity-propagation outputs
+  # (see .kiro/specs/lakeformation-identity-propagation/design.md §Data Models)
+  # -------------------------------------------------------------------------
+  # (Outputs consolidated above — AdminRoleArn, BiRoleArn, IdentityPoolId,
+  # AdminUserPassword, BiUserPassword are declared earlier in this Outputs
+  # block. Duplicate declarations removed to satisfy the YAML "no duplicate
+  # mapping keys" constraint that `cfn-lint`/`aws cloudformation validate-template`
+  # both enforce.)

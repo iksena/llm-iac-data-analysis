@@ -1,0 +1,300 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  DeployCtrl - per-color app stack (Blue or Green).
+  Creates a single-instance AutoScalingGroup behind the persistent
+  stack's matching target group. The GH Actions workflow deploys this
+  stack once per release; bg-persistent.yml must exist first.
+
+Parameters:
+
+  PersistentStackName:
+    Type: String
+    Default: deployctrl-persistent
+    Description: Name of the bg-persistent stack to import resources from.
+
+  Color:
+    Type: String
+    AllowedValues: [blue, green]
+    Description: Which color this stack represents. Selects the target group to register with.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet to launch the instance in. Pick any subnet the persistent ALB serves.
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium, t3.large, m5.large]
+
+  DiskSizeGB:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 200
+
+  CodeS3Bucket:
+    Type: String
+    Description: S3 bucket holding the release tarball (workflow uploads it).
+
+  CodeS3Key:
+    Type: String
+    Description: S3 key of the release tarball, e.g. deployctrl-<sha>.tar.gz.
+
+  AppSecretKey:
+    Type: String
+    NoEcho: true
+    MinLength: 20
+    Description: >
+      Django SECRET_KEY. MUST be the same value for blue and green so user
+      sessions survive the swap. Provided by the workflow from a GH secret.
+
+  AllowedHosts:
+    Type: String
+    Default: '*'
+    Description: Comma-separated ALLOWED_HOSTS. Set to your ALB DNS / domain in prod.
+
+  CORSAllowedOrigins:
+    Type: String
+    Default: ''
+
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, production]
+
+  JWTAccessHours:
+    Type: Number
+    Default: 8
+    MinValue: 1
+    MaxValue: 72
+
+  JWTRefreshDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 30
+
+  RunSeedData:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Whether to run `manage.py seed_data` on first boot. Set to true ONLY for the very first deploy.
+
+Mappings:
+  EnvironmentConfig:
+    development: { Debug: 'True' }
+    production:  { Debug: 'False' }
+
+Resources:
+
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - { Effect: Allow, Principal: { Service: ec2.amazonaws.com }, Action: sts:AssumeRole }
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: S3CodeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${CodeS3Bucket}/${CodeS3Key}'
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref AppRole]
+
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-lt'
+      LaunchTemplateData:
+        ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        InstanceType: !Ref InstanceType
+        KeyName: !Ref KeyPairName
+        IamInstanceProfile:
+          Arn: !GetAtt AppInstanceProfile.Arn
+        SecurityGroupIds:
+          - Fn::ImportValue: !Sub '${PersistentStackName}-app-sg'
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref DiskSizeGB
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - { Key: Name,  Value: !Sub '${AWS::StackName}' }
+              - { Key: Color, Value: !Ref Color }
+              - { Key: Stack, Value: !Ref AWS::StackName }
+        UserData:
+          Fn::Base64:
+            Fn::Sub:
+              - |
+                #!/bin/bash -xe
+                exec > >(tee /var/log/deployctrl-init.log | logger -t deployctrl-init -s 2>/dev/console) 2>&1
+                export PATH=$PATH:/opt/aws/bin
+
+                signal() {
+                  cfn-signal -e "$1" \
+                    --stack '${AWS::StackName}' \
+                    --resource AppAutoScalingGroup \
+                    --region '${AWS::Region}'
+                }
+                trap 'signal 1' ERR
+
+                # ── 1. System packages ──────────────────────────────────────
+                dnf install -y python3.11 nginx git unzip
+
+                # ── 2. Terraform 1.10.5 ─────────────────────────────────────
+                curl -fsSL https://releases.hashicorp.com/terraform/1.10.5/terraform_1.10.5_linux_amd64.zip \
+                  -o /tmp/terraform.zip
+                unzip -q /tmp/terraform.zip -d /usr/local/bin/
+                rm /tmp/terraform.zip
+
+                # ── 3. Dedicated system user ────────────────────────────────
+                useradd -r -s /sbin/nologin deployctrl
+
+                # ── 4. Download application code from S3 ────────────────────
+                mkdir -p /opt/deployctrl
+                aws s3 cp s3://${CodeS3Bucket}/${CodeS3Key} /tmp/deployctrl.tar.gz
+                tar -xzf /tmp/deployctrl.tar.gz -C /opt/deployctrl
+                rm /tmp/deployctrl.tar.gz
+                chown -R deployctrl:deployctrl /opt/deployctrl
+                chmod -R g+rw /opt/deployctrl/tf_templates
+
+                # ── 5. Python virtual environment & dependencies ────────────
+                python3.11 -m venv /opt/deployctrl/.venv
+                /opt/deployctrl/.venv/bin/pip install --upgrade pip -q
+                /opt/deployctrl/.venv/bin/pip install -r /opt/deployctrl/requirements.txt -q
+
+                # ── 6. Environment file (Mongo points at the persistent VM) ─
+                printf 'SECRET_KEY=%s\nDEBUG=%s\nALLOWED_HOSTS=%s\nMONGO_URI=mongodb://%s:27017/deployctrl\nMONGO_DB=deployctrl\nJWT_ACCESS_HOURS=%s\nJWT_REFRESH_DAYS=%s\nCORS_ALLOWED_ORIGINS=%s\n' \
+                  '${AppSecretKey}' '${DebugValue}' '${AllowedHosts}' \
+                  '${MongoIp}' \
+                  '${JWTAccessHours}' '${JWTRefreshDays}' '${CORSAllowedOrigins}' \
+                  > /opt/deployctrl/.env
+
+                chmod 600 /opt/deployctrl/.env
+                chown deployctrl:deployctrl /opt/deployctrl/.env
+
+                # ── 7. Static files & (optional) seed data ──────────────────
+                cd /opt/deployctrl
+                sudo -u deployctrl /opt/deployctrl/.venv/bin/python manage.py \
+                  collectstatic --noinput -v 0
+
+                if [ '${RunSeedData}' = 'true' ]; then
+                  sudo -u deployctrl /opt/deployctrl/.venv/bin/python manage.py seed_data || true
+                fi
+
+                # ── 8. Gunicorn systemd service ─────────────────────────────
+                mkdir -p /var/log/deployctrl
+                chown deployctrl:deployctrl /var/log/deployctrl
+
+                cat > /etc/systemd/system/deployctrl.service <<'UNIT'
+                [Unit]
+                Description=DeployCtrl - Gunicorn application server
+                After=network.target
+
+                [Service]
+                Type=simple
+                User=deployctrl
+                Group=deployctrl
+                WorkingDirectory=/opt/deployctrl
+                EnvironmentFile=/opt/deployctrl/.env
+                ExecStart=/opt/deployctrl/.venv/bin/gunicorn deployctrl.wsgi:application --bind 127.0.0.1:8000 --workers 2 --timeout 60 --access-logfile /var/log/deployctrl/access.log --error-logfile /var/log/deployctrl/error.log
+                Restart=on-failure
+                RestartSec=5
+
+                [Install]
+                WantedBy=multi-user.target
+                UNIT
+
+                systemctl daemon-reload
+                systemctl enable --now deployctrl
+
+                # ── 9. Nginx reverse proxy ──────────────────────────────────
+                rm -f /etc/nginx/conf.d/default.conf
+
+                cat > /etc/nginx/conf.d/deployctrl.conf <<'NGINX'
+                server {
+                    listen 80 default_server;
+                    server_name _;
+                    client_max_body_size 10M;
+
+                    location /static/ {
+                        alias /opt/deployctrl/staticfiles/;
+                        expires 30d;
+                        add_header Cache-Control "public, immutable";
+                    }
+                    location / {
+                        proxy_pass         http://127.0.0.1:8000;
+                        proxy_http_version 1.1;
+                        proxy_set_header   Host              $host;
+                        proxy_set_header   X-Real-IP         $remote_addr;
+                        proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+                        proxy_set_header   X-Forwarded-Proto $scheme;
+                        proxy_read_timeout 60s;
+                    }
+                }
+                NGINX
+
+                nginx -t
+                systemctl enable --now nginx
+
+                # ── 10. Signal CloudFormation success ───────────────────────
+                signal 0
+
+              - DebugValue: !FindInMap [EnvironmentConfig, !Ref Environment, Debug]
+                MongoIp:
+                  Fn::ImportValue: !Sub '${PersistentStackName}-mongo-ip'
+
+  AppAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT20M
+    Properties:
+      AutoScalingGroupName: !Sub '${AWS::StackName}-asg'
+      MinSize: 1
+      MaxSize: 1
+      DesiredCapacity: 1
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier:
+        - !Ref SubnetId
+      TargetGroupARNs:
+        - Fn::ImportValue: !Sub '${PersistentStackName}-${Color}-tg'
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 600
+      Tags:
+        - { Key: Name,  Value: !Sub '${AWS::StackName}', PropagateAtLaunch: false }
+        - { Key: Color, Value: !Ref Color,               PropagateAtLaunch: true  }
+        - { Key: Stack, Value: !Ref AWS::StackName,      PropagateAtLaunch: true  }
+
+Outputs:
+
+  AsgName:
+    Value: !Ref AppAutoScalingGroup
+
+  Color:
+    Value: !Ref Color
+
+  CodeS3Key:
+    Description: The S3 key this color is currently running
+    Value: !Ref CodeS3Key

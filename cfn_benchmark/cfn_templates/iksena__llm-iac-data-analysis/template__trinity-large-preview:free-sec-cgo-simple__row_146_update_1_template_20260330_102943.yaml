@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Automated Image Analysis Pipeline with S3, Lambda, Step Functions, and Rekognition
+
+Parameters:
+  PhoneNumber:
+    Type: String
+    Default: "+1234567890"
+    Description: Phone number to receive SMS alerts (E.164 format)
+
+Resources:
+  ImageAnalysisBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            Function: !GetAtt ImageAnalysisLambda.Arn
+
+  ImageAnalysisLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: RekognitionAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'rekognition:DetectLabels'
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                Resource: !Sub 'arn:aws:s3:::${ImageAnalysisBucket}/*'
+
+  ImageAnalysisLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt ImageAnalysisLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              s3 = boto3.client('s3')
+              rekognition = boto3.client('rekognition')
+              bucket_name = event['Records'][0]['s3']['bucket']['name']
+              object_key = event['Records'][0]['s3']['object']['key']
+
+              response = s3.get_object(Bucket=bucket_name, Key=object_key)
+              image_bytes = response['Body'].read()
+
+              rekognition_response = rekognition.detect_labels(
+                  Image={'Bytes': image_bytes},
+                  MaxLabels=10,
+                  MinConfidence=75
+              )
+
+              labels = rekognition_response['Labels']
+              human_detected = any(label['Name'] == 'Person' for label in labels)
+
+              return {
+                  'human_detected': human_detected,
+                  'labels': [label['Name'] for label in labels]
+              }
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaRole'
+
+  StepFunctionsStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      DefinitionString: |
+        {
+          "StartAt": "AnalyzeImage",
+          "States": {
+            "AnalyzeImage": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "ImageAnalysisLambda",
+                "Payload": {
+                  "Records": [
+                    {
+                      "s3": {
+                        "bucket": {
+                          "name.$": "$.bucket_name"
+                        },
+                        "object": {
+                          "key.$": "$.object_key"
+                        }
+                      }
+                    }
+                  ]
+                }
+              },
+              "ResultSelector": {
+                "human_detected.$": "$.Payload.human_detected",
+                "labels.$": "$.Payload.labels"
+              },
+              "Next": "SendNotification"
+            },
+            "SendNotification": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.human_detected",
+                  "BooleanEquals": true,
+                  "Next": "SendSMS"
+                }
+              ],
+              "Default": "End"
+            },
+            "SendSMS": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "NotificationLambda",
+                "Payload": {
+                  "human_detected.$": "$.human_detected",
+                  "labels.$": "$.labels"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+
+  NotificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: SNSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'sns:Publish'
+                Resource: !Ref SNSTopic
+
+  NotificationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Role: !GetAtt NotificationLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          def lambda_handler(event, context):
+              sns = boto3.client('sns')
+              message = f"Human detected in image. Labels: {', '.join(event['labels'])}"
+              sns.publish(
+                  TopicArn=os.environ['SNS_TOPIC_ARN'],
+                  Message=message,
+                  PhoneNumber=os.environ['PHONE_NUMBER']
+              )
+              return {
+                  'statusCode': 200,
+                  'body': 'SMS sent successfully'
+              }
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SNSTopic
+          PHONE_NUMBER: !Ref PhoneNumber
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Protocol: sms
+          Endpoint: !Ref PhoneNumber
+
+Outputs:
+  ImageAnalysisBucketName:
+    Description: Name of the S3 bucket for image analysis
+    Value: !Ref ImageAnalysisBucket
+  StepFunctionsStateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !Ref StepFunctionsStateMachine

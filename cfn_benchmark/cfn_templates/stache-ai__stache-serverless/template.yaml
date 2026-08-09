@@ -1,0 +1,1104 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Stache AI - Serverless deployment for AWS Lambda
+
+Parameters:
+  ResourcePrefix:
+    Type: String
+    Description: Prefix for all resource names (allows multiple deployments per account)
+    Default: "stache"
+    AllowedPattern: "^[a-z][a-z0-9-]*$"
+    ConstraintDescription: Must start with lowercase letter, contain only lowercase letters, numbers, and hyphens
+  AppDomain:
+    Type: String
+    Description: Custom domain for the application (optional)
+    Default: ""
+  CertificateArn:
+    Type: String
+    Description: ACM certificate ARN for custom domain (required if AppDomain is set)
+    Default: ""
+  EnterpriseLayerArn:
+    Type: String
+    Description: Optional enterprise extension layer ARN (from stache-enterprise stack)
+    Default: ""
+  UploadCorsOrigins:
+    Type: CommaDelimitedList
+    Description: Allowed origins for presigned-upload CORS on OriginalsBucket (app + mobile origins). Default "*" keeps dev simple; pin origins in prod.
+    Default: "*"
+Conditions:
+  UseCustomDomain: !Not [!Equals [!Ref AppDomain, ""]]
+  HasEnterpriseLayer: !Not [!Equals [!Ref EnterpriseLayerArn, ""]]
+
+Globals:
+  Function:
+    Timeout: 900
+    MemorySize: 2048
+    Runtime: python3.12
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        # Provider Configuration
+        LLM_PROVIDER: bedrock
+        EMBEDDING_PROVIDER: bedrock
+        VECTORDB_PROVIDER: s3vectors
+        NAMESPACE_PROVIDER: dynamodb
+        DOCUMENT_INDEX_PROVIDER: dynamodb
+        RERANKER_PROVIDER: simple
+
+        # AWS Provider Settings (AWS_REGION is automatically set by Lambda)
+        BEDROCK_LLM_MODEL: us.amazon.nova-pro-v1:0
+        BEDROCK_ENRICHMENT_MODEL: us.amazon.nova-lite-v1:0
+        BEDROCK_EMBEDDING_MODEL: cohere.embed-english-v3
+        S3VECTORS_BUCKET: !Sub '${ResourcePrefix}-vectors-${AWS::AccountId}'
+        S3VECTORS_INDEX: !Sub '${ResourcePrefix}-vectors'
+        S3VECTORS_DOCUMENTS_INDEX: !Sub '${ResourcePrefix}-documents'
+        S3VECTORS_SUMMARIES_INDEX: !Sub '${ResourcePrefix}-summaries'
+        S3VECTORS_INSIGHTS_INDEX: !Sub '${ResourcePrefix}-insights'
+        DYNAMODB_NAMESPACE_TABLE: !Ref NamespaceTable
+        DYNAMODB_DOCUMENTS_TABLE: !Ref DocumentsTable
+
+        # General Settings
+        LOG_LEVEL: info
+        EMBEDDING_DIMENSION: "1024"
+        CHUNK_SIZE: "1000"
+        CHUNK_OVERLAP: "100"
+
+        # Enrichment Settings
+        AI_ENRICHMENT_ENABLED: "true"
+        ENABLE_SUMMARY_GENERATION: "false"
+
+        # CORS - allow CloudFront, custom domain, and localhost
+        CORS_ORIGINS: !If
+          - UseCustomDomain
+          - !Sub 'https://${AppDomain},https://${CloudFrontDistribution.DomainName},http://localhost:3000,http://localhost:8000'
+          - !Sub 'https://${CloudFrontDistribution.DomainName},http://localhost:3000,http://localhost:8000'
+
+Resources:
+  # Lambda Layer with Stache packages
+  StacheLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: !Sub '${ResourcePrefix}-dependencies'
+      Description: Stache AI packages for Lambda
+      ContentUri: layer/
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Delete
+
+  # S3 Vectors bucket for vector storage (NOT an S3 bucket - different service)
+  S3VectorsBucket:
+    Type: AWS::S3Vectors::VectorBucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VectorBucketName: !Sub '${ResourcePrefix}-vectors-${AWS::AccountId}'
+
+  # S3 Vectors index for document chunks
+  VectorsIndex:
+    Type: AWS::S3Vectors::Index
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VectorBucketArn: !GetAtt S3VectorsBucket.VectorBucketArn
+      IndexName: !Sub '${ResourcePrefix}-vectors'
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - text
+
+  # S3 Vectors index for documents
+  DocumentsVectorIndex:
+    Type: AWS::S3Vectors::Index
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VectorBucketArn: !GetAtt S3VectorsBucket.VectorBucketArn
+      IndexName: !Sub '${ResourcePrefix}-documents'
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - text
+
+  # S3 Vectors index for summaries
+  SummariesVectorIndex:
+    Type: AWS::S3Vectors::Index
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VectorBucketArn: !GetAtt S3VectorsBucket.VectorBucketArn
+      IndexName: !Sub '${ResourcePrefix}-summaries'
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - text
+
+  # S3 Vectors index for insights
+  InsightsVectorIndex:
+    Type: AWS::S3Vectors::Index
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      VectorBucketArn: !GetAtt S3VectorsBucket.VectorBucketArn
+      IndexName: !Sub '${ResourcePrefix}-insights'
+      DataType: float32
+      Dimension: 1024
+      DistanceMetric: cosine
+      MetadataConfiguration:
+        NonFilterableMetadataKeys:
+          - text
+
+  # S3 Bucket for frontend static files
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-frontend-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # S3 Bucket Policy allowing CloudFront access
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${FrontendBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}'
+
+  # CloudFront Origin Access Control for S3
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub '${ResourcePrefix}-oac-${AWS::AccountId}'
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # CloudFront Distribution for frontend
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        HttpVersion: http2and3
+        # Custom domain alias (only if configured)
+        Aliases: !If
+          - UseCustomDomain
+          - - !Ref AppDomain
+          - !Ref AWS::NoValue
+        # SSL certificate
+        ViewerCertificate: !If
+          - UseCustomDomain
+          - AcmCertificateArn: !Ref CertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !Ref CloudFrontOriginAccessControl
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
+          Compress: true
+        # SPA routing - return index.html for 403/404
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  # DynamoDB table for namespace registry
+  NamespaceTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ResourcePrefix}-namespaces'
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: parent_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: parent_id-index
+          KeySchema:
+            - AttributeName: parent_id
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+
+  # DynamoDB table for document index
+  # Schema: PK (DOC#{namespace}#{doc_id}) + SK (METADATA)
+  # GSI1: namespace queries (GSI1PK=NAMESPACE#{ns}, GSI1SK=CREATED#{ts})
+  # GSI2: filename lookups (GSI2PK=FILENAME#{ns}#{file}, GSI2SK=CREATED#{ts})
+  DocumentsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ResourcePrefix}-documents'
+      BillingMode: PAY_PER_REQUEST
+      DeletionProtectionEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+        - AttributeName: GSI2PK
+          AttributeType: S
+        - AttributeName: GSI2SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: GSI2
+          KeySchema:
+            - AttributeName: GSI2PK
+              KeyType: HASH
+            - AttributeName: GSI2SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # Cognito User Pool for authentication
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+
+  # Cognito User Pool Client (web frontend)
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn:
+      - CloudFrontDistribution
+    Properties:
+      ClientName: !Sub '${AWS::StackName}-client'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlows:
+        - code
+        - implicit
+      AllowedOAuthScopes:
+        - email
+        - openid
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+      # Callback URLs - CloudFront + custom domain + localhost
+      CallbackURLs: !If
+        - UseCustomDomain
+        - - !Sub 'https://${AppDomain}'
+          - !Sub 'https://${AppDomain}/callback'
+          - !Sub 'https://${CloudFrontDistribution.DomainName}'
+          - !Sub 'https://${CloudFrontDistribution.DomainName}/callback'
+          - 'http://localhost:3000'
+          - 'http://localhost:3000/callback'
+        - - !Sub 'https://${CloudFrontDistribution.DomainName}'
+          - !Sub 'https://${CloudFrontDistribution.DomainName}/callback'
+          - 'http://localhost:3000'
+          - 'http://localhost:3000/callback'
+      LogoutURLs: !If
+        - UseCustomDomain
+        - - !Sub 'https://${AppDomain}'
+          - !Sub 'https://${CloudFrontDistribution.DomainName}'
+          - 'http://localhost:3000'
+        - - !Sub 'https://${CloudFrontDistribution.DomainName}'
+          - 'http://localhost:3000'
+      SupportedIdentityProviders:
+        - COGNITO
+
+  # Cognito User Pool Domain
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub '${AWS::StackName}-${AWS::AccountId}'
+      UserPoolId: !Ref UserPool
+
+  # Resource Server for machine-to-machine OAuth scopes
+  # This defines custom scopes that can be used with client_credentials flow
+  ApiResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref UserPool
+      Identifier: !Sub '${AWS::StackName}-api'
+      Name: Stache API
+      Scopes:
+        - ScopeName: read
+          ScopeDescription: Read access to knowledge base (search, list, get)
+        - ScopeName: write
+          ScopeDescription: Write access to knowledge base (ingest, create, update, delete)
+
+  # Machine-to-machine client for stache-tools CLI/SDK
+  # Uses client_credentials flow with client secret
+  StacheToolsClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: ApiResourceServer
+    Properties:
+      ClientName: !Sub '${AWS::StackName}-tools'
+      UserPoolId: !Ref UserPool
+      GenerateSecret: true
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - !Sub '${AWS::StackName}-api/read'
+        - !Sub '${AWS::StackName}-api/write'
+      SupportedIdentityProviders:
+        - COGNITO
+      # No callback URLs needed for client_credentials flow
+
+  # Lambda function for HTTP API (API Gateway + Cognito)
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-api'
+      CodeUri: ./
+      Handler: src.api_handler.handler
+      MemorySize: 2048
+      Layers:
+        - !Ref StacheLayer
+        - !If [HasEnterpriseLayer, !Ref EnterpriseLayerArn, !Ref "AWS::NoValue"]
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      Environment:
+        Variables:
+          # Ingestion Phase 2 - AWS async tier
+          INGEST_QUEUE_PROVIDER: sqs
+          INGEST_JOBSTORE_PROVIDER: dynamodb
+          INGEST_BLOB_PROVIDER: s3
+          INGEST_QUEUE_SQS_URL: !Ref IngestQueue
+          INGEST_JOBSTORE_DYNAMODB_TABLE: !Ref IngestJobsTable
+          INGEST_BLOB_S3_BUCKET: !Ref OriginalsBucket
+          # Phase 3 - hand out presigned PUT URLs for large/mobile uploads.
+          # S3CrudPolicy on OriginalsBucket (below) grants the s3:PutObject needed to sign.
+          INGEST_INTAKE_PROVIDER: s3presign
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NamespaceTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DocumentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IngestJobsTable
+        - S3CrudPolicy:
+            BucketName: !Ref OriginalsBucket
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt IngestQueue.QueueName
+        - Statement:
+            # Bedrock access - wildcard resource required for cross-region inference profiles
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:Converse
+              Resource: '*'
+            # Marketplace permissions for Bedrock model access
+            - Effect: Allow
+              Action:
+                - aws-marketplace:ViewSubscriptions
+                - aws-marketplace:Subscribe
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - s3vectors:GetVectorBucket
+              Resource:
+                - !GetAtt S3VectorsBucket.VectorBucketArn
+            - Effect: Allow
+              Action:
+                - s3vectors:CreateIndex
+                - s3vectors:GetIndex
+                - s3vectors:ListIndexes
+                - s3vectors:PutVectors
+                - s3vectors:QueryVectors
+                - s3vectors:ListVectors
+                - s3vectors:DeleteVectors
+                - s3vectors:GetVectors
+              Resource:
+                - !Sub '${S3VectorsBucket.VectorBucketArn}/index/*'
+      Events:
+        # HTTP API events
+        Ping:
+          Type: HttpApi
+          Properties:
+            Path: /ping
+            Method: GET
+            ApiId: !Ref StacheHttpApi
+            Auth:
+              Authorizer: NONE
+        # OPTIONS must be unauthenticated for CORS preflight
+        OptionsProxy:
+          Type: HttpApi
+          Properties:
+            Path: /{proxy+}
+            Method: OPTIONS
+            ApiId: !Ref StacheHttpApi
+            Auth:
+              Authorizer: NONE
+        # All other routes use default JWT authorizer
+        ApiRoutes:
+          Type: HttpApi
+          Properties:
+            Path: /{proxy+}
+            Method: ANY
+            ApiId: !Ref StacheHttpApi
+
+  # Lambda function for AgentCore Gateway (Claude Desktop MCP)
+  AgentCoreFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-agentcore'
+      CodeUri: ./
+      Handler: src.agentcore_handler.handler
+      MemorySize: 2048
+      Layers:
+        - !Ref StacheLayer
+        - !If [HasEnterpriseLayer, !Ref EnterpriseLayerArn, !Ref "AWS::NoValue"]
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NamespaceTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DocumentsTable
+        - Statement:
+            # Bedrock access - wildcard resource required for cross-region inference profiles
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:Converse
+              Resource: '*'
+            # Marketplace permissions for Bedrock model access
+            - Effect: Allow
+              Action:
+                - aws-marketplace:ViewSubscriptions
+                - aws-marketplace:Subscribe
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - s3vectors:GetVectorBucket
+              Resource:
+                - !GetAtt S3VectorsBucket.VectorBucketArn
+            - Effect: Allow
+              Action:
+                - s3vectors:CreateIndex
+                - s3vectors:GetIndex
+                - s3vectors:ListIndexes
+                - s3vectors:PutVectors
+                - s3vectors:QueryVectors
+                - s3vectors:ListVectors
+                - s3vectors:DeleteVectors
+                - s3vectors:GetVectors
+              Resource:
+                - !Sub '${S3VectorsBucket.VectorBucketArn}/index/*'
+
+  # Lambda function for cleanup worker (processes cleanup jobs from document deletion)
+  CleanupWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-cleanup-worker'
+      CodeUri: ./
+      Handler: stache_ai.workers.cleanup_worker.lambda_handler
+      Timeout: 300
+      MemorySize: 512
+      Layers:
+        - !Ref StacheLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DocumentsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3vectors:GetVectorBucket
+              Resource:
+                - !GetAtt S3VectorsBucket.VectorBucketArn
+            - Effect: Allow
+              Action:
+                - s3vectors:CreateIndex
+                - s3vectors:GetIndex
+                - s3vectors:ListIndexes
+                - s3vectors:PutVectors
+                - s3vectors:QueryVectors
+                - s3vectors:ListVectors
+                - s3vectors:DeleteVectors
+                - s3vectors:GetVectors
+              Resource:
+                - !Sub '${S3VectorsBucket.VectorBucketArn}/index/*'
+      Events:
+        ScheduledCleanup:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Enabled: true
+
+  # Lambda function for trash purge worker (runs periodically to delete expired documents)
+  TrashPurgeWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-trash-purge'
+      CodeUri: ./
+      Handler: stache_ai.workers.trash_purge_worker.lambda_handler
+      Timeout: 600
+      MemorySize: 256
+      Layers:
+        - !Ref StacheLayer
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DocumentsTable
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3vectors:GetVectorBucket
+              Resource:
+                - !GetAtt S3VectorsBucket.VectorBucketArn
+            - Effect: Allow
+              Action:
+                - s3vectors:CreateIndex
+                - s3vectors:GetIndex
+                - s3vectors:ListIndexes
+                - s3vectors:PutVectors
+                - s3vectors:QueryVectors
+                - s3vectors:ListVectors
+                - s3vectors:DeleteVectors
+                - s3vectors:GetVectors
+              Resource:
+                - !Sub '${S3VectorsBucket.VectorBucketArn}/index/*'
+      Events:
+        DailyPurge:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 2 * * ? *)
+            Enabled: true
+
+  # Dead Letter Queue for failed Lambda invocations
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-lambda-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+      VisibilityTimeout: 300
+
+  # =========================================================================
+  # Ingestion Phase 2 - AWS async tier (S3 originals + SQS + DynamoDB jobs)
+  # =========================================================================
+
+  # S3 bucket for retained originals (kept forever - no lifecycle expiry).
+  # Producers trigger ingestion by dropping objects under the configured blob
+  # prefix (originals/ by default), e.g. originals/<any-path>/file.pdf. The
+  # S3BlobStore prepends the prefix; the worker strips it to recover the key.
+  OriginalsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    # S3 -> SQS notification requires the queue policy to exist first
+    DependsOn: IngestQueuePolicy
+    Properties:
+      BucketName: !Sub '${ResourcePrefix}-originals-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      # Phase 3 - allow browsers/mobile clients to PUT directly to presigned URLs.
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods:
+              - PUT
+              - GET
+            AllowedOrigins: !Ref UploadCorsOrigins
+            AllowedHeaders:
+              - '*'
+            ExposedHeaders:
+              - ETag
+            MaxAge: 3000
+      NotificationConfiguration:
+        QueueConfigurations:
+          # No prefix filter: producer drops (originals/<path>) AND presign uploads
+          # (originals/{job_id}/{filename}) must both enqueue. The worker branches on
+          # whether the key's job_id maps to an existing job (presign) vs a raw drop.
+          - Event: s3:ObjectCreated:*
+            Queue: !GetAtt IngestQueue.Arn
+
+  # DynamoDB table for ingestion job records
+  # PK: job_id; GSI1 (requested_by queries), GSI2 (status queries)
+  # Job records expire via TTL (ttl); originals in S3 do not.
+  IngestJobsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ResourcePrefix}-ingest-jobs'
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - AttributeName: job_id
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+        - AttributeName: GSI2PK
+          AttributeType: S
+        - AttributeName: GSI2SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: job_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: GSI2
+          KeySchema:
+            - AttributeName: GSI2PK
+              KeyType: HASH
+            - AttributeName: GSI2SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # SQS queue for ingestion jobs (worker drives the pipeline off-request)
+  IngestQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-ingest-queue'
+      VisibilityTimeout: 960  # >= worker timeout (900s)
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt IngestDLQ.Arn
+        maxReceiveCount: 3
+
+  # Dead Letter Queue for ingestion jobs that fail repeatedly
+  IngestDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ResourcePrefix}-ingest-dlq'
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  # Allow S3 (OriginalsBucket) to send object-created notifications to the queue.
+  # SourceArn uses !Sub (not !Ref OriginalsBucket) to break the circular dependency.
+  IngestQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref IngestQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: s3.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt IngestQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Sub 'arn:aws:s3:::${ResourcePrefix}-originals-${AWS::AccountId}'
+
+  # Worker Lambda - consumes ingest jobs from SQS and runs the pipeline
+  IngestWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-ingest-worker'
+      CodeUri: ./
+      Handler: stache_ai_aws.sqs_worker.lambda_handler
+      Timeout: 900
+      MemorySize: 2048
+      Layers:
+        - !Ref StacheLayer
+        - !If [HasEnterpriseLayer, !Ref EnterpriseLayerArn, !Ref "AWS::NoValue"]
+      Environment:
+        Variables:
+          INGEST_QUEUE_PROVIDER: sqs
+          INGEST_JOBSTORE_PROVIDER: dynamodb
+          INGEST_BLOB_PROVIDER: s3
+          INGEST_QUEUE_SQS_URL: !Ref IngestQueue
+          INGEST_JOBSTORE_DYNAMODB_TABLE: !Ref IngestJobsTable
+          INGEST_BLOB_S3_BUCKET: !Ref OriginalsBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IngestJobsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DocumentsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NamespaceTable
+        - S3CrudPolicy:
+            BucketName: !Ref OriginalsBucket
+        - Statement:
+            # Bedrock access - wildcard resource required for cross-region inference profiles
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:InvokeModelWithResponseStream
+                - bedrock:Converse
+              Resource: '*'
+            # Marketplace permissions for Bedrock model access
+            - Effect: Allow
+              Action:
+                - aws-marketplace:ViewSubscriptions
+                - aws-marketplace:Subscribe
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - s3vectors:GetVectorBucket
+              Resource:
+                - !GetAtt S3VectorsBucket.VectorBucketArn
+            - Effect: Allow
+              Action:
+                - s3vectors:CreateIndex
+                - s3vectors:GetIndex
+                - s3vectors:ListIndexes
+                - s3vectors:PutVectors
+                - s3vectors:QueryVectors
+                - s3vectors:ListVectors
+                - s3vectors:DeleteVectors
+                - s3vectors:GetVectors
+              Resource:
+                - !Sub '${S3VectorsBucket.VectorBucketArn}/index/*'
+            # Enterprise concept graph (parity with the API function): resolve the
+            # concepts table name from SSM and read/write the concept DynamoDB tables.
+            - Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource:
+                - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ResourcePrefix}/enterprise/concepts-table'
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:BatchGetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:Scan
+                - dynamodb:DeleteItem
+                - dynamodb:BatchWriteItem
+              Resource:
+                - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourcePrefix}-concept*'
+                - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ResourcePrefix}-concept*/index/*'
+      Events:
+        SqsTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt IngestQueue.Arn
+            BatchSize: 1
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+
+  # Reaper Lambda - marks jobs wedged in processing as failed (retryable)
+  IngestReaperFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ResourcePrefix}-ingest-reaper'
+      CodeUri: ./
+      Handler: stache_ai_aws.reaper.lambda_handler
+      Timeout: 300
+      MemorySize: 256
+      Layers:
+        - !Ref StacheLayer
+      Environment:
+        Variables:
+          INGEST_JOBSTORE_PROVIDER: dynamodb
+          INGEST_JOBSTORE_DYNAMODB_TABLE: !Ref IngestJobsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IngestJobsTable
+      Events:
+        ScheduledReap:
+          Type: Schedule
+          Properties:
+            Schedule: rate(5 minutes)
+            Enabled: true
+
+  # CloudWatch Alarm for API Function Errors
+  ApiErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-api-errors'
+      AlarmDescription: Alert when API Lambda has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiFunction
+
+  # CloudWatch Alarm for AgentCore Function Errors
+  AgentCoreErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-agentcore-errors'
+      AlarmDescription: Alert when AgentCore Lambda has errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AgentCoreFunction
+
+  # HTTP API Gateway with Cognito JWT Authorizer
+  # Why HTTP API: Supports both ID tokens (web frontend) and access tokens (M2M clients)
+  # with JWT validation that accepts either 'aud' (ID tokens) or 'client_id' (access tokens)
+  # matching the configured audience. This unified approach eliminates the need for
+  # separate OAuth scopes that break web frontend compatibility.
+  StacheHttpApi:
+    Type: AWS::Serverless::HttpApi
+    DependsOn: CloudFrontDistribution
+    Properties:
+      StageName: Prod
+      CorsConfiguration:
+        # PE feedback: Reduce preflight overhead with long MaxAge (24 hours)
+        MaxAge: 86400
+        AllowOrigins:
+          - !Sub 'https://${CloudFrontDistribution.DomainName}'
+          - !If [UseCustomDomain, !Sub 'https://${AppDomain}', !Ref AWS::NoValue]
+          - 'http://localhost:3000'
+          - 'http://localhost:8000'
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - PATCH
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        AllowCredentials: true
+      Auth:
+        DefaultAuthorizer: CognitoJwtAuthorizer
+        Authorizers:
+          CognitoJwtAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              Issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+              Audience:
+                - !Ref UserPoolClient
+                - !Ref StacheToolsClient
+
+Outputs:
+  StacheLayerArn:
+    Description: Stache dependencies Lambda layer ARN
+    Value: !Ref StacheLayer
+
+  ApiUrl:
+    Description: HTTP API Gateway endpoint URL (JWT authorizer)
+    Value: !Sub 'https://${StacheHttpApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/'
+
+  ApiFunction:
+    Description: HTTP API Lambda Function ARN
+    Value: !GetAtt ApiFunction.Arn
+
+  ApiFunctionName:
+    Description: HTTP API Lambda Function name (for stache-tools Lambda transport)
+    Value: !Ref ApiFunction
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiFunctionName'
+
+  AgentCoreFunction:
+    Description: AgentCore Lambda Function ARN (for Claude Desktop MCP)
+    Value: !GetAtt AgentCoreFunction.Arn
+
+  S3VectorsBucket:
+    Description: S3 Vectors bucket name
+    Value: !Ref S3VectorsBucket
+
+  NamespaceTable:
+    Description: DynamoDB namespace table
+    Value: !Ref NamespaceTable
+
+  DocumentsTable:
+    Description: DynamoDB documents table
+    Value: !Ref DocumentsTable
+
+  OriginalsBucket:
+    Description: S3 bucket for retained ingestion originals
+    Value: !Ref OriginalsBucket
+
+  IngestQueueUrl:
+    Description: SQS queue URL for ingestion jobs
+    Value: !Ref IngestQueue
+
+  IngestJobsTable:
+    Description: DynamoDB ingestion jobs table
+    Value: !Ref IngestJobsTable
+
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  UserPoolClientId:
+    Description: Cognito User Pool Client ID (for frontend)
+    Value: !Ref UserPoolClient
+
+  # stache-tools machine-to-machine client outputs
+  StacheToolsClientId:
+    Description: Cognito client ID for stache-tools CLI/SDK
+    Value: !Ref StacheToolsClient
+    Export:
+      Name: !Sub '${AWS::StackName}-StacheToolsClientId'
+
+  StacheToolsTokenUrl:
+    Description: OAuth token endpoint for stache-tools
+    Value: !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/token'
+
+  StacheToolsScopes:
+    Description: OAuth scopes for stache-tools
+    Value: !Sub '${AWS::StackName}-api/read ${AWS::StackName}-api/write'
+
+  UserPoolDomain:
+    Description: Cognito User Pool Domain
+    Value: !Sub '${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolDomain'
+
+  # AgentCore outputs
+  AgentCoreFunctionArn:
+    Description: AgentCore Lambda function ARN (for MCP gateway)
+    Value: !GetAtt AgentCoreFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentCoreFunctionArn'
+
+  AgentCoreFunctionName:
+    Description: AgentCore Lambda function name
+    Value: !Ref AgentCoreFunction
+
+  # Frontend outputs
+  FrontendBucketName:
+    Description: S3 bucket for frontend files
+    Value: !Ref FrontendBucket
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref CloudFrontDistribution
+
+  CloudFrontDomain:
+    Description: CloudFront distribution domain
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  AppDomain:
+    Description: Custom domain (if configured)
+    Value: !If [UseCustomDomain, !Ref AppDomain, '']
+
+  FrontendUrl:
+    Description: Frontend URL (custom domain or CloudFront)
+    Value: !If
+      - UseCustomDomain
+      - !Sub 'https://${AppDomain}'
+      - !Sub 'https://${CloudFrontDistribution.DomainName}'
+
+  LoginUrl:
+    Description: Cognito login URL
+    Value: !If
+      - UseCustomDomain
+      - !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=token&scope=email+openid+profile&redirect_uri=https://${AppDomain}'
+      - !Sub 'https://${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=token&scope=email+openid+profile&redirect_uri=https://${CloudFrontDistribution.DomainName}'
+
+  ApiFunctionRoleArn:
+    Description: IAM role ARN for API Lambda (assume this for local dev)
+    Value: !GetAtt ApiFunctionRole.Arn
+
+  CleanupWorkerFunction:
+    Description: Cleanup worker Lambda function name
+    Value: !Ref CleanupWorkerFunction
+
+  TrashPurgeWorkerFunction:
+    Description: Trash purge worker Lambda function name
+    Value: !Ref TrashPurgeWorkerFunction
+
+  S3VectorsIndexArn:
+    Description: S3 Vectors index ARN
+    Value: !GetAtt VectorsIndex.IndexArn

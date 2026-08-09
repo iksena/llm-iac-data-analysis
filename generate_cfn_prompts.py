@@ -12,6 +12,9 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from tqdm import tqdm
+from dotenv import load_dotenv
+
+load_dotenv()  # Load environment variables from .env file if present
 
 # ── 1. Configuration ──────────────────────────────────────────────────────────
 BASE_DIR = Path('./cfn_benchmark')
@@ -33,20 +36,26 @@ if not OPENROUTER_API_KEY:
 
 # ── 2. System Instructions for Prompt Generation ─────────────────────────────
 SYSTEM_PROMPT = """You are an expert Cloud Architect and DevOps Lead. 
-Your task is to analyze a complete, valid AWS CloudFormation template and reverse-engineer it into a natural, realistic user requirement prompt.
+Your task is to analyze a complete, valid AWS CloudFormation template and reverse-engineer it into a natural, realistic user requirement prompt that tests an AI assistant's ability to infer IaC requirements.
 
-The generated requirement prompt will be given to another AI assistant to write the CloudFormation code from scratch. It MUST be a single cohesive paragraph following these exact guidelines:
+The generated requirement prompt MUST be a single cohesive paragraph following these guidelines:
 
-1. Style & Tone: Write as a practitioner requesting infrastructure. Start the paragraph exactly with: "We need a CloudFormation template that creates..." followed by the high-level objective and its purpose.
-2. Essential Infrastructure: Capture all core resources, architectures, and critical dependencies (e.g., VPCs, IAM roles, dead-letter queues, conditions, outputs) without omitting anything necessary for the architecture to function.
-3. Balance Specificity & Flexibility: Specify resource counts, exact metric thresholds (e.g., 80% CPU, $10 billing limit), and architectural patterns (e.g., cross-AZ). Avoid overly prescriptive implementation details (do not dictate internal YAML/JSON structures, specific DependsOn clauses, or explicit Ref/GetAtt syntax unless conceptually necessary).
-4. Hardcoded Values: You MUST extract and explicitly state any specific image IDs (AMIs), URLs, email addresses, or dummy credential values present in the code that are strictly necessary to deploy the resources successfully. Include them naturally in the text (e.g., "For the endpoint URL, use 'www.testanu.com'").
-5. Security & Constraints: Mention required encryption, IAM least-privilege policies, security groups, or specific networking rules (e.g., public vs private subnets).
+1. Style & Tone: Write as a DevOps engineer creating a task ticket. Start the paragraph exactly with: "We need a CloudFormation template that creates..."
+2. High-Level Intent & Inference Space:
+   - Emphasize the core objective and high-level purpose (e.g., "for testing purposes", "to host a static website").
+   - DO NOT over-specify standard supporting resources or secondary implementation details (e.g., IAM admin policies, detailed security group rules, CloudFront origin settings, route tables, or output blocks). Allow the AI assistant space to infer these best practices on its own.
+3. Essential Parameters & Hardcoded Values:
+   - Only explicitly state parameters strictly necessary to prevent deployment failure (e.g., required default variable values, key aliases, specific VPC CIDRs/subnet allocations).
+   - Only mention the AWS region if it is a non-standard region (assume 'us-east-1' as the implicit default).
+   - Extract specific hardcoded values (e.g., AMIs, domain names, URLs) only if they are central to the template's functional objective.
+4. Scale Detail by Complexity:
+   - Simple/Single-Resource (Easy): Keep the prompt to 1-2 short sentences covering the main goal and any required key names/aliases.
+   - Multi-Resource/VPCs (Complex): Detail the primary structural components (e.g., subnets, CIDRs) but generalize secondary security/ACL rules.
 
 Output Rules:
-- DO NOT use bullet points, numbered lists, or markdown formatting. 
-- DO NOT include raw CloudFormation code, YAML, or JSON snippets.
-- Write exactly ONE well-structured paragraph that reads like a real-world Jira ticket.
+- Write exactly ONE well-structured paragraph.
+- DO NOT use bullet points, numbered lists, markdown formatting, or raw YAML/JSON syntax.
+- Use plain standard ASCII quotes (") only—avoid smart/curly quotes to prevent encoding issues.
 """
 
 # ── 3. Helper Functions ───────────────────────────────────────────────────────
@@ -61,7 +70,7 @@ def read_cfn_template(dest_file_str: str) -> str:
     
     return file_path.read_text(encoding="utf-8", errors="ignore").strip()
 
-def call_openrouter(cfn_code: str, retries: int = 3) -> str:
+def call_openrouter(cfn_code: str, difficulty: str, retries: int = 3) -> str:
     """Calls OpenRouter API to generate the user prompt requirement."""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
@@ -70,7 +79,7 @@ def call_openrouter(cfn_code: str, retries: int = 3) -> str:
         "X-Title": "IaC Benchmark Prompt Generator"
     }
     
-    user_content = f"Here is the reference CloudFormation template:\n\n```yaml\n{cfn_code}\n```\n\nGenerate the complete, detailed user requirement prompt."
+    user_content = f"Scenario Difficulty Level: {difficulty}\n\nHere is the reference CloudFormation template:\n\n```yaml\n{cfn_code}\n```\n\nGenerate the complete, detailed user requirement prompt."
     
     payload = {
         "model": MODEL_NAME,
@@ -139,7 +148,8 @@ def main():
             if not rec['cfn_code']:
                 rec['user_prompt'] = "ERROR: Missing or empty CloudFormation template file."
             else:
-                prompt_result = call_openrouter(rec['cfn_code'])
+                diff_level = str(rec.get('difficulty', 'Unspecified'))
+                prompt_result = call_openrouter(rec['cfn_code'], diff_level)
                 rec['user_prompt'] = prompt_result if prompt_result else "ERROR: LLM generation failed."
 
             new_count += 1

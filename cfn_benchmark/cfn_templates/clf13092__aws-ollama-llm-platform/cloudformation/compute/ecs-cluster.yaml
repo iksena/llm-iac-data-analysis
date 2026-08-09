@@ -1,0 +1,364 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Compute layer for AWS Ollama Platform - ECS Cluster, ALB, and GPU Capacity Provider (Task Definitions created dynamically)'
+
+Parameters:
+  Environment:
+    Type: String
+    Description: 'Environment name for resource naming'
+
+  VPCId:
+    Type: String
+    Description: 'VPC ID for ECS cluster'
+
+  PrivateSubnetIds:
+    Type: CommaDelimitedList
+    Description: 'Private subnet IDs for ECS tasks'
+
+  PublicSubnetIds:
+    Type: CommaDelimitedList
+    Description: 'Public subnet IDs for ALB'
+
+  VpcCidrBlock:
+    Type: String
+    Description: 'CIDR block of the VPC to allow traffic from within the VPC'
+
+  # ==== GPU ノード用 追加パラメータ ====
+  GPUInstanceType:
+    Type: String
+    Default: g5.xlarge
+    Description: 'EC2 instance type for GPU nodes (e.g., g5.xlarge, g5.2xlarge, g6.xlarge)'
+  GPUAsgDesiredCapacity:
+    Type: Number
+    Default: 0
+    Description: 'Desired capacity for GPU AutoScalingGroup'
+  GPUAsgMinSize:
+    Type: Number
+    Default: 0
+    Description: 'Min size for GPU AutoScalingGroup'
+  GPUAsgMaxSize:
+    Type: Number
+    Default: 2
+    Description: 'Max size for GPU AutoScalingGroup'
+  RootVolumeSizeGiB:
+    Type: Number
+    Default: 200
+    Description: 'Root volume size (GiB) for GPU instances (models/cache)'
+
+  # ECS GPU最適化 AMI (SSM)
+  ECSGPUAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ecs/optimized-ami/amazon-linux-2/gpu/recommended/image_id'
+    Description: 'ECS GPU-optimized AMI ID from SSM Parameter Store'
+
+Resources:
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${Environment}-ollama-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: 'enabled'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: 'aws-ollama-platform'
+
+  # Application Load Balancer
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${Environment}-ollama-alb'
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '600'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: 'aws-ollama-platform'
+
+  # ALB SG
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Controls access to the Application Load Balancer'
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-ollama-alb-sg'
+
+  # ECS タスク用 SG（ALB → 8080/TCP）
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Controls access for ECS tasks'
+      VpcId: !Ref VPCId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-ollama-ecs-sg'
+
+  # ECS コンテナログ用 LogGroup
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${Environment}-ollama'
+      RetentionInDays: 7
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ALB Listener (HTTP)
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '404'
+            ContentType: 'text/plain'
+            MessageBody: 'No active Ollama instances'
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  # 既定のTG（参考用/未使用想定。ダイナミックなTGはAPI側で作成）
+  DefaultTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${Environment}-ollama-default-tg'
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref VPCId
+      TargetType: ip
+      HealthCheckEnabled: true
+      HealthCheckPath: '/api/tags'
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ======= ここから GPU ノード（EC2）一式 =======
+
+  # ECS GPU インスタンス用 IAM ロール & インスタンスプロファイル
+  ECSGPUInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: 'aws-ollama-platform'
+
+  ECSGPUInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref ECSGPUInstanceRole]
+      InstanceProfileName: !Sub '${Environment}-ecs-gpu-instance-profile'
+
+  # ECS GPU インスタンス用 SG（管理/SSMのみ想定、入れ口なし・全アウトバウンド）
+  ECSInstancesSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: 'Security group for ECS GPU instances (no inbound; SSM recommended)'
+      VpcId: !Ref VPCId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-ecs-gpu-instances-sg'
+
+  # GPU ノード用 Launch Template
+  GPUNodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${Environment}-ecs-gpu-lt'
+      LaunchTemplateData:
+        ImageId: !Ref ECSGPUAmiId
+        InstanceType: !Ref GPUInstanceType
+        IamInstanceProfile:
+          Name: !Ref ECSGPUInstanceProfile
+        SecurityGroupIds: [!Ref ECSInstancesSecurityGroup]
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: !Ref RootVolumeSizeGiB
+              DeleteOnTermination: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo "ECS_CLUSTER=${ECSCluster}" >> /etc/ecs/ecs.config
+            echo "ECS_ENABLE_GPU_SUPPORT=true" >> /etc/ecs/ecs.config
+            systemctl enable --now ecs
+
+  # GPU ノード Auto Scaling Group
+  GPUAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub '${Environment}-ecs-gpu-asg'
+      VPCZoneIdentifier: !Ref PrivateSubnetIds
+      MinSize: !Ref GPUAsgMinSize
+      MaxSize: !Ref GPUAsgMaxSize
+      DesiredCapacity: !Ref GPUAsgDesiredCapacity
+      NewInstancesProtectedFromScaleIn: true
+      CapacityRebalance: true
+      MixedInstancesPolicy:
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref GPUNodeLaunchTemplate
+            Version: !GetAtt GPUNodeLaunchTemplate.LatestVersionNumber
+          Overrides:
+            - InstanceType: g5.xlarge
+            - InstanceType: g5.2xlarge
+            - InstanceType: g6.xlarge
+        InstancesDistribution:
+          OnDemandBaseCapacity: 0
+          OnDemandPercentageAboveBaseCapacity: 0        # ← まずは全Spotで動かす
+          SpotAllocationStrategy: capacity-optimized-prioritized
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-ecs-gpu'
+          PropagateAtLaunch: true
+        - Key: Environment
+          Value: !Ref Environment
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: 'aws-ollama-platform'
+          PropagateAtLaunch: true
+
+  # Capacity Provider（ASG と ECS の橋渡し）
+  GPUCapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      Name: !Sub '${Environment}-gpu-ec2'
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref GPUAutoScalingGroup
+        ManagedScaling:
+          Status: ENABLED
+          TargetCapacity: 70
+          MinimumScalingStepSize: 1
+          MaximumScalingStepSize: 100
+        ManagedTerminationProtection: ENABLED
+
+  # Cluster に Capacity Provider を関連付け（デフォルト戦略）
+  ClusterCapacityProviders:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref ECSCluster
+      CapacityProviders:
+        - !Ref GPUCapacityProvider
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: !Ref GPUCapacityProvider
+          Weight: 1
+          Base: 0
+
+Outputs:
+  ECSClusterName:
+    Description: 'Name of the ECS Cluster'
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSClusterName'
+
+  ECSClusterArn:
+    Description: 'ARN of the ECS Cluster'
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSClusterArn'
+
+  ApplicationLoadBalancerURL:
+    Description: 'URL of the Application Load Balancer'
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationLoadBalancerURL'
+
+  ApplicationLoadBalancerDNSName:
+    Description: 'DNS Name of the Application Load Balancer'
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub '${AWS::StackName}-ApplicationLoadBalancerDNSName'
+
+  LoadBalancerArn:
+    Description: 'ARN of the Application Load Balancer'
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub '${AWS::StackName}-LoadBalancerArn'
+
+  ALBListenerArn:
+    Description: 'ARN of the ALB Listener'
+    Value: !Ref ALBListener
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBListenerArn'
+
+  DefaultTargetGroupArn:
+    Description: 'ARN of the Default Target Group'
+    Value: !Ref DefaultTargetGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-DefaultTargetGroupArn'
+
+  ECSSecurityGroupId:
+    Description: 'Security Group ID for ECS Tasks'
+    Value: !Ref ECSSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSSecurityGroupId'
+
+  ALBSecurityGroupId:
+    Description: 'Security Group ID for Application Load Balancer'
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ALBSecurityGroupId'
+
+  ECSLogGroupName:
+    Description: 'Name of the CloudWatch Log Group for ECS Tasks'
+    Value: !Ref ECSLogGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ECSLogGroupName'
+
+  # === 新規: API 層へ渡すための出力 ===
+  GpuCapacityProviderName:
+    Description: 'Capacity Provider name for GPU EC2 nodes'
+    Value: !Ref GPUCapacityProvider
+    Export:
+      Name: !Sub '${AWS::StackName}-GpuCapacityProviderName'

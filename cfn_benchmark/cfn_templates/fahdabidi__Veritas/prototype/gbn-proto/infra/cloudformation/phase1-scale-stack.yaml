@@ -1,0 +1,1043 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  GBN Phase 1 Serverless Scale Test stack.
+  Provisions VPC subnet partitioning (Hostile/Free), ECS Fargate services,
+  Cloud Map discovery, CloudWatch dashboards, and cost guardrails.
+
+Parameters:
+  ScaleTarget:
+    Type: Number
+    Default: 100
+    AllowedValues: [100, 500, 1000]
+    Description: Total relay target for the scale test.
+
+  SeedRelayNoisePrivKey:
+    Type: String
+    Description: 32-byte hex string corresponding to Noise_XX private key for SeedRelay.
+
+  PublisherPrivKeyHex:
+    Type: String
+    Description: 32-byte hex string (ed25519 seed).
+
+  PublisherPubKeyHex:
+    Type: String
+    Description: 32-byte hex string (x25519 pubkey).
+
+  ContainerImageRelay:
+    Type: String
+    Default: ''
+    Description: Optional full relay image URI (e.g. <acct>.dkr.ecr.<region>.amazonaws.com/gbn-phase1/gbn-relay:latest).
+
+  ContainerImagePublisher:
+    Type: String
+    Default: ''
+    Description: Optional full publisher image URI.
+
+  MaxTestDurationHours:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 12
+    Description: Maximum intended lifetime of this test stack (hours). Used for TTL tagging/guardrails.
+
+  BudgetAlarmUsd:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    Description: EstimatedCharges threshold in USD for billing alarm.
+
+  ChaosLambdaS3Bucket:
+    Type: String
+    Default: ''
+    Description: Optional S3 bucket containing chaos-controller.zip.
+
+  ChaosLambdaS3Key:
+    Type: String
+    Default: ''
+    Description: Optional S3 key for chaos-controller.zip.
+
+  SeedRelayKeyName:
+    Type: String
+    Default: ''
+    Description: Optional EC2 key pair name for SSH access to SeedRelay and Publisher.
+
+  AdminCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR for SSH/control-plane access from your client.
+
+Mappings:
+  ScaleConfig:
+    '100':
+      HostileDesired: '90'
+      FreeDesired: '10'
+    '500':
+      HostileDesired: '450'
+      FreeDesired: '50'
+    '1000':
+      HostileDesired: '900'
+      FreeDesired: '100'
+
+Conditions:
+  HasRelayImageOverride: !Not [!Equals [!Ref ContainerImageRelay, '']]
+  HasPublisherImageOverride: !Not [!Equals [!Ref ContainerImagePublisher, '']]
+  HasChaosLambdaS3: !And
+    - !Not [!Equals [!Ref ChaosLambdaS3Bucket, '']]
+    - !Not [!Equals [!Ref ChaosLambdaS3Key, '']]
+  HasSeedRelayKeyName: !Not [!Equals [!Ref SeedRelayKeyName, '']]
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-vpc'
+        - Key: TTLHours
+          Value: !Ref MaxTestDurationHours
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-igw'
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-public-rt'
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  HostileSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/23
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-hostile-subnet'
+        - Key: SubnetClass
+          Value: HostileSubnet
+
+  FreeSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-free-subnet'
+        - Key: SubnetClass
+          Value: FreeSubnet
+
+  HostileSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref HostileSubnet
+
+  FreeSubnetRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTable
+      SubnetId: !Ref FreeSubnet
+
+  RelaySecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Relay/Creator east-west traffic within test VPC
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 4001
+          ToPort: 4001
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminCidr
+        # Phase 2: onion relay port (VPC-internal only)
+        - IpProtocol: tcp
+          FromPort: 9001
+          ToPort: 9001
+          CidrIp: 10.0.0.0/16
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-relay-sg'
+
+  PublisherSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Publisher ingress restricted to FreeSubnet only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 4001
+          ToPort: 4001
+          CidrIp: 10.0.3.0/24
+        - IpProtocol: icmp
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AdminCidr
+        # Phase 2: mpub-receiver port - FreeSubnet exit relays only (enforces geofence)
+        - IpProtocol: tcp
+          FromPort: 7001
+          ToPort: 7001
+          CidrIp: 10.0.3.0/24
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-publisher-sg'
+
+  EcrRepositoryRelay:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${AWS::StackName}-gbn-relay'
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 50 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 50
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+  EcrRepositoryPublisher:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${AWS::StackName}-gbn-publisher'
+      ImageTagMutability: MUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 50 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 50
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+
+  Ec2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2InstanceRole
+
+  SeedRelayInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.small
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-default-x86_64}}'
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      KeyName: !If [HasSeedRelayKeyName, !Ref SeedRelayKeyName, !Ref AWS::NoValue]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 20
+            DeleteOnTermination: true
+      SubnetId: !Ref HostileSubnet
+      PrivateIpAddress: 10.0.1.10
+      SecurityGroupIds:
+        - !Ref RelaySecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-seed-relay'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf update -y
+          dnf install -y docker awscli amazon-ssm-agent
+          systemctl daemon-reload
+          systemctl enable --now amazon-ssm-agent
+          systemctl enable --now docker
+
+          for i in $(seq 1 10); do
+            aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com && break
+            sleep 5
+          done
+
+          cat >/usr/local/bin/gbn-start-seed-relay.sh <<'EOF'
+          #!/bin/bash
+          set -euxo pipefail
+          aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+          IMAGE_URI="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}-gbn-relay:latest"
+          if [ -n "${ContainerImageRelay}" ]; then IMAGE_URI="${ContainerImageRelay}"; fi
+          docker pull "$IMAGE_URI"
+          docker rm -f gbn-seed-relay || true
+          docker run -d --restart always --name gbn-seed-relay --network host \
+            -e GBN_ROLE=relay \
+            -e GBN_P2P_PORT=4001 \
+            -e GBN_ONION_PORT=9001 \
+            -e GBN_CONTROL_PORT=5050 \
+            -e GBN_INSTANCE_IPV4=10.0.1.10 \
+            -e GBN_SUBNET_TAG=HostileSubnet \
+            -e GBN_NOISE_PRIVKEY_HEX=${SeedRelayNoisePrivKey} \
+            -e GBN_PUBLISHER_IP=10.0.3.10 \
+            -e GBN_PUBLISHER_PUBKEY_HEX=${PublisherPubKeyHex} \
+            -e RUST_LOG=info \
+            "$IMAGE_URI"
+          EOF
+          chmod +x /usr/local/bin/gbn-start-seed-relay.sh
+
+          cat >/etc/systemd/system/gbn-seed-relay.service <<'EOF'
+          [Unit]
+          Description=GBN Seed Relay Container
+          After=network-online.target docker.service
+          Wants=network-online.target
+          Requires=docker.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/bin/gbn-start-seed-relay.sh
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable --now gbn-seed-relay.service
+
+  PublisherInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: SeedRelayInstance
+    Properties:
+      InstanceType: t3.small
+      ImageId: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-default-x86_64}}'
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      KeyName: !If [HasSeedRelayKeyName, !Ref SeedRelayKeyName, !Ref AWS::NoValue]
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeType: gp3
+            VolumeSize: 20
+            DeleteOnTermination: true
+      SubnetId: !Ref FreeSubnet
+      PrivateIpAddress: 10.0.3.10
+      SecurityGroupIds:
+        - !Ref PublisherSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}-publisher'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+          dnf update -y
+          dnf install -y docker awscli amazon-ssm-agent
+          systemctl daemon-reload
+          systemctl enable --now amazon-ssm-agent
+          systemctl enable --now docker
+
+          for i in $(seq 1 10); do
+            aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com && break
+            sleep 5
+          done
+
+          cat >/usr/local/bin/gbn-start-publisher.sh <<'EOF'
+          #!/bin/bash
+          set -euxo pipefail
+          aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com
+          IMAGE_URI="${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${AWS::StackName}-gbn-relay:latest"
+          if [ -n "${ContainerImageRelay}" ]; then IMAGE_URI="${ContainerImageRelay}"; fi
+          docker pull "$IMAGE_URI"
+          docker rm -f gbn-publisher || true
+          docker run -d --restart always --name gbn-publisher --network host \
+            -e GBN_ROLE=publisher \
+            -e GBN_P2P_PORT=4001 \
+            -e GBN_MPUB_PORT=7001 \
+            -e GBN_CONTROL_PORT=5050 \
+            -e GBN_SEED_IPS=${SeedRelayInstance.PrivateIp}:4001 \
+            -e GBN_INSTANCE_IPV4=10.0.3.10 \
+            -e GBN_SUBNET_TAG=PublisherNode \
+            -e GBN_PUBLISHER_KEY_HEX=${PublisherPrivKeyHex} \
+            -e RUST_LOG=info \
+            "$IMAGE_URI"
+          EOF
+          chmod +x /usr/local/bin/gbn-start-publisher.sh
+
+          cat >/etc/systemd/system/gbn-publisher.service <<'EOF'
+          [Unit]
+          Description=GBN Publisher Container
+          After=network-online.target docker.service
+          Wants=network-online.target
+          Requires=docker.service
+
+          [Service]
+          Type=oneshot
+          RemainAfterExit=yes
+          ExecStart=/usr/local/bin/gbn-start-publisher.sh
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable --now gbn-publisher.service
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${AWS::StackName}-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: TTLHours
+          Value: !Ref MaxTestDurationHours
+
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ecs/${AWS::StackName}/gbn'
+      RetentionInDays: 14
+
+  EcsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: GbnExecutionSsmPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Required so ECS can inject GBN_PUBLISHER_KEY_HEX from SSM Secrets
+              # at task launch (AmazonECSTaskExecutionRolePolicy does not include SSM access)
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/gbn/proto/*'
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GbnScaleTaskPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - servicediscovery:DiscoverInstances
+                  - servicediscovery:GetNamespace
+                  - servicediscovery:GetService
+                  - servicediscovery:RegisterInstance
+                  - servicediscovery:DeregisterInstance
+                Resource: '*'
+              # Phase 2: Publisher reads private key from SSM Parameter Store
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/gbn/proto/*'
+
+  ChaosLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ChaosEngineEcsControl
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                  - ecs:StopTask
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-chaos-controller'
+
+  ChaosControllerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-chaos-controller'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ChaosLambdaRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Code: !If
+        - HasChaosLambdaS3
+        - S3Bucket: !Ref ChaosLambdaS3Bucket
+          S3Key: !Ref ChaosLambdaS3Key
+        - ZipFile: |
+            import json
+            import os
+            import random
+            import time
+            import boto3
+
+            ecs = boto3.client("ecs")
+            lambda_client = boto3.client("lambda")
+
+            def _env_float(name, default):
+                try:
+                    return float(os.environ.get(name, str(default)))
+                except (TypeError, ValueError):
+                    return default
+
+            def _targets_for_service(cluster_name, service_name, churn_rate):
+                task_arns = ecs.list_tasks(cluster=cluster_name, serviceName=service_name).get("taskArns", [])
+                if not task_arns:
+                    return []
+                churn_rate = max(0.0, min(1.0, churn_rate))
+                kill_count = int(len(task_arns) * churn_rate)
+                if kill_count <= 0:
+                    return []
+                return random.sample(task_arns, k=min(kill_count, len(task_arns)))
+
+            def _apply_churn(cluster_name, hostile_service, free_service, hostile_rate, free_rate):
+                stopped = {"hostile": [], "free": []}
+                for arn in _targets_for_service(cluster_name, hostile_service, hostile_rate):
+                    ecs.stop_task(cluster=cluster_name, task=arn, reason="ChaosEngine-Hostile")
+                    stopped["hostile"].append(arn)
+                for arn in _targets_for_service(cluster_name, free_service, free_rate):
+                    ecs.stop_task(cluster=cluster_name, task=arn, reason="ChaosEngine-Free")
+                    stopped["free"].append(arn)
+                return stopped
+
+            def handler(event, context):
+                event = event or {}
+                cluster_name = os.environ["CLUSTER_NAME"]
+                hostile_service = os.environ.get("HOSTILE_SERVICE_NAME", "HostileRelayService")
+                free_service = os.environ.get("FREE_SERVICE_NAME", "FreeRelayService")
+                hostile_rate = _env_float("HOSTILE_CHURN_RATE", 0.4)
+                free_rate = _env_float("FREE_CHURN_RATE", 0.2)
+                delay_seconds = int(os.environ.get("DELAY_SECONDS", "30"))
+                is_delayed = bool(event.get("delayed", False))
+
+                if is_delayed:
+                    time.sleep(max(0, delay_seconds))
+
+                stopped = _apply_churn(cluster_name, hostile_service, free_service, hostile_rate, free_rate)
+
+                if not is_delayed:
+                    lambda_client.invoke(
+                        FunctionName=context.invoked_function_arn,
+                        InvocationType="Event",
+                        Payload=json.dumps({"delayed": True}).encode("utf-8"),
+                    )
+
+                return {
+                    "ok": True,
+                    "mode": "delayed" if is_delayed else "scheduled",
+                    "hostile_stopped": len(stopped["hostile"]),
+                    "free_stopped": len(stopped["free"]),
+                }
+      Environment:
+        Variables:
+          CLUSTER_NAME: !Ref ECSCluster
+          HOSTILE_SERVICE_NAME: !GetAtt HostileRelayService.Name
+          FREE_SERVICE_NAME: !GetAtt FreeRelayService.Name
+          HOSTILE_CHURN_RATE: '0.4'
+          FREE_CHURN_RATE: '0.2'
+          DELAY_SECONDS: '30'
+
+  ChaosEngineRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-chaos-engine'
+      Description: GBN chaos-engine scheduler (disabled by default)
+      ScheduleExpression: rate(1 minute)
+      State: DISABLED
+      Targets:
+        - Arn: !GetAtt ChaosControllerLambda.Arn
+          Id: ChaosControllerLambdaTarget
+
+  ChaosEngineRuleInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ChaosControllerLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ChaosEngineRule.Arn
+
+  CreatorTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-creator'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: creator
+          Image: !If
+            - HasRelayImageOverride
+            - !Ref ContainerImageRelay
+            - !Sub '${EcrRepositoryRelay.RepositoryUri}:latest'
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: creator
+          Environment:
+            - Name: GBN_ROLE
+              Value: creator
+            - Name: GBN_SUBNET_TAG
+              Value: CreatorNode
+            - Name: GBN_DISCOVERY_MODE
+              Value: static
+            - Name: GBN_SEED_IPS
+              Value: !Sub '${SeedRelayInstance.PrivateIp}:4001'
+            - Name: GBN_PUBLISHER_IP
+              Value: 10.0.3.10
+            - Name: GBN_PUBLISHER_PUBKEY_HEX
+              Value: !Ref PublisherPubKeyHex
+            - Name: GBN_SCALE
+              Value: !Ref ScaleTarget
+            - Name: GBN_P2P_PORT
+              Value: '4001'
+            - Name: GBN_REBOOTSTRAP_INTERVAL_SECS
+              Value: '20'
+            # Phase 2: circuit build parameters
+            - Name: GBN_CIRCUIT_DELAY_SECS
+              Value: '120'
+            - Name: GBN_CIRCUIT_PATHS
+              Value: '1'
+            - Name: GBN_CIRCUIT_HOPS
+              Value: '1'
+            - Name: GBN_UPLOAD_SIZE_BYTES
+              Value: '1048576'
+            - Name: GBN_ONION_PORT
+              Value: '9001'
+
+  RelayTaskDefinitionHostile:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-relay-hostile'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: relay
+          Image: !If
+            - HasRelayImageOverride
+            - !Ref ContainerImageRelay
+            - !Sub '${EcrRepositoryRelay.RepositoryUri}:latest'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 4001
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: relay-hostile
+          Environment:
+            - Name: GBN_ROLE
+              Value: relay
+            - Name: GBN_SUBNET_TAG
+              Value: HostileSubnet
+            - Name: GBN_DISCOVERY_MODE
+              Value: static
+            - Name: GBN_SEED_IPS
+              Value: !Sub '${SeedRelayInstance.PrivateIp}:4001'
+            - Name: GBN_SCALE
+              Value: !Ref ScaleTarget
+            - Name: GBN_P2P_PORT
+              Value: '4001'
+            - Name: GBN_REBOOTSTRAP_INTERVAL_SECS
+              Value: '20'
+            # Phase 2: onion relay port (HostileSubnet middle/guard relays)
+            - Name: GBN_ONION_PORT
+              Value: '9001'
+          PortMappings:
+            - ContainerPort: 4001
+              Protocol: tcp
+            - ContainerPort: 9001
+              Protocol: tcp
+
+  RelayTaskDefinitionFree:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${AWS::StackName}-relay-free'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt EcsExecutionRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: relay
+          Image: !If
+            - HasRelayImageOverride
+            - !Ref ContainerImageRelay
+            - !Sub '${EcrRepositoryRelay.RepositoryUri}:latest'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 4001
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: relay-free
+          Environment:
+            - Name: GBN_ROLE
+              Value: relay
+            - Name: GBN_SUBNET_TAG
+              Value: FreeSubnet
+            - Name: GBN_DISCOVERY_MODE
+              Value: static
+            - Name: GBN_SEED_IPS
+              Value: !Sub '${SeedRelayInstance.PrivateIp}:4001'
+            - Name: GBN_SCALE
+              Value: !Ref ScaleTarget
+            - Name: GBN_P2P_PORT
+              Value: '4001'
+            - Name: GBN_REBOOTSTRAP_INTERVAL_SECS
+              Value: '20'
+            # Phase 2: onion relay port (FreeSubnet exit relays)
+            - Name: GBN_ONION_PORT
+              Value: '9001'
+          PortMappings:
+            - ContainerPort: 4001
+              Protocol: tcp
+            - ContainerPort: 9001
+              Protocol: tcp
+
+  HostileRelayService:
+    Type: AWS::ECS::Service
+    DependsOn: SeedRelayInstance
+    Properties:
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref RelayTaskDefinitionHostile
+      DesiredCount: 0
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref HostileSubnet]
+          SecurityGroups: [!Ref RelaySecurityGroup]
+
+  FreeRelayService:
+    Type: AWS::ECS::Service
+    DependsOn: SeedRelayInstance
+    Properties:
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref RelayTaskDefinitionFree
+      DesiredCount: 0
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref FreeSubnet]
+          SecurityGroups: [!Ref RelaySecurityGroup]
+
+  CreatorService:
+    Type: AWS::ECS::Service
+    DependsOn: SeedRelayInstance
+    Properties:
+      Cluster: !Ref ECSCluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref CreatorTaskDefinition
+      DesiredCount: 0
+      EnableExecuteCommand: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [!Ref HostileSubnet]
+          SecurityGroups: [!Ref RelaySecurityGroup]
+
+  BillingAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub '${AWS::StackName} Billing Alerts'
+
+  BillingAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-estimated-charges'
+      AlarmDescription: !Sub 'Estimated charges exceeded $${BudgetAlarmUsd} for scale test stack.'
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Dimensions:
+        - Name: Currency
+          Value: USD
+      Statistic: Maximum
+      Period: 21600
+      EvaluationPeriods: 1
+      Threshold: !Ref BudgetAlarmUsd
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref BillingAlarmTopic
+
+  ProtocolMetricsDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-protocol-metrics'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "BootstrapResult (Blackhole/Active)",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [["GBN/ScaleTest","BootstrapResult"]]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "GossipBandwidthBytes",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [["GBN/ScaleTest","GossipBandwidthBytes"]]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "CircuitBuildResult",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [["GBN/ScaleTest","CircuitBuildResult"]]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "ChunksDelivered",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [["GBN/ScaleTest","ChunksDelivered"]]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "ChunksReassembled (Publisher)",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [["GBN/ScaleTest","ChunksReassembled"],["GBN/ScaleTest","HashMatchResult"]]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "PathDiversityResult (Creator)",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [["GBN/ScaleTest","PathDiversityResult"]]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 18, "width": 12, "height": 6,
+              "properties": {
+                "title": "ChunksReceived (Exit Relays → Publisher)",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [["GBN/ScaleTest","ChunksReceived"]]
+              }
+            }
+          ]
+        }
+
+  HarnessHealthDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-harness-health'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "ECS Running Tasks",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [["AWS/ECS","RunningTaskCount","ClusterName","${ECSCluster}"]]
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "ECS Pending Tasks",
+                "view": "timeSeries",
+                "region": "${AWS::Region}",
+                "metrics": [["AWS/ECS","PendingTaskCount","ClusterName","${ECSCluster}"]]
+              }
+            }
+          ]
+        }
+
+Outputs:
+  VpcId:
+    Description: VPC for phase1 scale test
+    Value: !Ref VPC
+
+  HostileSubnetId:
+    Description: Hostile subnet ID
+    Value: !Ref HostileSubnet
+
+  FreeSubnetId:
+    Description: Free subnet ID
+    Value: !Ref FreeSubnet
+
+  ECSClusterName:
+    Description: ECS cluster name
+    Value: !Ref ECSCluster
+
+  ECRUriRelay:
+    Description: ECR URI for relay images
+    Value: !GetAtt EcrRepositoryRelay.RepositoryUri
+
+  ECRUriPublisher:
+    Description: ECR URI for publisher images
+    Value: !GetAtt EcrRepositoryPublisher.RepositoryUri
+
+  BillingAlarmName:
+    Description: Billing alarm name
+    Value: !Ref BillingAlarm
+
+  ChaosLambdaName:
+    Description: Chaos controller lambda function name
+    Value: !Ref ChaosControllerLambda
+
+  ChaosEngineRuleName:
+    Description: EventBridge rule name for chaos engine (disabled by default)
+    Value: !Ref ChaosEngineRule
+
+  CostGuardrailNote:
+    Description: Reminder for stack policy/TTL enforcement
+    Value: !Sub 'Apply a stack policy on create/update and tear down within ${MaxTestDurationHours}h.'

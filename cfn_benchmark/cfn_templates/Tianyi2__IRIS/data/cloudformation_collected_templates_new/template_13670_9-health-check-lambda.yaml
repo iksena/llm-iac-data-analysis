@@ -1,0 +1,233 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Health Check Lambda - Tests endpoints in both regions via Transit Gateway
+
+Parameters:
+  VpcId:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /app-failover/vpc-id-us-east-1
+  PrivateSubnet1:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /app-failover/private-subnet-1-us-east-1
+  PrivateSubnet2:
+    Type: AWS::SSM::Parameter::Value<String>
+    Default: /app-failover/private-subnet-2-us-east-1
+
+Resources:
+  HealthCheckSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: HealthCheckLambdaSG
+      GroupDescription: Security group for health check Lambda
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to endpoints in both regions
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP to endpoints in both regions
+
+  HealthCheckRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: HealthCheckLambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: HealthCheckPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - route53-recovery-cluster:*
+                  - route53-recovery-control-config:*
+                  - cloudwatch:PutMetricData
+                  - lambda:InvokeFunction
+                Resource: '*'
+
+  HealthCheckFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: MultiRegionHealthCheck
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt HealthCheckRole.Arn
+      Timeout: 60
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref HealthCheckSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          ENDPOINTS_US_EAST_1: "https://app1.internal.example.com,https://app2.internal.example.com"
+          ENDPOINTS_US_WEST_2: "https://app1.internal.example.com,https://app2.internal.example.com"
+          FAILOVER_LAMBDA: TriggerFailover
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import urllib3
+          from datetime import datetime
+
+          http = urllib3.PoolManager()
+          cloudwatch = boto3.client('cloudwatch')
+
+          def check_endpoint(url, region):
+              """Check if endpoint is reachable and healthy"""
+              try:
+                  response = http.request('GET', url, timeout=5.0)
+                  healthy = response.status == 200
+                  latency = 0  # Could measure actual latency
+
+                  return {
+                      'url': url,
+                      'region': region,
+                      'healthy': healthy,
+                      'status_code': response.status,
+                      'latency_ms': latency
+                  }
+              except Exception as e:
+                  return {
+                      'url': url,
+                      'region': region,
+                      'healthy': False,
+                      'error': str(e),
+                      'latency_ms': 0
+                  }
+
+          def publish_metrics(results):
+              """Publish health check results to CloudWatch"""
+              for result in results:
+                  cloudwatch.put_metric_data(
+                      Namespace='MultiRegionHealthCheck',
+                      MetricData=[
+                          {
+                              'MetricName': 'EndpointHealth',
+                              'Value': 1 if result['healthy'] else 0,
+                              'Unit': 'None',
+                              'Timestamp': datetime.utcnow(),
+                              'Dimensions': [
+                                  {'Name': 'Region', 'Value': result['region']},
+                                  {'Name': 'Endpoint', 'Value': result['url']}
+                              ]
+                          }
+                      ]
+                  )
+
+          def lambda_handler(event, context):
+              # Get endpoints from environment
+              endpoints_east = os.environ.get('ENDPOINTS_US_EAST_1', '').split(',')
+              endpoints_west = os.environ.get('ENDPOINTS_US_WEST_2', '').split(',')
+
+              results = []
+
+              # Check us-east-1 endpoints
+              for url in endpoints_east:
+                  if url:
+                      results.append(check_endpoint(url, 'us-east-1'))
+
+              # Check us-west-2 endpoints (via Transit Gateway)
+              for url in endpoints_west:
+                  if url:
+                      results.append(check_endpoint(url, 'us-west-2'))
+
+              # Publish metrics
+              publish_metrics(results)
+
+              # Determine if failover needed
+              east_healthy = sum(1 for r in results if r['region'] == 'us-east-1' and r['healthy'])
+              west_healthy = sum(1 for r in results if r['region'] == 'us-west-2' and r['healthy'])
+
+              east_total = len([r for r in results if r['region'] == 'us-east-1'])
+              west_total = len([r for r in results if r['region'] == 'us-west-2'])
+
+              # Check which region is currently active
+              ssm = boto3.client('ssm', region_name='us-east-1')
+              control1 = ssm.get_parameter(Name='/app-failover/arc-control-us-east-1')['Parameter']['Value']
+              cluster = ssm.get_parameter(Name='/app-failover/arc-cluster')['Parameter']['Value']
+
+              config = boto3.client('route53-recovery-control-config', region_name='us-west-2')
+              cluster_info = config.describe_cluster(ClusterArn=cluster)
+              endpoint = cluster_info['Cluster']['ClusterEndpoints'][0]['Endpoint']
+
+              import re
+              region_match = re.search(r'\.([a-z]{2}-[a-z]+-\d)\.amazonaws\.com', endpoint)
+              endpoint_region = region_match.group(1) if region_match else 'us-east-1'
+
+              arc = boto3.client('route53-recovery-cluster', endpoint_url=endpoint, region_name=endpoint_region)
+              state1 = arc.get_routing_control_state(RoutingControlArn=control1)['RoutingControlState']
+
+              active_region = 'us-east-1' if state1 == 'On' else 'us-west-2'
+
+              # Decision: Failover if active region has < 50% healthy endpoints
+              should_failover = False
+              if active_region == 'us-east-1' and east_total > 0:
+                  health_percentage = (east_healthy / east_total) * 100
+                  should_failover = health_percentage < 50
+              elif active_region == 'us-west-2' and west_total > 0:
+                  health_percentage = (west_healthy / west_total) * 100
+                  should_failover = health_percentage < 50
+
+              response = {
+                  'timestamp': datetime.utcnow().isoformat(),
+                  'active_region': active_region,
+                  'us_east_1': {'healthy': east_healthy, 'total': east_total},
+                  'us_west_2': {'healthy': west_healthy, 'total': west_total},
+                  'should_failover': should_failover,
+                  'results': results
+              }
+
+              # Trigger failover if needed
+              if should_failover:
+                  print(f"Health check failed in {active_region}. Triggering failover...")
+                  lambda_client = boto3.client('lambda')
+                  lambda_client.invoke(
+                      FunctionName=os.environ['FAILOVER_LAMBDA'],
+                      InvocationType='Event'
+                  )
+                  response['action'] = 'failover_triggered'
+
+              return response
+
+  HealthCheckSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: MultiRegionHealthCheckSchedule
+      Description: Run health checks every 1 minute
+      ScheduleExpression: rate(1 minute)
+      State: DISABLED  # Start disabled
+      Targets:
+        - Arn: !GetAtt HealthCheckFunction.Arn
+          Id: HealthCheckTarget
+
+  HealthCheckPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HealthCheckFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HealthCheckSchedule.Arn
+
+Outputs:
+  HealthCheckFunctionName:
+    Value: !Ref HealthCheckFunction
+  HealthCheckScheduleName:
+    Value: !Ref HealthCheckSchedule
+  Instructions:
+    Value: "1. Update ENDPOINTS_* env vars with actual URLs. 2. Ensure private hosted zones are associated with both VPCs or use Route 53 Resolver. 3. Enable schedule when ready."

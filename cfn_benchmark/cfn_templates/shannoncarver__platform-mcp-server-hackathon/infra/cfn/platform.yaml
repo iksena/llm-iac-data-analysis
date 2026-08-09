@@ -1,0 +1,204 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  LINQ Platform MCP Server (V1). DynamoDB tables for the user-permissions
+  store and the tool registry, a Lambda fronted by an HTTP API v2 with
+  AWS_IAM auth, and a CloudWatch Logs group for the per-request audit
+  records. Per ADR 0025.
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    Description: API Gateway stage name.
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    MemorySize: 512
+    Timeout: 30
+    Architectures:
+      - arm64
+    Environment:
+      Variables:
+        USER_PERMISSIONS_TABLE_NAME: !Ref UserPermissionsTable
+        TOOL_REGISTRY_TABLE_NAME: !Ref ToolRegistryTable
+        NODE_OPTIONS: "--enable-source-maps"
+
+Resources:
+  # ---------- DynamoDB ----------
+
+  UserPermissionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: platform_mcp_user_permissions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_email
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: linq:purpose
+          Value: platform-mcp-user-permissions
+
+  ToolRegistryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: platform_mcp_tool_registry
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: toolId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: toolId
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: linq:purpose
+          Value: platform-mcp-tool-registry
+
+  # ---------- CloudWatch Logs (audit sink) ----------
+
+  AuditLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: /linq/platform-mcp/audit
+      RetentionInDays: 90
+
+  # ---------- Lambda + IAM ----------
+
+  PlatformMcpLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: platform-mcp-server
+      Description: LINQ Platform MCP Server entry handler.
+      CodeUri: ../../
+      Handler: index.handler
+      ReservedConcurrentExecutions: 10
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Scan
+                - dynamodb:Query
+              Resource:
+                - !GetAtt UserPermissionsTable.Arn
+                - !GetAtt ToolRegistryTable.Arn
+            - Effect: Allow
+              Action:
+                - logs:CreateLogStream
+                - logs:PutLogEvents
+              Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/linq/platform-mcp/audit:*"
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              # Permits the Lambda to read per-handler OAuth client
+              # credentials. Each registered handler family (erp, crm, dwh,
+              # support) gets its own secret under platform-mcp/<family>/...
+              # The values are populated post-deploy by scripts/seed-jwt-secret.ts
+              # from the per-product CFN stack outputs (Cognito client_id,
+              # client_secret, token_endpoint, etc.). Cross-account `execute-api:Invoke`
+              # is intentionally NOT granted — auth on the cross-account hop
+              # is JWT (Bearer) over public HTTPS, not SigV4 + AWS_IAM.
+              # NOTE: this `https-jwt` secret-grant does NOT cover the
+              # `lambda-direct` Auth0 handler — that handler reads its own
+              # secret. The grant below covers `lambda-direct` instead.
+              Resource:
+                - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:platform-mcp/*"
+            # `lambda-direct` dispatch pattern — in-account synchronous
+            # Lambda Invoke. Used for platform-team-owned handlers (the
+            # Auth0 management handler is the first such handler). Distinct
+            # from the `secretsmanager:GetSecretValue` grant above, which
+            # is only used by the `https-jwt` cross-account dispatcher.
+            # Function name is hardcoded via !Sub: same-account /
+            # same-region / stable name keeps this independent of the
+            # Auth0 stack's deploy order. See docs/dispatch-patterns.md.
+            - Effect: Allow
+              Action:
+                - lambda:InvokeFunction
+              Resource:
+                - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:auth0-handler-platform-mcp"
+      Events:
+        JsonRpc:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref PlatformMcpApi
+            Method: POST
+            Path: /jsonrpc
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: cjs
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - src/index.ts
+
+  # ---------- API Gateway HTTP API v2 (AWS_IAM auth on /jsonrpc) ----------
+
+  PlatformMcpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref StageName
+      Auth:
+        Authorizers: {}
+        # Default authorization: AWS_IAM. Routes that opt out would set
+        # AuthorizationType: NONE explicitly. Our only route (/jsonrpc)
+        # inherits this default.
+        DefaultAuthorizer: AWS_IAM
+        EnableIamAuthorizer: true
+      AccessLogSettings:
+        DestinationArn: !GetAtt AccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","userArn":"$context.authorizer.iam.userArn","status":"$context.status","integrationStatus":"$context.integrationStatus","latency":"$context.responseLatency"}
+
+  AccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: /linq/platform-mcp/access
+      RetentionInDays: 30
+
+Outputs:
+  PlatformMcpApiUrl:
+    Description: Base URL for the Platform MCP HTTP API.
+    Value: !Sub "https://${PlatformMcpApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+    Export:
+      Name: PlatformMcpApiUrl
+
+  PlatformMcpLambdaRoleArn:
+    Description: IAM role ARN that the Platform MCP Lambda assumes. Use this in the per-product API Gateway resource policies.
+    Value: !GetAtt PlatformMcpLambdaRole.Arn
+    Export:
+      Name: PlatformMcpLambdaRoleArn
+
+  UserPermissionsTableName:
+    Description: Name of the user-permissions DynamoDB table.
+    Value: !Ref UserPermissionsTable
+    Export:
+      Name: PlatformMcpUserPermissionsTable
+
+  ToolRegistryTableName:
+    Description: Name of the tool-registry DynamoDB table.
+    Value: !Ref ToolRegistryTable
+    Export:
+      Name: PlatformMcpToolRegistryTable

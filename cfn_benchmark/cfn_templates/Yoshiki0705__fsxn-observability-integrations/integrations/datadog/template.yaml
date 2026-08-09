@@ -1,0 +1,422 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: FSx for ONTAP Datadog Integration - Serverless audit log shipping via S3 Access Point
+
+Parameters:
+  FsxS3AccessPointArn:
+    Type: String
+    Description: >-
+      ARN of the FSx for ONTAP S3 Access Point attached to the audit volume.
+      Format: arn:aws:s3:<region>:<account-id>:accesspoint/<name>
+    AllowedPattern: 'arn:aws:s3:[a-z0-9-]+:\d{12}:accesspoint/.+'
+
+  DatadogApiKeySecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing the Datadog API key
+    AllowedPattern: 'arn:aws:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+'
+
+  DatadogSite:
+    Type: String
+    Default: ap1.datadoghq.com
+    AllowedValues:
+      - datadoghq.com
+      - us3.datadoghq.com
+      - us5.datadoghq.com
+      - datadoghq.eu
+      - ap1.datadoghq.com
+      - ap2.datadoghq.com
+      - ddog-gov.com
+    Description: >-
+      Datadog site (determines API endpoint region).
+      US1=datadoghq.com, US3=us3.datadoghq.com, US5=us5.datadoghq.com,
+      EU1=datadoghq.eu, AP1(Tokyo)=ap1.datadoghq.com, AP2=ap2.datadoghq.com,
+      US1-FED=ddog-gov.com
+
+  AuditLogPrefix:
+    Type: String
+    Default: 'audit/'
+    Description: >-
+      Key prefix for audit log files within the FSx volume
+      (e.g., audit/ for /audit_log directory)
+
+  ScheduleRate:
+    Type: String
+    Default: 'rate(5 minutes)'
+    Description: >-
+      How often to invoke the audit log processor.
+      FSx for ONTAP S3 APs do not support event notifications,
+      so Lambda is invoked on a schedule.
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues:
+      - DEBUG
+      - INFO
+      - WARNING
+      - ERROR
+    Description: Lambda function log level
+
+  Environment:
+    Type: String
+    Default: production
+    Description: Environment tag for Datadog logs (e.g., production, staging, development)
+
+  EnableGzip:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable gzip compression for log payloads
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 3008
+    Description: Lambda function memory size in MB
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+  VpcEnabled:
+    Type: String
+    Default: 'false'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >-
+      Enable VPC configuration for Lambda.
+      Note: Internet-origin FSx for ONTAP S3 APs timed out with only Gateway Endpoints in our testing.
+      If VpcEnabled=true, ensure NAT Gateway is available for S3 AP access.
+
+  VpcSubnetIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Comma-separated list of subnet IDs (required if VpcEnabled=true)
+
+  VpcSecurityGroupIds:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: Comma-separated list of security group IDs (required if VpcEnabled=true)
+
+Conditions:
+  IsVpcEnabled: !Equals [!Ref VpcEnabled, 'true']
+
+Resources:
+  # Dead Letter Queue
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dlq'
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Project
+          Value: fsxn-observability
+        - Key: Vendor
+          Value: datadog
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AccessPointRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${FsxS3AccessPointArn}'
+                  - !Sub '${FsxS3AccessPointArn}/object/*'
+
+        - PolicyName: SecretsManagerRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DatadogApiKeySecretArn
+
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-shipper:*'
+
+        - PolicyName: SQSSendMessage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt DeadLetterQueue.Arn
+
+        - !If
+          - IsVpcEnabled
+          - PolicyName: VpcNetworkInterface
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - ec2:CreateNetworkInterface
+                    - ec2:DescribeNetworkInterfaces
+                    - ec2:DeleteNetworkInterface
+                  Resource: '*'
+          - !Ref AWS::NoValue
+
+  # Lambda Function
+  LogShipperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-shipper'
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Code:
+        ZipFile: |
+          # Placeholder - deploy actual code via CI/CD or S3
+          def lambda_handler(event, context):
+              raise NotImplementedError("Deploy actual handler code")
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          DATADOG_SITE: !Ref DatadogSite
+          API_KEY_SECRET_ARN: !Ref DatadogApiKeySecretArn
+          FSX_S3_ACCESS_POINT_ARN: !Ref FsxS3AccessPointArn
+          AUDIT_LOG_PREFIX: !Ref AuditLogPrefix
+          LOG_LEVEL: !Ref LogLevel
+          DD_SOURCE: fsxn
+          DD_SERVICE: ontap-audit
+          DD_ENV: !Ref Environment
+          ENABLE_GZIP: !Ref EnableGzip
+      VpcConfig: !If
+        - IsVpcEnabled
+        - SubnetIds: !Ref VpcSubnetIds
+          SecurityGroupIds: !Ref VpcSecurityGroupIds
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: fsxn-observability
+        - Key: Vendor
+          Value: datadog
+
+  # EventBridge Scheduler - Periodic audit log processing
+  # FSx for ONTAP S3 APs do not support event notifications,
+  # so Lambda is invoked on a schedule to check for new files.
+  AuditSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-scheduler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt LogShipperFunction.Arn
+
+  AuditProcessorSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${AWS::StackName}-audit-processor'
+      Description: Periodically invoke Lambda to process new FSx for ONTAP audit log files
+      ScheduleExpression: !Ref ScheduleRate
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: ENABLED
+      Target:
+        Arn: !GetAtt LogShipperFunction.Arn
+        RoleArn: !GetAtt AuditSchedulerRole.Arn
+        Input: !Sub '{"source": "scheduler", "action": "process_audit_logs", "prefix": "${AuditLogPrefix}"}'
+
+  # CloudWatch Log Group
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-shipper'
+      RetentionInDays: 30
+
+  # CloudWatch Alarm - Errors
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-errors'
+      AlarmDescription: FSx for ONTAP Datadog log shipper error rate exceeded threshold
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LogShipperFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm - Throttles
+  ThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-throttles'
+      AlarmDescription: FSx for ONTAP Datadog log shipper throttling detected
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LogShipperFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # CloudWatch Alarm - DLQ Messages
+  DLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-dlq-messages'
+      AlarmDescription: Messages appearing in Dead Letter Queue
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # ============================================================
+  # CloudWatch Dashboard — Operational Health
+  # ============================================================
+  OperationalDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-health'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda Errors & Throttles",
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${LogShipperFunction}", {"color": "#d62728"}],
+                  ["AWS/Lambda", "Throttles", "FunctionName", "${LogShipperFunction}", {"color": "#ff7f0e"}]
+                ],
+                "period": 300, "stat": "Sum", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda Duration (ms)",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${LogShipperFunction}", {"stat": "Average"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${LogShipperFunction}", {"stat": "Maximum"}]
+                ],
+                "period": 300, "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda Invocations",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${LogShipperFunction}"]
+                ],
+                "period": 300, "stat": "Sum", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "DLQ Depth",
+                "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${DeadLetterQueue.QueueName}", {"color": "#d62728"}]
+                ],
+                "period": 300, "stat": "Maximum", "region": "${AWS::Region}"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  LambdaFunctionArn:
+    Description: ARN of the log shipper Lambda function
+    Value: !GetAtt LogShipperFunction.Arn
+
+  LambdaFunctionName:
+    Description: Name of the log shipper Lambda function
+    Value: !Ref LogShipperFunction
+
+  DeadLetterQueueUrl:
+    Description: URL of the Dead Letter Queue
+    Value: !Ref DeadLetterQueue
+
+  DeadLetterQueueArn:
+    Description: ARN of the Dead Letter Queue
+    Value: !GetAtt DeadLetterQueue.Arn
+
+  ErrorAlarmArn:
+    Description: ARN of the error CloudWatch alarm
+    Value: !GetAtt ErrorAlarm.Arn
+
+  EventBridgeScheduleArn:
+    Description: ARN of the EventBridge Scheduler schedule
+    Value: !GetAtt AuditProcessorSchedule.Arn
+
+  LogGroupName:
+    Description: CloudWatch Log Group name for Lambda execution logs
+    Value: !Sub '/aws/lambda/${AWS::StackName}-shipper'
+
+  DashboardName:
+    Description: CloudWatch Dashboard name for operational health
+    Value: !Sub '${AWS::StackName}-health'

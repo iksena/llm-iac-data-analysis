@@ -1,0 +1,883 @@
+# stacks/apps/networks.yml
+# 200A
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Creates an ECS service for the public Networks web server, along with target
+  group and listener rule for the shared ALB. Also creates an ECS service for
+  the internal Networks Sphinx server, along with a network load balancer, and
+  target groups and listeners for web and Sphinx traffic on the NLB. The NLB
+  and Sphinx service run in the private subnet of the shared VPC. A new TLS
+  certificate is created for the NLB.
+
+Parameters:
+  kWebContainerName:
+    Type: String
+    Default: networks-web
+  kWebApplicationPort:
+    Type: Number
+    Default: 3000
+  kSphinxContainerName:
+    Type: String
+    Default: networks-sphinx
+  kSphinxPort:
+    Type: Number
+    Default: 9312
+  #######
+  NestedChangeSetScrubbingResourcesState: { Type: String }
+  AlbFullName: { Type: String }
+  AlbHttpsListenerArn: { Type: String }
+  EcsClusterArn: { Type: String }
+  EnvironmentType: { Type: String }
+  EnvironmentTypeAbbreviation: { Type: String }
+  EnvironmentTypeLowercase: { Type: String }
+  RegionMode: { Type: String }
+  RootStackName: { Type: String }
+  RootStackId: { Type: String }
+  VpcId: { Type: AWS::EC2::VPC::Id }
+  VpcCidrBlock: { Type: String }
+  VpcIpv6CidrBlocks: { Type: String }
+  EcrImageTag: { Type: AWS::SSM::Parameter::Value<String> }
+  AlbListenerRulePriorityPrefix: { Type: String }
+  VpcPrivateSubnet1Id: { Type: AWS::EC2::Subnet::Id }
+  VpcPrivateSubnet2Id: { Type: AWS::EC2::Subnet::Id }
+  VpcPrivateSubnet3Id: { Type: AWS::EC2::Subnet::Id }
+  S3SigningEndpointUrl: { Type: String }
+  S3SigningAccessKeyId: { Type: String }
+  SharedMemcachedEndpointAddress: { Type: String }
+  SharedMemcachedEndpointPort: { Type: String }
+  EchoServiceToken: { Type: String }
+  SharedMysqlClientSecurityGroupId: { Type: AWS::EC2::SecurityGroup::Id }
+  SharedAuroraMysqlEndpoint: { Type: String }
+  SharedAuroraMysqlPort: { Type: String }
+  PorterJobExecutionSnsTopicArn: { Type: String }
+  NewRelicApiKeyPrxLite: { Type: String }
+  NetworksHostname: { Type: String }
+  NetworksS3BucketArn: { Type: AWS::SSM::Parameter::Value<String> }
+  AnnounceResourcePrefix: { Type: String }
+  ExchangeHostname: { Type: String }
+  ExchangeApiHostname: { Type: String }
+  IdHostname: { Type: String }
+  X8664AsgCapacityProviderName: { Type: String }
+
+Conditions:
+  IsProduction: !Equals [!Ref EnvironmentType, Production]
+  HasAuroraEndpoint: !Not [!Equals [!Ref SharedAuroraMysqlEndpoint, ""]]
+  IsPrimaryRegion: !Equals [!Ref RegionMode, Primary]
+  EnableNestedChangeSetScrubbingResources: !Equals [!Ref NestedChangeSetScrubbingResourcesState, Enabled]
+
+Resources:
+  NestedChangeSetScrubber: { Type: AWS::SNS::Topic, Condition: EnableNestedChangeSetScrubbingResources }
+
+  Constants:
+    Type: Custom::Echo
+    Properties:
+      ServiceToken: !Ref EchoServiceToken
+      SphinxBaseUrl: !Sub https://${Nlb.LoadBalancerName}.${AWS::Region}.prx.tech/
+      VanityNlbDomain: !Sub ${Nlb.LoadBalancerName}.${AWS::Region}.prx.tech
+      NetworksS3BucketName: !Select [5, !Split [":", !Ref NetworksS3BucketArn]]
+      # Provides a namespace for Exchange-specific queues
+      SqsQueuePrefix: !Sub ${AnnounceResourcePrefix}_exchange_
+
+  TaskUser:
+    # TODO Someday when the AWS client within the Networks app has support for
+    # role-based authentication, these policies should be moved into task
+    # roles, and the user should be removed
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action: sns:Publish
+                Effect: Allow
+                Resource: !Ref PorterJobExecutionSnsTopicArn
+                Sid: AllowPorterJobExecution
+            Version: "2012-10-17"
+          PolicyName: Porter
+        - PolicyDocument:
+            Statement:
+              - Action: sqs:SendMessage
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${AnnounceResourcePrefix}*
+                  # TODO Remove this once Exchange is moved to the new cluster
+                  - !Sub arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:Prx3*
+                Sid: AllowSqsSendForEmails
+              - Action: sqs:ListQueues
+                Effect: Allow
+                Resource: "*"
+                Sid: AllowSqsList
+            Version: "2012-10-17"
+          PolicyName: SharedQueues
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - s3:List*
+                Effect: Allow
+                Resource: !Ref NetworksS3BucketArn
+                Sid: AllowBucketActions
+              - Action:
+                  - s3:AbortMultipartUpload
+                  - s3:Delete*
+                  - s3:Get*
+                  - s3:ListMultipartUploadParts
+                  - s3:Put*
+                Effect: Allow
+                Resource: !Sub ${NetworksS3BucketArn}/*
+                Sid: AllowObjectActions
+            Version: "2012-10-17"
+          PolicyName: NetworksBucket
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Network }
+  TaskUserAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref TaskUser
+
+  # INTERNET-FACING WEB SERVER #################################################
+
+  PublicWebHostChangePasswordListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - RedirectConfig:
+            Host: !Ref IdHostname
+            Port: "443"
+            Path: /.well-known/change-password
+            Protocol: HTTPS
+            Query: ""
+            StatusCode: HTTP_302
+          Type: redirect
+      Conditions:
+        - Field: host-header
+          Values:
+            - networks.*
+        - Field: path-pattern
+          Values:
+            - /.well-known/change-password
+      ListenerArn: !Ref AlbHttpsListenerArn
+      Priority: !Join ["", [!Ref AlbListenerRulePriorityPrefix, "10"]]
+  PublicWebHostHeaderSharedAlbListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref PublicWebTargetGroup
+          Type: forward
+      Conditions:
+        - Field: host-header
+          Values:
+            - networks.*
+      ListenerArn: !Ref AlbHttpsListenerArn
+      Priority: !Join ["", [!Ref AlbListenerRulePriorityPrefix, "20"]]
+
+  PublicWebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 15
+      HealthCheckPath: /sessions/new
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      Port: 80
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_networks_public" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+      TargetType: instance
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  PublicWebTargetGroupHttp5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub ERROR [Networks] Web server <${EnvironmentTypeAbbreviation}> RETURNING 5XX ERRORS (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Networks's public-facing Rails server is returning
+        5XX errors from the ECS service to the load balancer.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref AlbFullName
+        - Name: TargetGroup
+          Value: !GetAtt PublicWebTargetGroup.TargetGroupFullName
+      EvaluationPeriods: 1
+      MetricName: HTTPCode_Target_5XX_Count
+      Namespace: AWS/ApplicationELB
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:ops:cloudwatch-log-group-name, Value: !Ref PublicWebTaskLogGroup }
+        - { Key: prx:dev:application, Value: Networks }
+      Threshold: 0
+      TreatMissingData: notBreaching
+
+  # This is the Rails app running in client mode, meaning it will connect to a
+  # remote Sphinx server and run the public-facing web server. It receives
+  # HTTPS traffic via the shared application load balancer.
+  PublicWebEcsService:
+    Type: AWS::ECS::Service
+    Condition: HasAuroraEndpoint # See README
+    Properties:
+      CapacityProviderStrategy:
+        - Base: 0
+          CapacityProvider: !Ref X8664AsgCapacityProviderName
+          Weight: 1
+      Cluster: !Ref EcsClusterArn
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      DesiredCount: !If [IsPrimaryRegion, 2, 0]
+      EnableECSManagedTags: true
+      EnableExecuteCommand: true
+      LoadBalancers:
+        - ContainerName: !Ref kWebContainerName
+          ContainerPort: !Ref kWebApplicationPort
+          TargetGroupArn: !Ref PublicWebTargetGroup
+      PlacementConstraints:
+        - Type: memberOf
+          Expression: attribute:ecs.cpu-architecture == x86_64
+      PropagateTags: TASK_DEFINITION
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+      TaskDefinition: !Ref PublicWebTaskDefinition
+
+  PublicWebTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+  PublicWebExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action: ssm:GetParameters
+                Effect: Allow
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Networks/*
+                Sid: AllowAppParameterRead
+            Version: "2012-10-17"
+          PolicyName: ContainerSecrets
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+  PublicWebTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+        Version: "2012-10-17"
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Effect: Allow
+                Resource: "*"
+                Sid: AllowSsmChannels
+            Version: "2012-10-17"
+          PolicyName: EcsExec
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+  PublicWebTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Command:
+            - web
+          Cpu: !If [IsProduction, 200, 128]
+          Environment:
+            - Name: APP_NAME
+              Value: networks
+            - Name: RAILS_ENV
+              Value: !Ref EnvironmentTypeLowercase
+            - Name: APP_ENV
+              Value: !Ref EnvironmentTypeAbbreviation
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+            - Name: SIGNER_URL
+              Value: !Ref S3SigningEndpointUrl
+            - Name: SIGNER_ACCESS_KEY
+              Value: !Ref S3SigningAccessKeyId
+            - Name: MEMCACHED_PORT_11211_TCP_ADDR
+              Value: !Ref SharedMemcachedEndpointAddress
+            - Name: MEMCACHED_PORT_11211_TCP_PORT
+              Value: !Ref SharedMemcachedEndpointPort
+            - Name: SPHINX_SERVER
+              Value: !GetAtt Constants.VanityNlbDomain
+            - Name: SPHINX_PORT
+              Value: !Ref kSphinxPort
+            - Name: SPHINX_BASE_URL
+              Value: !GetAtt Constants.SphinxBaseUrl
+            - Name: SPHINX_BIN
+              Value: /usr/local/bin
+            - Name: DB_PORT_3306_TCP_ADDR
+              Value: !Ref SharedAuroraMysqlEndpoint
+            - Name: DB_PORT_3306_TCP_PORT
+              Value: !Ref SharedAuroraMysqlPort
+            - Name: DATABASE_POOL_SIZE
+              Value: "5"
+            - Name: LOG_LEVEL
+              Value: !If [IsProduction, INFO, DEBUG]
+            - Name: RAILS_LOG_STDOUT
+              Value: "true"
+            - Name: RAILS_PORT
+              Value: !Ref kWebApplicationPort
+            - Name: PORTER_SNS_TOPIC
+              Value: !Ref PorterJobExecutionSnsTopicArn
+            - Name: SITE_HOST
+              Value: !Ref NetworksHostname
+            - Name: AWS_ACCESS_KEY_ID
+              Value: !Ref TaskUserAccessKey
+            - Name: AWS_SECRET_ACCESS_KEY
+              Value: !GetAtt TaskUserAccessKey.SecretAccessKey
+            - Name: AWS_S3_BUCKET
+              Value: !GetAtt Constants.NetworksS3BucketName
+            - Name: SQS_PREFIX
+              Value: !GetAtt Constants.SqsQueuePrefix
+            - Name: CACHE_STORE
+              Value: mem_cache_store
+            - Name: SSO_BASE_URL
+              Value: !Sub https://${ExchangeHostname}/sso/user/
+            - Name: PRX_API_BASE_URL
+              Value: !Sub https://${ExchangeApiHostname}/
+            - Name: NEW_RELIC_KEY
+              Value: !Ref NewRelicApiKeyPrxLite
+            - Name: NEW_RELIC_NAME
+              Value: !If [IsProduction, Networks Production, Networks Staging]
+          Essential: true
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrImageTag}
+          LinuxParameters:
+            InitProcessEnabled: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref PublicWebTaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Memory: !If [IsProduction, 2000, 1000]
+          MemoryReservation: !If [IsProduction, 1000, 500]
+          Name: !Ref kWebContainerName
+          PortMappings:
+            - ContainerPort: !Ref kWebApplicationPort
+              HostPort: 0
+          Secrets:
+            - Name: DB_ENV_MYSQL_DATABASE
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/database-name
+            - Name: DB_ENV_MYSQL_PASSWORD
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/database-password
+            - Name: DB_ENV_MYSQL_USER
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/database-username
+            - Name: FIXER_API_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/fixer-api-key
+            - Name: FIXER_API_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/fixer-api-secret
+            - Name: INDEX_TOKEN
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/index-token
+            - Name: PRX_API_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/prx-api-key
+            - Name: PUBLIC_URL_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/public-url-secret
+            - Name: RAILS_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/rails-secret
+            - Name: RAILS_SESSION_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/rails-session-secret
+      ExecutionRoleArn: !GetAtt PublicWebExecutionRole.Arn
+      NetworkMode: bridge
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+      TaskRoleArn: !GetAtt PublicWebTaskRole.Arn
+
+  # # INTERNAL SPHINX SERVER #####################################################
+
+  Nlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      IpAddressType: ipv4
+      Scheme: internal
+      Subnets:
+        - !Ref VpcPrivateSubnet1Id
+        - !Ref VpcPrivateSubnet2Id
+        - !Ref VpcPrivateSubnet3Id
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+      Type: network
+
+  # NLBs do not provide a default TLS certificate for their native DNS name, so
+  # to handle TLS traffic, a custom cert and domain must be be used.
+  NlbCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !GetAtt Constants.VanityNlbDomain
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_networks_${Nlb.LoadBalancerName}" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+      ValidationMethod: DNS
+
+  VanityNlbDomainRecordSetGroup:
+    Type: AWS::Route53::RecordSetGroup
+    Properties:
+      Comment: !Sub >-
+        Record sets for dualstack web traffic to the Networks
+        ${EnvironmentType} NLB
+      HostedZoneName: prx.tech.
+      RecordSets:
+        - Type: AAAA
+          Name: !GetAtt Constants.VanityNlbDomain
+          AliasTarget:
+            DNSName: !GetAtt Nlb.DNSName
+            HostedZoneId: !GetAtt Nlb.CanonicalHostedZoneID
+        - Type: A
+          Name: !GetAtt Constants.VanityNlbDomain
+          AliasTarget:
+            DNSName: !GetAtt Nlb.DNSName
+            HostedZoneId: !GetAtt Nlb.CanonicalHostedZoneID
+
+  SphinxServerSearchdTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: Nlb
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 3
+      Port: !Ref kSphinxPort
+      Protocol: TCP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      TargetType: ip
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_networks_searchd" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  SphinxServerSearchdNlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref SphinxServerSearchdTargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref Nlb
+      Port: !Ref kSphinxPort
+      Protocol: TCP
+
+  SphinxServerWebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: Nlb
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPort: !Ref kWebApplicationPort
+      HealthyThresholdCount: 3
+      Port: 80
+      Protocol: TCP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      TargetType: ip
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_networks_sphinx" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  SphinxServerWebNlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      Certificates:
+        - CertificateArn: !Ref NlbCertificate
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref SphinxServerWebTargetGroup
+      LoadBalancerArn: !Ref Nlb
+      Port: 443
+      Protocol: TLS
+      SslPolicy: ELBSecurityPolicy-2016-08
+
+  SphinxServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: >-
+        Allows web and Sphinx traffic into the Sphinx server service, and MySQL
+        traffic out
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - CidrIpv6: ::/0
+          FromPort: 443
+          IpProtocol: tcp
+          ToPort: 443
+        - CidrIp: 0.0.0.0/0
+          FromPort: !Ref SharedAuroraMysqlPort
+          IpProtocol: tcp
+          ToPort: !Ref SharedAuroraMysqlPort
+        - CidrIpv6: ::/0
+          FromPort: !Ref SharedAuroraMysqlPort
+          IpProtocol: tcp
+          ToPort: !Ref SharedAuroraMysqlPort
+      SecurityGroupIngress:
+        - CidrIp: !Ref VpcCidrBlock
+          IpProtocol: tcp
+          FromPort: !Ref kWebApplicationPort
+          ToPort: !Ref kWebApplicationPort
+        - CidrIpv6: !Ref VpcIpv6CidrBlocks
+          IpProtocol: tcp
+          FromPort: !Ref kWebApplicationPort
+          ToPort: !Ref kWebApplicationPort
+        - CidrIp: !Ref VpcCidrBlock
+          IpProtocol: tcp
+          FromPort: !Ref kSphinxPort
+          ToPort: !Ref kSphinxPort
+        - CidrIpv6: !Ref VpcIpv6CidrBlocks
+          IpProtocol: tcp
+          FromPort: !Ref kSphinxPort
+          ToPort: !Ref kSphinxPort
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_networks_sphinx" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+      VpcId: !Ref VpcId
+
+  # This is the Sphinx server. It runs both the Networks Rails app, and the
+  # Sphinx processes for handling search queries and indexing. It recieves
+  # HTTP and Sphinx traffic via the network load balancer (defined in this
+  # template). The LOCAL_SPHINX environment variable is responsible for making
+  # the image act as a Sphinx server.
+  SphinxServerEcsService:
+    Type: AWS::ECS::Service
+    Condition: HasAuroraEndpoint # See README
+    DependsOn:
+      - SphinxServerSearchdNlbListener
+      - SphinxServerWebNlbListener
+    Properties:
+      CapacityProviderStrategy:
+        - Base: 0
+          CapacityProvider: !Ref X8664AsgCapacityProviderName
+          Weight: 1
+      Cluster: !Ref EcsClusterArn
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      DesiredCount: !If [IsPrimaryRegion, 1, 0]
+      EnableECSManagedTags: true
+      EnableExecuteCommand: true
+      LoadBalancers:
+        - ContainerName: !Ref kSphinxContainerName
+          ContainerPort: !Ref kWebApplicationPort
+          TargetGroupArn: !Ref SphinxServerWebTargetGroup
+        - ContainerName: !Ref kSphinxContainerName
+          ContainerPort: !Ref kSphinxPort
+          TargetGroupArn: !Ref SphinxServerSearchdTargetGroup
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !GetAtt SphinxServerSecurityGroup.GroupId
+            - !Ref SharedMysqlClientSecurityGroupId
+          AssignPublicIp: DISABLED
+          Subnets:
+            - !Ref VpcPrivateSubnet1Id
+            - !Ref VpcPrivateSubnet2Id
+            - !Ref VpcPrivateSubnet3Id
+      PlacementConstraints:
+        - Type: memberOf
+          Expression: attribute:ecs.cpu-architecture == x86_64
+      PropagateTags: TASK_DEFINITION
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+      TaskDefinition: !Ref SphinxServerTaskDefinition
+
+  SphinxServerTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+  SphinxServerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action: ssm:GetParameters
+                Effect: Allow
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Networks/*
+                Sid: AllowAppParameterRead
+            Version: "2012-10-17"
+          PolicyName: ContainerSecrets
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+  SphinxServerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+        Version: "2012-10-17"
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Effect: Allow
+                Resource: "*"
+                Sid: AllowSsmChannels
+            Version: "2012-10-17"
+          PolicyName: EcsExec
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+  SphinxServerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Command:
+            - web
+          Cpu: !If [IsProduction, 200, 128]
+          Environment:
+            - Name: LOCAL_SPHINX
+              Value: "true" # Makes the image act as a Sphinx server
+            #####
+            - Name: APP_NAME
+              Value: networks
+            - Name: RAILS_ENV
+              Value: !Ref EnvironmentTypeLowercase
+            - Name: APP_ENV
+              Value: !Ref EnvironmentTypeAbbreviation
+            - Name: SIGNER_URL
+              Value: !Ref S3SigningEndpointUrl
+            - Name: SIGNER_ACCESS_KEY
+              Value: !Ref S3SigningAccessKeyId
+            - Name: MEMCACHED_PORT_11211_TCP_ADDR
+              Value: !Ref SharedMemcachedEndpointAddress
+            - Name: MEMCACHED_PORT_11211_TCP_PORT
+              Value: !Ref SharedMemcachedEndpointPort
+            - Name: SPHINX_SERVER
+              Value: !GetAtt Constants.VanityNlbDomain
+            - Name: SPHINX_PORT
+              Value: !Ref kSphinxPort
+            - Name: SPHINX_BASE_URL
+              Value: !GetAtt Constants.SphinxBaseUrl
+            - Name: SPHINX_BIN
+              Value: /usr/local/bin
+            - Name: DB_PORT_3306_TCP_ADDR
+              Value: !Ref SharedAuroraMysqlEndpoint
+            - Name: DB_PORT_3306_TCP_PORT
+              Value: !Ref SharedAuroraMysqlPort
+            - Name: DATABASE_POOL_SIZE
+              Value: "5"
+            - Name: LOG_LEVEL
+              Value: !If [IsProduction, INFO, DEBUG]
+            - Name: RAILS_LOG_STDOUT
+              Value: "true"
+            - Name: RAILS_PORT
+              Value: !Ref kWebApplicationPort
+            - Name: PORTER_SNS_TOPIC
+              Value: !Ref PorterJobExecutionSnsTopicArn
+            - Name: SITE_HOST
+              Value: !Ref NetworksHostname
+            - Name: AWS_ACCESS_KEY_ID
+              Value: !Ref TaskUserAccessKey
+            - Name: AWS_SECRET_ACCESS_KEY
+              Value: !GetAtt TaskUserAccessKey.SecretAccessKey
+            - Name: AWS_S3_BUCKET
+              Value: !GetAtt Constants.NetworksS3BucketName
+            - Name: SQS_PREFIX
+              Value: !GetAtt Constants.SqsQueuePrefix
+            - Name: CACHE_STORE
+              Value: mem_cache_store
+            - Name: SSO_BASE_URL
+              Value: !Sub https://${ExchangeHostname}/sso/user/
+            - Name: PRX_API_BASE_URL
+              Value: !Sub https://${ExchangeApiHostname}/
+            - Name: NEW_RELIC_KEY
+              Value: !Ref NewRelicApiKeyPrxLite
+            - Name: NEW_RELIC_NAME
+              Value: !If [IsProduction, Networks Production, Networks Staging]
+          Essential: true
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrImageTag}
+          LinuxParameters:
+            InitProcessEnabled: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref SphinxServerTaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Memory: !If [IsProduction, 2000, 1000]
+          MemoryReservation: !If [IsProduction, 1000, 500]
+          Name: !Ref kSphinxContainerName
+          PortMappings:
+            - ContainerPort: !Ref kWebApplicationPort
+            - ContainerPort: !Ref kSphinxPort
+          Secrets:
+            - Name: DB_ENV_MYSQL_DATABASE
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/database-name
+            - Name: DB_ENV_MYSQL_PASSWORD
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/database-password
+            - Name: DB_ENV_MYSQL_USER
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/database-username
+            - Name: FIXER_API_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/fixer-api-key
+            - Name: FIXER_API_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/fixer-api-secret
+            - Name: INDEX_TOKEN
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/index-token
+            - Name: PRX_API_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/prx-api-key
+            - Name: PUBLIC_URL_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/public-url-secret
+            - Name: RAILS_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/rails-secret
+            - Name: RAILS_SESSION_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Networks/rails-session-secret
+      ExecutionRoleArn: !GetAtt SphinxServerExecutionRole.Arn
+      NetworkMode: awsvpc
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Networks }
+      TaskRoleArn: !GetAtt SphinxServerTaskRole.Arn
+
+Outputs:
+  PublicWebTargetGroupFullName:
+    Value: !GetAtt PublicWebTargetGroup.TargetGroupFullName

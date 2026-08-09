@@ -1,0 +1,184 @@
+#
+# Copyright 2020 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+#
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Test stack for Canary lambda removal
+Outputs:
+  CleanupCanaryLambdaArn:
+    Description: Cleanup Canary Lambda Function
+    Value: !GetAtt CleanupCanaryLambdaFunction.Arn
+Resources:
+  CleanupCanaryLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+
+  CleanupCanaryLambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: CleanupCanaryLambdaPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Resource: "*"
+            Action:
+              - "ec2:DescribeNetworkInterfaces"
+          - Effect: Allow
+            Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:*"
+            Action:
+              - "ec2:DeleteNetworkInterface"
+          - Effect: Allow
+            Resource:
+              - !Sub "arn:aws:synthetics:${AWS::Region}:${AWS::AccountId}:canary:*"
+            Action:
+              - "synthetics:DeleteCanary"
+              - "synthetics:GetCanary"
+          - Effect: Allow
+            Resource:
+              - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:*"
+            Action:
+              - "lambda:DeleteFunction"
+      Roles:
+        - Ref: CleanupCanaryLambdaRole
+
+  LoggingCanaryLambdaLambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LoggingCanaryLambdaPolicy
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Resource:
+              - !Join
+                - ":"
+                - - "arn:aws:logs"
+                  - !Ref "AWS::Region"
+                  - !Ref "AWS::AccountId"
+                  - "log-group:/aws/lambda/*"
+            Action:
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+      Roles:
+        - Ref: CleanupCanaryLambdaRole
+
+  CleanupCanaryLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Timeout: 600
+      Description: Invoke a function during stack creation.
+      Runtime: python3.7
+      Role: !GetAtt CleanupCanaryLambdaRole.Arn
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import logging
+          import boto3
+          from random import randint
+
+          from botocore.exceptions import WaiterError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def handler(event, context):
+              canary_names = event['ResourceProperties']['CanaryNames']
+              try:
+                  logger.info(event)
+                  session = boto3.Session()
+                  synthetics_client = session.client('synthetics')
+                  lambda_client = session.client('lambda')
+                  iam_client = session.client('iam')
+                  ec2_client = session.client('ec2')
+                  if event['RequestType'] == 'Delete':
+                      for canary_name in canary_names:
+                          canary_desc = synthetics_client.get_canary(
+                              Name=canary_name
+                          )
+                          lambda_arn = canary_desc["Canary"]["EngineArn"]
+                          eni_ids = []
+                          eni_desc = ec2_client.describe_network_interfaces(
+                              Filters=[
+                                  {
+                                      'Name': 'description',
+                                      'Values': [
+                                          f'AWS Lambda VPC ENI-cwsyn-{canary_name}*',
+                                      ]
+                                  },
+                              ],
+                          )
+                          if eni_desc['NetworkInterfaces']:
+                              eni_ids = [x['NetworkInterfaceId'] for x in eni_desc['NetworkInterfaces']]
+                          else:
+                              raise KeyError(f'Not found ENI for canary {canary_name}')
+                          logger.info(f'Deleting canary: [{canary_name}].')
+                          synthetics_client.delete_canary(
+                              Name=canary_name
+                          )
+                          logger.info(f'Deleting lambda: [{lambda_arn}].')
+                          lambda_client.delete_function(
+                              FunctionName=lambda_arn.rsplit(':',1)[0],
+                          )
+                          for eni_id in eni_ids:
+                              logger.info(f'Deleting eni: [{eni_id}].')
+                              try:
+                                  eni_waiter = ec2_client.get_waiter('network_interface_available')
+                                  eni_waiter.wait(
+                                      NetworkInterfaceIds=[eni_id],
+                                      WaiterConfig={
+                                          'Delay': 10,
+                                          'MaxAttempts': 60
+                                      }
+                                  )
+
+                                  ec2_client.delete_network_interface(
+                                      NetworkInterfaceId=eni_id
+                                  )
+                              except WaiterError:
+                                  pass
+                  send_response(event, context, canary_names, cfnresponse.SUCCESS)
+              except Exception as e:
+                  event['Error'] = str(e)
+                  send_response(event, context, canary_names, cfnresponse.FAILED)
+
+          def send_response(event, context, canary_names, response_status):
+              physical_id = get_physical_id(event)
+              response_data = {'Event': event}
+              cfnresponse.send(event, context, response_status, response_data, physical_id)
+
+          def get_physical_id(event):
+              if event.get('PhysicalResourceId'):
+                  return event['PhysicalResourceId']
+              return f'CustomResource-{random_with_N_digits(5)}'
+
+          def random_with_N_digits(n):
+              range_start = 10 ** (n - 1)
+              range_end = (10 ** n) - 1
+              return randint(range_start, range_end)
+      TracingConfig:
+        Mode: Active

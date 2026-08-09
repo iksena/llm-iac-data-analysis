@@ -1,0 +1,3764 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: 'Backend Stack - Lambda functions, API Gateway, EventBridge, SNS for Hospitality Insights'
+
+Parameters:
+  Environment:
+    Type: String
+    Description: Environment name
+    Default: prod
+
+  ProjectName:
+    Type: String
+    Description: Project name
+    Default: hospitality-insights
+
+  ProjectTag:
+    Type: String
+    Description: Project tag for all resources
+    Default: hospitality-insights
+
+  UserPoolId:
+    Type: String
+    Description: Cognito User Pool ID for API Gateway authorizer
+
+  UserPoolClientId:
+    Type: String
+    Description: Cognito User Pool Client ID
+
+  RawPostsStreamArn:
+    Type: String
+    Description: ARN of RawPosts DynamoDB stream
+
+  AnalysisResultsStreamArn:
+    Type: String
+    Description: ARN of AnalysisResults DynamoDB stream
+
+  TargetCompany:
+    Type: String
+    Default: AnyCompany
+    Description: Replacement company name for demo data scrubbing
+
+  KeywordReplacementsJson:
+    Type: String
+    Default: '{}'
+    Description: >-
+      JSON object mapping source keywords to replacement keywords during scrubbing.
+      Example: {"BrandRewards":"Loyalty Program","PropTech":"PMS"}
+
+Globals:
+  Function:
+    Runtime: python3.14
+    Timeout: 300
+    MemorySize: 512
+    Tracing: Active
+    Tags:
+      Project: !Ref ProjectTag
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        PROJECT_NAME: !Ref ProjectName
+
+Resources:
+  # ============================================================================
+  # Bedrock Application Inference Profile
+  # ============================================================================
+
+  BedrockSonnetApplicationProfile:
+    Type: AWS::Bedrock::ApplicationInferenceProfile
+    Properties:
+      InferenceProfileName: !Ref ProjectName
+      Description: Claude-Sonnet-4.6-profile
+      ModelSource:
+        CopyFrom: !Sub 'arn:aws:bedrock:${AWS::Region}::inference-profile/us.anthropic.claude-sonnet-4-6'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # SNS Topics
+  # ============================================================================
+
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alerts-${Environment}'
+      DisplayName: Hospitality Insights Alerts
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+
+  OutageAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-outage-alerts-${Environment}'
+      DisplayName: Hospitality Insights Outage Alerts
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================================
+  # Step Functions State Machines
+  # ============================================================================
+
+  # Main scraper workflow (scheduled)
+  ScraperWorkflowStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-scraper-workflow-${Environment}'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      TracingConfiguration:
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+      DefinitionString: !Sub |
+        {
+          "Comment": "Complete scraper workflow: scrape -> analyze -> detect alerts",
+          "StartAt": "GetEnabledSources",
+          "States": {
+            "GetEnabledSources": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${ScraperOrchestratorFunction}",
+                "Payload": {
+                  "action": "list_sources"
+                }
+              },
+              "ResultPath": "$.orchestratorResult",
+              "Next": "InvokeScrapersInParallel"
+            },
+            "InvokeScrapersInParallel": {
+              "Type": "Parallel",
+              "Branches": [
+                {
+                  "StartAt": "CheckTwitterEnabled",
+                  "States": {
+                    "CheckTwitterEnabled": {
+                      "Type": "Choice",
+                      "Choices": [
+                        {
+                          "Variable": "$.orchestratorResult.Payload.platforms.twitter",
+                          "BooleanEquals": true,
+                          "Next": "InvokeTwitterScraper"
+                        }
+                      ],
+                      "Default": "TwitterSkipped"
+                    },
+                    "InvokeTwitterScraper": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${ProjectName}-twitter-scraper-${Environment}",
+                        "Payload": {
+                          "sources.$": "$.orchestratorResult.Payload.sources"
+                        }
+                      },
+                      "End": true
+                    },
+                    "TwitterSkipped": {
+                      "Type": "Pass",
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "CheckRedditEnabled",
+                  "States": {
+                    "CheckRedditEnabled": {
+                      "Type": "Choice",
+                      "Choices": [
+                        {
+                          "Variable": "$.orchestratorResult.Payload.platforms.reddit",
+                          "BooleanEquals": true,
+                          "Next": "InvokeRedditScraper"
+                        }
+                      ],
+                      "Default": "RedditSkipped"
+                    },
+                    "InvokeRedditScraper": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${ProjectName}-reddit-scraper-${Environment}",
+                        "Payload": {
+                          "sources.$": "$.orchestratorResult.Payload.sources"
+                        }
+                      },
+                      "End": true
+                    },
+                    "RedditSkipped": {
+                      "Type": "Pass",
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "CheckTripAdvisorEnabled",
+                  "States": {
+                    "CheckTripAdvisorEnabled": {
+                      "Type": "Choice",
+                      "Choices": [
+                        {
+                          "Variable": "$.orchestratorResult.Payload.platforms.tripadvisor",
+                          "BooleanEquals": true,
+                          "Next": "InvokeTripAdvisorScraper"
+                        }
+                      ],
+                      "Default": "TripAdvisorSkipped"
+                    },
+                    "InvokeTripAdvisorScraper": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::lambda:invoke",
+                      "Parameters": {
+                        "FunctionName": "${ProjectName}-tripadvisor-scraper-${Environment}",
+                        "Payload": {
+                          "sources.$": "$.orchestratorResult.Payload.sources"
+                        }
+                      },
+                      "End": true
+                    },
+                    "TripAdvisorSkipped": {
+                      "Type": "Pass",
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "ResultPath": "$.scrapingResults",
+              "Next": "QueryPendingPosts"
+            },
+            "QueryPendingPosts": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${QueryPendingPostsFunction}"
+              },
+              "ResultPath": "$.pendingPosts",
+              "Next": "CheckPostsExist"
+            },
+            "CheckPostsExist": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.pendingPosts.Payload.count",
+                  "NumericGreaterThan": 0,
+                  "Next": "ProcessPostsMap"
+                }
+              ],
+              "Default": "NoPosts"
+            },
+            "NoPosts": {
+              "Type": "Pass",
+              "Result": {
+                "Payload": {
+                  "processed": 0,
+                  "filtered": 0,
+                  "outages": {}
+                }
+              },
+              "ResultPath": "$.analysisResult",
+              "Next": "DetectAlerts"
+            },
+            "ProcessPostsMap": {
+              "Type": "Map",
+              "ToleratedFailurePercentage": 10,
+              "ItemReader": {
+                "Resource": "arn:aws:states:::s3:getObject",
+                "ReaderConfig": {
+                  "InputType": "JSONL",
+                  "MaxItems": 10000
+                },
+                "Parameters": {
+                  "Bucket.$": "$.pendingPosts.Payload.bucket",
+                  "Key.$": "$.pendingPosts.Payload.key"
+                }
+              },
+              "MaxConcurrency": 5,
+              "ItemProcessor": {
+                "ProcessorConfig": {
+                  "Mode": "DISTRIBUTED",
+                  "ExecutionType": "EXPRESS"
+                },
+                "StartAt": "CheckToxicity",
+                "States": {
+                  "CheckToxicity": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${ToxicityCheckerFunction}",
+                      "Payload.$": "$"
+                    },
+                    "ResultSelector": {
+                      "platformSourceId.$": "$.Payload.platformSourceId",
+                      "timestampPostId.$": "$.Payload.timestampPostId",
+                      "isToxic.$": "$.Payload.isToxic"
+                    },
+                    "Next": "IsToxic"
+                  },
+                  "IsToxic": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.isToxic",
+                        "BooleanEquals": true,
+                        "Next": "PostFiltered"
+                      }
+                    ],
+                    "Default": "AnalyzeSentiment"
+                  },
+                  "PostFiltered": {
+                    "Type": "Pass",
+                    "Result": {
+                      "filtered": true
+                    },
+                    "End": true
+                  },
+                  "AnalyzeSentiment": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${SentimentAnalyzerSingleFunction}",
+                      "Payload.$": "$"
+                    },
+                    "ResultSelector": {
+                      "platformSourceId.$": "$.Payload.platformSourceId",
+                      "timestampPostId.$": "$.Payload.timestampPostId",
+                      "sentiment.$": "$.Payload.sentiment"
+                    },
+                    "Next": "ClassifyIssue"
+                  },
+                  "ClassifyIssue": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${IssueClassifierSingleFunction}",
+                      "Payload.$": "$"
+                    },
+                    "ResultSelector": {
+                      "platformSourceId.$": "$.Payload.platformSourceId",
+                      "timestampPostId.$": "$.Payload.timestampPostId",
+                      "sentiment.$": "$.Payload.sentiment",
+                      "issueClassification.$": "$.Payload.issueClassification"
+                    },
+                    "Next": "StoreResult"
+                  },
+                  "StoreResult": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${StoreAnalysisResultFunction}",
+                      "Payload.$": "$"
+                    },
+                    "ResultPath": null,
+                    "End": true
+                  }
+                }
+              },
+              "ResultPath": null,
+              "Next": "AggregateOutages"
+            },
+            "AggregateOutages": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${AggregateOutagesFunction}",
+                "Payload": {}
+              },
+              "ResultPath": "$.analysisResult",
+              "Next": "CheckOutagesDetected"
+            },
+            "CheckOutagesDetected": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.analysisResult.Payload.hasOutages",
+                  "BooleanEquals": true,
+                  "Next": "VerifyOutages"
+                }
+              ],
+              "Default": "DetectAlerts"
+            },
+            "VerifyOutages": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${OutageVerifierFunction}",
+                "Payload": {
+                  "outagesDetected.$": "$.analysisResult.Payload.outagesDetected"
+                }
+              },
+              "ResultPath": "$.verificationResult",
+              "Next": "DetectAlertsWithVerification"
+            },
+            "DetectAlertsWithVerification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${AlertDetectorFunction}",
+                "Payload": {
+                  "action": "check_pending",
+                  "outagesDetected.$": "$.verificationResult.Payload.confirmedOutages"
+                }
+              },
+              "ResultPath": "$.alertResult",
+              "Next": "FormatSummary"
+            },
+            "DetectAlerts": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${AlertDetectorFunction}",
+                "Payload": {
+                  "action": "check_pending",
+                  "outagesDetected": {}
+                }
+              },
+              "ResultPath": "$.alertResult",
+              "Next": "FormatSummary"
+            },
+            "FormatSummary": {
+              "Type": "Pass",
+              "Parameters": {
+                "summary": {
+                  "totalItemsAdded.$": "$.analysisResult.Payload.processed",
+                  "totalFiltered.$": "$.analysisResult.Payload.filtered",
+                  "alertsTriggered.$": "$.alertResult.Payload.alertsGenerated"
+                }
+              },
+              "Next": "TriggerDataTransform"
+            },
+            "TriggerDataTransform": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::states:startExecution",
+              "Parameters": {
+                "StateMachineArn": "arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-data-transform-${Environment}",
+                "Input": {
+                  "triggeredBy": "scraper-workflow"
+                }
+              },
+              "ResultPath": null,
+              "End": true
+            }
+          }
+        }
+
+  # Ad-hoc processing workflow (manual trigger)
+  ProcessRawPostsStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-process-raw-posts-${Environment}'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      TracingConfiguration:
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+      DefinitionString: !Sub |
+        {
+          "Comment": "Ad-hoc workflow: analyze pending posts -> detect alerts",
+          "StartAt": "QueryPendingPosts",
+          "States": {
+            "QueryPendingPosts": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${QueryPendingPostsFunction}"
+              },
+              "ResultPath": "$.pendingPosts",
+              "Next": "CheckPostsExist"
+            },
+            "CheckPostsExist": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.pendingPosts.Payload.count",
+                  "NumericGreaterThan": 0,
+                  "Next": "ProcessPostsMap"
+                }
+              ],
+              "Default": "NoPosts"
+            },
+            "NoPosts": {
+              "Type": "Pass",
+              "Result": {
+                "Payload": {
+                  "processed": 0,
+                  "filtered": 0,
+                  "outages": {}
+                }
+              },
+              "ResultPath": "$.analysisResult",
+              "Next": "DetectAlerts"
+            },
+            "ProcessPostsMap": {
+              "Type": "Map",
+              "ToleratedFailurePercentage": 10,
+              "ItemReader": {
+                "Resource": "arn:aws:states:::s3:getObject",
+                "ReaderConfig": {
+                  "InputType": "JSONL",
+                  "MaxItems": 10000
+                },
+                "Parameters": {
+                  "Bucket.$": "$.pendingPosts.Payload.bucket",
+                  "Key.$": "$.pendingPosts.Payload.key"
+                }
+              },
+              "MaxConcurrency": 5,
+              "ItemProcessor": {
+                "ProcessorConfig": {
+                  "Mode": "DISTRIBUTED",
+                  "ExecutionType": "EXPRESS"
+                },
+                "StartAt": "CheckToxicity",
+                "States": {
+                  "CheckToxicity": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${ToxicityCheckerFunction}",
+                      "Payload.$": "$"
+                    },
+                    "ResultSelector": {
+                      "platformSourceId.$": "$.Payload.platformSourceId",
+                      "timestampPostId.$": "$.Payload.timestampPostId",
+                      "isToxic.$": "$.Payload.isToxic"
+                    },
+                    "Next": "IsToxic"
+                  },
+                  "IsToxic": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.isToxic",
+                        "BooleanEquals": true,
+                        "Next": "PostFiltered"
+                      }
+                    ],
+                    "Default": "AnalyzeSentiment"
+                  },
+                  "PostFiltered": {
+                    "Type": "Pass",
+                    "Result": {
+                      "filtered": true
+                    },
+                    "End": true
+                  },
+                  "AnalyzeSentiment": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${SentimentAnalyzerSingleFunction}",
+                      "Payload.$": "$"
+                    },
+                    "ResultSelector": {
+                      "platformSourceId.$": "$.Payload.platformSourceId",
+                      "timestampPostId.$": "$.Payload.timestampPostId",
+                      "sentiment.$": "$.Payload.sentiment"
+                    },
+                    "Next": "ClassifyIssue"
+                  },
+                  "ClassifyIssue": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${IssueClassifierSingleFunction}",
+                      "Payload.$": "$"
+                    },
+                    "ResultSelector": {
+                      "platformSourceId.$": "$.Payload.platformSourceId",
+                      "timestampPostId.$": "$.Payload.timestampPostId",
+                      "sentiment.$": "$.Payload.sentiment",
+                      "issueClassification.$": "$.Payload.issueClassification"
+                    },
+                    "Next": "StoreResult"
+                  },
+                  "StoreResult": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${StoreAnalysisResultFunction}",
+                      "Payload.$": "$"
+                    },
+                    "ResultPath": null,
+                    "End": true
+                  }
+                }
+              },
+              "ResultPath": null,
+              "Next": "AggregateOutages"
+            },
+            "AggregateOutages": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${AggregateOutagesFunction}",
+                "Payload": {}
+              },
+              "ResultPath": "$.analysisResult",
+              "Next": "CheckOutagesDetected"
+            },
+            "CheckOutagesDetected": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.analysisResult.Payload.hasOutages",
+                  "BooleanEquals": true,
+                  "Next": "VerifyOutages"
+                }
+              ],
+              "Default": "DetectAlerts"
+            },
+            "VerifyOutages": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${OutageVerifierFunction}",
+                "Payload": {
+                  "outagesDetected.$": "$.analysisResult.Payload.outagesDetected"
+                }
+              },
+              "ResultPath": "$.verificationResult",
+              "Next": "DetectAlertsWithVerification"
+            },
+            "DetectAlertsWithVerification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${AlertDetectorFunction}",
+                "Payload": {
+                  "action": "check_pending",
+                  "outagesDetected.$": "$.verificationResult.Payload.confirmedOutages"
+                }
+              },
+              "ResultPath": "$.alertResult",
+              "Next": "FormatSummary"
+            },
+            "DetectAlerts": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${AlertDetectorFunction}",
+                "Payload": {
+                  "action": "check_pending",
+                  "outagesDetected": {}
+                }
+              },
+              "ResultPath": "$.alertResult",
+              "Next": "FormatSummary"
+            },
+            "FormatSummary": {
+              "Type": "Pass",
+              "Parameters": {
+                "summary": {
+                  "totalItemsAdded.$": "$.analysisResult.Payload.processed",
+                  "totalFiltered.$": "$.analysisResult.Payload.filtered",
+                  "alertsTriggered.$": "$.alertResult.Payload.alertsGenerated"
+                }
+              },
+              "End": true
+            }
+          }
+        }
+
+  # Insights generation workflow
+  InsightsStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-insights-generator-${Environment}'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      TracingConfiguration:
+        Enabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+      DefinitionString: !Sub |
+        {
+          "Comment": "Generate insights for posts in a date range",
+          "StartAt": "CollectPosts",
+          "States": {
+            "CollectPosts": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "${InsightsCollectorFunction}",
+                "Payload.$": "$"
+              },
+              "ResultPath": "$.collectorResult",
+              "Next": "CheckPostsExist"
+            },
+            "CheckPostsExist": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.collectorResult.Payload.posts[0]",
+                  "IsPresent": true,
+                  "Next": "ProcessPosts"
+                }
+              ],
+              "Default": "NoPostsFound"
+            },
+            "ProcessPosts": {
+              "Type": "Map",
+              "ItemsPath": "$.collectorResult.Payload.posts",
+              "MaxConcurrency": 5,
+              "ResultPath": "$.processedInsights",
+              "Parameters": {
+                "postId.$": "$$.Map.Item.Value.postId",
+                "url.$": "$$.Map.Item.Value.url"
+              },
+              "Iterator": {
+                "StartAt": "ProcessSinglePost",
+                "States": {
+                  "ProcessSinglePost": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::lambda:invoke",
+                    "Parameters": {
+                      "FunctionName": "${InsightsProcessorFunction}",
+                      "Payload.$": "$"
+                    },
+                    "End": true
+                  }
+                }
+              },
+              "End": true
+            },
+            "NoPostsFound": {
+              "Type": "Pass",
+              "Result": {
+                "message": "No posts found in date range or all posts already have insights"
+              },
+              "End": true
+            }
+          }
+        }
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-stepfunctions-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: InvokeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ScraperOrchestratorFunction.Arn
+                  - !GetAtt SentimentAnalysisFunction.Arn
+                  - !GetAtt OutageVerifierFunction.Arn
+                  - !GetAtt AlertDetectorFunction.Arn
+                  - !GetAtt InsightsCollectorFunction.Arn
+                  - !GetAtt InsightsProcessorFunction.Arn
+                  - !GetAtt QueryPendingPostsFunction.Arn
+                  - !GetAtt ToxicityCheckerFunction.Arn
+                  - !GetAtt SentimentAnalyzerSingleFunction.Arn
+                  - !GetAtt IssueClassifierSingleFunction.Arn
+                  - !GetAtt StoreAnalysisResultFunction.Arn
+                  - !GetAtt AggregateOutagesFunction.Arn
+                  - !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-*-scraper-${Environment}'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectName}-scan-results-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-scan-results-${AWS::AccountId}/*'
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource:
+                  - !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-scraper-workflow-${Environment}'
+                  - !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-process-raw-posts-${Environment}'
+                  - !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-data-transform-${Environment}'
+  # EventBridge Scheduler to trigger Step Functions
+  ScraperSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${ProjectName}-scraper-schedule-${Environment}'
+      Description: Trigger scraper workflow every 15 minutes
+      ScheduleExpression: rate(15 minutes)
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      State: ENABLED
+      Target:
+        Arn: !GetAtt ScraperWorkflowStateMachine.Arn
+        RoleArn: !GetAtt EventBridgeSchedulerRole.Arn
+        Input: '{"scrapingInterval": "15min"}'
+
+  EventBridgeSchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-scheduler-stepfunctions-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+      Policies:
+        - PolicyName: StartStepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !GetAtt ScraperWorkflowStateMachine.Arn
+
+  # ============================================================================
+  # Data Transform - IAM Role, Lambda Functions, Step Functions State Machine
+  # ============================================================================
+
+  DataTransformLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-data-transform-lambda-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-analysis-results-${Environment}'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-insights-${Environment}'
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-brand-config-${Environment}'
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:Scan
+                Resource:
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-analysis-results-scrubbed'
+                  - !Sub 'arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${ProjectName}-insights-scrubbed'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::${ProjectName}-scan-results-${AWS::AccountId}/*'
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:GetInferenceProfile
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+
+  DataTransformStateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-data-transform-sfn-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ScanKeysFunction.Arn
+                  - !GetAtt TransformItemFunction.Arn
+                  - !GetAtt ScanInsightsKeysFunction.Arn
+                  - !GetAtt TransformInsightFunction.Arn
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub 'arn:aws:s3:::${ProjectName}-scan-results-${AWS::AccountId}'
+                  - !Sub 'arn:aws:s3:::${ProjectName}-scan-results-${AWS::AccountId}/*'
+        - PolicyName: StartChildExecutions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-data-transform-${Environment}'
+
+  ScanKeysFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-scan-keys-${Environment}'
+      CodeUri: ../lambda/data-transform/
+      Handler: scan_keys.lambda_handler
+      Role: !GetAtt DataTransformLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          SOURCE_TABLE: !Sub '${ProjectName}-analysis-results-${Environment}'
+          DEST_TABLE: !Sub '${ProjectName}-analysis-results-scrubbed'
+          OUTPUT_BUCKET: !Sub '${ProjectName}-scan-results-${AWS::AccountId}'
+
+  TransformItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-transform-item-${Environment}'
+      CodeUri: ../lambda/data-transform/
+      Handler: transform_item.lambda_handler
+      Role: !GetAtt DataTransformLambdaRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Environment:
+        Variables:
+          SOURCE_TABLE: !Sub '${ProjectName}-analysis-results-${Environment}'
+          DEST_TABLE: !Sub '${ProjectName}-analysis-results-scrubbed'
+          TARGET_COMPANY: !Ref TargetCompany
+          BEDROCK_MODEL_ID: !GetAtt BedrockSonnetApplicationProfile.InferenceProfileArn
+          KEYWORD_REPLACEMENTS_JSON: !Ref KeywordReplacementsJson
+          BRAND_CONFIG_TABLE: !Sub '${ProjectName}-brand-config-${Environment}'
+
+  ScanInsightsKeysFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-scan-insights-keys-${Environment}'
+      CodeUri: ../lambda/data-transform/
+      Handler: scan_insights_keys.lambda_handler
+      Role: !GetAtt DataTransformLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          SOURCE_INSIGHTS_TABLE: !Sub '${ProjectName}-insights-${Environment}'
+          DEST_INSIGHTS_TABLE: !Sub '${ProjectName}-insights-scrubbed'
+          OUTPUT_BUCKET: !Sub '${ProjectName}-scan-results-${AWS::AccountId}'
+
+  TransformInsightFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-transform-insight-${Environment}'
+      CodeUri: ../lambda/data-transform/
+      Handler: transform_insight.lambda_handler
+      Role: !GetAtt DataTransformLambdaRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          SOURCE_INSIGHTS_TABLE: !Sub '${ProjectName}-insights-${Environment}'
+          DEST_INSIGHTS_TABLE: !Sub '${ProjectName}-insights-scrubbed'
+          TARGET_COMPANY: !Ref TargetCompany
+          KEYWORD_REPLACEMENTS_JSON: !Ref KeywordReplacementsJson
+          BRAND_CONFIG_TABLE: !Sub '${ProjectName}-brand-config-${Environment}'
+
+  DataTransformStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${ProjectName}-data-transform-${Environment}'
+      RoleArn: !GetAtt DataTransformStateMachineRole.Arn
+      TracingConfiguration:
+        Enabled: true
+      DefinitionString: !Sub |
+        {
+          "Comment": "Scan AnalysisResults and Insights, transform company references via Bedrock, write to scrubbed tables",
+          "StartAt": "Parallel",
+          "States": {
+            "Parallel": {
+              "Type": "Parallel",
+              "Branches": [
+                {
+                  "StartAt": "ScanAnalysisKeys",
+                  "States": {
+                    "ScanAnalysisKeys": {
+                      "Type": "Task",
+                      "Resource": "${ScanKeysFunction.Arn}",
+                      "ResultPath": "$.scanResult",
+                      "Next": "TransformAnalysisItems"
+                    },
+                    "TransformAnalysisItems": {
+                      "Type": "Map",
+                      "ToleratedFailurePercentage": 5,
+                      "ItemReader": {
+                        "Resource": "arn:aws:states:::s3:getObject",
+                        "ReaderConfig": {
+                          "InputType": "JSONL"
+                        },
+                        "Parameters": {
+                          "Bucket.$": "$.scanResult.bucket",
+                          "Key.$": "$.scanResult.key"
+                        }
+                      },
+                      "MaxConcurrency": 5,
+                      "ResultPath": null,
+                      "ItemProcessor": {
+                        "ProcessorConfig": {
+                          "Mode": "DISTRIBUTED",
+                          "ExecutionType": "EXPRESS"
+                        },
+                        "StartAt": "TransformSingleItem",
+                        "States": {
+                          "TransformSingleItem": {
+                            "Type": "Task",
+                            "Resource": "${TransformItemFunction.Arn}",
+                            "ResultPath": null,
+                            "End": true
+                          }
+                        }
+                      },
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "ScanInsightsKeys",
+                  "States": {
+                    "ScanInsightsKeys": {
+                      "Type": "Task",
+                      "Resource": "${ScanInsightsKeysFunction.Arn}",
+                      "ResultPath": "$.scanResult",
+                      "Next": "TransformInsightsItems"
+                    },
+                    "TransformInsightsItems": {
+                      "Type": "Map",
+                      "ToleratedFailurePercentage": 5,
+                      "ItemReader": {
+                        "Resource": "arn:aws:states:::s3:getObject",
+                        "ReaderConfig": {
+                          "InputType": "JSONL"
+                        },
+                        "Parameters": {
+                          "Bucket.$": "$.scanResult.bucket",
+                          "Key.$": "$.scanResult.key"
+                        }
+                      },
+                      "MaxConcurrency": 5,
+                      "ResultPath": null,
+                      "ItemProcessor": {
+                        "ProcessorConfig": {
+                          "Mode": "DISTRIBUTED",
+                          "ExecutionType": "EXPRESS"
+                        },
+                        "StartAt": "TransformSingleInsight",
+                        "States": {
+                          "TransformSingleInsight": {
+                            "Type": "Task",
+                            "Resource": "${TransformInsightFunction.Arn}",
+                            "ResultPath": null,
+                            "End": true
+                          }
+                        }
+                      },
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "Next": "Done"
+            },
+            "Done": {
+              "Type": "Succeed"
+            }
+          }
+        }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # ============================================================================
+  # Lambda Functions - Scrapers
+  # ============================================================================
+
+  ScraperOrchestratorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-scraper-orchestrator-${Environment}'
+      CodeUri: ../lambda/scrapers/orchestrator/
+      Handler: scraper_orchestrator.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-scraper-lambda-role-${Environment}'
+      Environment:
+        Variables:
+          SOURCES_TABLE: !Sub '${ProjectName}-sources-${Environment}'
+
+  TwitterScraperFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-twitter-scraper-${Environment}'
+      CodeUri: ../lambda/scrapers/twitter/
+      Handler: twitter_scraper.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-scraper-lambda-role-${Environment}'
+      Environment:
+        Variables:
+          RAW_POSTS_TABLE: !Sub '${ProjectName}-raw-posts-${Environment}'
+          SOURCES_TABLE: !Sub '${ProjectName}-sources-${Environment}'
+
+  RedditScraperFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-reddit-scraper-${Environment}'
+      CodeUri: ../lambda/scrapers/reddit/
+      Handler: reddit_scraper.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-scraper-lambda-role-${Environment}'
+      Environment:
+        Variables:
+          RAW_POSTS_TABLE: !Sub '${ProjectName}-raw-posts-${Environment}'
+          SOURCES_TABLE: !Sub '${ProjectName}-sources-${Environment}'
+
+  TripAdvisorScraperFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-tripadvisor-scraper-${Environment}'
+      CodeUri: ../lambda/scrapers/tripadvisor/
+      Handler: tripadvisor_scraper.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-scraper-lambda-role-${Environment}'
+      Environment:
+        Variables:
+          RAW_POSTS_TABLE: !Sub '${ProjectName}-raw-posts-${Environment}'
+          SOURCES_TABLE: !Sub '${ProjectName}-sources-${Environment}'
+
+  # ============================================================================
+  # Lambda Functions - Analysis
+  # ============================================================================
+
+  SentimentAnalysisFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-sentiment-analysis-${Environment}'
+      CodeUri: ../lambda/analysis/
+      Handler: analysis_orchestrator.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-analysis-lambda-role-${Environment}'
+      MemorySize: 1024
+      Environment:
+        Variables:
+          ANALYSIS_RESULTS_TABLE: !Sub '${ProjectName}-analysis-results-${Environment}'
+          KEYWORDS_TABLE: !Sub '${ProjectName}-keywords-${Environment}'
+          BRAND_CONFIG_TABLE: !Sub '${ProjectName}-brand-config-${Environment}'
+          RAW_POSTS_TABLE: !Sub '${ProjectName}-raw-posts-${Environment}'
+
+  OutageVerifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-outage-verifier-${Environment}'
+      CodeUri: ../lambda/analysis/
+      Handler: outage_verifier.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-analysis-lambda-role-${Environment}'
+      MemorySize: 1024
+      Timeout: 300
+      Environment:
+        Variables:
+          ANALYSIS_RESULTS_TABLE: !Sub '${ProjectName}-analysis-results-${Environment}'
+          BEDROCK_MODEL_ID: !GetAtt BedrockSonnetApplicationProfile.InferenceProfileArn
+
+  QueryPendingPostsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-query-pending-posts-${Environment}'
+      CodeUri: ../lambda/analysis/
+      Handler: query_pending_posts.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-analysis-lambda-role-${Environment}'
+      MemorySize: 512
+      Timeout: 60
+      Environment:
+        Variables:
+          RAW_POSTS_TABLE: !Sub '${ProjectName}-raw-posts-${Environment}'
+          PENDING_POSTS_BUCKET: !Sub '${ProjectName}-scan-results-${AWS::AccountId}'
+
+  ToxicityCheckerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-toxicity-checker-${Environment}'
+      CodeUri: ../lambda/analysis/
+      Handler: toxicity_checker.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-analysis-lambda-role-${Environment}'
+      MemorySize: 512
+      Timeout: 30
+      Environment:
+        Variables:
+          RAW_POSTS_TABLE: !Sub '${ProjectName}-raw-posts-${Environment}'
+
+  SentimentAnalyzerSingleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-sentiment-analyzer-single-${Environment}'
+      CodeUri: ../lambda/analysis/
+      Handler: sentiment_analyzer_single.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-analysis-lambda-role-${Environment}'
+      MemorySize: 512
+      Timeout: 30
+      Environment:
+        Variables:
+          RAW_POSTS_TABLE: !Sub '${ProjectName}-raw-posts-${Environment}'
+
+  IssueClassifierSingleFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-issue-classifier-single-${Environment}'
+      CodeUri: ../lambda/analysis/
+      Handler: issue_classifier_single.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-analysis-lambda-role-${Environment}'
+      MemorySize: 512
+      Timeout: 30
+      Environment:
+        Variables:
+          RAW_POSTS_TABLE: !Sub '${ProjectName}-raw-posts-${Environment}'
+          BEDROCK_MODEL_ID: !GetAtt BedrockSonnetApplicationProfile.InferenceProfileArn
+
+  StoreAnalysisResultFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-store-analysis-result-${Environment}'
+      CodeUri: ../lambda/analysis/
+      Handler: store_analysis_result.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-analysis-lambda-role-${Environment}'
+      MemorySize: 512
+      Timeout: 30
+      Environment:
+        Variables:
+          RAW_POSTS_TABLE: !Sub '${ProjectName}-raw-posts-${Environment}'
+          ANALYSIS_RESULTS_TABLE: !Sub '${ProjectName}-analysis-results-${Environment}'
+          KEYWORDS_TABLE: !Sub '${ProjectName}-keywords-${Environment}'
+          BRAND_CONFIG_TABLE: !Sub '${ProjectName}-brand-config-${Environment}'
+
+  AggregateOutagesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-aggregate-outages-${Environment}'
+      CodeUri: ../lambda/analysis/
+      Handler: aggregate_outages.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-analysis-lambda-role-${Environment}'
+      MemorySize: 512
+      Timeout: 60
+      Environment:
+        Variables:
+          RAW_POSTS_TABLE: !Sub '${ProjectName}-raw-posts-${Environment}'
+          ANALYSIS_RESULTS_TABLE: !Sub '${ProjectName}-analysis-results-${Environment}'
+
+  # ============================================================================
+  # Lambda Functions - Alerts
+  # ============================================================================
+
+  AlertDetectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-alert-detector-${Environment}'
+      CodeUri: ../lambda/alerts/
+      Handler: alert_detector.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-alerts-lambda-role-${Environment}'
+      Environment:
+        Variables:
+          ALERTS_TABLE: !Sub '${ProjectName}-alerts-${Environment}'
+          ALERT_CONFIG_TABLE: !Sub '${ProjectName}-alert-config-${Environment}'
+          ANALYSIS_RESULTS_TABLE: !Sub '${ProjectName}-analysis-results-${Environment}'
+          ALERTS_TOPIC: !Ref AlertsTopic
+          OUTAGE_ALERTS_TOPIC: !Ref OutageAlertsTopic
+
+  AlertsApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-alerts-api-${Environment}'
+      CodeUri: ../lambda/alerts/
+      Handler: alerts_api.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-api-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          ALERTS_TABLE: !Sub '${ProjectName}-alerts-${Environment}'
+
+  # ============================================================================
+  # Lambda Functions - Dashboard
+  # ============================================================================
+
+  DashboardRealtimeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-dashboard-realtime-${Environment}'
+      CodeUri: ../lambda/dashboard/
+      Handler: realtime.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-api-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          ANALYSIS_RESULTS_TABLE: !Sub '${ProjectName}-analysis-results-${Environment}'
+          ALERTS_TABLE: !Sub '${ProjectName}-alerts-${Environment}'
+          TABLE_CONFIG_TABLE: !Sub '${ProjectName}-table-config-${Environment}'
+
+  DashboardHistoricalFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-dashboard-historical-${Environment}'
+      CodeUri: ../lambda/dashboard/
+      Handler: historical.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-api-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          ANALYSIS_RESULTS_TABLE: !Sub '${ProjectName}-analysis-results-${Environment}'
+          TABLE_CONFIG_TABLE: !Sub '${ProjectName}-table-config-${Environment}'
+
+  DashboardContentIntelligenceFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-dashboard-content-intelligence-${Environment}'
+      CodeUri: ../lambda/dashboard/
+      Handler: content_intelligence.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-api-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          ANALYSIS_RESULTS_TABLE: !Sub '${ProjectName}-analysis-results-${Environment}'
+          TABLE_CONFIG_TABLE: !Sub '${ProjectName}-table-config-${Environment}'
+
+  # ============================================================================
+  # Lambda Functions - Admin
+  # ============================================================================
+
+  AdminSourcesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-admin-sources-${Environment}'
+      CodeUri: ../lambda/admin/
+      Handler: sources_api.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-admin-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          SOURCES_TABLE: !Sub '${ProjectName}-sources-${Environment}'
+          SCRAPER_SCHEDULE_NAME: !Sub '${ProjectName}-scraper-schedule-${Environment}'
+
+  TripAdvisorLocationSearchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-tripadvisor-location-search-${Environment}'
+      CodeUri: ../lambda/admin/
+      Handler: tripadvisor_location_search.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-admin-lambda-role-${Environment}'
+      Timeout: 15
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+
+  AdminCredentialsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-admin-credentials-${Environment}'
+      CodeUri: ../lambda/admin/
+      Handler: credentials_api.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-admin-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+          AUDIT_LOG_GROUP: !Sub '/aws/lambda/${ProjectName}-admin-audit-${Environment}'
+
+  AdminKeywordsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-admin-keywords-${Environment}'
+      CodeUri: ../lambda/admin/
+      Handler: keywords_api.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-admin-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          KEYWORDS_TABLE: !Sub '${ProjectName}-keywords-${Environment}'
+
+  AdminAlertConfigFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-admin-alert-config-${Environment}'
+      CodeUri: ../lambda/admin/
+      Handler: alert_config_api.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-admin-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          ALERT_CONFIG_TABLE: !Sub '${ProjectName}-alert-config-${Environment}'
+
+  AdminPlatformConfigFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-admin-platform-config-${Environment}'
+      CodeUri: ../lambda/admin/
+      Handler: platform_config_api.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-admin-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          SOURCES_TABLE: !Sub '${ProjectName}-sources-${Environment}'
+          RAW_POSTS_TABLE: !Sub '${ProjectName}-raw-posts-${Environment}'
+          SCRAPER_SCHEDULE_NAME: !Sub '${ProjectName}-scraper-schedule-${Environment}'
+          SCRAPER_WORKFLOW_ARN: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-scraper-workflow-${Environment}'
+
+  AdminBrandConfigFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-admin-brand-config-${Environment}'
+      CodeUri: ../lambda/admin/
+      Handler: brand_config_api.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-admin-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          BRAND_CONFIG_TABLE: !Sub '${ProjectName}-brand-config-${Environment}'
+          FRONTEND_BUCKET: !Sub '${ProjectName}-frontend-${Environment}'
+
+  TableConfigApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-table-config-api-${Environment}'
+      CodeUri: ../lambda/admin/
+      Handler: table_config_api.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-admin-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_CONFIG_TABLE: !Sub '${ProjectName}-table-config-${Environment}'
+          DEFAULT_ANALYSIS_TABLE: !Sub '${ProjectName}-analysis-results-${Environment}'
+          DEFAULT_INSIGHTS_TABLE: !Sub '${ProjectName}-insights-${Environment}'
+          DATA_TRANSFORM_STATE_MACHINE_ARN: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${ProjectName}-data-transform-${Environment}'
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref Environment
+
+  # ============================================================================
+  # Lambda Functions - Insights
+  # ============================================================================
+
+  InsightsCollectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-insights-collector-${Environment}'
+      CodeUri: ../lambda/insights/
+      Handler: insights_collector.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-analysis-lambda-role-${Environment}'
+      Timeout: 300
+      MemorySize: 512
+      Environment:
+        Variables:
+          ANALYSIS_RESULTS_TABLE: !Sub '${ProjectName}-analysis-results-${Environment}'
+          INSIGHTS_TABLE: !Sub '${ProjectName}-insights-${Environment}'
+
+  InsightsProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-insights-processor-${Environment}'
+      CodeUri: ../lambda/insights/
+      Handler: insights_processor.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-analysis-lambda-role-${Environment}'
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          ANALYSIS_RESULTS_TABLE: !Sub '${ProjectName}-analysis-results-${Environment}'
+          INSIGHTS_TABLE: !Sub '${ProjectName}-insights-${Environment}'
+          BEDROCK_MODEL_ID: !GetAtt BedrockSonnetApplicationProfile.InferenceProfileArn
+
+  InsightsApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-insights-api-${Environment}'
+      CodeUri: ../lambda/insights/
+      Handler: insights_api.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-api-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          INSIGHTS_TABLE: !Sub '${ProjectName}-insights-${Environment}'
+          INSIGHTS_STATE_MACHINE_ARN: !Ref InsightsStateMachine
+          TABLE_CONFIG_TABLE: !Sub '${ProjectName}-table-config-${Environment}'
+
+  # ============================================================================
+  # Lambda Functions - Actions
+  # ============================================================================
+
+  ActionsApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-actions-api-${Environment}'
+      CodeUri: ../lambda/actions/
+      Handler: actions_api.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-api-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          ACTIONS_TABLE: !Sub '${ProjectName}-actions-${Environment}'
+
+  # ============================================================================
+  # Lambda Functions - Tools (standalone utilities)
+  # ============================================================================
+
+  TripAdvisorLocationCollectorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-tripadvisor-location-collector-${Environment}'
+      CodeUri: ../lambda/tools/
+      Handler: tripadvisor_location_collector.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-scraper-lambda-role-${Environment}'
+      Timeout: 900
+      MemorySize: 256
+      Environment:
+        Variables:
+          TRIPADVISOR_SECRET_ID: ''
+          CREDENTIAL_ID: ''
+          OUTPUT_BUCKET: !Sub '${ProjectName}-scan-results-${AWS::AccountId}'
+          BRAND_CONFIG_TABLE: !Sub '${ProjectName}-brand-config-${Environment}'
+
+  BrandsApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-brands-api-${Environment}'
+      CodeUri: ../lambda/admin/
+      Handler: brands_api.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-api-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          BRANDS_TABLE: !Sub '${ProjectName}-brands-${Environment}'
+
+  PeopleApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-people-api-${Environment}'
+      CodeUri: ../lambda/admin/
+      Handler: people_api.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-api-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          PEOPLE_TABLE: !Sub '${ProjectName}-people-${Environment}'
+
+  UsersApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-users-api-${Environment}'
+      CodeUri: ../lambda/admin/
+      Handler: users_api.lambda_handler
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-admin-lambda-role-${Environment}'
+      Timeout: 30
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPoolId
+
+  # ============================================================================
+  # Lambda Functions - Chatbot
+  # ============================================================================
+
+  ChatbotApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-chatbot-api-${Environment}'
+      CodeUri: ../lambda/chatbot/
+      Handler: index.handler
+      Runtime: nodejs22.x
+      Role: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${ProjectName}-api-lambda-role-${Environment}'
+      Timeout: 300
+      MemorySize: 512
+
+  # ============================================================================
+  # API Gateway
+  # ============================================================================
+
+  RestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      Description: Hospitality Insights API
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+        - Key: Environment
+          Value: !Ref Environment
+
+  APIAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: !Sub '${ProjectName}-authorizer-${Environment}'
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref RestAPI
+      ProviderARNs:
+        - !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolId}'
+
+  # Dashboard Resources
+  DashboardResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !GetAtt RestAPI.RootResourceId
+      PathPart: dashboard
+
+  DashboardRealtimeResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref DashboardResource
+      PathPart: realtime
+
+  DashboardRealtimeMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref DashboardRealtimeResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DashboardRealtimeFunction.Arn}/invocations'
+
+  DashboardRealtimeOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref DashboardRealtimeResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  DashboardRealtimePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DashboardRealtimeFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  DashboardHistoricalResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref DashboardResource
+      PathPart: historical
+
+  DashboardHistoricalMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref DashboardHistoricalResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DashboardHistoricalFunction.Arn}/invocations'
+
+  DashboardHistoricalOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref DashboardHistoricalResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  DashboardHistoricalPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DashboardHistoricalFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  DashboardContentIntelligenceResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref DashboardResource
+      PathPart: content-intelligence
+
+  DashboardContentIntelligenceMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref DashboardContentIntelligenceResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DashboardContentIntelligenceFunction.Arn}/invocations'
+
+  DashboardContentIntelligenceOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref DashboardContentIntelligenceResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  DashboardContentIntelligencePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DashboardContentIntelligenceFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # Alerts Resources
+  AlertsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !GetAtt RestAPI.RootResourceId
+      PathPart: alerts
+
+  AlertsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AlertsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AlertsApiFunction.Arn}/invocations'
+
+  AlertsIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AlertsResource
+      PathPart: '{id}'
+
+  AlertsPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AlertsIdResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AlertsApiFunction.Arn}/invocations'
+
+  AlertsDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AlertsIdResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AlertsApiFunction.Arn}/invocations'
+
+  AlertsIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AlertsIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AlertsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AlertsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,PUT,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AlertsGetPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlertsApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # Admin Resources
+  AdminResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !GetAtt RestAPI.RootResourceId
+      PathPart: admin
+
+  # Admin Sources
+  AdminSourcesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminResource
+      PathPart: sources
+
+  AdminSourcesGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminSourcesResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminSourcesFunction.Arn}/invocations'
+
+  AdminSourcesPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminSourcesResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminSourcesFunction.Arn}/invocations'
+
+  AdminSourcesOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminSourcesResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminSourcesIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminSourcesResource
+      PathPart: '{sourceId}'
+
+  AdminSourcesIdPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminSourcesIdResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminSourcesFunction.Arn}/invocations'
+
+  AdminSourcesIdDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminSourcesIdResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminSourcesFunction.Arn}/invocations'
+
+  AdminSourcesIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminSourcesIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminSourcesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminSourcesFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # TripAdvisor Location Search
+  AdminTripAdvisorResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminResource
+      PathPart: tripadvisor
+
+  AdminTripAdvisorLocationSearchResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminTripAdvisorResource
+      PathPart: location-search
+
+  AdminTripAdvisorLocationSearchGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminTripAdvisorLocationSearchResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TripAdvisorLocationSearchFunction.Arn}/invocations'
+
+  AdminTripAdvisorLocationSearchOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminTripAdvisorLocationSearchResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminTripAdvisorLocationSearchPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TripAdvisorLocationSearchFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # Admin Credentials
+  AdminCredentialsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminResource
+      PathPart: credentials
+
+  AdminCredentialsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminCredentialsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminCredentialsFunction.Arn}/invocations'
+
+  AdminCredentialsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminCredentialsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminCredentialsFunction.Arn}/invocations'
+
+  AdminCredentialsPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminCredentialsResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminCredentialsFunction.Arn}/invocations'
+
+  AdminCredentialsDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminCredentialsResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminCredentialsFunction.Arn}/invocations'
+
+  AdminCredentialsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminCredentialsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminCredentialsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminCredentialsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # Admin Keywords
+  AdminKeywordsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminResource
+      PathPart: keywords
+
+  AdminKeywordsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminKeywordsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminKeywordsFunction.Arn}/invocations'
+
+  AdminKeywordsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminKeywordsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminKeywordsFunction.Arn}/invocations'
+
+  AdminKeywordsPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminKeywordsResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminKeywordsFunction.Arn}/invocations'
+
+  AdminKeywordsDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminKeywordsResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminKeywordsFunction.Arn}/invocations'
+
+  AdminKeywordsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminKeywordsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminKeywordsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminKeywordsFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # Admin Keywords - ID resource (for DELETE/PUT by ID)
+  AdminKeywordsIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminKeywordsResource
+      PathPart: '{keywordId}'
+
+  AdminKeywordsIdDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminKeywordsIdResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminKeywordsFunction.Arn}/invocations'
+
+  AdminKeywordsIdPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminKeywordsIdResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminKeywordsFunction.Arn}/invocations'
+
+  AdminKeywordsIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminKeywordsIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,PUT,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Admin Alert Config
+  AdminAlertConfigResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminResource
+      PathPart: alert-config
+
+  AdminAlertConfigGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminAlertConfigResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminAlertConfigFunction.Arn}/invocations'
+
+  AdminAlertConfigPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminAlertConfigResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminAlertConfigFunction.Arn}/invocations'
+
+  AdminAlertConfigOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminAlertConfigResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # Admin Alert Config with ID parameter
+  AdminAlertConfigIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminAlertConfigResource
+      PathPart: '{configId}'
+
+  AdminAlertConfigIdGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminAlertConfigIdResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminAlertConfigFunction.Arn}/invocations'
+
+  AdminAlertConfigPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminAlertConfigIdResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminAlertConfigFunction.Arn}/invocations'
+
+  AdminAlertConfigDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminAlertConfigIdResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminAlertConfigFunction.Arn}/invocations'
+
+  AdminAlertConfigIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminAlertConfigIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminAlertConfigPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminAlertConfigFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # Admin Platform Config
+  AdminPlatformConfigResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminResource
+      PathPart: platform-config
+
+  AdminPlatformConfigGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminPlatformConfigResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminPlatformConfigFunction.Arn}/invocations'
+
+  AdminPlatformConfigPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminPlatformConfigResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminPlatformConfigFunction.Arn}/invocations'
+
+  AdminPlatformConfigPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminPlatformConfigResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminPlatformConfigFunction.Arn}/invocations'
+
+  AdminPlatformConfigOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminPlatformConfigResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,PUT,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminPlatformConfigPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminPlatformConfigFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # Admin Brand Config
+  AdminBrandConfigResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminResource
+      PathPart: brand-config
+
+  AdminBrandConfigGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminBrandConfigResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminBrandConfigFunction.Arn}/invocations'
+
+  AdminBrandConfigPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminBrandConfigResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminBrandConfigFunction.Arn}/invocations'
+
+  AdminBrandConfigOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminBrandConfigResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,PUT,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminBrandConfigLogoUploadResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminBrandConfigResource
+      PathPart: logo-upload
+
+  AdminBrandConfigLogoUploadPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminBrandConfigLogoUploadResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminBrandConfigFunction.Arn}/invocations'
+
+  AdminBrandConfigLogoUploadOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminBrandConfigLogoUploadResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminBrandConfigPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminBrandConfigFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # Admin Table Config
+  AdminTableConfigResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminResource
+      PathPart: table-config
+
+  AdminTableConfigGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminTableConfigResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TableConfigApiFunction.Arn}/invocations'
+
+  AdminTableConfigPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminTableConfigResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TableConfigApiFunction.Arn}/invocations'
+
+  AdminTableConfigPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminTableConfigResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TableConfigApiFunction.Arn}/invocations'
+
+  AdminTableConfigOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminTableConfigResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,PUT,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminTableConfigPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TableConfigApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # Insights API
+  InsightsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !GetAtt RestAPI.RootResourceId
+      PathPart: insights
+
+  InsightsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref InsightsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${InsightsApiFunction.Arn}/invocations'
+
+  InsightsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref InsightsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${InsightsApiFunction.Arn}/invocations'
+
+  InsightsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref InsightsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  InsightsIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref InsightsResource
+      PathPart: '{id}'
+
+  InsightsIdGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref InsightsIdResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${InsightsApiFunction.Arn}/invocations'
+
+  InsightsIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref InsightsIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  InsightsApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref InsightsApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # Actions API
+  ActionsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !GetAtt RestAPI.RootResourceId
+      PathPart: actions
+
+  ActionsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref ActionsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ActionsApiFunction.Arn}/invocations'
+
+  ActionsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref ActionsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ActionsApiFunction.Arn}/invocations'
+
+  ActionsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref ActionsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ActionsIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref ActionsResource
+      PathPart: '{id}'
+
+  ActionsIdGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref ActionsIdResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ActionsApiFunction.Arn}/invocations'
+
+  ActionsIdPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref ActionsIdResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ActionsApiFunction.Arn}/invocations'
+
+  ActionsIdDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref ActionsIdResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ActionsApiFunction.Arn}/invocations'
+
+  ActionsIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref ActionsIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ActionsApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ActionsApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # ============================================================================
+  # Brands API
+  # ============================================================================
+
+  AdminBrandsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminResource
+      PathPart: brands
+
+  AdminBrandsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminBrandsResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BrandsApiFunction.Arn}/invocations'
+
+  AdminBrandsPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminBrandsResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BrandsApiFunction.Arn}/invocations'
+
+  AdminBrandsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminBrandsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminBrandsIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminBrandsResource
+      PathPart: '{id}'
+
+  AdminBrandsIdGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminBrandsIdResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BrandsApiFunction.Arn}/invocations'
+
+  AdminBrandsIdPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminBrandsIdResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BrandsApiFunction.Arn}/invocations'
+
+  AdminBrandsIdDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminBrandsIdResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BrandsApiFunction.Arn}/invocations'
+
+  AdminBrandsIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminBrandsIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  BrandsApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BrandsApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # ============================================================================
+  # People API
+  # ============================================================================
+
+  AdminPeopleResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminResource
+      PathPart: people
+
+  AdminPeopleGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminPeopleResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PeopleApiFunction.Arn}/invocations'
+
+  AdminPeoplePostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminPeopleResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PeopleApiFunction.Arn}/invocations'
+
+  AdminPeopleOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminPeopleResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminPeopleIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminPeopleResource
+      PathPart: '{id}'
+
+  AdminPeopleIdGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminPeopleIdResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PeopleApiFunction.Arn}/invocations'
+
+  AdminPeopleIdPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminPeopleIdResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PeopleApiFunction.Arn}/invocations'
+
+  AdminPeopleIdDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminPeopleIdResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PeopleApiFunction.Arn}/invocations'
+
+  AdminPeopleIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminPeopleIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  PeopleApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PeopleApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # ============================================================================
+  # Users API (Cognito user management)
+  # ============================================================================
+
+  AdminUsersResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminResource
+      PathPart: users
+
+  AdminUsersGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminUsersResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersApiFunction.Arn}/invocations'
+
+  AdminUsersPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminUsersResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersApiFunction.Arn}/invocations'
+
+  AdminUsersOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminUsersResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AdminUsersIdResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !Ref AdminUsersResource
+      PathPart: '{username}'
+
+  AdminUsersIdDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminUsersIdResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersApiFunction.Arn}/invocations'
+
+  AdminUsersIdPutMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminUsersIdResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${UsersApiFunction.Arn}/invocations'
+
+  AdminUsersIdOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref AdminUsersIdResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,PUT,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  UsersApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref UsersApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # SSO Config (unauthenticated — returns identity provider info for login page)
+  SSOConfigFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-sso-config-${Environment}'
+      Handler: sso_config.lambda_handler
+      CodeUri: ../lambda/auth/
+      Policies:
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - cognito-idp:DescribeUserPoolClient
+                - cognito-idp:DescribeUserPool
+              Resource: !Sub 'arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolId}'
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPoolId
+          USER_POOL_CLIENT_ID: !Ref UserPoolClientId
+      Tags:
+        Project: !Ref ProjectTag
+        Environment: !Ref Environment
+
+  SSOConfigResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !GetAtt RestAPI.RootResourceId
+      PathPart: sso-config
+
+  SSOConfigGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref SSOConfigResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SSOConfigFunction.Arn}/invocations'
+
+  SSOConfigOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref SSOConfigResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  SSOConfigPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SSOConfigFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # ============================================================================
+  # Chatbot API
+  # ============================================================================
+
+  ChatbotResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RestAPI
+      ParentId: !GetAtt RestAPI.RootResourceId
+      PathPart: chatbot
+
+  ChatbotPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref ChatbotResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        ResponseTransferMode: STREAM
+        TimeoutInMillis: 300000
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2021-11-15/functions/${ChatbotApiFunction.Arn}/response-streaming-invocations'
+
+  ChatbotOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestAPI
+      ResourceId: !Ref ChatbotResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  ChatbotPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ChatbotApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestAPI}/*'
+
+  # API Deployment
+  APIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - DashboardRealtimeMethod
+      - DashboardRealtimeOptionsMethod
+      - DashboardHistoricalMethod
+      - DashboardHistoricalOptionsMethod
+      - DashboardContentIntelligenceMethod
+      - DashboardContentIntelligenceOptionsMethod
+      - AlertsGetMethod
+      - AlertsPutMethod
+      - AlertsDeleteMethod
+      - AlertsOptionsMethod
+      - AlertsIdOptionsMethod
+      - AdminSourcesGetMethod
+      - AdminSourcesPostMethod
+      - AdminSourcesOptionsMethod
+      - AdminSourcesIdPutMethod
+      - AdminSourcesIdDeleteMethod
+      - AdminSourcesIdOptionsMethod
+      - AdminTripAdvisorLocationSearchGetMethod
+      - AdminTripAdvisorLocationSearchOptionsMethod
+      - AdminCredentialsGetMethod
+      - InsightsGetMethod
+      - InsightsPostMethod
+      - InsightsOptionsMethod
+      - InsightsIdGetMethod
+      - InsightsIdOptionsMethod
+      - ActionsGetMethod
+      - ActionsPostMethod
+      - ActionsOptionsMethod
+      - ActionsIdGetMethod
+      - ActionsIdPutMethod
+      - ActionsIdDeleteMethod
+      - ActionsIdOptionsMethod
+      - AdminBrandsGetMethod
+      - AdminBrandsPostMethod
+      - AdminBrandsOptionsMethod
+      - AdminBrandsIdGetMethod
+      - AdminBrandsIdPutMethod
+      - AdminBrandsIdDeleteMethod
+      - AdminBrandsIdOptionsMethod
+      - AdminPeopleGetMethod
+      - AdminPeoplePostMethod
+      - AdminPeopleOptionsMethod
+      - AdminPeopleIdGetMethod
+      - AdminPeopleIdPutMethod
+      - AdminPeopleIdDeleteMethod
+      - AdminPeopleIdOptionsMethod
+      - AdminCredentialsPostMethod
+      - AdminCredentialsPutMethod
+      - AdminCredentialsDeleteMethod
+      - AdminCredentialsOptionsMethod
+      - AdminKeywordsGetMethod
+      - AdminKeywordsPostMethod
+      - AdminKeywordsPutMethod
+      - AdminKeywordsDeleteMethod
+      - AdminKeywordsOptionsMethod
+      - AdminKeywordsIdDeleteMethod
+      - AdminKeywordsIdPutMethod
+      - AdminKeywordsIdOptionsMethod
+      - AdminAlertConfigGetMethod
+      - AdminAlertConfigPostMethod
+      - AdminAlertConfigPutMethod
+      - AdminAlertConfigDeleteMethod
+      - AdminAlertConfigOptionsMethod
+      - AdminAlertConfigIdGetMethod
+      - AdminAlertConfigIdOptionsMethod
+      - AdminPlatformConfigGetMethod
+      - AdminPlatformConfigPutMethod
+      - AdminPlatformConfigPostMethod
+      - AdminPlatformConfigOptionsMethod
+      - AdminBrandConfigGetMethod
+      - AdminBrandConfigPutMethod
+      - AdminBrandConfigOptionsMethod
+      - AdminBrandConfigLogoUploadPostMethod
+      - AdminBrandConfigLogoUploadOptionsMethod
+      - AdminTableConfigGetMethod
+      - AdminTableConfigPutMethod
+      - AdminTableConfigPostMethod
+      - AdminTableConfigOptionsMethod
+      - AdminUsersGetMethod
+      - AdminUsersPostMethod
+      - AdminUsersOptionsMethod
+      - AdminUsersIdDeleteMethod
+      - AdminUsersIdPutMethod
+      - AdminUsersIdOptionsMethod
+      - SSOConfigGetMethod
+      - SSOConfigOptionsMethod
+      - ChatbotPostMethod
+      - ChatbotOptionsMethod
+    Properties:
+      RestApiId: !Ref RestAPI
+      Description: !Sub 'Deployment-${AWS::StackName}-v98'
+      StageName: !Ref Environment
+
+  # CORS Gateway Responses
+  GatewayResponse4XX:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      ResponseType: DEFAULT_4XX
+      RestApiId: !Ref RestAPI
+
+  GatewayResponse5XX:
+    Type: AWS::ApiGateway::GatewayResponse
+    Properties:
+      ResponseParameters:
+        gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+        gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+        gatewayresponse.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+      ResponseType: DEFAULT_5XX
+      RestApiId: !Ref RestAPI
+
+Outputs:
+  RestAPIId:
+    Description: ID of the REST API
+    Value: !Ref RestAPI
+    Export:
+      Name: !Sub '${ProjectName}-api-id-${Environment}'
+
+  RestAPIEndpoint:
+    Description: Endpoint URL of the REST API
+    Value: !Sub 'https://${RestAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-api-endpoint-${Environment}'
+
+  ScraperWorkflowStateMachineArn:
+    Description: ARN of the scraper workflow Step Functions state machine
+    Value: !GetAtt ScraperWorkflowStateMachine.Arn
+    Export:
+      Name: !Sub '${ProjectName}-scraper-workflow-arn-${Environment}'
+
+  ProcessRawPostsStateMachineArn:
+    Description: ARN of the ad-hoc raw posts processing Step Functions state machine
+    Value: !GetAtt ProcessRawPostsStateMachine.Arn
+    Export:
+      Name: !Sub '${ProjectName}-process-raw-posts-arn-${Environment}'
+
+  AlertsTopicArn:
+    Description: ARN of the alerts SNS topic
+    Value: !Ref AlertsTopic
+
+  OutageAlertsTopicArn:
+    Description: ARN of the outage-only alerts SNS topic
+    Value: !Ref OutageAlertsTopic
+
+  BedrockApplicationProfileArn:
+    Description: ARN of the Bedrock Application Inference Profile for Claude Sonnet 4.6
+    Value: !GetAtt BedrockSonnetApplicationProfile.InferenceProfileArn

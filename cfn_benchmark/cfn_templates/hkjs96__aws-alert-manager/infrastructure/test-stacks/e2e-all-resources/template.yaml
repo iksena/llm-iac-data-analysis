@@ -1,0 +1,607 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  E2E All-Resources Test Infra.
+  RDS MySQL + Aurora Provisioned (W+R) + Aurora Serverless v2 + DocDB +
+  ALB + NLB + TG + ElastiCache Redis + NAT Gateway.
+  All resources tagged Monitoring=on for alarm auto-creation validation.
+  Delete stack immediately after testing to save cost.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId1:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet AZ-a (public, for ALB/NLB/NAT/EC2)
+  SubnetId2:
+    Type: AWS::EC2::Subnet::Id
+    Description: Subnet AZ-b (public, for ALB/NLB)
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 8
+  AmiId:
+    Type: AWS::EC2::Image::Id
+    Description: Amazon Linux 2023 AMI ID
+
+Resources:
+  # ============================================================
+  # Shared Security Groups
+  # ============================================================
+  DbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${Environment}-e2e-db-sg'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: 10.0.0.0/8
+        - IpProtocol: tcp
+          FromPort: 27017
+          ToPort: 27017
+          CidrIp: 10.0.0.0/8
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          CidrIp: 10.0.0.0/8
+
+  LbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${Environment}-e2e-lb-sg'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  Ec2Sg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub '${Environment}-e2e-ec2-sg'
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+
+  # ============================================================
+  # IAM Role for EC2 (SSM + CW Agent)
+  # ============================================================
+  Ec2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-e2e-ec2-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  Ec2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref Ec2Role
+
+  # ============================================================
+  # EC2 Instances (target + bastion)
+  # ============================================================
+  # Multi-EBS instance: root + 2 data volumes (/data, /logs) -> 3 disk paths.
+  Ec2Target:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref AmiId
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      BlockDeviceMappings:
+        - DeviceName: /dev/sdf
+          Ebs:
+            VolumeSize: 5
+            VolumeType: gp3
+            DeleteOnTermination: true
+        - DeviceName: /dev/sdg
+          Ebs:
+            VolumeSize: 5
+            VolumeType: gp3
+            DeleteOnTermination: true
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref SubnetId1
+          AssociatePublicIpAddress: true
+          GroupSet:
+            - !Ref Ec2Sg
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          dnf install -y httpd
+          INSTANCE_ID=$(ec2-metadata -i | awk '{print $2}')
+          cat > /var/www/html/index.html <<EOF
+          {"instance":"$INSTANCE_ID","status":"ok"}
+          EOF
+          mkdir -p /var/www/html/ip
+          cp /var/www/html/index.html /var/www/html/ip/index.html
+          systemctl enable httpd && systemctl start httpd
+          # --- extra EBS volumes (multi-disk: /data, /logs) ---
+          # NVMe enumeration order is not guaranteed (root is not always nvme0n1),
+          # so pick the blank data disks (no partitions, no mountpoint) instead of
+          # hardcoding device names.
+          idx=0
+          for dev in $(lsblk -dpno NAME,TYPE | awk '$2=="disk"{print $1}'); do
+            has_child=$(lsblk -no NAME "$dev" | tail -n +2 | wc -l)
+            mp=$(lsblk -no MOUNTPOINT "$dev" | tr -d ' \n')
+            if [ "$has_child" -eq 0 ] && [ -z "$mp" ]; then
+              if [ "$idx" -eq 0 ]; then m=/data; else m=/logs; fi
+              mkfs -t xfs -f "$dev"
+              mkdir -p "$m"
+              mount "$dev" "$m"
+              grep -q " $m " /etc/fstab || echo "$dev $m xfs defaults,nofail 0 2" >> /etc/fstab
+              idx=$((idx+1))
+            fi
+          done
+          dnf install -y amazon-cloudwatch-agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWCFG'
+          {
+            "metrics": {
+              "namespace": "CWAgent",
+              "metrics_collected": {
+                "mem": { "measurement": ["mem_used_percent"], "metrics_collection_interval": 60 },
+                "disk": { "measurement": ["disk_used_percent"], "metrics_collection_interval": 60, "resources": ["/", "/data", "/logs"] }
+              },
+              "append_dimensions": { "InstanceId": "${!aws:InstanceId}" }
+            }
+          }
+          CWCFG
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-ec2-target'
+
+  # Single-EBS instance: root volume only -> 1 disk path (/).
+  Ec2Bastion:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref AmiId
+      IamInstanceProfile: !Ref Ec2InstanceProfile
+      NetworkInterfaces:
+        - DeviceIndex: '0'
+          SubnetId: !Ref SubnetId1
+          AssociatePublicIpAddress: true
+          GroupSet:
+            - !Ref Ec2Sg
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          dnf install -y httpd
+          INSTANCE_ID=$(ec2-metadata -i | awk '{print $2}')
+          cat > /var/www/html/index.html <<EOF
+          {"instance":"$INSTANCE_ID","status":"ok","role":"bastion"}
+          EOF
+          mkdir -p /var/www/html/ip
+          cp /var/www/html/index.html /var/www/html/ip/index.html
+          systemctl enable httpd && systemctl start httpd
+          dnf install -y amazon-cloudwatch-agent
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'CWCFG'
+          {
+            "metrics": {
+              "namespace": "CWAgent",
+              "metrics_collected": {
+                "mem": { "measurement": ["mem_used_percent"], "metrics_collection_interval": 60 },
+                "disk": { "measurement": ["disk_used_percent"], "metrics_collection_interval": 60, "resources": ["/"] }
+              },
+              "append_dimensions": { "InstanceId": "${!aws:InstanceId}" }
+            }
+          }
+          CWCFG
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json -s
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-ec2-bastion'
+
+  # ============================================================
+  # Shared Subnet Groups
+  # ============================================================
+  RdsSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub '${Environment}-e2e-rds-subnet-group'
+      SubnetIds:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+
+  DocDBSubnetGroup:
+    Type: AWS::DocDB::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub '${Environment}-e2e-docdb-subnet-group'
+      SubnetIds:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+
+  ElastiCacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub '${Environment}-e2e-redis-subnet-group'
+      Description: !Sub '${Environment}-e2e-redis-subnet-group'
+      SubnetIds:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+
+  # ============================================================
+  # 1. RDS MySQL (non-Aurora)
+  # ============================================================
+  RDSInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub '${Environment}-e2e-rds'
+      DBInstanceClass: db.t3.micro
+      Engine: mysql
+      EngineVersion: '8.0'
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBMasterPassword
+      AllocatedStorage: 20
+      DBSubnetGroupName: !Ref RdsSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DbSg
+      PubliclyAccessible: false
+      DeletionProtection: false
+      BackupRetentionPeriod: 0
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-rds'
+
+  # ============================================================
+  # 2. Aurora Provisioned (Writer + Reader)
+  # ============================================================
+  AuroraProvCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    Properties:
+      DBClusterIdentifier: !Sub '${Environment}-e2e-aurora-prov'
+      Engine: aurora-mysql
+      EngineVersion: '8.0.mysql_aurora.3.08.0'
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !Ref RdsSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DbSg
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      StorageEncrypted: true
+
+  AuroraProvWriter:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${Environment}-e2e-aurora-writer'
+      DBClusterIdentifier: !Ref AuroraProvCluster
+      DBInstanceClass: db.t3.medium
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-aurora-writer'
+        - Key: Threshold_CPU
+          Value: '90'
+
+  AuroraProvReader:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${Environment}-e2e-aurora-reader'
+      DBClusterIdentifier: !Ref AuroraProvCluster
+      DBInstanceClass: db.t3.medium
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-aurora-reader'
+
+  # ============================================================
+  # 3. Aurora Serverless v2
+  # ============================================================
+  AuroraSv2Cluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    Properties:
+      DBClusterIdentifier: !Sub '${Environment}-e2e-aurora-sv2'
+      Engine: aurora-mysql
+      EngineVersion: '8.0.mysql_aurora.3.08.0'
+      MasterUsername: admin
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !Ref RdsSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DbSg
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 1
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      StorageEncrypted: true
+
+  AuroraSv2Writer:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${Environment}-e2e-aurora-sv2-writer'
+      DBClusterIdentifier: !Ref AuroraSv2Cluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-aurora-sv2-writer'
+
+  # ============================================================
+  # 4. DocumentDB
+  # ============================================================
+  DocDBCluster:
+    Type: AWS::DocDB::DBCluster
+    Properties:
+      DBClusterIdentifier: !Sub '${Environment}-e2e-docdb'
+      MasterUsername: docdbadmin
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !Ref DocDBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DbSg
+      DeletionProtection: false
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-docdb'
+
+  DocDBInstance:
+    Type: AWS::DocDB::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub '${Environment}-e2e-docdb-inst'
+      DBClusterIdentifier: !Ref DocDBCluster
+      DBInstanceClass: db.t3.medium
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-docdb-inst'
+
+  # ============================================================
+  # 5. ALB + Target Group
+  # ============================================================
+  TestAlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${Environment}-e2e-alb'
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+      SecurityGroups:
+        - !Ref LbSg
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-alb'
+
+  AlbTgInstance:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${Environment}-e2e-alb-tg-inst'
+      Protocol: HTTP
+      Port: 80
+      VpcId: !Ref VpcId
+      TargetType: instance
+      Targets:
+        - Id: !Ref Ec2Target
+          Port: 80
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-alb-tg-inst'
+
+  AlbTgIp:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${Environment}-e2e-alb-tg-ip'
+      Protocol: HTTP
+      Port: 80
+      VpcId: !Ref VpcId
+      TargetType: ip
+      Targets:
+        - Id: !GetAtt Ec2Bastion.PrivateIp
+          Port: 80
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-alb-tg-ip'
+
+  AlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref TestAlb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AlbTgInstance
+
+  AlbListenerRuleIp:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref AlbListener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values: ['/ip/*']
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref AlbTgIp
+
+  # ============================================================
+  # 6. NLB + Target Group
+  # ============================================================
+  TestNlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${Environment}-e2e-nlb'
+      Type: network
+      Scheme: internet-facing
+      Subnets:
+        - !Ref SubnetId1
+        - !Ref SubnetId2
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-nlb'
+
+  NlbTg:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${Environment}-e2e-nlb-tg'
+      Protocol: TCP
+      Port: 80
+      VpcId: !Ref VpcId
+      TargetType: ip
+      Targets:
+        - Id: !GetAtt Ec2Target.PrivateIp
+          Port: 80
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-nlb-tg'
+
+  NlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref TestNlb
+      Port: 80
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref NlbTg
+
+  # ============================================================
+  # 7. ElastiCache Redis
+  # ============================================================
+  RedisCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      ClusterName: !Sub '${Environment}-e2e-redis'
+      Engine: redis
+      CacheNodeType: cache.t3.micro
+      NumCacheNodes: 1
+      CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DbSg
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-redis'
+        - Key: Threshold_CurrConnections
+          Value: '300'
+        - Key: Threshold_StringGetLatency
+          Value: '0.005'
+
+  # ============================================================
+  # 8. NAT Gateway (requires EIP)
+  # ============================================================
+  NatEip:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-nat-eip'
+
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip.AllocationId
+      SubnetId: !Ref SubnetId1
+      Tags:
+        - Key: Monitoring
+          Value: 'on'
+        - Key: Name
+          Value: !Sub '${Environment}-e2e-natgw'
+        - Key: Threshold_PacketsDropCount
+          Value: '5'
+
+Outputs:
+  Ec2TargetId:
+    Value: !Ref Ec2Target
+  Ec2BastionId:
+    Value: !Ref Ec2Bastion
+  AlbDnsName:
+    Value: !GetAtt TestAlb.DNSName
+  NlbDnsName:
+    Value: !GetAtt TestNlb.DNSName
+  RDSInstanceId:
+    Value: !Ref RDSInstance
+  AuroraProvWriterId:
+    Value: !Ref AuroraProvWriter
+  AuroraProvReaderId:
+    Value: !Ref AuroraProvReader
+  AuroraSv2WriterId:
+    Value: !Ref AuroraSv2Writer
+  DocDBInstanceId:
+    Value: !Ref DocDBInstance
+  AlbArn:
+    Value: !Ref TestAlb
+  NlbArn:
+    Value: !Ref TestNlb
+  AlbTgInstanceArn:
+    Value: !Ref AlbTgInstance
+  AlbTgIpArn:
+    Value: !Ref AlbTgIp
+  NlbTgArn:
+    Value: !Ref NlbTg
+  RedisClusterId:
+    Value: !Ref RedisCluster
+  NatGatewayId:
+    Value: !Ref NatGateway
+  ExpectedAlarms:
+    Value: >-
+      EC2 target: 2 (CPU,StatusCheckFailed) + CWAgent(Memory,Disk) if agent running
+      EC2 bastion: 2 (CPU,StatusCheckFailed)
+      RDS: 7 (CPU,FreeMemoryGB,FreeStorageGB,Connections,ReadLatency,WriteLatency,ConnectionAttempts)
+      Aurora Writer: 5 (CPU,FreeMemoryGB,Connections,FreeLocalStorageGB,ReplicaLag)
+      Aurora Reader: 5 (CPU,FreeMemoryGB,Connections,FreeLocalStorageGB,ReaderReplicaLag)
+      Aurora SV2: 3 (CPU,ACUUtilization,Connections)
+      DocDB: 3 (CPU,FreeMemoryGB,Connections)
+      ALB: 5 (RequestCount,ELB5XX,TargetResponseTime,ELB4XX,TargetConnectionError)
+      NLB: 5 (ProcessedBytes,ActiveFlowCount,NewFlowCount,TCPClientReset,TCPTargetReset)
+      ALB TG (instance): 4 (HealthyHostCount,UnHealthyHostCount,RequestCountPerTarget,TGResponseTime)
+      ALB TG (ip): 4 (HealthyHostCount,UnHealthyHostCount,RequestCountPerTarget,TGResponseTime)
+      NLB TG: 2 (HealthyHostCount,UnHealthyHostCount)
+      ElastiCache: 5 (CPU,EngineCPU,SwapUsage,Evictions,CurrConnections)
+      NAT GW: 2 (PacketsDropCount,ErrorPortAllocation)
+      Total: ~54+ alarms

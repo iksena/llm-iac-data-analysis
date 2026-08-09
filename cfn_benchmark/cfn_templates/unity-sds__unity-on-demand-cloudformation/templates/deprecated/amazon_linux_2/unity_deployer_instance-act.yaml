@@ -1,0 +1,479 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: Deploy an EC2 instance into an existing VPC for deployment of Unity
+
+Metadata:
+  QuickStartDocumentation:
+    EntrypointName: Launch into an existing VPC
+
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Basic configuration
+        Parameters:
+          - VPCID
+          - PublicSubnetID
+          - KeyPairName
+          - InstanceType
+          - PrivilegedPolicyName
+    ParameterLabels:
+      VPCID:
+        default: VPC ID
+      PublicSubnetID:
+        default: Public subnet ID
+      KeyPairName:
+        default: SSH key name
+      InstanceType:
+        default: EC2 instance type
+      PrivilegedPolicyName:
+        default: Privileged (admin-level) IAM policy name
+
+Parameters:
+  VPCID:
+    Description: ID of your existing VPC (e.g., vpc-0343606e).
+    Type: AWS::EC2::VPC::Id
+
+  PublicSubnetID:
+    Description: ID of the public subnet in an Availability Zone of your existing VPC (e.g., subnet-fe9a8b32).
+    Type: AWS::EC2::Subnet::Id
+
+  KeyPairName:
+    Description: Name of an existing key pair, which allows you to securely connect to your instance after it launches.
+    Type: AWS::EC2::KeyPair::KeyName
+
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    AllowedValues:
+      - c3.xlarge
+      - c4.xlarge
+      - c5.xlarge
+      - c6i.xlarge
+    Default: c6i.xlarge
+    ConstraintDescription: must be a valid EC2 instance type.
+
+  PrivilegedPolicyName:
+    Description: Name of an existing IAM policy which allows privileged access to AWS services.
+    Type: String
+    Default: mcp-tenantOperator-AMI-APIG
+
+Mappings:
+  AWSRegion2AMI:
+    us-east-1:
+      HVM64: ami-06e19b474320acfa8
+    us-east-2:
+      HVM64: ami-0a847dcd32f366120
+    us-west-1:
+      HVM64: ami-0b7451f34d8d9447a
+    us-west-2:
+      HVM64: ami-0f03d969d430caf73
+
+Resources:
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: allowLambdaLogging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:*"
+                Resource: "*"
+      PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/${PrivilegedPolicyName}"
+
+  RandomStringLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: 128
+      Timeout: 20
+      Code:
+        ZipFile: |
+          import cfnresponse
+          import logging
+          import random
+          import string
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def get_random_string(event, context):
+              random_string = "".join(
+                  random.choice(string.ascii_lowercase + string.digits)
+                  for i in range(int(event["ResourceProperties"]["Length"]))
+              )
+              logger.info("Random string generated: %s", random_string)
+              return random_string
+
+          def handler(event, context):
+              response_data = dict()
+              try:
+                  response_data["RandomString"] = get_random_string(event, context)
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+              except Exception as e:
+                  logger.error(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+
+  RandomStringResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      Length: 5
+      ServiceToken: !GetAtt RandomStringLambdaFunction.Arn
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryPowerUser
+        # TODO: need to generalize for JPL, MCP and normal AWS accounts; currently these are specific to MCP
+        - !Sub "arn:aws:iam::${AWS::AccountId}:policy/${PrivilegedPolicyName}"
+        - !Sub "arn:aws:iam::${AWS::AccountId}:policy/DatalakeKinesisPolicy"
+        - !Sub "arn:aws:iam::${AWS::AccountId}:policy/McpToolsAccessPolicy"
+      PermissionsBoundary: !Sub "arn:aws:iam::${AWS::AccountId}:policy/${PrivilegedPolicyName}"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref InstanceRole
+
+  DeployerInstance:
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT60M
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          deployer_install:
+            - install_cfn
+            - install_deployer_tools
+            - create_eks_cluster
+            - deploy_sps
+            - deploy_unity-on-demand-api
+        install_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              group: root
+              mode: "000400"
+              owner: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.DeployerInstance.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource DeployerInstance --configsets deployer_install --url https://stackbuilder.amazonaws.com
+              group: root
+              mode: "000400"
+              owner: root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: true
+                ensureRunning: true
+                files:
+                  - /etc/cfn/cfn-hup.conf
+                  - /etc/cfn/hooks.d/cfn-auto-reloader.conf
+        install_deployer_tools:
+          files:
+            /home/ec2-user/.bash_profile:
+              content: !Sub |
+                # .bash_profile
+
+                # Get the aliases and functions
+                if [ -f ~/.bashrc ]; then
+                        . ~/.bashrc
+                fi
+
+                # User specific environment and startup programs
+
+                PATH=$HOME/.local/bin:$HOME/bin:/usr/local/bin:$PATH
+
+                export PATH
+              group: ec2-user
+              mode: "000644"
+              owner: ec2-user
+          packages:
+            yum:
+              docker: []
+              git: []
+          services:
+            sysvinit:
+              docker:
+                enabled: true
+                ensureRunning: true
+          commands:
+            01_install_eksctl:
+              command: !Sub |
+                set -ex \
+                && echo "running 01_install_eksctl" \
+                && curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp \
+                && mv /tmp/eksctl /usr/local/bin \
+                && chmod +x /usr/local/bin/eksctl \
+                && ln -s /usr/local/bin/eksctl /bin/eksctl
+              test: !Sub |
+                $(eksctl version >/dev/null 2>&1 </dev/null); (( $? != 0 ))
+            02_install_kubectl:
+              # TODO: install the version of kubectl that matches the k8s server version specified above
+              command: !Sub |
+                set -ex \
+                && echo "running 02_install_kubectl" \
+                && curl --silent -o /tmp/kubectl https://s3.${AWS::Region}.amazonaws.com/amazon-eks/1.24.7/2022-10-31/bin/linux/amd64/kubectl \
+                && mv /tmp/kubectl /usr/local/bin \
+                && chmod +x /usr/local/bin/kubectl \
+                && ln -s /usr/local/bin/kubectl /bin/kubectl
+              test: !Sub |
+                $(kubectl version --client >/dev/null 2>&1 </dev/null); (( $? != 0 ))
+            03_docker_for_ec2_user:
+              command: !Sub |
+                set -ex \
+                && echo "running 03_docker_for_ec2_user" \
+                && usermod -a -G docker ec2-user
+            04_install_tfenv:
+              command: !Sub |
+                set -ex \
+                && echo "running 04_install_tfenv" \
+                && git clone --depth=1 https://github.com/tfutils/tfenv.git /home/ec2-user/.tfenv \
+                && chown -R ec2-user:ec2-user /home/ec2-user/.tfenv \
+                && ln -s /home/ec2-user/.tfenv/bin/* /usr/local/bin
+            05_clone_unity_sps_repo:
+              command: !Sub |
+                set -ex \
+                && echo "running 05_clone_unity_sps_repo" \
+                && git clone https://github.com/unity-sds/unity-sps-prototype.git /home/ec2-user/unity-sps-prototype \
+                && chown -R ec2-user:ec2-user /home/ec2-user/unity-sps-prototype
+            06_remove_outdated_awscli:
+              command: !Sub |
+                set -ex \
+                && echo "running 06_remove_outdated_awscli" \
+                && yum remove awscli -y \
+                && ln -s /usr/local/bin/aws /bin/aws
+            07_install_conda:
+              command: !Sub |
+                set -ex \
+                && echo "running 07_install_conda" \
+                && curl -sSL https://repo.anaconda.com/miniconda/Miniconda3-py39_22.11.1-1-Linux-x86_64.sh -o /tmp/install_miniconda.sh \
+                && chmod 755 /tmp/install_miniconda.sh \
+                && /tmp/install_miniconda.sh -b -p /usr/local -u
+            08_install_serverless:
+              command: !Sub |
+                set -ex \
+                && echo "running 08_install_serverless" \
+                && curl -sSL https://nodejs.org/dist/v16.20.0/node-v16.20.0-linux-x64.tar.gz -o /tmp/node-v16.20.0-linux-x64.tar.gz \
+                && tar xvfz /tmp/node-v16.20.0-linux-x64.tar.gz -C /usr/local \
+                && ln -sf /usr/local/node-v16.20.0-linux-x64/bin/node /usr/local/bin/ \
+                && ln -sf /usr/local/node-v16.20.0-linux-x64/bin/corepack /usr/local/bin/ \
+                && ln -sf /usr/local/node-v16.20.0-linux-x64/bin/npx /usr/local/bin/ \
+                && ln -sf /usr/local/node-v16.20.0-linux-x64/bin/npm /usr/local/bin/ \
+                && npm install -g serverless \
+                && ln -sf /usr/local/node-v16.20.0-linux-x64/bin/serverless /usr/local/bin/ \
+                && ln -sf /usr/local/node-v16.20.0-linux-x64/bin/sls /usr/local/bin/
+            09_clone_unity_cs_infra_repo:
+              # TODO: for now cloning branch updates-4-on-demand; eventually need develop
+              command: !Sub |
+                set -ex \
+                && echo "running 09_clone_unity_cs_infra_repo" \
+                && git clone -b updates-4-on-demand https://github.com/unity-sds/unity-cs-infra.git /home/ec2-user/unity-cs-infra \
+                && chown -R ec2-user:ec2-user /home/ec2-user/unity-cs-infra
+        create_eks_cluster:
+          files:
+            /home/ec2-user/act_inputs.json:
+              # TODO: work with @buggtb to pass in random string to name EKS cluster uniquely
+              content: !Sub |
+                {
+                  "inputs": {
+                    "ACCOUNTID": "${AWS::AccountId}",
+                    "GET_THIS_PARAMETER_FROM_TOM": "${RandomStringResource.RandomString}"
+                  }
+                }
+              group: ec2-user
+              mode: '000644'
+              owner: ec2-user
+          commands:
+            01_create_cluster:
+              command: !Sub |
+                set -ex \
+                && echo "running 01_create_cluster" \
+                && docker run -v /home/ec2-user/unity-cs-infra:/home/ubuntu/unity-cs -v /home/ec2-user/act_inputs.json:/home/ubuntu/act_inputs.json -v /var/run/docker.sock:/var/run/docker.sock -v /usr/bin/docker:/usr/bin/docker -w /home/ubuntu/unity-cs ghcr.io/unity-sds/unity-cs-infra:main /home/ubuntu/bin/act -W .github/workflows/deploy_eks_ondemand.yml -e /home/ubuntu/act_inputs.json -P ubuntu-latest=catthehacker/ubuntu:act-latest
+              cwd: /home/ec2-user
+            02_configure_cluster:
+              command: !Sub |
+                set -ex \
+                && echo "running 02_configure_cluster" \
+                && sudo -i -u ec2-user aws eks update-kubeconfig --region ${AWS::Region} --name unity-sps-on-demand \
+                && sudo -i -u ec2-user kubectl set env daemonset -n kube-system aws-node AWS_VPC_K8S_CNI_EXTERNALSNAT=true \
+                && sudo -i -u ec2-user eksctl create iamidentitymapping --cluster unity-sps-on-demand --region=${AWS::Region} --arn arn:aws:iam::${AWS::AccountId}:role/mcp-tenantDeveloper --group system:masters --username admin \
+                && sudo -i -u ec2-user eksctl create iamidentitymapping --cluster unity-sps-on-demand --region=${AWS::Region} --arn arn:aws:iam::${AWS::AccountId}:role/mcp-tenantOperator --group system:masters --username admin \
+                && sudo -i -u ec2-user kubectl apply -k "github.com/kubernetes-sigs/aws-ebs-csi-driver/deploy/kubernetes/overlays/stable/?ref=release-1.18"
+              cwd: /home/ec2-user
+        deploy_sps:
+          files:
+            /home/ec2-user/unity-sps-prototype/terraform-unity/terraform.tfvars:
+              content: !Sub |
+                celeryconfig_filename                         = "celeryconfig_remote.py"
+                container_registry_owner                      = "unity-sds/unity-sps-prototype"
+                container_registry_server                     = "ghcr.io"
+                container_registry_username                   = "gmanipon"
+                counter                                       = "${RandomStringResource.RandomString}"
+                datasets_filename                             = "datasets.remote.template.json"
+                default_group_node_group_launch_template_name = "eksctl-unity-sps-on-demand-${RandomStringResource.RandomString}-nodegroup-defaultgroupNodeGroup"
+                default_group_node_group_name                 = "defaultgroupNodeGroup"
+                docker_images = {
+                  "ades_wpst_api" : "ghcr.io/unity-sds/unity-sps-prototype/ades-wpst-api:unity-v1.0.0",
+                  "busybox" : "busybox:1.36.0",
+                  "dind" : "docker:23.0.3-dind",
+                  "hysds_core" : "ghcr.io/unity-sds/unity-sps-prototype/hysds-core:unity-v1.0.0",
+                  "hysds_factotum" : "ghcr.io/unity-sds/unity-sps-prototype/hysds-factotum:unity-v1.0.0",
+                  "hysds_grq2" : "ghcr.io/unity-sds/unity-sps-prototype/hysds-grq2:unity-v1.0.0",
+                  "hysds_mozart" : "ghcr.io/unity-sds/unity-sps-prototype/hysds-mozart:unity-v1.0.0",
+                  "hysds_ui" : "ghcr.io/unity-sds/unity-sps-prototype/hysds-ui-remote:unity-v1.0.0",
+                  "hysds_verdi" : "ghcr.io/unity-sds/unity-sps-prototype/hysds-verdi:unity-v1.0.0",
+                  "logstash" : "docker.elastic.co/logstash/logstash:7.10.2",
+                  "rabbitmq" : "rabbitmq:3.11.13-management",
+                  "redis" : "redis:7.0.10",
+                  "sps_api" : "ghcr.io/unity-sds/unity-sps-prototype/sps-api:unity-v1.0.0",
+                  "sps_hysds_pge_base" : "ghcr.io/unity-sds/unity-sps-prototype/sps-hysds-pge-base:unity-v1.0.0"
+                }
+                eks_cluster_name    = "unity-sps-on-demand-${RandomStringResource.RandomString}"
+                elb_subnet          = "subnet-087b54673c7549e2d"
+                kubeconfig_filepath = "~/.kube/config"
+                namespace           = "unity-sps"
+                project             = "nisar"
+                region              = "us-west-2"
+                release             = "23.1"
+                service_area        = "sps"
+                service_port_map = {
+                  "ades_wpst_api_service" : 5001,
+                  "grq2_es" : 9201,
+                  "grq2_service" : 8878,
+                  "hysds_ui_service" : 3000,
+                  "mozart_es" : 9200,
+                  "mozart_service" : 8888,
+                  "rabbitmq_mgmt_service_cluster_rpc" : 15672,
+                  "rabbitmq_service_cluster_rpc" : 15672,
+                  "rabbitmq_service_epmd" : 4369,
+                  "rabbitmq_service_listener" : 5672,
+                  "redis_service" : 6379,
+                  "sps_api_service" : 5002
+                }
+                service_type                   = "LoadBalancer"
+                uads_development_efs_fsmt_id   = "fsmt-06d161d46a1b16cb6"
+                venue                          = "dev"
+                verdi_node_group_capacity_type = "ON_DEMAND"
+                verdi_node_group_instance_types = [
+                  "m3.medium"
+                ]
+                verdi_node_group_scaling_config = {
+                  "desired_size" : 3,
+                  "max_size" : 10,
+                  "min_size" : 0
+                }
+              group: ec2-user
+              mode: '000644'
+              owner: ec2-user
+          commands:
+            01_terraform_init:
+              command: !Sub |
+                set -ex \
+                && echo "running 01_terraform_init" \
+                && sudo -i -u ec2-user tfenv install \
+                && sudo -u ec2-user /usr/local/bin/terraform init
+              cwd: /home/ec2-user/unity-sps-prototype/terraform-unity
+            # NOTE: no longer needed since gp2 should be default but left here as an example;
+            # create gp2-sps storageclass and set as default first to avoid race conditions (2 defaults)
+            #02_terraform_apply_gp2-sps:
+            #  command: !Sub |
+            #    set -ex \
+            #    && echo "running 02_terraform_apply_gp2-sps" \
+            #    && sudo -u ec2-user /usr/local/bin/terraform apply -target=module.unity-sps-hysds-cluster.kubernetes_storage_class.gp2-sps -target=module.unity-sps-hysds-cluster.null_resource.unset_default -auto-approve
+            #  cwd: /home/ec2-user/unity-sps-prototype/terraform-unity
+            03_terraform_apply:
+              command: !Sub |
+                set -ex \
+                && echo "running 03_terraform_apply" \
+                && sudo -u ec2-user /usr/local/bin/terraform apply --auto-approve \
+                && sudo -u ec2-user /usr/local/bin/terraform output | grep sps_api | awk 'BEGIN{FS="\""}{print "export sps_api="$4}' > sps_api.sh
+              cwd: /home/ec2-user/unity-sps-prototype/terraform-unity
+        deploy_unity-on-demand-api:
+          commands:
+            01_clone_repo:
+              command: !Sub |
+                set -ex \
+                && echo "running 01_clone_repo" \
+                && git clone https://github.com/unity-sds/unity-on-demand-api.git /home/ec2-user/unity-on-demand-api \
+                && chown -R ec2-user:ec2-user /home/ec2-user/unity-on-demand-api
+              cwd: /home/ec2-user
+            02_run_serverless_deploy:
+              command: !Sub |
+                set -ex \
+                && echo "running 02_run_serverless_deploy" \
+                && sudo -i -u ec2-user bash -c "cd ~/unity-on-demand-api \
+                   && serverless plugin install -n serverless-python-requirements \
+                   && serverless plugin install -n serverless-wsgi \
+                   && source ~/unity-sps-prototype/terraform-unity/sps_api.sh \
+                   && serverless deploy --param cluster_name=unity-sps-on-demand-${RandomStringResource.RandomString} \
+                                        --param sps_api_url=http://${!sps_api}:5002 \
+                                        --param permissionsBoundaryPolicyName=${PrivilegedPolicyName} \
+                                        --region ${AWS::Region} \
+                                        --stage ${RandomStringResource.RandomString}"
+              cwd: /home/ec2-user/unity-on-demand-api
+    Properties:
+      ImageId: !FindInMap [AWSRegion2AMI, !Ref 'AWS::Region', HVM64]
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnetID
+      EbsOptimized: true
+      SecurityGroupIds:
+        - !Ref DeployerSecurityGroup
+      IamInstanceProfile: !Ref InstanceProfile
+      Tags:
+        - Key: Name
+          Value: unity-deployer-instance
+      UserData: !Base64
+        Fn::Sub: |
+          #!/bin/bash -xe
+          yum update -y aws-cfn-bootstrap
+          /opt/aws/bin/cfn-init -v --stack ${AWS::StackId} --resource DeployerInstance --configsets deployer_install --region ${AWS::Region}
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource DeployerInstance --region ${AWS::Region}
+
+  DeployerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: security group for unity-deployer-instance
+      VpcId: !Ref VPCID
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          FromPort: 22
+          IpProtocol: tcp
+          ToPort: 22
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: "-1"

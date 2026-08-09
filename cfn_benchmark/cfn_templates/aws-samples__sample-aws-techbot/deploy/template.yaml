@@ -1,0 +1,1533 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS TechBot - AI-powered AWS technical assistant on Amazon Bedrock AgentCore Runtime
+  with Feishu bot integration and optional Memory for multi-turn conversations.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Basic Configuration
+        Parameters:
+          - ProjectName
+          - ModelId
+      - Label:
+          default: Memory Configuration
+        Parameters:
+          - EnableMemory
+          - MemoryExpiryDays
+      - Label:
+          default: Feishu Integration
+        Parameters:
+          - AppId
+          - AppSecret
+          - FeishuVerificationToken
+    ParameterLabels:
+      ProjectName:
+        default: Project Name
+      ModelId:
+        default: Amazon Bedrock Model ID
+      EnableMemory:
+        default: Enable AgentCore Memory?
+      MemoryExpiryDays:
+        default: Memory Expiry (Days)
+      AppId:
+        default: Feishu App ID
+      AppSecret:
+        default: Feishu App Secret
+      FeishuVerificationToken:
+        default: Feishu Verification Token
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: techbot
+    AllowedPattern: ^[a-z][a-z0-9]*$
+    ConstraintDescription: Lowercase alphanumeric only, starting with a letter
+    Description: Project name (lowercase), used as prefix for all resources
+
+  ModelId:
+    Type: String
+    Default: zai.glm-5
+    AllowedValues:
+      - zai.glm-5
+      - minimax.minimax-m2.5
+    Description: >
+      Select an Amazon Bedrock model.
+      GLM-5 (Zhipu AI) | MiniMax M2.5 (MiniMax)
+
+  EnableMemory:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: >
+      Enable AgentCore Memory for multi-turn conversation context.
+      If disabled, the agent will not remember previous messages.
+
+  MemoryExpiryDays:
+    Type: Number
+    Default: 30
+    MinValue: 7
+    MaxValue: 365
+    Description: >
+      Number of days before memory events expire (7-365).
+      Only effective when Memory is enabled.
+
+  AppId:
+    Type: String
+    MinLength: 1
+    Description: Feishu App ID for bot integration
+
+  AppSecret:
+    Type: String
+    MinLength: 1
+    Description: Feishu App Secret
+
+  FeishuVerificationToken:
+    Type: String
+    MinLength: 1
+    Description: >
+      Feishu Verification Token for webhook request validation.
+      Found in Feishu Open Platform → Events & Callbacks → Encryption Strategy.
+
+Mappings:
+  ArtifactBucket:
+    us-west-2:
+      Name: haomiaoj-yuzeli-aws-techbot-oregon
+
+Rules:
+  RegionCheck:
+    Assertions:
+      - Assert: !Contains
+          - - us-west-2
+          - !Ref AWS::Region
+        AssertDescription: This stack can only be deployed in us-west-2
+
+Conditions:
+  CreateMemory: !Equals [!Ref EnableMemory, 'true']
+
+Resources:
+
+  # =========================
+  # ECR Repository (private, auto-created)
+  # =========================
+  EcrRepo:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    Properties:
+      RepositoryName: !Sub ${ProjectName}-repo
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: false
+
+  # =========================
+  # CodeBuild: pull public image → push to private ECR
+  # =========================
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:PutImage
+                  - ecr:InitiateLayerUpload
+                  - ecr:UploadLayerPart
+                  - ecr:CompleteLayerUpload
+                Resource: !GetAtt EcrRepo.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  ImageCopyProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-image-copy
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: ARM_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-aarch64-standard:3.0
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: ECR_REPO
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-repo
+          - Name: SOURCE_IMAGE
+            Value: public.ecr.aws/f3p2c7j2/techbot:latest
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            build:
+              commands:
+                - aws ecr get-login-password | docker login --username AWS --password-stdin $ECR_REPO
+                - docker pull $SOURCE_IMAGE
+                - docker tag $SOURCE_IMAGE $ECR_REPO:latest
+                - docker push $ECR_REPO:latest
+      TimeoutInMinutes: 10
+
+  # Custom Resource Lambda: triggers CodeBuild and waits
+  ImageCopyFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-imagecopy-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CodeBuildAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt ImageCopyProject.Arn
+
+  ImageCopyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-image-copy
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 600
+      MemorySize: 128
+      Role: !GetAtt ImageCopyFunctionRole.Arn
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ImageCopyProject
+      Code:
+        ZipFile: |
+          import json, os, time, boto3, urllib.request
+          cb = boto3.client("codebuild")
+          def send_response(event, context, status, data={}):
+              body = json.dumps({"Status": status, "Reason": f"See CloudWatch: {context.log_group_name}", "PhysicalResourceId": context.log_stream_name, "StackId": event["StackId"], "RequestId": event["RequestId"], "LogicalResourceId": event["LogicalResourceId"], "Data": data}).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=body, headers={"Content-Type": ""}, method="PUT")
+              urllib.request.urlopen(req)
+          def handler(event, context):
+              if event["RequestType"] == "Delete":
+                  send_response(event, context, "SUCCESS")
+                  return
+              try:
+                  build = cb.start_build(projectName=os.environ["PROJECT_NAME"])
+                  build_id = build["build"]["id"]
+                  while True:
+                      time.sleep(10)
+                      r = cb.batch_get_builds(ids=[build_id])
+                      status = r["builds"][0]["buildStatus"]
+                      if status == "SUCCEEDED":
+                          send_response(event, context, "SUCCESS")
+                          return
+                      elif status in ("FAILED", "FAULT", "TIMED_OUT", "STOPPED"):
+                          send_response(event, context, "FAILED", {"Error": status})
+                          return
+              except Exception as e:
+                  send_response(event, context, "FAILED", {"Error": str(e)})
+
+  ImageCopyTrigger:
+    Type: Custom::ImageCopy
+    DependsOn:
+      - EcrRepo
+      - ImageCopyProject
+    Properties:
+      ServiceToken: !GetAtt ImageCopyFunction.Arn
+
+  # =========================
+  # AgentCore Memory (conditional)
+  # =========================
+  AgentCoreMemoryRole:
+    Type: AWS::IAM::Role
+    Condition: CreateMemory
+    Properties:
+      RoleName: !Sub ${ProjectName}-memory-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+
+  AgentCoreMemory:
+    Type: AWS::BedrockAgentCore::Memory
+    Condition: CreateMemory
+    Properties:
+      Name: !Sub ${ProjectName}_memory
+      Description: !Sub ${ProjectName} multi-turn conversation memory
+      EventExpiryDuration: !Ref MemoryExpiryDays
+      MemoryExecutionRoleArn: !GetAtt AgentCoreMemoryRole.Arn
+
+  # =========================
+  # Cognito (Gateway auth)
+  # =========================
+  GatewayCognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${ProjectName}-gateway-pool
+
+  GatewayCognitoResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref GatewayCognitoUserPool
+      Identifier: gateway
+      Name: !Sub ${ProjectName}-gateway
+      Scopes:
+        - ScopeName: invoke
+          ScopeDescription: Invoke the gateway
+
+  GatewayCognitoClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: GatewayCognitoResourceServer
+    Properties:
+      UserPoolId: !Ref GatewayCognitoUserPool
+      ClientName: !Sub ${ProjectName}-gateway-client
+      GenerateSecret: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - gateway/invoke
+      AllowedOAuthFlowsUserPoolClient: true
+      SupportedIdentityProviders:
+        - COGNITO
+
+  GatewayCognitoDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      UserPoolId: !Ref GatewayCognitoUserPool
+      Domain: !Sub ${ProjectName}-gw-${AWS::AccountId}
+
+  # =========================
+  # AgentCore Gateway
+  # =========================
+  GatewayServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-gateway-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GatewayPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt GlobalKnowledgeFunction.Arn
+                  - !GetAtt ChinaKnowledgeFunction.Arn
+                  - !GetAtt CustomerStoriesFunction.Arn
+                  - !GetAtt PricingFunction.Arn
+                  - !GetAtt KiroKnowledgeFunction.Arn
+                  - !GetAtt AwsOperationsFunction.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  AgentCoreGateway:
+    Type: AWS::BedrockAgentCore::Gateway
+    Properties:
+      Name: !Sub ${ProjectName}-gateway
+      ProtocolType: MCP
+      RoleArn: !GetAtt GatewayServiceRole.Arn
+      AuthorizerType: CUSTOM_JWT
+      AuthorizerConfiguration:
+        CustomJWTAuthorizer:
+          DiscoveryUrl: !Sub >-
+            https://cognito-idp.${AWS::Region}.amazonaws.com/${GatewayCognitoUserPool}/.well-known/openid-configuration
+          AllowedClients:
+            - !Ref GatewayCognitoClient
+
+  # =========================
+  # Gateway Target: Global Knowledge
+  # =========================
+  GlobalKnowledgeFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-global-knowledge-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  GlobalKnowledgeLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${ProjectName}-global-knowledge-deps
+      Description: Dependencies for global-knowledge gateway target
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      Content:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: global-knowledge-layer.zip
+
+  GlobalKnowledgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-global-knowledge
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Architectures:
+        - arm64
+      Code:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: global-knowledge-code.zip
+      Role: !GetAtt GlobalKnowledgeFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref GlobalKnowledgeLayer
+
+  GlobalKnowledgeTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt AgentCoreGateway.GatewayIdentifier
+      Name: TechbotGlobalKnowledge
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt GlobalKnowledgeFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: aws___search_documentation
+                  Description: >-
+                    Search across all AWS documentation, blogs, best practices, and agent SOPs.
+                    Use specific AWS service names for best results.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      search_phrase:
+                        Type: string
+                        Description: The search query
+                      topics:
+                        Type: array
+                        Description: >-
+                          Optional list of topics to filter (up to 3): reference_documentation,
+                          current_awareness, troubleshooting, amplify_docs, cdk_docs,
+                          cdk_constructs, cloudformation, agent_sops, general
+                    Required:
+                      - search_phrase
+                - Name: aws___read_documentation
+                  Description: >-
+                    Fetch and convert an AWS documentation page to markdown.
+                    For long docs, use start_index for pagination.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      url:
+                        Type: string
+                        Description: URL of the AWS documentation page
+                      start_index:
+                        Type: integer
+                        Description: Character index to start from (for pagination)
+                      max_length:
+                        Type: integer
+                        Description: Maximum characters to return
+                    Required:
+                      - url
+                - Name: aws___recommend
+                  Description: >-
+                    Get content recommendations for an AWS documentation page.
+                    Returns related pages and newly released content.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      url:
+                        Type: string
+                        Description: URL of the documentation page
+                    Required:
+                      - url
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  # =========================
+  # Gateway Target: China Knowledge
+  # =========================
+  ChinaKnowledgeFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-china-knowledge-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  ChinaKnowledgeLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${ProjectName}-china-knowledge-deps
+      Description: Dependencies for china-knowledge gateway target
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      Content:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: china-knowledge-layer.zip
+
+  ChinaKnowledgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-china-knowledge
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Architectures:
+        - arm64
+      Code:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: china-knowledge-code.zip
+      Role: !GetAtt ChinaKnowledgeFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref ChinaKnowledgeLayer
+
+  ChinaKnowledgeTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt AgentCoreGateway.GatewayIdentifier
+      Name: TechbotChinaKnowledge
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt ChinaKnowledgeFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: get_China_available_services
+                  Description: >-
+                    Search for AWS services available in China regions (cn-north-1 Beijing, cn-northwest-1 Ningxia).
+                    Use to check if a specific AWS service is available in China.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      search_phrase:
+                        Type: string
+                        Description: Service name or keyword (e.g. Amazon Bedrock, Lambda, S3)
+                      limit:
+                        Type: integer
+                        Description: Maximum number of results (default 5)
+                    Required:
+                      - search_phrase
+                - Name: read_China_documentation
+                  Description: >-
+                    Fetch and read an AWS China documentation page.
+                    Supports amazonaws.cn and aws.amazon.com URLs.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      url:
+                        Type: string
+                        Description: URL of the documentation page (amazonaws.cn or aws.amazon.com domain)
+                      max_length:
+                        Type: integer
+                        Description: Maximum characters to return (default 5000)
+                      start_index:
+                        Type: integer
+                        Description: Character offset for pagination (default 0)
+                    Required:
+                      - url
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  # =========================
+  # Gateway Target: Customer Stories
+  # =========================
+  CustomerStoriesFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-customer-stories-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  CustomerStoriesLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${ProjectName}-customer-stories-deps
+      Description: Dependencies for customer-stories gateway target
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      Content:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: customer-stories-layer.zip
+
+  CustomerStoriesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-customer-stories
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Architectures:
+        - arm64
+      Code:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: customer-stories-code.zip
+      Role: !GetAtt CustomerStoriesFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 256
+      Layers:
+        - !Ref CustomerStoriesLayer
+
+  CustomerStoriesTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt AgentCoreGateway.GatewayIdentifier
+      Name: TechbotCustomerStory
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt CustomerStoriesFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: search_stories
+                  Description: >-
+                    Search AWS customer success stories by keyword. Search by company name,
+                    AWS service, industry, or use case. Returns customer name, headline,
+                    summary, tags, and URL. The search API only supports English.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      search_phrase:
+                        Type: string
+                        Description: Search keyword in English
+                      limit:
+                        Type: integer
+                        Description: Results per page (default 8, max 50)
+                      page:
+                        Type: integer
+                        Description: Page number, 0-based (default 0)
+                    Required:
+                      - search_phrase
+                - Name: read_story
+                  Description: >-
+                    Read the full content of an AWS customer story page.
+                    Use URLs from search_stories results. Does NOT support YouTube URLs.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      url:
+                        Type: string
+                        Description: URL of the AWS customer story (aws.amazon.com domain)
+                      max_length:
+                        Type: integer
+                        Description: Maximum characters to return (default 10000)
+                      start_index:
+                        Type: integer
+                        Description: Character offset for pagination (default 0)
+                    Required:
+                      - url
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  # =========================
+  # Gateway Target: Pricing
+  # =========================
+  PricingFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-pricing-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AWSPriceListServiceFullAccess
+
+  PricingLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${ProjectName}-pricing-deps
+      Description: Dependencies for pricing gateway target (includes aws-pricing-mcp-server)
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      Content:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: pricing-layer.zip
+
+  PricingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-pricing
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Architectures:
+        - arm64
+      Code:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: pricing-code.zip
+      Role: !GetAtt PricingFunctionRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Layers:
+        - !Ref PricingLayer
+
+  PricingTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt AgentCoreGateway.GatewayIdentifier
+      Name: TechbotPricing
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt PricingFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: get_pricing_service_codes
+                  Description: >-
+                    Get available AWS service codes for pricing queries.
+                    Always call this first before get_pricing.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      search:
+                        Type: string
+                        Description: Optional search filter for service codes
+                - Name: get_pricing_service_attributes
+                  Description: >-
+                    Get available filter attributes for a given AWS service.
+                    Call after get_pricing_service_codes to discover filterable dimensions.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      service_code:
+                        Type: string
+                        Description: AWS service code (e.g. AmazonEC2)
+                    Required:
+                      - service_code
+                - Name: get_pricing_attribute_values
+                  Description: >-
+                    Get valid values for a specific pricing attribute.
+                    Call after get_pricing_service_attributes.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      service_code:
+                        Type: string
+                        Description: AWS service code
+                      attribute_name:
+                        Type: string
+                        Description: Attribute name from get_pricing_service_attributes
+                    Required:
+                      - service_code
+                      - attribute_name
+                - Name: get_pricing
+                  Description: >-
+                    Get actual AWS pricing using validated parameters from previous steps.
+                    WARNING - Always call get_pricing_service_codes, get_pricing_service_attributes,
+                    and get_pricing_attribute_values first.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      service_code:
+                        Type: string
+                        Description: AWS service code
+                      filters:
+                        Type: array
+                        Description: Array of filter objects with Field, Value, Type
+                    Required:
+                      - service_code
+                - Name: get_price_list_urls
+                  Description: >-
+                    Get URLs to download complete pricing datasets (CSV/JSON).
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      service_code:
+                        Type: string
+                        Description: AWS service code
+                      region:
+                        Type: string
+                        Description: AWS region code
+                    Required:
+                      - service_code
+                - Name: generate_cost_report
+                  Description: >-
+                    Generate a detailed cost report. Only use when user explicitly requests it.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      services:
+                        Type: array
+                        Description: Array of service configurations for cost calculation
+                    Required:
+                      - services
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  # =========================
+  # Gateway Target: Kiro Knowledge
+  # =========================
+  KiroKnowledgeFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-kiro-knowledge-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  KiroKnowledgeLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${ProjectName}-kiro-knowledge-deps
+      Description: Dependencies for kiro-knowledge gateway target
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      Content:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: kiro-knowledge-layer.zip
+
+  KiroKnowledgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-kiro-knowledge
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Architectures:
+        - arm64
+      Code:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: kiro-knowledge-code.zip
+      Role: !GetAtt KiroKnowledgeFunctionRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Layers:
+        - !Ref KiroKnowledgeLayer
+
+  KiroKnowledgeTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt AgentCoreGateway.GatewayIdentifier
+      Name: TechbotKiroKnowledge
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt KiroKnowledgeFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: kiro_search
+                  Description: >-
+                    Search Kiro documentation across both kiro.dev (official English docs) and
+                    Book of Kiro (community Chinese docs) in parallel. Use keyword_en to search
+                    the official English documentation via Algolia, and keyword_zh to search the
+                    community Chinese documentation by crawling. It will return search results
+                    with referenced urls from both sources. You must include the referenced urls
+                    at the end of your response in the given <> format.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      keyword_en:
+                        Type: string
+                        Description: English keyword to search kiro.dev official documentation
+                      keyword_zh:
+                        Type: string
+                        Description: >-
+                          Keyword to search Book of Kiro community documentation (Chinese site).
+                          Use Chinese for general terms, but keep technical terms in English
+                          (e.g. MCP, hook, spec, steering, agent)
+                      original_query:
+                        Type: string
+                        Description: >-
+                          Original query of the user (should match exactly the same as the
+                          original user query including all characters and language)
+                      limit:
+                        Type: integer
+                        Description: Maximum number of results to return per source (default 10)
+                    Required:
+                      - keyword_en
+                      - keyword_zh
+                      - original_query
+                - Name: kiro_read
+                  Description: >-
+                    Fetch and read the content of a Kiro documentation page. Supports both
+                    kiro.dev (official docs, Next.js SSR) and kiro-community.github.io/book-of-kiro
+                    (community docs, static HTML). Use this tool to get the full content of a page
+                    returned by kiro_search. For long pages, use start_index and max_length to
+                    paginate through the content.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      url:
+                        Type: string
+                        Description: >-
+                          URL of the Kiro documentation page to read
+                          (must be from kiro.dev or kiro-community.github.io/book-of-kiro)
+                      original_query:
+                        Type: string
+                        Description: >-
+                          Original query of the user (should match exactly the same as the
+                          original user query including all characters and language)
+                      start_index:
+                        Type: integer
+                        Description: Character offset to start reading from, for pagination (default 0)
+                      max_length:
+                        Type: integer
+                        Description: Maximum number of characters to return (default 5000)
+                    Required:
+                      - url
+                      - original_query
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  # =========================
+  # Gateway Target: AWS Operations
+  # =========================
+  AwsOperationsFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-aws-operations-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Policies:
+        - PolicyName: AwsOperationsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Broad write access for common services
+              - Effect: Allow
+                Action:
+                  - "ec2:*"
+                  - "s3:*"
+                  - "lambda:*"
+                  - "rds:*"
+                  - "ecs:*"
+                  - "eks:*"
+                  - "dynamodb:*"
+                  - "elasticloadbalancing:*"
+                  - "autoscaling:*"
+                  - "application-autoscaling:*"
+                  - "cloudwatch:*"
+                  - "logs:*"
+                  - "sns:*"
+                  - "sqs:*"
+                  - "cloudfront:*"
+                  - "ce:*"
+                  - "events:*"
+                  - "states:*"
+                  - "kinesis:*"
+                  - "firehose:*"
+                  - "elasticache:*"
+                  - "es:*"
+                  - "secretsmanager:*"
+                  - "ssm:*"
+                  - "acm:*"
+                  - "ecr:*"
+                  - "codebuild:*"
+                  - "codepipeline:*"
+                  - "bedrock:*"
+                  - "bedrock-agentcore:*"
+                  - "budgets:*"
+                  - "kms:Encrypt"
+                  - "kms:Decrypt"
+                  - "kms:GenerateDataKey"
+                  - "kms:CreateAlias"
+                  - "kms:CreateKey"
+                  - "sts:GetCallerIdentity"
+                  - "mcp:*"
+                Resource: '*'
+              # Deny destructive operations (all Allow services)
+              - Effect: Deny
+                Action:
+                  - "ec2:Delete*"
+                  - "ec2:Terminate*"
+                  - "s3:Delete*"
+                  - "lambda:Delete*"
+                  - "lambda:Remove*"
+                  - "rds:Delete*"
+                  - "ecs:Delete*"
+                  - "eks:Delete*"
+                  - "dynamodb:Delete*"
+                  - "elasticloadbalancing:Delete*"
+                  - "autoscaling:Delete*"
+                  - "autoscaling:Terminate*"
+                  - "application-autoscaling:Delete*"
+                  - "cloudwatch:Delete*"
+                  - "logs:Delete*"
+                  - "sns:Delete*"
+                  - "sns:Remove*"
+                  - "sqs:Delete*"
+                  - "cloudfront:Delete*"
+                  - "events:Delete*"
+                  - "events:Remove*"
+                  - "states:Delete*"
+                  - "kinesis:Delete*"
+                  - "kinesis:Remove*"
+                  - "firehose:Delete*"
+                  - "elasticache:Delete*"
+                  - "es:Delete*"
+                  - "secretsmanager:Delete*"
+                  - "secretsmanager:Remove*"
+                  - "ssm:Delete*"
+                  - "acm:Delete*"
+                  - "ecr:Delete*"
+                  - "codebuild:Delete*"
+                  - "codepipeline:Delete*"
+                  - "bedrock:Delete*"
+                  - "bedrock-agentcore:Delete*"
+                  - "budgets:Delete*"
+                  - "kms:Delete*"
+                  - "kms:ScheduleKeyDeletion"
+                Resource: '*'
+              # Deny high-risk non-delete operations
+              - Effect: Deny
+                Action:
+                  # Network / Security Group exposure
+                  - "ec2:AuthorizeSecurityGroupIngress"
+                  - "ec2:AuthorizeSecurityGroupEgress"
+                  - "ec2:RevokeSecurityGroup*"
+                  - "ec2:ModifyInstanceAttribute"
+                  - "ec2:ModifySnapshotAttribute"
+                  - "ec2:ModifyImageAttribute"
+                  # S3 public access
+                  - "s3:PutBucketPolicy"
+                  - "s3:PutBucketAcl"
+                  - "s3:PutPublicAccessBlock"
+                  - "s3:PutAccountPublicAccessBlock"
+                  - "s3:PutObjectAcl"
+                  # RDS public exposure
+                  - "rds:ModifyDBInstance"
+                  - "rds:ModifyDBCluster"
+                  - "rds:ModifyDBSnapshotAttribute"
+                  - "rds:ModifyDBClusterSnapshotAttribute"
+                  # DNS modification
+                  - "route53:ChangeResourceRecordSets"
+                  # IAM privilege escalation
+                  - "iam:Create*"
+                  - "iam:Put*"
+                  - "iam:Attach*"
+                  - "iam:Detach*"
+                  - "iam:Update*"
+                  - "iam:PassRole"
+                  - "iam:AddRoleToInstanceProfile"
+                  # KMS key management
+                  - "kms:DisableKey"
+                  - "kms:ScheduleKeyDeletion"
+                  - "kms:PutKeyPolicy"
+                  # Resource policy exposure (Palisade checks)
+                  - "sns:AddPermission"
+                  - "sqs:AddPermission"
+                  - "lambda:AddPermission"
+                  - "secretsmanager:PutResourcePolicy"
+                  - "ecr:SetRepositoryPolicy"
+                  - "es:UpdateElasticsearchDomainConfig"
+                  # Logging / audit trail tampering
+                  - "cloudtrail:StopLogging"
+                  - "cloudtrail:DeleteTrail"
+                  - "cloudtrail:UpdateTrail"
+                  - "config:StopConfigurationRecorder"
+                  - "config:DeleteConfigurationRecorder"
+                  # Organizations
+                  - "organizations:*"
+                Resource: '*'
+
+  AwsOperationsLayer:
+    Type: AWS::Lambda::LayerVersion
+    Properties:
+      LayerName: !Sub ${ProjectName}-aws-operations-deps
+      Description: Dependencies for aws-operations gateway target (mcp-proxy-for-aws)
+      CompatibleRuntimes:
+        - python3.12
+      CompatibleArchitectures:
+        - arm64
+      Content:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: aws-operations-layer.zip
+
+  AwsOperationsFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-aws-operations
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Architectures:
+        - arm64
+      Code:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: aws-operations-code.zip
+      Role: !GetAtt AwsOperationsFunctionRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Layers:
+        - !Ref AwsOperationsLayer
+      Environment:
+        Variables:
+          AWS_REGION_OVERRIDE: !Ref AWS::Region
+          TOOLKIT_MCP_URL: "https://aws-mcp.us-east-1.api.aws/mcp"
+
+  AwsOperationsTarget:
+    Type: AWS::BedrockAgentCore::GatewayTarget
+    Properties:
+      GatewayIdentifier: !GetAtt AgentCoreGateway.GatewayIdentifier
+      Name: TechbotOperations
+      TargetConfiguration:
+        Mcp:
+          Lambda:
+            LambdaArn: !GetAtt AwsOperationsFunction.Arn
+            ToolSchema:
+              InlinePayload:
+                - Name: aws___call_aws
+                  Description: >-
+                    Execute authenticated AWS API calls using CLI command syntax.
+                    Supports all AWS services. Use for querying, creating, or modifying resources.
+                    NEVER use for delete or terminate operations.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      cli_command:
+                        Type: string
+                        Description: >-
+                          AWS CLI command to execute (e.g. "aws ec2 describe-instances --region us-west-2",
+                          "aws s3 ls", "aws lambda list-functions --region us-west-2")
+                    Required:
+                      - cli_command
+                - Name: aws___suggest_aws_commands
+                  Description: >-
+                    Get descriptions and syntax help for relevant AWS APIs.
+                    Use when unsure about the correct CLI command or parameters.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      query:
+                        Type: string
+                        Description: Description of what you want to do (e.g. list all EC2 instances)
+                    Required:
+                      - query
+                - Name: aws___run_script
+                  Description: >-
+                    Execute Python code with AWS API access for complex multi-step operations.
+                    Use for tasks that involve listing resources and checking properties,
+                    parallel API calls, or cross-service checks.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      code:
+                        Type: string
+                        Description: Python code to execute
+                    Required:
+                      - code
+                - Name: aws___retrieve_skill
+                  Description: >-
+                    Retrieve an AWS agent skill — structured step-by-step operation guides
+                    with best practices, decision frameworks, and CLI commands for specific AWS tasks.
+                    MUST call search_documentation first to discover the skill_name.
+                    Use when the user asks to perform a complex AWS operation (create resources,
+                    configure security, set up monitoring, etc.) to get official verified procedures.
+                  InputSchema:
+                    Type: object
+                    Properties:
+                      skill_name:
+                        Type: string
+                        Description: >-
+                          Exact skill name from search_documentation results.
+                          Must be discovered via search first, never guessed.
+                      file:
+                        Type: string
+                        Description: >-
+                          Optional specific file within the skill (e.g. references/architecture.md).
+                          Omit to get the main SKILL.md.
+                    Required:
+                      - skill_name
+      CredentialProviderConfigurations:
+        - CredentialProviderType: GATEWAY_IAM_ROLE
+
+  # =========================
+  # AgentCore Runtime
+  # =========================
+  AgentCoreRuntimeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-runtime-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock-agentcore.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSPriceListServiceFullAccess
+      Policies:
+        - PolicyName: RuntimePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - bedrock-agentcore:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                  - xray:GetSamplingRules
+                  - xray:GetSamplingTargets
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - cognito-idp:DescribeUserPoolClient
+                Resource: !GetAtt GatewayCognitoUserPool.Arn
+
+  AgentCoreRuntime:
+    Type: AWS::BedrockAgentCore::Runtime
+    DependsOn: ImageCopyTrigger
+    Properties:
+      AgentRuntimeName: !Sub ${ProjectName}_runtime
+      Description: !Sub ${ProjectName} AgentCore Runtime
+      RoleArn: !GetAtt AgentCoreRuntimeRole.Arn
+      AgentRuntimeArtifact:
+        ContainerConfiguration:
+          ContainerUri: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ProjectName}-repo:latest
+      NetworkConfiguration:
+        NetworkMode: PUBLIC
+      EnvironmentVariables:
+        AWS_REGION: !Ref AWS::Region
+        MODEL_ID: !Ref ModelId
+        MEMORY_ID: !If
+          - CreateMemory
+          - !GetAtt AgentCoreMemory.MemoryId
+          - ''
+        GATEWAY_URL: !Sub
+          - https://${GatewayId}.gateway.bedrock-agentcore.${AWS::Region}.amazonaws.com/mcp
+          - GatewayId: !GetAtt AgentCoreGateway.GatewayIdentifier
+        COGNITO_USER_POOL_ID: !Ref GatewayCognitoUserPool
+        COGNITO_CLIENT_ID: !Ref GatewayCognitoClient
+
+  # =========================
+  # Secrets Manager (Feishu credentials)
+  # =========================
+  FeishuSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${ProjectName}-feishu-credentials
+      Description: Feishu bot credentials (App ID, App Secret, Verification Token)
+      SecretString: !Sub |
+        {
+          "APP_ID": "${AppId}",
+          "APP_SECRET": "${AppSecret}",
+          "VERIFICATION_TOKEN": "${FeishuVerificationToken}"
+        }
+
+  # =========================
+  # API Gateway (Feishu webhook)
+  # =========================
+  TechBotApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${ProjectName}-api
+      Description: !Sub ${ProjectName} Feishu webhook endpoint
+
+  ChatResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TechBotApi
+      ParentId: !GetAtt TechBotApi.RootResourceId
+      PathPart: chat
+
+  ChatMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TechBotApi
+      ResourceId: !Ref ChatResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HandlerFunction.Arn}/invocations
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ChatMethod
+    Properties:
+      RestApiId: !Ref TechBotApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref TechBotApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+
+  # =========================
+  # Handler Lambda (webhook receiver)
+  # =========================
+  HandlerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-handler-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeWorker
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt WorkerFunction.Arn
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref FeishuSecret
+
+  HandlerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-handler
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json, os, boto3
+          lambda_client = boto3.client("lambda")
+          sm_client = boto3.client("secretsmanager")
+          WORKER_FUNCTION_NAME = os.environ.get("WORKER_FUNCTION_NAME", "")
+          SECRET_ARN = os.environ.get("SECRET_ARN", "")
+          _cached_secret = None
+          def get_secret():
+              global _cached_secret
+              if not _cached_secret:
+                  resp = sm_client.get_secret_value(SecretId=SECRET_ARN)
+                  _cached_secret = json.loads(resp["SecretString"])
+              return _cached_secret
+          def resp(code, body):
+              return {"statusCode": code, "headers": {"Content-Type": "application/json"}, "body": json.dumps(body, ensure_ascii=False)}
+          def lambda_handler(event, context):
+              body = event.get("body")
+              if body:
+                  try:
+                      event = json.loads(body)
+                  except Exception:
+                      return resp(400, {"msg": "invalid json"})
+              if "challenge" in event:
+                  return resp(200, {"challenge": event["challenge"]})
+              secret = get_secret()
+              token = event.get("header", {}).get("token", "")
+              if token != secret.get("VERIFICATION_TOKEN", ""):
+                  return resp(403, {"msg": "invalid token"})
+              if event.get("header", {}).get("event_type") != "im.message.receive_v1":
+                  return resp(200, {"msg": "ok"})
+              message = event.get("event", {}).get("message", {})
+              content_str = message.get("content", "{}")
+              try:
+                  content = json.loads(content_str)
+              except Exception:
+                  content = {}
+              text = content.get("text", "")
+              if "@_all" in text:
+                  return resp(200, {"msg": "ok"})
+              lambda_client.invoke(
+                  FunctionName=WORKER_FUNCTION_NAME,
+                  InvocationType="Event",
+                  Payload=json.dumps(event, ensure_ascii=False).encode("utf-8"),
+              )
+              return resp(200, {"msg": "ok"})
+      Role: !GetAtt HandlerFunctionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          WORKER_FUNCTION_NAME: !Ref WorkerFunction
+          SECRET_ARN: !Ref FeishuSecret
+
+  HandlerApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref HandlerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TechBotApi}/*/POST/chat
+
+  # =========================
+  # Worker Lambda (calls AgentCore, patches Feishu card)
+  # =========================
+  WorkerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-worker-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeAgentCore
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource:
+                  - !GetAtt AgentCoreRuntime.AgentRuntimeArn
+                  - !Sub ${AgentCoreRuntime.AgentRuntimeArn}/runtime-endpoint/*
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref FeishuSecret
+
+  WorkerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-worker
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Code:
+        S3Bucket: !FindInMap [ArtifactBucket, !Ref 'AWS::Region', Name]
+        S3Key: worker.zip
+      Role: !GetAtt WorkerFunctionRole.Arn
+      Timeout: 400
+      MemorySize: 512
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:770693421928:layer:Klayers-p312-requests:19
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref FeishuSecret
+          AGENT_RUNTIME_ARN: !GetAtt AgentCoreRuntime.AgentRuntimeArn
+          AGENTCORE_REGION: !Ref AWS::Region
+
+Outputs:
+  MemoryId:
+    Condition: CreateMemory
+    Description: AgentCore Memory ID
+    Value: !GetAtt AgentCoreMemory.MemoryId
+
+  RuntimeArn:
+    Description: AgentCore Runtime ARN
+    Value: !GetAtt AgentCoreRuntime.AgentRuntimeArn
+
+  GatewayId:
+    Description: AgentCore Gateway ID
+    Value: !GetAtt AgentCoreGateway.GatewayIdentifier
+
+  GatewayUrl:
+    Description: AgentCore Gateway MCP endpoint URL
+    Value: !Sub
+      - https://${GatewayId}.gateway.bedrock-agentcore.${AWS::Region}.amazonaws.com/mcp
+      - GatewayId: !GetAtt AgentCoreGateway.GatewayIdentifier
+
+  FeishuEventSubscriptionUrl:
+    Description: Feishu bot event subscription URL (paste into Feishu Open Platform → Event Subscription → Request URL)
+    Value: !Sub https://${TechBotApi}.execute-api.${AWS::Region}.amazonaws.com/prod/chat
+
+  HandlerFunctionName:
+    Value: !Ref HandlerFunction
+
+  WorkerFunctionName:
+    Value: !Ref WorkerFunction

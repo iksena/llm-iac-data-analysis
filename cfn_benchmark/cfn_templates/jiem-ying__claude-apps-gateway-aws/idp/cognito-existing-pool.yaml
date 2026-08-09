@@ -1,0 +1,147 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Adds a confidential OIDC web client for the Claude Apps Gateway to an EXISTING
+  Cognito user pool, and stores its generated secret in Secrets Manager. This is
+  an add-on stack — it never edits the pool itself; it only references the pool by
+  id. Use this when you already run a Cognito user pool and want the gateway to
+  reuse it as its IdP. (To stand up a fresh pool instead, use cognito-create-pool.yaml.)
+
+Parameters:
+  UserPoolId:
+    Type: String
+    Description: Existing Cognito user pool id, e.g. <region>_xxxxxxxxx
+  GatewayHostname:
+    Type: String
+    Description: Gateway DNS name; the callback URL is https://<this>/oauth/callback
+
+Resources:
+  GatewayClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${AWS::StackName}-gateway"
+      UserPoolId: !Ref UserPoolId
+      GenerateSecret: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes: [openid, email, profile]
+      CallbackURLs:
+        - !Sub "https://${GatewayHostname}/oauth/callback"
+      SupportedIdentityProviders: [COGNITO]
+      ExplicitAuthFlows: [ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      IdTokenValidity: 60
+      AccessTokenValidity: 60
+      RefreshTokenValidity: 720
+      TokenValidityUnits:
+        IdToken: minutes
+        AccessToken: minutes
+        RefreshToken: minutes
+
+  SecretStoreRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+      Policies:
+        - PolicyName: cognito-and-secrets
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: cognito-idp:DescribeUserPoolClient
+                Resource: !Sub "arn:${AWS::Partition}:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolId}"
+              - Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:DeleteSecret
+                Resource: !Sub "arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AWS::StackName}-*"
+
+  SecretStoreFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt SecretStoreRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          # Self-contained CFN custom resource: vendors the response POST via
+          # urllib so it doesn't depend on the `cfnresponse` module, which is not
+          # bundled in the python3.12 runtime.
+          import json, urllib.request
+          import boto3
+
+          def send(event, context, status, data, physical_id=None):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': f"See CloudWatch log stream {context.log_stream_name}",
+                  'PhysicalResourceId': physical_id or context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'NoEcho': False,
+                  'Data': data,
+              }).encode('utf-8')
+              req = urllib.request.Request(event['ResponseURL'], data=body, method='PUT',
+                                           headers={'content-type': '', 'content-length': str(len(body))})
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              try:
+                  props = event['ResourceProperties']
+                  secret_name = props['SecretName']
+                  secrets = boto3.client('secretsmanager')
+                  if event['RequestType'] == 'Delete':
+                      try:
+                          secrets.delete_secret(SecretId=secret_name,
+                                                ForceDeleteWithoutRecovery=True)
+                      except secrets.exceptions.ResourceNotFoundException:
+                          pass
+                      send(event, context, 'SUCCESS', {}, secret_name)
+                      return
+                  cognito = boto3.client('cognito-idp')
+                  resp = cognito.describe_user_pool_client(
+                      UserPoolId=props['UserPoolId'], ClientId=props['ClientId'])
+                  client_secret = resp['UserPoolClient'].get('ClientSecret')
+                  if not client_secret:
+                      raise ValueError("client has no secret (GenerateSecret must be true)")
+                  try:
+                      arn = secrets.create_secret(Name=secret_name,
+                          SecretString=client_secret,
+                          Description="Claude Apps Gateway OIDC client secret")['ARN']
+                  except secrets.exceptions.ResourceExistsException:
+                      secrets.update_secret(SecretId=secret_name, SecretString=client_secret)
+                      arn = secrets.describe_secret(SecretId=secret_name)['ARN']
+                  send(event, context, 'SUCCESS', {'SecretArn': arn}, secret_name)
+              except Exception as e:
+                  print(f"error: {e}")
+                  send(event, context, 'FAILED', {'Message': str(e)},
+                       event.get('ResourceProperties', {}).get('SecretName'))
+
+  GatewayClientSecret:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SecretStoreFunction.Arn
+      UserPoolId: !Ref UserPoolId
+      ClientId: !Ref GatewayClient
+      SecretName: !Sub "${AWS::StackName}-oidc-client-secret"
+
+Outputs:
+  ClientId:
+    Description: Pass as OidcClientId to claude-apps-gateway.yaml.
+    Value: !Ref GatewayClient
+  ClientSecretArn:
+    Description: Pass as OidcClientSecretArn to claude-apps-gateway.yaml.
+    Value: !GetAtt GatewayClientSecret.SecretArn
+  Issuer:
+    Description: Pass as OidcIssuer (used when rendering gateway.yaml).
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}"

@@ -1,0 +1,156 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Parameters:
+  PrivateRouteTables:
+    Type: String
+
+  PublicSubnet:
+    Type: String
+
+Mappings:
+  RegionMap:
+    'ap-southeast-2':
+      AMI: 'ami-09dba131bcfb36a0c'
+
+Resources:
+  NATInstanceAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - !Ref PublicSubnet
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          OnDemandPercentageAboveBaseCapacity: 0
+          SpotAllocationStrategy: lowest-price
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref NATInstanceLaunchTemplate
+            Version: !GetAtt NATInstanceLaunchTemplate.LatestVersionNumber
+          Overrides:
+          - InstanceType: t3a.nano
+          - InstanceType: t3.nano
+      MaxSize: '1'
+      MinSize: '1'
+      MetricsCollection:
+      - Granularity: 1Minute
+        Metrics:
+        - GroupInServiceInstances
+      Tags:
+      - Key: Name
+        PropagateAtLaunch: true
+        Value: !Join ['', [!Ref 'AWS::AccountId', '-', !Ref 'AWS::Region', '-', !Ref 'AWS::StackName']]
+
+  NATInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+      - PolicyName: ec2
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+            - 'ec2:ModifyInstanceAttribute'
+            - 'ec2:CreateRoute'
+            - 'ec2:ReplaceRoute'
+            - "ec2:AttachNetworkInterface"
+            Resource:
+            - '*'
+
+  NATStaticNetworkInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      SourceDestCheck: False
+
+  NATEIP:
+    Type: AWS::EC2::EIP
+
+  NATEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      NetworkInterfaceId: !Ref NATStaticNetworkInterface
+      AllocationId: !GetAtt NATEIP.AllocationId
+
+  NATInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Join ['', [!Ref 'AWS::AccountId', '-', !Ref 'AWS::Region', '-', !Ref 'AWS::StackName']]
+      Roles:
+      - !Ref NATInstanceRole
+
+  NATInstanceLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Join ['', [!Ref 'AWS::AccountId', '-', !Ref 'AWS::Region', '-', !Ref 'AWS::StackName']]
+      LaunchTemplateData:
+        IamInstanceProfile:
+          Arn: !GetAtt NATInstanceProfile.Arn
+        ImageId:
+          Fn::FindInMap:
+          - RegionMap
+          - !Ref 'AWS::Region'
+          - AMI
+        InstanceType: t3.nano
+        UserData:
+          'Fn::Base64': !Sub
+          - |
+            #!/bin/bash -ex
+            trap '/opt/aws/bin/cfn-signal -e 1 --region ${Region} --stack ${StackName} --resource NATAutoScalingGroup' ERR
+
+            INSTANCEID=$(curl -s -m 60 http://169.254.169.254/latest/meta-data/instance-id)
+
+            aws --region ${Region} ec2 modify-instance-attribute \
+              --instance-id $INSTANCEID \
+              --source-dest-check "{\"Value\": false}"
+
+            aws --region ${Region} ec2 attach-network-interface \
+                --device-index 1 \
+                --instance-id $INSTANCEID \
+                --network-interface-id ${NATStaticNetworkInterface}
+
+            # Wait for above eni to attach.
+            while ! ip link show dev eth1; do
+              sleep 1
+            done
+
+            # Enable accepting incoming network packets.
+            sysctl -q -w net.ipv4.ip_forward=1
+
+            # Disables sending IPv4 ICMP redirected packets.
+            sysctl -q -w net.ipv4.conf.eth1.send_redirects=0
+
+            # Enabled Network Address Translation (NAT).
+            iptables -t nat -A POSTROUTING -o eth1 -j MASQUERADE
+
+            # Remove default route to primary interface.
+            ip route del default dev eth0
+
+            # Update private subnet route tables to point to eni.
+            IFS=$','
+            tables=${PrivateRouteTables}
+            for table in $tables; do
+              aws --region ${Region} ec2 replace-route \
+                --route-table-id $table \
+                --destination-cidr-block "0.0.0.0/0" \
+                --network-interface-id ${NATStaticNetworkInterface} || \
+                  aws --region ${Region} ec2 create-route \
+                    --route-table-id $table \
+                    --destination-cidr-block "0.0.0.0/0" \
+                    --network-interface-id ${NATStaticNetworkInterface}
+            done
+            unset IFS
+          - PrivateRouteTables: !Ref PrivateRouteTables
+            Region: !Ref "AWS::Region"
+            StackName: !Ref "AWS::StackName"
+            NATStaticNetworkInterface: !Ref NATStaticNetworkInterface

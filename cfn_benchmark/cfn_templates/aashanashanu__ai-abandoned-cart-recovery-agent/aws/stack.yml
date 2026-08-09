@@ -1,0 +1,727 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >-
+  Unified stack for the AI Abandoned Cart Recovery Agent.
+  Includes: EventBridge → Lambda ingestion pipeline, Decision Engine Lambda,
+  S3 bucket for decision matrix, IAM roles, and CloudWatch log groups.
+
+# ==============================================================
+# Parameters
+# ==============================================================
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Deployment environment
+
+  ProjectName:
+    Type: String
+    Default: ai-abandoned-cart-recovery
+    Description: Project name prefix for resource naming
+
+  # --- Event Ingest Parameters ---
+  EsEndpoint:
+    Type: String
+    Default: ""
+    Description: Elasticsearch/OpenSearch endpoint (https://...)
+
+  EsApiKey:
+    Type: String
+    Default: ""
+    Description: (Optional) API key for Elasticsearch (id:key). Will be base64-encoded by the function.
+
+  EsUsername:
+    Type: String
+    Default: ""
+
+  EsPassword:
+    Type: String
+    Default: ""
+
+  CheckAtMinutes:
+    Type: Number
+    Default: 30
+    Description: Minutes to add to last_seen when computing check_at for cart_state
+
+  EventBusName:
+    Type: String
+    Default: abandoned-cart-recovery-bus
+    Description: Name of the custom EventBridge bus to use for events
+
+  # --- Decision Engine Parameters ---
+  DecisionEngineLambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: Decision engine Lambda function timeout in seconds
+
+  DecisionEngineLambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: Decision engine Lambda function memory size in MB
+
+  # --- Recovery Action Parameters ---
+  SenderEmail:
+    Type: String
+    Default: ""
+    Description: Verified SES sender email address for recovery emails
+
+  RecoveryActionLambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: Recovery action Lambda function timeout in seconds
+
+  RecoveryActionLambdaMemorySize:
+    Type: Number
+    Default: 256
+    Description: Recovery action Lambda function memory size in MB
+
+  # --- MCP Server Parameters ---
+  McpServerLambdaTimeout:
+    Type: Number
+    Default: 60
+    Description: MCP server Lambda function timeout in seconds (higher to allow downstream invocations)
+
+  McpServerLambdaMemorySize:
+    Type: Number
+    Default: 512
+    Description: MCP server Lambda function memory size in MB
+
+  McpApiKeyStageName:
+    Type: String
+    Default: v1
+    Description: API Gateway stage name for the MCP server endpoint
+
+# ==============================================================
+# Resources
+# ==============================================================
+Resources:
+
+  # ============================================================
+  # 1. Event Ingest – EventBridge → Lambda
+  # ============================================================
+  EventIngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-event-ingest-${Environment}'
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      CodeUri: lambda/event_ingest/
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ES_ENDPOINT: !Ref EsEndpoint
+          ES_API_KEY: !Ref EsApiKey
+          ES_USERNAME: !Ref EsUsername
+          ES_PASSWORD: !Ref EsPassword
+          CHECK_AT_MINUTES: !Ref CheckAtMinutes
+          EVENT_BUS_NAME: !Ref EventBusName
+          ENVIRONMENT: !Ref Environment
+      Policies:
+        - AWSLambdaBasicExecutionRole
+      Events:
+        FromEventBridge:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref EventBusName
+            Pattern:
+              source:
+                - "ai-abandoned-cart"
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # ============================================================
+  # 2. S3 Bucket for Decision Matrix
+  # ============================================================
+  DecisionMatrixBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-decision-matrix-${Environment}-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DecisionMatrixBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DecisionMatrixBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyUnencryptedObjectUploads
+            Effect: Deny
+            Principal: '*'
+            Action: s3:PutObject
+            Resource: !Sub '${DecisionMatrixBucket.Arn}/*'
+            Condition:
+              StringNotEquals:
+                s3:x-amz-server-side-encryption: AES256
+
+  # ============================================================
+  # 3. IAM Role for Decision Engine Lambda
+  # ============================================================
+  DecisionEngineLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-decision-engine-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3ReadDecisionMatrix
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                Resource: !Sub '${DecisionMatrixBucket.Arn}/decision-matrix.json'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # 4. Decision Engine Lambda Function
+  # ============================================================
+  DecisionEngineLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-decision-engine-${Environment}'
+      Description: Decision engine for abandoned cart recovery actions
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt DecisionEngineLambdaRole.Arn
+      Timeout: !Ref DecisionEngineLambdaTimeout
+      MemorySize: !Ref DecisionEngineLambdaMemorySize
+      Environment:
+        Variables:
+          DECISION_BUCKET: !Ref DecisionMatrixBucket
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          # Updated via deploy script
+          def handler(event, context):
+              return {"statusCode": 200, "body": "Deploy actual code"}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # 5. CloudWatch Log Groups
+  # ============================================================
+  DecisionEngineLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-decision-engine-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # 6. Lambda Permission for EventBridge invocation (Decision Engine)
+  # ============================================================
+  DecisionEngineLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DecisionEngineLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*'
+
+  # ============================================================
+  # 7. IAM Role for Recovery Action Lambda
+  # ============================================================
+  RecoveryActionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-recovery-action-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SESSendEmail
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+        - PolicyName: EventBridgePutEvents
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${EventBusName}'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # 8. Recovery Action Lambda Function
+  # ============================================================
+  RecoveryActionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-recovery-action-${Environment}'
+      Description: Sends recovery actions (SES email) and publishes recovery history to EventBridge
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt RecoveryActionLambdaRole.Arn
+      Timeout: !Ref RecoveryActionLambdaTimeout
+      MemorySize: !Ref RecoveryActionLambdaMemorySize
+      Environment:
+        Variables:
+          SENDER_EMAIL: !Ref SenderEmail
+          EVENT_BUS_NAME: !Ref EventBusName
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          # Placeholder – deploy actual code via CI/CD pipeline
+          # See aws/lambda/recovery_action/handler.py
+          def handler(event, context):
+              return {"statusCode": 200, "body": "Deploy actual code"}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # 9. CloudWatch Log Group for Recovery Action
+  # ============================================================
+  RecoveryActionLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-recovery-action-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # 10. Lambda Permission for Recovery Action (EventBridge)
+  # ============================================================
+  RecoveryActionLambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RecoveryActionLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*'
+
+  # ============================================================
+  # 11. IAM Role for MCP Server Lambda
+  # ============================================================
+  McpServerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-mcp-server-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: InvokeToolLambdas
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt DecisionEngineLambda.Arn
+                  - !GetAtt RecoveryActionLambda.Arn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # 12. MCP Server Lambda Function
+  # ============================================================
+  McpServerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-mcp-server-${Environment}'
+      Description: MCP (Model Context Protocol) server exposing decision engine and recovery action as tools
+      Runtime: python3.12
+      Handler: handler.handler
+      Role: !GetAtt McpServerLambdaRole.Arn
+      Timeout: !Ref McpServerLambdaTimeout
+      MemorySize: !Ref McpServerLambdaMemorySize
+      Environment:
+        Variables:
+          DECISION_ENGINE_FUNCTION: !Ref DecisionEngineLambda
+          RECOVERY_ACTION_FUNCTION: !Ref RecoveryActionLambda
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          # Placeholder – deploy actual code via CI/CD pipeline
+          # See aws/lambda/mcp_server/handler.py
+          def handler(event, context):
+              return {"statusCode": 200, "body": "Deploy actual code"}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # 13. CloudWatch Log Group for MCP Server
+  # ============================================================
+  McpServerLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-mcp-server-${Environment}'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # 14. API Gateway REST API for MCP Server
+  # ============================================================
+  McpApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-mcp-api-${Environment}'
+      Description: API Gateway for MCP server – AI Abandoned Cart Recovery
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ── /mcp resource ─────────────────────────────────────────
+  McpApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref McpApi
+      ParentId: !GetAtt McpApi.RootResourceId
+      PathPart: mcp
+
+  # ── POST /mcp (JSON-RPC endpoint) ─────────────────────────
+  McpApiPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref McpApi
+      ResourceId: !Ref McpApiResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${McpServerLambda.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: '200'
+
+  # ── GET /mcp (health check / server info) ──────────────────
+  McpApiGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref McpApi
+      ResourceId: !Ref McpApiResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${McpServerLambda.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: '200'
+
+  # ── DELETE /mcp (session termination) ──────────────────────
+  McpApiDeleteMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref McpApi
+      ResourceId: !Ref McpApiResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${McpServerLambda.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: '200'
+
+  # ── OPTIONS /mcp (CORS preflight – no API key required) ────
+  McpApiOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref McpApi
+      ResourceId: !Ref McpApiResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      ApiKeyRequired: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${McpServerLambda.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: '204'
+
+  # ============================================================
+  # 15. API Gateway Deployment & Stage
+  # ============================================================
+  McpApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - McpApiPostMethod
+      - McpApiGetMethod
+      - McpApiDeleteMethod
+      - McpApiOptionsMethod
+    Properties:
+      RestApiId: !Ref McpApi
+
+  McpApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref McpApi
+      DeploymentId: !Ref McpApiDeployment
+      StageName: !Ref McpApiKeyStageName
+      Description: !Sub 'MCP server stage (${Environment})'
+      MethodSettings:
+        - ResourcePath: /~1mcp
+          HttpMethod: POST
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 100
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============================================================
+  # 16. API Key & Usage Plan
+  # ============================================================
+  McpApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    DependsOn: McpApiStage
+    Properties:
+      Name: !Sub '${ProjectName}-mcp-api-key-${Environment}'
+      Description: API key for MCP server access
+      Enabled: true
+      StageKeys:
+        - RestApiId: !Ref McpApi
+          StageName: !Ref McpApiKeyStageName
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  McpApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: McpApiStage
+    Properties:
+      UsagePlanName: !Sub '${ProjectName}-mcp-usage-plan-${Environment}'
+      Description: Usage plan for the MCP server API
+      ApiStages:
+        - ApiId: !Ref McpApi
+          Stage: !Ref McpApiKeyStageName
+      Throttle:
+        BurstLimit: 50
+        RateLimit: 100
+      Quota:
+        Limit: 10000
+        Period: DAY
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  McpApiUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !Ref McpApiKey
+      KeyType: API_KEY
+      UsagePlanId: !Ref McpApiUsagePlan
+
+  # ============================================================
+  # 17. Lambda Permission for API Gateway → MCP Server
+  # ============================================================
+  McpServerLambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref McpServerLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${McpApi}/*'
+
+# ==============================================================
+# Outputs
+# ==============================================================
+Outputs:
+  # --- Event Ingest ---
+  EventIngestFunctionArn:
+    Description: Event ingest Lambda function ARN
+    Value: !GetAtt EventIngestFunction.Arn
+    Export:
+      Name: !Sub '${ProjectName}-event-ingest-arn-${Environment}'
+
+  EventIngestFunctionName:
+    Description: Event ingest Lambda function name
+    Value: !Ref EventIngestFunction
+    Export:
+      Name: !Sub '${ProjectName}-event-ingest-name-${Environment}'
+
+  # --- Decision Engine ---
+  DecisionMatrixBucketName:
+    Description: S3 bucket name for decision matrix
+    Value: !Ref DecisionMatrixBucket
+    Export:
+      Name: !Sub '${ProjectName}-decision-bucket-${Environment}'
+
+  DecisionMatrixBucketArn:
+    Description: S3 bucket ARN for decision matrix
+    Value: !GetAtt DecisionMatrixBucket.Arn
+    Export:
+      Name: !Sub '${ProjectName}-decision-bucket-arn-${Environment}'
+
+  DecisionEngineLambdaArn:
+    Description: Decision engine Lambda function ARN
+    Value: !GetAtt DecisionEngineLambda.Arn
+    Export:
+      Name: !Sub '${ProjectName}-decision-engine-arn-${Environment}'
+
+  DecisionEngineLambdaName:
+    Description: Decision engine Lambda function name
+    Value: !Ref DecisionEngineLambda
+    Export:
+      Name: !Sub '${ProjectName}-decision-engine-name-${Environment}'
+
+  # --- Recovery Action ---
+  RecoveryActionLambdaArn:
+    Description: Recovery action Lambda function ARN
+    Value: !GetAtt RecoveryActionLambda.Arn
+    Export:
+      Name: !Sub '${ProjectName}-recovery-action-arn-${Environment}'
+
+  RecoveryActionLambdaName:
+    Description: Recovery action Lambda function name
+    Value: !Ref RecoveryActionLambda
+    Export:
+      Name: !Sub '${ProjectName}-recovery-action-name-${Environment}'
+
+  # --- MCP Server ---
+  McpServerLambdaArn:
+    Description: MCP server Lambda function ARN
+    Value: !GetAtt McpServerLambda.Arn
+    Export:
+      Name: !Sub '${ProjectName}-mcp-server-arn-${Environment}'
+
+  McpServerLambdaName:
+    Description: MCP server Lambda function name
+    Value: !Ref McpServerLambda
+    Export:
+      Name: !Sub '${ProjectName}-mcp-server-name-${Environment}'
+
+  McpServerUrl:
+    Description: MCP server endpoint URL (POST JSON-RPC requests here)
+    Value: !Sub 'https://${McpApi}.execute-api.${AWS::Region}.amazonaws.com/${McpApiKeyStageName}/mcp'
+    Export:
+      Name: !Sub '${ProjectName}-mcp-server-url-${Environment}'
+
+  McpApiKeyId:
+    Description: API key ID for the MCP server (retrieve the value via AWS Console or CLI)
+    Value: !Ref McpApiKey
+    Export:
+      Name: !Sub '${ProjectName}-mcp-api-key-id-${Environment}'
+
+  McpApiId:
+    Description: API Gateway REST API ID
+    Value: !Ref McpApi
+    Export:
+      Name: !Sub '${ProjectName}-mcp-api-id-${Environment}'

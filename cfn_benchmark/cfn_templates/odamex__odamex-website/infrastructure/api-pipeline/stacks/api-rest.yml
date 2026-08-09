@@ -1,0 +1,328 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: The resources used to create the API
+Parameters:
+  EnvironmentName:
+    AllowedValues:
+      - 'local'
+      - 'dev'
+      - 'qa'
+      - 'stg'
+      - 'prod'
+    Type: String
+    Description: The name for the environment that this cloudformation will be part of.
+    Default: dev
+  UserPoolId:
+    Type: String
+  UserPoolArn:
+    Type: String
+  S3UserUploadName:
+    Type: String
+  DatabaseSecurityGroup:
+    Type: String
+    Description: Security group for database access
+  DatabaseSubnetList:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Database subnets to attach API Lambda to
+  DBAdminSecret:
+    Type: String
+  DBClusterArn:
+    Type: String
+  GoogleMapsApiKeyParameterName:
+    Type: AWS::SSM::Parameter::Name
+  ProjectName:
+    Description: Primary project name
+    Type: String
+    Default: 'odamex'
+  ProjectURL:
+    Type: String
+    Default: 'odamex.net'
+  HostedZoneId:
+    Description: Route 53 hosted zone ID for API custom domain
+    Type: String
+  WAFArn:
+    Type: String
+
+Conditions:
+  IsStaging: !Equals
+    - !Ref EnvironmentName
+    - stg
+  IsProd: !Equals
+    - !Ref EnvironmentName
+    - prod
+  IsNotProd: !Not
+    - !Condition IsProd
+  IsStagingOrProd: !Or
+    - !Condition IsStaging
+    - !Condition IsProd
+
+Mappings:
+  LogLevel:
+    local:
+      level: DEBUG
+    dev:
+      level: DEBUG
+    qa:
+      level: INFO
+    stg:
+      level: INFO
+    prod:
+      level: INFO
+
+Resources:
+  LambdaForProxyRestAPIExecRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub ${ProjectName}-${EnvironmentName}-LambdaForProxyRestAPIExecRole
+      Tags:
+        - Key: platform
+          Value: odamex
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-${EnvironmentName}-LambdaForProxyRestAPIExecPolicy'
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              # groups are sorted in alphabetical order by service prefix
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminDeleteUser
+                  - cognito-idp:AdminDisableUser
+                  - cognito-idp:AdminEnableUser
+                  - cognito-idp:AdminGetUser
+                  - cognito-idp:AdminResetUserPassword
+                  - cognito-idp:AdminSetUserMFAPreference
+                  - cognito-idp:AdminUpdateUserAttributes
+                  - cognito-idp:ChangePassword
+                Resource: !Ref UserPoolArn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - rds-data:*
+                Resource: !Ref DBClusterArn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DBAdminSecret
+              - Effect: Allow
+                Action:
+                  - ses:SendTemplatedEmail
+                # We could restrict this to specific email template ARNs, but the CloudFormation docs don't specify
+                # how to get the ARN. The ARNs also aren't displayed in the console OR in the CLI output, so since
+                # this is pretty low risk, just leaving it as * for simplicity.
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: '*'
+
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+
+  APIProxy:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: !Join ['-', [!Ref EnvironmentName, 'rest-proxy']]
+      Tags:
+        platform: odamex
+  APIProxyAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      ProviderARNs:
+        - !Ref UserPoolArn
+      IdentitySource: method.request.header.Authorization
+      Name: !Join ['-', [!Ref EnvironmentName, 'cognito-authorizer']]
+      RestApiId: !Ref APIProxy
+      Type: COGNITO_USER_POOLS
+
+  APIProxyResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIProxy
+      ParentId: !GetAtt APIProxy.RootResourceId
+      PathPart: '{proxy+}'
+  APIProxyResourceMethodMock:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      RestApiId: !Ref APIProxy
+      ResourceId: !Ref APIProxyResource
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+          StatusCode: 200
+      Integration:
+        RequestTemplates:
+          application/json: |
+            {"statusCode": 200}
+        Type: MOCK
+        IntegrationResponses:
+          - ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Methods: "'DELETE,GET,HEAD,OPTIONS,PATCH,POST,PUT'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization,X-Amz-Date,X-Api-Key,X-Amz-Security-Token'"
+            ResponseTemplates:
+              application/json: ''
+            StatusCode: 200
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+  APIProxyResourceMethodANY:
+    Type: 'AWS::ApiGateway::Method'
+    DependsOn:
+      - APIProxy
+      - LambdaForProxyRestAPI
+    Properties:
+      RestApiId: !Ref APIProxy
+      ResourceId: !Ref APIProxyResource
+      HttpMethod: ANY
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref APIProxyAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${lambdaArn}/invocations
+          - lambdaArn: !GetAtt LambdaForProxyRestAPI.Arn
+
+  # Lambda for Proxy API
+  LambdaForProxyRestAPI:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-rest-api'
+      Tags:
+        - Key: platform
+          Value: odamex
+      Handler: built/index.handler
+      MemorySize: 384
+      Role: !GetAtt LambdaForProxyRestAPIExecRole.Arn
+      Runtime: nodejs22.x
+      Timeout: 600
+      LoggingConfig:
+        ApplicationLogLevel: !FindInMap [LogLevel, !Ref EnvironmentName, level]
+        LogFormat: JSON
+        SystemLogLevel: !FindInMap [LogLevel, !Ref EnvironmentName, level]
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref DatabaseSecurityGroup
+        SubnetIds: !Ref DatabaseSubnetList
+      Environment:
+        Variables:
+          EnvironmentName: !Ref EnvironmentName
+          REGION: !Ref 'AWS::Region'
+          AUTH_USERPOOLID: !Ref UserPoolId
+          DB_AdminSecret: !Ref DBAdminSecret
+          DB_ClusterArn: !Ref DBClusterArn
+          ProjectURL: !Ref ProjectURL
+          ACCOUNT_ID: !Sub ${AWS::AccountId}
+      Code:
+        ZipFile: |
+          // to be deployed
+  LambdaForProxyConfigPermission:
+    Type: 'AWS::Lambda::Permission'
+    DependsOn:
+      - APIProxy
+      - LambdaForProxyRestAPI
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LambdaForProxyRestAPI
+      Principal: apigateway.amazonaws.com
+
+  APIProxyDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn:
+      - APIProxyResourceMethodMock
+      - APIProxyResourceMethodANY
+    Properties:
+      RestApiId: !Ref APIProxy
+  APIProxyStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      StageName: !Sub '${ProjectName}-${EnvironmentName}'
+      Description: !Sub '${ProjectName}-${EnvironmentName}-stage'
+      Tags:
+        platform: odamex
+      RestApiId: !Ref APIProxy
+      DeploymentId: !Ref APIProxyDeployment
+  APICertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      Tags:
+        - Key: platform
+          Value: odamex
+      DomainName: !Sub 'api.${ProjectURL}'
+      DomainValidationOptions:
+        - DomainName: !Sub 'api.${ProjectURL}'
+          HostedZoneId: !Ref HostedZoneId
+      ValidationMethod: DNS
+  APICustomDomain:
+    Type: AWS::ApiGateway::DomainName
+    Properties:
+      DomainName: !Sub 'api.${ProjectURL}'
+      Tags:
+        - Key: platform
+          Value: odamex
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      RegionalCertificateArn: !Ref APICertificate
+      SecurityPolicy: TLS_1_2
+  APIDomainBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    DependsOn:
+      - APIProxyStage
+    Properties:
+      DomainName: !Ref APICustomDomain
+      RestApiId: !Ref APIProxy
+      Stage: !Ref APIProxyStage
+  APIDomainRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      AliasTarget:
+        DNSName: !GetAtt APICustomDomain.RegionalDomainName
+        HostedZoneId: !GetAtt APICustomDomain.RegionalHostedZoneId
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'api.${ProjectURL}'
+      Type: A
+
+  # WebACL association for Proxy API
+  APIProxyWebACL:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn:
+      - APIProxyStage
+    Properties:
+      ResourceArn: !Sub
+        - arn:aws:apigateway:${AWS::Region}::/restapis/${restApiId}/stages/${EnvironmentName}
+        - restApiId: !Ref APIProxy
+      WebACLArn: !Ref WAFArn
+
+  APIEmailSESConfigurationSet:
+    Type: AWS::SES::ConfigurationSet
+    Properties:
+      Name: !Sub ${ProjectName}-${EnvironmentName}-ses-configuration-set
+      Tags:
+        - Key: platform
+          Value: odamex
+      DeliveryOptions:
+        TlsPolicy: REQUIRE
+      SendingOptions:
+        SendingEnabled: true
+
+Outputs:
+  APIProxy:
+    Value: !Ref APIProxy
+  APIProxyResource:
+    Value: !Ref APIProxyResource

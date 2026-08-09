@@ -1,0 +1,446 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudWatch Log Alarm for FSx for ONTAP Audit Logs.
+  Uses the new AWS::CloudWatch::LogAlarm resource (July 2026) to create alarms
+  directly from CloudWatch Logs Insights queries — no metric filters required.
+
+  Prerequisites:
+    - FSx for ONTAP admin audit logs flowing to CloudWatch Logs
+      (via syslog-vpce-cloudwatch.yaml or custom pipeline)
+    - SNS Topic for alarm notifications
+
+  E2E Validation (2026-07-02, ap-northeast-1):
+    - AWS::CloudWatch::LogAlarm deploys successfully via CloudFormation
+    - cfn-lint E3006 is expected (resource spec not yet updated)
+    - AWS CLI put-log-alarm not available in v2.35.x (use CloudFormation)
+    - State flow: INSUFFICIENT_DATA → OK → ALARM (first eval ~5-10 min)
+    - Console displays as "Log alarm" type (separate from "Metric alarm")
+    - Log format: <priority>Mon DD HH:MM:SS FsxId...: [kern_audit:info:N] ...
+
+  Reference:
+    https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Alarm-On-Logs.html
+
+  Deploy:
+    bash shared/scripts/deploy-log-alarm.sh
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Log Source
+        Parameters:
+          - LogGroupName
+      - Label:
+          default: Detection Configuration
+        Parameters:
+          - DetectionType
+          - CustomQueryString
+          - CustomAggregation
+          - TargetPattern
+          - AlarmThreshold
+      - Label:
+          default: Evaluation Schedule
+        Parameters:
+          - EvaluationFrequencyMinutes
+          - QueryResultsToEvaluate
+          - QueryResultsToAlarm
+      - Label:
+          default: Notification
+        Parameters:
+          - AlarmSnsTopicArn
+          - ActionLogLineCount
+    ParameterLabels:
+      LogGroupName:
+        default: CloudWatch Logs ロググループ名
+      DetectionType:
+        default: 検知タイプ
+      TargetPattern:
+        default: 検知対象パターン (パス/ユーザー/キーワード)
+      AlarmThreshold:
+        default: アラート閾値
+
+Parameters:
+  LogGroupName:
+    Type: String
+    Default: /syslog/fsxn-admin-audit
+    Description: >
+      CloudWatch Logs log group containing FSx for ONTAP audit logs.
+      Use the output from syslog-vpce-cloudwatch.yaml stack.
+
+  DetectionType:
+    Type: String
+    Default: sensitive-file-access
+    AllowedValues:
+      - sensitive-file-access
+      - failed-access-attempts
+      - bulk-delete-operations
+      - specific-user-activity
+      - custom
+    Description: >
+      Pre-built detection pattern or custom query.
+      - sensitive-file-access: Alert on access to specific file paths
+      - failed-access-attempts: Alert on authentication/authorization failures
+      - bulk-delete-operations: Alert on mass file deletions (ransomware indicator)
+      - specific-user-activity: Alert on activity by a specific user
+      - custom: Use CustomQueryString and CustomAggregation
+
+  TargetPattern:
+    Type: String
+    Default: /vol/data/confidential
+    Description: >
+      Target pattern for detection. Interpretation depends on DetectionType:
+      - sensitive-file-access: file path prefix (e.g., /vol/data/confidential)
+      - failed-access-attempts: (ignored, matches all failures)
+      - bulk-delete-operations: (ignored, matches all deletes)
+      - specific-user-activity: username (e.g., admin or DOMAIN\\user)
+      - custom: (ignored, uses CustomQueryString)
+
+  CustomQueryString:
+    Type: String
+    Default: ''
+    Description: >
+      Custom Logs Insights query (DetectionType=custom only).
+      Example: fields @timestamp, @message | filter @message like /ERROR/
+
+  CustomAggregation:
+    Type: String
+    Default: 'count(*)'
+    Description: >
+      Aggregation expression for custom queries.
+      Examples: count(*), avg(duration), max(bytes)
+
+  AlarmThreshold:
+    Type: Number
+    Default: 0
+    Description: >
+      Alarm triggers when aggregated result exceeds this value.
+      0 = any matching event triggers alarm (count > 0).
+
+  EvaluationFrequencyMinutes:
+    Type: String
+    Default: '5'
+    AllowedValues: ['1', '5', '10', '15', '30', '60']
+    Description: >
+      How often the query runs (minutes). String type so !FindInMap reliably
+      matches the string keys in FrequencyToSeconds (a Number Ref does not
+      match string map keys — confirmed in E2E 2026-07-02).
+
+  QueryResultsToEvaluate:
+    Type: Number
+    Default: 3
+    MinValue: 1
+    MaxValue: 100
+    Description: >
+      Number of recent query executions to evaluate (N in M-out-of-N).
+
+  QueryResultsToAlarm:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 100
+    Description: >
+      Number of breaching results required to trigger ALARM (M in M-out-of-N).
+      1 = single breach triggers alarm immediately.
+
+  AlarmSnsTopicArn:
+    Type: String
+    Description: >
+      ARN of the SNS topic for alarm notifications.
+      Example: arn:aws:sns:ap-northeast-1:123456789012:fsxn-security-alerts
+
+  ActionLogLineCount:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 50
+    Description: >
+      Number of matching log lines to include in SNS email notifications.
+      Set to 0 to disable log line inclusion.
+
+Conditions:
+  IsSensitiveFileAccess: !Equals [!Ref DetectionType, 'sensitive-file-access']
+  IsFailedAccess: !Equals [!Ref DetectionType, 'failed-access-attempts']
+  IsBulkDelete: !Equals [!Ref DetectionType, 'bulk-delete-operations']
+  IsSpecificUser: !Equals [!Ref DetectionType, 'specific-user-activity']
+  IsCustom: !Equals [!Ref DetectionType, 'custom']
+  IncludeLogLines: !Not [!Equals [!Ref ActionLogLineCount, 0]]
+
+Resources:
+  # --- IAM Role: Scheduled Query Execution ---
+  ScheduledQueryExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-scheduled-query-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ScheduledQueryExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:StartQuery
+                  - logs:StopQuery
+                  - logs:GetQueryResults
+                  - logs:DescribeLogGroups
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}:*
+
+  # --- IAM Role: Log Lines in SNS (optional) ---
+  LogLineRole:
+    Type: AWS::IAM::Role
+    Condition: IncludeLogLines
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-log-line-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: GetQueryResults
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:GetQueryResults
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${LogGroupName}:*
+
+  # --- Log Alarm: Sensitive File Access ---
+  SensitiveFileAccessAlarm:
+    Type: AWS::CloudWatch::LogAlarm
+    Condition: IsSensitiveFileAccess
+    Properties:
+      AlarmName: !Sub fsxn-sensitive-file-access-${AWS::StackName}
+      AlarmDescription: !Sub >
+        FSx for ONTAP: Access detected to sensitive path "${TargetPattern}".
+        This alarm fires when any access to the specified path pattern is
+        recorded in audit logs. Investigate the user and operation context.
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: !Ref AlarmThreshold
+      QueryResultsToEvaluate: !Ref QueryResultsToEvaluate
+      QueryResultsToAlarm: !Ref QueryResultsToAlarm
+      TreatMissingData: notBreaching
+      ScheduledQueryConfiguration:
+        QueryString: !Sub |
+          fields @timestamp, @message
+          | filter @message like /${TargetPattern}/
+        LogGroupIdentifiers:
+          - !Ref LogGroupName
+        ScheduledQueryRoleARN: !GetAtt ScheduledQueryExecutionRole.Arn
+        AggregationExpression: 'count(*)'
+        ScheduleConfiguration:
+          ScheduleExpression: !FindInMap [FrequencyToSeconds, !Ref EvaluationFrequencyMinutes, Rate]
+          StartTimeOffset: !FindInMap [FrequencyToSeconds, !Ref EvaluationFrequencyMinutes, Seconds]
+      AlarmActions:
+        - !Ref AlarmSnsTopicArn
+      ActionLogLineCount: !If [IncludeLogLines, !Ref ActionLogLineCount, !Ref 'AWS::NoValue']
+      ActionLogLineRoleArn: !If [IncludeLogLines, !GetAtt LogLineRole.Arn, !Ref 'AWS::NoValue']
+
+  # --- Log Alarm: Failed Access Attempts ---
+  FailedAccessAlarm:
+    Type: AWS::CloudWatch::LogAlarm
+    Condition: IsFailedAccess
+    Properties:
+      AlarmName: !Sub fsxn-failed-access-${AWS::StackName}
+      AlarmDescription: >
+        FSx for ONTAP: Authentication or authorization failures exceeded threshold.
+        May indicate brute-force attempts, misconfigured permissions, or
+        unauthorized access attempts. Review source IP and user identity.
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: !Ref AlarmThreshold
+      QueryResultsToEvaluate: !Ref QueryResultsToEvaluate
+      QueryResultsToAlarm: !Ref QueryResultsToAlarm
+      TreatMissingData: notBreaching
+      ScheduledQueryConfiguration:
+        QueryString: |
+          fields @timestamp, @message
+          | filter @message like /Failure/ or @message like /denied/ or @message like /DENIED/
+        LogGroupIdentifiers:
+          - !Ref LogGroupName
+        ScheduledQueryRoleARN: !GetAtt ScheduledQueryExecutionRole.Arn
+        AggregationExpression: 'count(*)'
+        ScheduleConfiguration:
+          ScheduleExpression: !FindInMap [FrequencyToSeconds, !Ref EvaluationFrequencyMinutes, Rate]
+          StartTimeOffset: !FindInMap [FrequencyToSeconds, !Ref EvaluationFrequencyMinutes, Seconds]
+      AlarmActions:
+        - !Ref AlarmSnsTopicArn
+      ActionLogLineCount: !If [IncludeLogLines, !Ref ActionLogLineCount, !Ref 'AWS::NoValue']
+      ActionLogLineRoleArn: !If [IncludeLogLines, !GetAtt LogLineRole.Arn, !Ref 'AWS::NoValue']
+
+  # --- Log Alarm: Bulk Delete Operations ---
+  BulkDeleteAlarm:
+    Type: AWS::CloudWatch::LogAlarm
+    Condition: IsBulkDelete
+    Properties:
+      AlarmName: !Sub fsxn-bulk-delete-${AWS::StackName}
+      AlarmDescription: >
+        FSx for ONTAP: Bulk file deletion detected. High deletion rates may
+        indicate ransomware activity, accidental recursive delete, or
+        malicious insider behavior. Correlate with ARP/EMS events.
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: !Ref AlarmThreshold
+      QueryResultsToEvaluate: !Ref QueryResultsToEvaluate
+      QueryResultsToAlarm: !Ref QueryResultsToAlarm
+      TreatMissingData: notBreaching
+      ScheduledQueryConfiguration:
+        QueryString: |
+          fields @timestamp, @message
+          | filter @message like /DELETE/ or @message like /delete/ or @message like /remove/
+        LogGroupIdentifiers:
+          - !Ref LogGroupName
+        ScheduledQueryRoleARN: !GetAtt ScheduledQueryExecutionRole.Arn
+        AggregationExpression: 'count(*)'
+        ScheduleConfiguration:
+          ScheduleExpression: !FindInMap [FrequencyToSeconds, !Ref EvaluationFrequencyMinutes, Rate]
+          StartTimeOffset: !FindInMap [FrequencyToSeconds, !Ref EvaluationFrequencyMinutes, Seconds]
+      AlarmActions:
+        - !Ref AlarmSnsTopicArn
+      ActionLogLineCount: !If [IncludeLogLines, !Ref ActionLogLineCount, !Ref 'AWS::NoValue']
+      ActionLogLineRoleArn: !If [IncludeLogLines, !GetAtt LogLineRole.Arn, !Ref 'AWS::NoValue']
+
+  # --- Log Alarm: Specific User Activity ---
+  SpecificUserAlarm:
+    Type: AWS::CloudWatch::LogAlarm
+    Condition: IsSpecificUser
+    Properties:
+      AlarmName: !Sub fsxn-user-activity-${AWS::StackName}
+      AlarmDescription: !Sub >
+        FSx for ONTAP: Activity detected for monitored user "${TargetPattern}".
+        This alarm fires when the specified user performs any operation recorded
+        in audit logs. Used for privileged user monitoring or investigation.
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: !Ref AlarmThreshold
+      QueryResultsToEvaluate: !Ref QueryResultsToEvaluate
+      QueryResultsToAlarm: !Ref QueryResultsToAlarm
+      TreatMissingData: notBreaching
+      ScheduledQueryConfiguration:
+        QueryString: !Sub |
+          fields @timestamp, @message
+          | filter @message like /${TargetPattern}/
+        LogGroupIdentifiers:
+          - !Ref LogGroupName
+        ScheduledQueryRoleARN: !GetAtt ScheduledQueryExecutionRole.Arn
+        AggregationExpression: 'count(*)'
+        ScheduleConfiguration:
+          ScheduleExpression: !FindInMap [FrequencyToSeconds, !Ref EvaluationFrequencyMinutes, Rate]
+          StartTimeOffset: !FindInMap [FrequencyToSeconds, !Ref EvaluationFrequencyMinutes, Seconds]
+      AlarmActions:
+        - !Ref AlarmSnsTopicArn
+      ActionLogLineCount: !If [IncludeLogLines, !Ref ActionLogLineCount, !Ref 'AWS::NoValue']
+      ActionLogLineRoleArn: !If [IncludeLogLines, !GetAtt LogLineRole.Arn, !Ref 'AWS::NoValue']
+
+  # --- Log Alarm: Custom Query ---
+  CustomAlarm:
+    Type: AWS::CloudWatch::LogAlarm
+    Condition: IsCustom
+    Properties:
+      AlarmName: !Sub fsxn-custom-log-alarm-${AWS::StackName}
+      AlarmDescription: Custom Log Alarm for FSx for ONTAP audit logs.
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: !Ref AlarmThreshold
+      QueryResultsToEvaluate: !Ref QueryResultsToEvaluate
+      QueryResultsToAlarm: !Ref QueryResultsToAlarm
+      TreatMissingData: notBreaching
+      ScheduledQueryConfiguration:
+        QueryString: !Ref CustomQueryString
+        LogGroupIdentifiers:
+          - !Ref LogGroupName
+        ScheduledQueryRoleARN: !GetAtt ScheduledQueryExecutionRole.Arn
+        AggregationExpression: !Ref CustomAggregation
+        ScheduleConfiguration:
+          ScheduleExpression: !FindInMap [FrequencyToSeconds, !Ref EvaluationFrequencyMinutes, Rate]
+          StartTimeOffset: !FindInMap [FrequencyToSeconds, !Ref EvaluationFrequencyMinutes, Seconds]
+      AlarmActions:
+        - !Ref AlarmSnsTopicArn
+      ActionLogLineCount: !If [IncludeLogLines, !Ref ActionLogLineCount, !Ref 'AWS::NoValue']
+      ActionLogLineRoleArn: !If [IncludeLogLines, !GetAtt LogLineRole.Arn, !Ref 'AWS::NoValue']
+
+Mappings:
+  # EvaluationFrequencyMinutes is Type: String so !Ref returns a string that
+  # reliably matches these string keys. (A Number Ref does not match string map
+  # keys — the ScheduleExpression FindInMap silently failed and produced an
+  # invalid rate; confirmed and fixed in E2E 2026-07-02.)
+  #
+  # Rate strings use singular "minute" for value 1: AWS rejects "rate(1 minutes)"
+  # with "Use singular unit with value 1".
+  FrequencyToSeconds:
+    '1':
+      Seconds: 60
+      Rate: rate(1 minute)
+    '5':
+      Seconds: 300
+      Rate: rate(5 minutes)
+    '10':
+      Seconds: 600
+      Rate: rate(10 minutes)
+    '15':
+      Seconds: 900
+      Rate: rate(15 minutes)
+    '30':
+      Seconds: 1800
+      Rate: rate(30 minutes)
+    '60':
+      Seconds: 3600
+      Rate: rate(60 minutes)
+
+Outputs:
+  AlarmArn:
+    Description: ARN of the created Log Alarm
+    Value: !If
+      - IsSensitiveFileAccess
+      - !Ref SensitiveFileAccessAlarm
+      - !If
+        - IsFailedAccess
+        - !Ref FailedAccessAlarm
+        - !If
+          - IsBulkDelete
+          - !Ref BulkDeleteAlarm
+          - !If
+            - IsSpecificUser
+            - !Ref SpecificUserAlarm
+            - !Ref CustomAlarm
+
+  AlarmName:
+    Description: Name of the created Log Alarm
+    Value: !If
+      - IsSensitiveFileAccess
+      - !Sub fsxn-sensitive-file-access-${AWS::StackName}
+      - !If
+        - IsFailedAccess
+        - !Sub fsxn-failed-access-${AWS::StackName}
+        - !If
+          - IsBulkDelete
+          - !Sub fsxn-bulk-delete-${AWS::StackName}
+          - !If
+            - IsSpecificUser
+            - !Sub fsxn-user-activity-${AWS::StackName}
+            - !Sub fsxn-custom-log-alarm-${AWS::StackName}
+
+  DetectionDescription:
+    Description: What this alarm detects
+    Value: !If
+      - IsSensitiveFileAccess
+      - !Sub 'Detects access to path pattern: ${TargetPattern}'
+      - !If
+        - IsFailedAccess
+        - 'Detects authentication/authorization failures'
+        - !If
+          - IsBulkDelete
+          - 'Detects bulk file deletion operations'
+          - !If
+            - IsSpecificUser
+            - !Sub 'Detects activity by user: ${TargetPattern}'
+            - 'Custom detection query'
+
+  ScheduledQueryRoleArn:
+    Description: IAM Role ARN for scheduled query execution
+    Value: !GetAtt ScheduledQueryExecutionRole.Arn

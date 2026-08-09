@@ -1,0 +1,565 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Cost-guarded Lightning Prediction proof of concept. Self-hosted mode runs
+  Kafka and Redis on EC2; managed mode creates MSK and ElastiCache.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: lightning-poc
+    AllowedPattern: "[a-z][a-z0-9-]{2,30}"
+  DeploymentMode:
+    Type: String
+    Default: self-hosted
+    AllowedValues: [self-hosted, managed]
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small]
+  RepositoryUrl:
+    Type: String
+    Default: https://github.com/wittenpan/Lightning-Prediction.git
+  RepositoryRef:
+    Type: String
+    Default: main
+  MonthlyBudgetUsd:
+    Type: Number
+    Default: 10
+    MinValue: 1
+    MaxValue: 100
+  BudgetEmail:
+    Type: String
+    Description: Email address for 50%, 80%, and 100% budget alerts.
+  AutoDeleteHours:
+    Type: Number
+    Default: 4
+    MinValue: 2
+    MaxValue: 24
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+
+Conditions:
+  UseManagedServices: !Equals [!Ref DeploymentMode, managed]
+
+Resources:
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.42.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-vpc
+        - Key: Project
+          Value: !Ref ProjectName
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref Vpc
+
+  AppSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-app
+
+  DataSubnetA:
+    Type: AWS::EC2::Subnet
+    Condition: UseManagedServices
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-data-a
+
+  DataSubnetB:
+    Type: AWS::EC2::Subnet
+    Condition: UseManagedServices
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.42.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-data-b
+
+  AppRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref AppRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  AppRouteAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref AppRouteTable
+      SubnetId: !Ref AppSubnet
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Outbound-only application host; access through SSM Session Manager.
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-app
+
+  RedisSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: UseManagedServices
+    Properties:
+      GroupDescription: Redis TLS access from the prediction host only.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+
+  MskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: UseManagedServices
+    Properties:
+      GroupDescription: MSK TLS access from the prediction host only.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 9094
+          ToPort: 9094
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Condition: UseManagedServices
+    Properties:
+      Description: !Sub ${ProjectName} private cache subnets
+      SubnetIds: [!Ref DataSubnetA, !Ref DataSubnetB]
+
+  RedisCache:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Condition: UseManagedServices
+    DependsOn: CostBudget
+    Properties:
+      ReplicationGroupDescription: !Sub ${ProjectName} encrypted Redis feature cache
+      Engine: redis
+      CacheNodeType: cache.t3.micro
+      NumCacheClusters: 1
+      AutomaticFailoverEnabled: false
+      MultiAZEnabled: false
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds: [!Ref RedisSecurityGroup]
+      AutoMinorVersionUpgrade: true
+      SnapshotRetentionLimit: 0
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: poc
+
+  MskCluster:
+    Type: AWS::MSK::Cluster
+    Condition: UseManagedServices
+    DependsOn: CostBudget
+    Properties:
+      ClusterName: !Sub ${ProjectName}-msk
+      KafkaVersion: 3.9.x
+      NumberOfBrokerNodes: 2
+      EnhancedMonitoring: DEFAULT
+      BrokerNodeGroupInfo:
+        InstanceType: kafka.t3.small
+        ClientSubnets: [!Ref DataSubnetA, !Ref DataSubnetB]
+        SecurityGroups: [!Ref MskSecurityGroup]
+        StorageInfo:
+          EBSStorageInfo:
+            VolumeSize: 20
+      ClientAuthentication:
+        Unauthenticated:
+          Enabled: true
+      EncryptionInfo:
+        EncryptionInTransit:
+          ClientBroker: TLS
+          InCluster: true
+      Tags:
+        Project: !Ref ProjectName
+        Environment: poc
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ReadMskBootstrapBrokers
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: kafka:GetBootstrapBrokers
+                Resource: !If
+                  - UseManagedServices
+                  - !Ref MskCluster
+                  - !Sub arn:${AWS::Partition}:kafka:${AWS::Region}:${AWS::AccountId}:cluster/no-managed-cluster/*
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  AppInstance:
+    Type: AWS::EC2::Instance
+    DependsOn: CostBudget
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
+      SubnetId: !Ref AppSubnet
+      SecurityGroupIds: [!Ref AppSecurityGroup]
+      MetadataOptions:
+        HttpEndpoint: enabled
+        HttpTokens: required
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-app
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: poc
+        - Key: AutoDeleteHours
+          Value: !Ref AutoDeleteHours
+      UserData:
+        Fn::Base64:
+          Fn::Sub:
+            - |
+              #!/bin/bash
+              set -euxo pipefail
+              exec > >(tee /var/log/lightning-bootstrap.log) 2>&1
+
+              # Amazon Linux 2023 includes curl-minimal; installing full curl conflicts with it.
+              dnf install -y docker git
+              systemctl enable --now docker
+              if ! command -v aws >/dev/null 2>&1; then dnf install -y awscli-2; fi
+
+              # Small burstable instances need headroom while building XGBoost.
+              fallocate -l 2G /swapfile
+              chmod 600 /swapfile
+              mkswap /swapfile
+              swapon /swapfile
+              mkdir -p /usr/local/lib/docker/cli-plugins
+              ARCH=$(uname -m)
+              if [ "$ARCH" = "x86_64" ]; then COMPOSE_ARCH=x86_64; else COMPOSE_ARCH=aarch64; fi
+              curl -fsSL "https://github.com/docker/compose/releases/download/v2.30.3/docker-compose-linux-$COMPOSE_ARCH" \
+                -o /usr/local/lib/docker/cli-plugins/docker-compose
+              chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+              git clone "${RepoUrl}" /opt/lightning
+              cd /opt/lightning
+              git checkout "${RepoRef}"
+
+              if [ "${Mode}" = "managed" ]; then
+                BOOTSTRAP=""
+                for ATTEMPT in $(seq 1 30); do
+                  BOOTSTRAP=$(aws kafka get-bootstrap-brokers \
+                    --cluster-arn "${ManagedMskArn}" \
+                    --region "${AWS::Region}" \
+                    --query BootstrapBrokerStringTls \
+                    --output text 2>/dev/null || true)
+                  if [ -n "$BOOTSTRAP" ] && [ "$BOOTSTRAP" != "None" ]; then break; fi
+                  sleep 20
+                done
+                test -n "$BOOTSTRAP"
+                cat > .env.aws <<EOF
+              KAFKA_BOOTSTRAP_SERVERS=$BOOTSTRAP
+              KAFKA_INPUT_TOPIC=lightning-strikes
+              KAFKA_OUTPUT_TOPIC=lightning-predictions
+              KAFKA_SECURITY_PROTOCOL=SSL
+              KAFKA_TOPIC_PARTITIONS=3
+              KAFKA_REPLICATION_FACTOR=2
+              REDIS_HOST=${ManagedRedisHost}
+              REDIS_PORT=6379
+              REDIS_SSL=true
+              MODEL_DIR=/app/data/models
+              EOF
+                docker compose -f docker-compose.aws.yml up -d --build
+              else
+                docker compose --profile live up -d --build
+              fi
+            - Mode: !Ref DeploymentMode
+              RepoUrl: !Ref RepositoryUrl
+              RepoRef: !Ref RepositoryRef
+              ManagedMskArn: !If [UseManagedServices, !Ref MskCluster, ""]
+              ManagedRedisHost: !If
+                - UseManagedServices
+                - !GetAtt RedisCache.PrimaryEndPoint.Address
+                - localhost
+
+  CostBudget:
+    Type: AWS::Budgets::Budget
+    DependsOn: BudgetAlarmSubscription
+    Properties:
+      Budget:
+        BudgetName: !Sub ${ProjectName}-monthly-cost
+        BudgetLimit:
+          Amount: !Ref MonthlyBudgetUsd
+          Unit: USD
+        BudgetType: COST
+        TimeUnit: MONTHLY
+      NotificationsWithSubscribers:
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 50
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref BudgetEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref BudgetEmail
+              SubscriptionType: EMAIL
+        - Notification:
+            ComparisonOperator: GREATER_THAN
+            NotificationType: ACTUAL
+            Threshold: 100
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - Address: !Ref BudgetEmail
+              SubscriptionType: EMAIL
+            - Address: !Ref BudgetAlarmTopic
+              SubscriptionType: SNS
+
+  AutoDeleteRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DeleteOnlyThisPocStack
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: cloudformation:DeleteStack
+                Resource: !Sub arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+              # CloudFormation uses the caller's credentials when no service
+              # role is attached to the stack. These are the lifecycle actions
+              # required to remove the resource types in this POC.
+              - Effect: Allow
+                Action:
+                  - budgets:DeleteBudget
+                  - budgets:DescribeBudget
+                  - ec2:DeleteInternetGateway
+                  - ec2:DeleteRoute
+                  - ec2:DeleteRouteTable
+                  - ec2:DeleteSecurityGroup
+                  - ec2:DeleteSubnet
+                  - ec2:DeleteTags
+                  - ec2:DeleteVpc
+                  - ec2:DescribeInstances
+                  - ec2:DescribeInternetGateways
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeRouteTables
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                  - ec2:DetachInternetGateway
+                  - ec2:DisassociateRouteTable
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:TerminateInstances
+                  - elasticache:DeleteCacheSubnetGroup
+                  - elasticache:DeleteReplicationGroup
+                  - elasticache:DescribeCacheSubnetGroups
+                  - elasticache:DescribeReplicationGroups
+                  - elasticache:ListTagsForResource
+                  - elasticache:RemoveTagsFromResource
+                  - events:DeleteRule
+                  - events:DescribeRule
+                  - events:ListTargetsByRule
+                  - events:RemoveTargets
+                  - iam:DeleteInstanceProfile
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:GetInstanceProfile
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                  - iam:ListInstanceProfilesForRole
+                  - iam:ListRolePolicies
+                  - iam:RemoveRoleFromInstanceProfile
+                  - kafka:DeleteCluster
+                  - kafka:DescribeCluster
+                  - kafka:DescribeClusterV2
+                  - kafka:ListTagsForResource
+                  - kafka:UntagResource
+                  - lambda:DeleteFunction
+                  - lambda:GetFunction
+                  - lambda:GetFunctionConfiguration
+                  - lambda:RemovePermission
+                  - logs:DeleteLogGroup
+                  - sns:DeleteTopic
+                  - sns:GetSubscriptionAttributes
+                  - sns:GetTopicAttributes
+                  - sns:ListSubscriptionsByTopic
+                  - sns:SetTopicAttributes
+                  - sns:Unsubscribe
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:*
+
+  AutoDeleteFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt AutoDeleteRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          STACK_NAME: !Ref AWS::StackName
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+
+          def handler(event, context):
+              stack_name = os.environ["STACK_NAME"]
+              boto3.client("cloudformation").delete_stack(StackName=stack_name)
+              return {"deleting": stack_name, "trigger": event.get("Records", "ttl")}
+
+  BudgetAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-budget-auto-delete
+
+  BudgetAlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref BudgetAlarmTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowAwsBudgetsPublish
+            Effect: Allow
+            Principal:
+              Service: budgets.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref BudgetAlarmTopic
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:${AWS::Partition}:budgets::${AWS::AccountId}:*
+
+  BudgetAlarmInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AutoDeleteFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref BudgetAlarmTopic
+
+  BudgetAlarmSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: BudgetAlarmInvokePermission
+    Properties:
+      Protocol: lambda
+      Endpoint: !GetAtt AutoDeleteFunction.Arn
+      TopicArn: !Ref BudgetAlarmTopic
+
+  AutoDeleteRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Deletes the proof-of-concept stack after its TTL.
+      ScheduleExpression: !Sub "rate(${AutoDeleteHours} hours)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AutoDeleteFunction.Arn
+          Id: DeletePocStack
+
+  AutoDeletePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AutoDeleteFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AutoDeleteRule.Arn
+
+Outputs:
+  DeploymentMode:
+    Value: !Ref DeploymentMode
+  InstanceId:
+    Value: !Ref AppInstance
+  SessionManagerCommand:
+    Value: !Sub aws ssm start-session --target ${AppInstance} --region ${AWS::Region}
+  DashboardPortForwardCommand:
+    Description: Open a private tunnel from localhost:8765 to the dashboard API.
+    Value: !Sub >-
+      aws ssm start-session --target ${AppInstance} --region ${AWS::Region}
+      --document-name AWS-StartPortForwardingSession
+      --parameters '{"portNumber":["8000"],"localPortNumber":["8765"]}'
+  ManagedMskClusterArn:
+    Value: !If [UseManagedServices, !Ref MskCluster, not-created]
+  ManagedRedisEndpoint:
+    Value: !If
+      - UseManagedServices
+      - !GetAtt RedisCache.PrimaryEndPoint.Address
+      - not-created
+  AutoDeleteAfterHours:
+    Value: !Ref AutoDeleteHours
+  MonthlyBudgetGuardrailUsd:
+    Description: Account cost budget; 100% actual-spend alert invokes stack deletion.
+    Value: !Ref MonthlyBudgetUsd

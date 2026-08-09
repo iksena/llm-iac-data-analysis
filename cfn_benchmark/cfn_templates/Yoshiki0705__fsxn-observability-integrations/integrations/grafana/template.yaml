@@ -1,0 +1,238 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: FSx for ONTAP Grafana Cloud Integration - Audit log shipping to Loki
+
+Parameters:
+  S3AccessPointArn:
+    Type: String
+    Description: >
+      S3 Access Point ARN used by the Lambda for both ListObjectsV2 and GetObject.
+      This should be an access point attached to the S3 bucket or FSx volume
+      containing audit logs.
+    AllowedPattern: 'arn:aws:s3:[a-z0-9-]+:\d{12}:accesspoint/.+'
+  GrafanaCredentialsSecretArn:
+    Type: String
+    Description: >
+      Secrets Manager ARN containing JSON: {"instance_id":"<id>","api_key":"<key>"}
+    AllowedPattern: 'arn:aws:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+'
+  LokiEndpoint:
+    Type: String
+    Description: >
+      Grafana Cloud endpoint URL. Supports two modes:
+      - OTLP Gateway (preferred): https://otlp-gateway-prod-<region>.grafana.net/otlp
+      - Loki Push API (fallback): https://logs-prod-<region>.grafana.net
+      The Lambda auto-detects the mode from the URL pattern.
+    AllowedPattern: 'https://.+'
+  LokiTenantId:
+    Type: String
+    Default: ''
+    Description: X-Scope-OrgID header (optional, for multi-tenant Loki)
+  S3KeyPrefix:
+    Type: String
+    Default: ''
+    Description: >
+      S3 key prefix for listing audit log objects (e.g., "audit/svm-prod-01/").
+      Used by the scheduler-triggered polling mode to scope ListObjectsV2.
+  ScheduleExpression:
+    Type: String
+    Default: 'rate(5 minutes)'
+    Description: >
+      EventBridge Scheduler rate expression for polling new audit log files.
+      Examples: "rate(5 minutes)", "rate(1 minute)", "rate(15 minutes)"
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+
+Resources:
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dlq'
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+  CheckpointParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/fsxn-grafana/${AWS::StackName}/last-processed-key'
+      Type: String
+      Value: '__INIT__'
+      Description: >
+        Tracks the last processed S3 key for audit log polling.
+        Updated by the Lambda after each successful processing run.
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${S3AccessPointArn}/object/*'
+                  - !Ref S3AccessPointArn
+        - PolicyName: Secrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref GrafanaCredentialsSecretArn
+        - PolicyName: SSMCheckpoint
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/fsxn-grafana/${AWS::StackName}/*'
+        - PolicyName: Logs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-shipper:*'
+        - PolicyName: DLQ
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  LogShipperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-shipper'
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              raise NotImplementedError("Deploy actual handler code")
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrentExecutions: 1
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          LOKI_ENDPOINT: !Ref LokiEndpoint
+          LOKI_TENANT_ID: !Ref LokiTenantId
+          API_KEY_SECRET_ARN: !Ref GrafanaCredentialsSecretArn
+          S3_ACCESS_POINT_ARN: !Ref S3AccessPointArn
+          S3_KEY_PREFIX: !Ref S3KeyPrefix
+          CHECKPOINT_PARAM_NAME: !Sub '/fsxn-grafana/${AWS::StackName}/last-processed-key'
+          LOG_LEVEL: !Ref LogLevel
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-shipper'
+      RetentionInDays: 30
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-scheduler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt LogShipperFunction.Arn
+        - PolicyName: SchedulerDLQ
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt SchedulerDLQ.Arn
+
+  SchedulerDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-scheduler-dlq'
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+  AuditLogSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${AWS::StackName}-audit-poll'
+      ScheduleExpression: !Ref ScheduleExpression
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt LogShipperFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: !Sub '{"source": "scheduler", "s3_access_point_arn": "${S3AccessPointArn}", "prefix": "${S3KeyPrefix}"}'
+        RetryPolicy:
+          MaximumRetryAttempts: 2
+          MaximumEventAgeInSeconds: 3600
+        DeadLetterConfig:
+          Arn: !GetAtt SchedulerDLQ.Arn
+
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LogShipperFunction
+      Action: lambda:InvokeFunction
+      Principal: scheduler.amazonaws.com
+      SourceArn: !GetAtt AuditLogSchedule.Arn
+
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-errors'
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref LogShipperFunction}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  LambdaFunctionArn:
+    Value: !GetAtt LogShipperFunction.Arn
+  DeadLetterQueueArn:
+    Value: !GetAtt DeadLetterQueue.Arn
+  SchedulerDLQArn:
+    Value: !GetAtt SchedulerDLQ.Arn
+  ScheduleArn:
+    Value: !GetAtt AuditLogSchedule.Arn
+  CheckpointParameterName:
+    Value: !Sub '/fsxn-grafana/${AWS::StackName}/last-processed-key'

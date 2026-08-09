@@ -1,0 +1,358 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AirportHub Master - nested stack orchestrator for multi-region deployment'
+
+Parameters:
+  PrimaryRegion:
+    Type: String
+    Default: 'us-east-1'
+    Description: Primary AWS region
+
+  SecondaryRegion:
+    Type: String
+    Default: 'us-east-2'
+    Description: Secondary AWS region (for ECR replication)
+
+  StackPrefix:
+    Type: String
+    Default: 'airporthub'
+    Description: Prefix for all resource names
+
+  # Cross-region parameters - empty on primary deploy, populated for secondary
+  CognitoUserPoolId:
+    Type: String
+    Default: ''
+    Description: Cognito User Pool ID (from primary region, empty on primary deploy)
+
+  CognitoUserPoolArn:
+    Type: String
+    Default: ''
+    Description: Cognito User Pool ARN (from primary region, empty on primary deploy)
+
+  CognitoAppClientId:
+    Type: String
+    Default: ''
+    Description: Cognito App Client ID (from primary region, empty on primary deploy)
+
+  GlobalClusterIdentifier:
+    Type: String
+    Default: ''
+    Description: DocumentDB global cluster ID (empty on primary, populated for secondary)
+
+  ContainerImageUri:
+    Type: String
+    Default: ''
+    Description: ECR container image URI (populated by deploy script after build)
+
+  SourceBucket:
+    Type: String
+    Default: ''
+    Description: S3 bucket containing application source for CodeBuild
+
+  SourceKey:
+    Type: String
+    Default: ''
+    Description: S3 key for application source zip
+
+  VpcCidr:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: VPC CIDR block
+
+  # CloudFront origin group - empty on first deploy, populated after secondary creates its VPC Origin
+  SecondaryVpcOriginId:
+    Type: String
+    Default: ''
+    Description: VPC Origin ID from us-east-2 (enables CloudFront origin group failover)
+
+Conditions:
+  # True when deploying to the primary region
+  IsPrimaryRegion: !Equals
+    - !Ref 'AWS::Region'
+    - !Ref PrimaryRegion
+
+  ShouldBuildContainer: !And
+    - Condition: IsPrimaryRegion
+    - !Not [!Equals [!Ref SourceBucket, '']]
+
+Resources:
+
+  # ============================================================
+  # Child Stack: Network (both regions)
+  # VPC, subnets, NAT gateways, security groups, VPC endpoints
+  # ============================================================
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: infrastructure/network.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+        VpcCidr: !Ref VpcCidr
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: Component
+          Value: network
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # Child Stack: Auth (primary region only)
+  # Cognito User Pool - secondary region uses primary's pool via params
+  # ============================================================
+  AuthStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: IsPrimaryRegion
+    Properties:
+      TemplateURL: infrastructure/auth.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: Component
+          Value: auth
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # Placeholder: DatabaseStack (Unit 2)
+  # ============================================================
+  DatabaseStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: NetworkStack
+    Properties:
+      TemplateURL: infrastructure/database.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+        IsPrimaryRegion: !If [IsPrimaryRegion, 'true', 'false']
+        GlobalClusterIdentifier: !Ref GlobalClusterIdentifier
+        PrivateSubnet1Id: !GetAtt NetworkStack.Outputs.PrivateSubnet1Id
+        PrivateSubnet2Id: !GetAtt NetworkStack.Outputs.PrivateSubnet2Id
+        DocDbSecurityGroupId: !GetAtt NetworkStack.Outputs.DocDbSecurityGroupId
+        SecondaryRegion: !Ref SecondaryRegion
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: Component
+          Value: database
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # Placeholder: ComputeStack (Unit 3)
+  # ============================================================
+  ComputeStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - NetworkStack
+      - DatabaseStack
+    Properties:
+      TemplateURL: infrastructure/compute.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+        IsPrimaryRegion: !If [IsPrimaryRegion, 'true', 'false']
+        PrimaryRegion: !Ref PrimaryRegion
+        SecondaryRegion: !Ref SecondaryRegion
+        VpcId: !GetAtt NetworkStack.Outputs.VpcId
+        PrivateSubnet1Id: !GetAtt NetworkStack.Outputs.PrivateSubnet1Id
+        PrivateSubnet2Id: !GetAtt NetworkStack.Outputs.PrivateSubnet2Id
+        EcsSecurityGroupId: !GetAtt NetworkStack.Outputs.EcsSecurityGroupId
+        AlbSecurityGroupId: !GetAtt NetworkStack.Outputs.AlbSecurityGroupId
+        ContainerImageUri: !Ref ContainerImageUri
+        CognitoUserPoolId: !If [IsPrimaryRegion, !GetAtt AuthStack.Outputs.UserPoolId, !Ref CognitoUserPoolId]
+        CognitoUserPoolArn: !If [IsPrimaryRegion, !GetAtt AuthStack.Outputs.UserPoolArn, !Ref CognitoUserPoolArn]
+        CognitoAppClientId: !If [IsPrimaryRegion, !GetAtt AuthStack.Outputs.AppClientId, !Ref CognitoAppClientId]
+        DocDbEndpoint: !GetAtt DatabaseStack.Outputs.ClusterEndpoint
+        DocDbSecretArn: !GetAtt DatabaseStack.Outputs.SecretArn
+        SecondaryVpcOriginId: !Ref SecondaryVpcOriginId
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: Component
+          Value: compute
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # CodeBuild Trigger - runs after ComputeStack creates the project
+  # Only triggers when SourceBucket is provided (second deploy)
+  # ============================================================
+  CodeBuildTrigger:
+    Type: Custom::CodeBuildTrigger
+    Condition: ShouldBuildContainer
+    DependsOn: ComputeStack
+    Properties:
+      ServiceToken: !GetAtt ComputeStack.Outputs.CodeBuildTriggerFunctionArn
+      ServiceTimeout: 900
+      ProjectName: !GetAtt ComputeStack.Outputs.CodeBuildProjectName
+      SourceBucket: !Ref SourceBucket
+      SourceKey: !Ref SourceKey
+
+  # ============================================================
+  # Placeholder: ApiServicesStack (Unit 3)
+  # ============================================================
+  ApiServicesStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - NetworkStack
+      - DatabaseStack
+      - ComputeStack
+    Properties:
+      TemplateURL: infrastructure/api-services.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+        IsPrimaryRegion: !If [IsPrimaryRegion, 'true', 'false']
+        VpcId: !GetAtt NetworkStack.Outputs.VpcId
+        PrivateSubnet1Id: !GetAtt NetworkStack.Outputs.PrivateSubnet1Id
+        PrivateSubnet2Id: !GetAtt NetworkStack.Outputs.PrivateSubnet2Id
+        LambdaSecurityGroupId: !GetAtt NetworkStack.Outputs.LambdaSecurityGroupId
+        HttpListenerArn: !GetAtt ComputeStack.Outputs.HttpListenerArn
+        DocDbEndpoint: !GetAtt DatabaseStack.Outputs.ClusterEndpoint
+        DocDbSecretArn: !GetAtt DatabaseStack.Outputs.SecretArn
+        CognitoUserPoolId: !If [IsPrimaryRegion, !GetAtt AuthStack.Outputs.UserPoolId, !Ref CognitoUserPoolId]
+        CognitoAppClientId: !If [IsPrimaryRegion, !GetAtt AuthStack.Outputs.AppClientId, !Ref CognitoAppClientId]
+        PrimaryRegion: !Ref PrimaryRegion
+        FlightAwareSecretArn: !GetAtt ComputeStack.Outputs.FlightAwareSecretArn
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: Component
+          Value: api-services
+        - Key: resilience-tier
+          Value: mission-critical
+
+  # ============================================================
+  # Placeholder: ObservabilityStack (Unit 4)
+  # ============================================================
+  ObservabilityStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - ComputeStack
+      - ApiServicesStack
+      - DatabaseStack
+    Properties:
+      TemplateURL: infrastructure/observability.yaml
+      Parameters:
+        StackPrefix: !Ref StackPrefix
+        IsPrimaryRegion: !If [IsPrimaryRegion, 'true', 'false']
+        EcsClusterName: !GetAtt ComputeStack.Outputs.EcsClusterName
+        EcsServiceName: !GetAtt ComputeStack.Outputs.EcsServiceName
+        AlbFullName: !GetAtt ComputeStack.Outputs.AlbFullName
+        AlbTargetGroupFullName: !GetAtt ComputeStack.Outputs.AlbTargetGroupFullName
+        FlightsLambdaName: !GetAtt ApiServicesStack.Outputs.FlightsLambdaName
+        AirportLambdaName: !GetAtt ApiServicesStack.Outputs.AirportLambdaName
+        CrewLambdaName: !GetAtt ApiServicesStack.Outputs.CrewLambdaName
+        DocDbClusterIdentifier: !GetAtt DatabaseStack.Outputs.ClusterIdentifier
+        RegionRole: !If [IsPrimaryRegion, 'Primary', 'Secondary']
+      Tags:
+        - Key: Project
+          Value: AirportHub
+        - Key: Component
+          Value: observability
+        - Key: resilience-tier
+          Value: mission-critical
+
+# ============================================================
+# Outputs - consumed by deploy script and ARC plan
+# ============================================================
+Outputs:
+
+  # Network outputs
+  VpcId:
+    Description: VPC ID
+    Value: !GetAtt NetworkStack.Outputs.VpcId
+  PrivateSubnet1Id:
+    Description: Private subnet AZ-1
+    Value: !GetAtt NetworkStack.Outputs.PrivateSubnet1Id
+  PrivateSubnet2Id:
+    Description: Private subnet AZ-2
+    Value: !GetAtt NetworkStack.Outputs.PrivateSubnet2Id
+  LambdaSecurityGroupId:
+    Description: Security group for Lambda functions
+    Value: !GetAtt NetworkStack.Outputs.LambdaSecurityGroupId
+
+  # Auth outputs - on primary, from auth stack; on secondary, from parameters
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !If
+      - IsPrimaryRegion
+      - !GetAtt AuthStack.Outputs.UserPoolId
+      - !Ref CognitoUserPoolId
+
+  CognitoUserPoolArn:
+    Description: Cognito User Pool ARN
+    Value: !If
+      - IsPrimaryRegion
+      - !GetAtt AuthStack.Outputs.UserPoolArn
+      - !Ref CognitoUserPoolArn
+
+  CognitoAppClientId:
+    Description: Cognito App Client ID
+    Value: !If
+      - IsPrimaryRegion
+      - !GetAtt AuthStack.Outputs.AppClientId
+      - !Ref CognitoAppClientId
+
+  # Database outputs
+  ClusterEndpoint:
+    Description: DocumentDB regional cluster endpoint
+    Value: !GetAtt DatabaseStack.Outputs.ClusterEndpoint
+
+  ClusterReadEndpoint:
+    Description: DocumentDB regional cluster read endpoint
+    Value: !GetAtt DatabaseStack.Outputs.ClusterReadEndpoint
+
+  ClusterResourceId:
+    Description: DocumentDB cluster resource ID (for ARC)
+    Value: !GetAtt DatabaseStack.Outputs.ClusterResourceId
+
+  GlobalClusterIdentifier:
+    Description: DocumentDB global cluster identifier
+    Value: !GetAtt DatabaseStack.Outputs.GlobalClusterIdentifier
+
+  SecretArn:
+    Description: DocumentDB Secrets Manager secret ARN
+    Value: !GetAtt DatabaseStack.Outputs.SecretArn
+
+  ClusterIdentifier:
+    Description: DocumentDB regional cluster identifier
+    Value: !GetAtt DatabaseStack.Outputs.ClusterIdentifier
+
+  # Compute outputs
+  EcsClusterArn:
+    Value: !GetAtt ComputeStack.Outputs.EcsClusterArn
+  EcsServiceArn:
+    Value: !GetAtt ComputeStack.Outputs.EcsServiceArn
+  AlbArn:
+    Value: !GetAtt ComputeStack.Outputs.AlbArn
+  AlbDnsName:
+    Value: !GetAtt ComputeStack.Outputs.AlbDnsName
+  CloudFrontDistributionId:
+    Condition: IsPrimaryRegion
+    Value: !GetAtt ComputeStack.Outputs.CloudFrontDistributionId
+  CloudFrontDomainName:
+    Condition: IsPrimaryRegion
+    Value: !GetAtt ComputeStack.Outputs.CloudFrontDomainName
+  EcrRepositoryUri:
+    Condition: IsPrimaryRegion
+    Value: !GetAtt ComputeStack.Outputs.EcrRepositoryUri
+  EcsScaleDownFunctionArn:
+    Value: !GetAtt ComputeStack.Outputs.EcsScaleDownFunctionArn
+
+  # VPC Origin ID - available in both regions for ARC failover
+  VpcOriginId:
+    Value: !GetAtt ComputeStack.Outputs.VpcOriginId
+
+  # API Services outputs
+  FlightsLambdaArn:
+    Value: !GetAtt ApiServicesStack.Outputs.FlightsLambdaArn
+  AirportLambdaArn:
+    Value: !GetAtt ApiServicesStack.Outputs.AirportLambdaArn
+  CrewLambdaArn:
+    Value: !GetAtt ApiServicesStack.Outputs.CrewLambdaArn
+
+  # Observability outputs
+  DashboardName:
+    Value: !GetAtt ObservabilityStack.Outputs.DashboardName
+  DashboardUrl:
+    Value: !GetAtt ObservabilityStack.Outputs.DashboardUrl

@@ -1,0 +1,276 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  FSx for ONTAP Splunk FPolicy Integration - Serverless event shipping
+  for FPolicy file operation events (SQS or EventBridge) to Splunk HEC.
+  Stack name pattern: fsxn-splunk-fpolicy
+  Requires the vendor-neutral shared/templates/fpolicy-apigw.yaml stack
+  (ECS Fargate FPolicy server + SQS + EventBridge custom bus) to be
+  deployed first; this stack only adds the Splunk shipper Lambda and
+  wires it to that stack's SQS queue / EventBridge bus.
+
+# DEPLOYMENT NOTE:
+# This template creates named IAM roles (RoleName property), so deployment
+# requires --capabilities CAPABILITY_NAMED_IAM (not just CAPABILITY_IAM).
+# Example:
+#   aws cloudformation deploy \
+#     --template-file template-fpolicy.yaml \
+#     --stack-name fsxn-splunk-fpolicy \
+#     --parameter-overrides \
+#       SplunkHecTokenSecretArn=arn:aws:secretsmanager:ap-northeast-1:123456789012:secret:splunk/fsxn-hec-token-XXXXXX \
+#       SplunkHecEndpoint=https://<splunk-hec-host>:8088 \
+#       FPolicySqsQueueArn=arn:aws:sqs:ap-northeast-1:123456789012:fsxn-fp-srv-fpolicy-ingestion \
+#     --capabilities CAPABILITY_NAMED_IAM
+
+Parameters:
+  SplunkHecTokenSecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing the Splunk HEC token
+    AllowedPattern: 'arn:aws:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+'
+
+  SplunkHecEndpoint:
+    Type: String
+    Description: Splunk HEC endpoint URL (e.g., https://splunk.example.com:8088)
+    AllowedPattern: 'https?://.+'
+
+  EventBridgeBusName:
+    Type: String
+    Default: default
+    Description: >-
+      EventBridge bus name for FPolicy events (custom bus deployed by
+      shared/templates/fpolicy-apigw.yaml, e.g. fsxn-fpolicy-events).
+      Used as the secondary/alternative trigger path.
+
+  FPolicySqsQueueArn:
+    Type: String
+    Default: ''
+    Description: >-
+      ARN of the SQS queue receiving FPolicy events from the Fargate
+      server (deployed by shared/templates/fpolicy-apigw.yaml, output
+      IngestionQueueUrl -> derive ARN, or IngestionQueue resource ARN).
+      If provided, creates an SQS event source mapping for the FPolicy
+      Lambda. This is the PRIMARY trigger path (SQS -> Lambda). The
+      EventBridge rule serves as a secondary/alternative path.
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues:
+      - DEBUG
+      - INFO
+      - WARNING
+      - ERROR
+    Description: Lambda function log level
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 3008
+    Description: Lambda function memory size in MB
+
+  LambdaTimeout:
+    Type: Number
+    Default: 60
+    MinValue: 10
+    MaxValue: 900
+    Description: Lambda function timeout in seconds
+
+Conditions:
+  HasFPolicySqsQueue: !Not [!Equals [!Ref FPolicySqsQueueArn, '']]
+
+Resources:
+  # ============================================================
+  # Dead Letter Queue for async invocation failures
+  # ============================================================
+  FPolicyDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-fpolicy-dlq'
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Project
+          Value: fsxn-observability
+        - Key: Vendor
+          Value: splunk
+
+  # ============================================================
+  # CloudWatch Log Group
+  # ============================================================
+  FPolicyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-fpolicy'
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: fsxn-observability
+        - Key: Vendor
+          Value: splunk
+
+  # ============================================================
+  # IAM Role
+  # ============================================================
+  FPolicyLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-fpolicy-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsManagerRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref SplunkHecTokenSecretArn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-fpolicy:*'
+        - PolicyName: SQSSendMessageDLQ
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt FPolicyDeadLetterQueue.Arn
+        - Fn::If:
+            - HasFPolicySqsQueue
+            - PolicyName: SQSFPolicyAccess
+              PolicyDocument:
+                Version: '2012-10-17'
+                Statement:
+                  - Effect: Allow
+                    Action:
+                      - sqs:ReceiveMessage
+                      - sqs:DeleteMessage
+                      - sqs:GetQueueAttributes
+                    Resource:
+                      - !Ref FPolicySqsQueueArn
+            - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: fsxn-observability
+        - Key: Vendor
+          Value: splunk
+
+  # ============================================================
+  # FPolicy Lambda Function
+  # ============================================================
+  FPolicyFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-fpolicy'
+      Runtime: python3.12
+      Handler: fpolicy_handler.lambda_handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              raise NotImplementedError("Deploy actual fpolicy_handler code")
+      Role: !GetAtt FPolicyLambdaRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      DeadLetterConfig:
+        TargetArn: !GetAtt FPolicyDeadLetterQueue.Arn
+      Environment:
+        Variables:
+          SPLUNK_HEC_ENDPOINT: !Ref SplunkHecEndpoint
+          HEC_TOKEN_SECRET_ARN: !Ref SplunkHecTokenSecretArn
+          LOG_LEVEL: !Ref LogLevel
+      Tags:
+        - Key: Project
+          Value: fsxn-observability
+        - Key: Vendor
+          Value: splunk
+
+  # ============================================================
+  # EventBridge Rule — FPolicy events -> FPolicy Lambda
+  # (Secondary/alternative trigger path)
+  # ============================================================
+  FPolicyEventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-fpolicy-to-splunk'
+      Description: Route FPolicy file operation events to Splunk shipper Lambda
+      EventBusName: !Ref EventBridgeBusName
+      State: ENABLED
+      EventPattern:
+        source:
+          - fpolicy.fsxn
+      Targets:
+        - Id: FPolicySplunkLambda
+          Arn: !GetAtt FPolicyFunction.Arn
+
+  FPolicyLambdaEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FPolicyFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt FPolicyEventBridgeRule.Arn
+
+  # ============================================================
+  # SQS Event Source Mapping — FPolicy SQS -> FPolicy Lambda
+  # (Primary trigger path: Fargate -> SQS -> Lambda -> Splunk HEC)
+  # ============================================================
+  FPolicySqsEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Condition: HasFPolicySqsQueue
+    Properties:
+      EventSourceArn: !Ref FPolicySqsQueueArn
+      FunctionName: !GetAtt FPolicyFunction.Arn
+      BatchSize: 10
+      Enabled: true
+
+  # ============================================================
+  # CloudWatch Alarm for FPolicy handler errors
+  # ============================================================
+  FPolicyErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-fpolicy-errors'
+      AlarmDescription: FPolicy Splunk shipper Lambda errors detected
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FPolicyFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+
+Outputs:
+  FPolicyLambdaFunctionArn:
+    Description: ARN of the FPolicy Splunk shipper Lambda function
+    Value: !GetAtt FPolicyFunction.Arn
+
+  FPolicyEventBridgeRuleArn:
+    Description: ARN of the EventBridge rule routing FPolicy events to Lambda
+    Value: !GetAtt FPolicyEventBridgeRule.Arn
+
+  FPolicyDeadLetterQueueArn:
+    Description: ARN of the FPolicy Dead Letter Queue
+    Value: !GetAtt FPolicyDeadLetterQueue.Arn
+
+  ArchitectureNote:
+    Description: FPolicy event delivery path to Splunk
+    Value: 'ONTAP -> FPolicy TCP -> ECS Fargate -> SQS -> Lambda -> Splunk HEC'

@@ -1,0 +1,365 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: 2010-09-09
+Description: Provider VPC, Auto scaling group, and VPC Lattice resources (service, listener, target group)
+Transform: 'AWS::LanguageExtensions'
+
+Parameters:
+  ServiceNetworkId:
+    Type: String
+    Description: VPC Lattice service network ID.
+  LatestAmiId:
+    Type: "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>"
+    Default: "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64"
+
+Mappings:
+  SubnetToIndex:
+    Workloada:
+      Index: 0
+    Workloadb:
+      Index: 1
+  Protocol:
+    HTTP:
+      Port: 80
+    HTTPS:
+      Port: 443
+
+Resources:
+  # ---------- VPC LATTICE SERVICE ----------
+  VpcLatticeService:
+    Type: AWS::VpcLattice::Service
+    Properties:
+      Name: !Sub service-${AWS::StackName}
+      AuthType: AWS_IAM
+
+  # Open (allow-all) auth policy
+  VpcLatticeServiceAuthPolicy:
+    Type: AWS::VpcLattice::AuthPolicy
+    Properties:
+      ResourceIdentifier: !Ref VpcLatticeService
+      Policy:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action: "*"
+            Principal: "*"
+            Resource: "*"
+
+  VpcLatticeServiceServiceAssociation:
+    Type: AWS::VpcLattice::ServiceNetworkServiceAssociation
+    Properties:
+      ServiceIdentifier: !Ref VpcLatticeService
+      ServiceNetworkIdentifier: !Ref ServiceNetworkId
+
+  VpcLatticeServiceHTTPSListener:
+    Type: AWS::VpcLattice::Listener
+    Properties:
+      Name: https-service-listener
+      ServiceIdentifier: !Ref VpcLatticeService
+      Port: 443
+      Protocol: HTTPS
+      DefaultAction:
+        Forward:
+          TargetGroups:
+            - TargetGroupIdentifier: !Ref VpcLatticeTargetGroup
+              Weight: 100
+
+  VpcLatticeTargetGroup:
+    Type: AWS::VpcLattice::TargetGroup
+    Properties:
+      Name: target-asg
+      Type: INSTANCE
+      Config:
+        Port: 80
+        Protocol: HTTP
+        ProtocolVersion: HTTP1
+        VpcIdentifier: !Ref VPC
+        HealthCheck:
+          Enabled: true
+
+  # ---------- VPC ----------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Join
+            - '-'
+            - - provider-vpc
+              - !Ref AWS::StackName
+
+  Ipv6Cidr:
+    Type: AWS::EC2::VPCCidrBlock
+    Properties:
+      AmazonProvidedIpv6CidrBlock: true
+      VpcId: !Ref VPC
+
+  EIGW:
+    Type: AWS::EC2::EgressOnlyInternetGateway
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub provider-eigw-${AWS::StackName}
+
+  # For::Each iteration: per Availability Zone
+  # Resources to create: 2 subnets, 2 route tables, 2 route table associations, and VPC routes to ::/0 via Egress-only IGW - obtaining AZ affinity
+  # VPC routes to ::/0 via Egress-Only Internet gateway
+  'Fn::ForEach::VPCResources':
+    - AvailabilityZone
+    - [a, b]
+      # Subnets
+    - 'WorkloadSubnet${AvailabilityZone}':
+        DependsOn:
+          - Ipv6Cidr
+        Type: AWS::EC2::Subnet
+        Properties:
+          VpcId: !Ref VPC
+          AvailabilityZone: !Sub ${AWS::Region}${AvailabilityZone}
+          CidrBlock: !Select
+            - !FindInMap [SubnetToIndex, !Sub "Workload${AvailabilityZone}", Index]
+            - !Cidr
+              - !GetAtt VPC.CidrBlock
+              - 256
+              - 8
+          Ipv6CidrBlock: !Select
+            - !FindInMap [SubnetToIndex, !Sub "Workload${AvailabilityZone}", Index]
+            - !Cidr
+              - !Select [0, !GetAtt VPC.Ipv6CidrBlocks]
+              - 256
+              - 64
+          AssignIpv6AddressOnCreation: true
+          Tags:
+            - Key: Name
+              Value: !Join
+                - '-'
+                - - !Sub provider-subnet-AZ${AvailabilityZone}
+                  - !Ref AWS::StackName
+      # Route Tables
+      'WorkloadRouteTable${AvailabilityZone}':
+        Type: AWS::EC2::RouteTable
+        Properties:
+          VpcId: !Ref VPC
+          Tags:
+            - Key: Name
+              Value: !Join
+                - '-'
+                - - !Sub provider-rt-AZ${AvailabilityZone}
+                  - !Ref AWS::StackName
+      # Route Table associations
+      'WorkloadRouteTableAssociation${AvailabilityZone}':
+        Type: AWS::EC2::SubnetRouteTableAssociation
+        Properties:
+          RouteTableId: !Ref
+            'Fn::Sub': 'WorkloadRouteTable${AvailabilityZone}'
+          SubnetId: !Ref
+            'Fn::Sub': 'WorkloadSubnet${AvailabilityZone}'
+      'DefaultToEIGWRoute${AvailabilityZone}':
+        Type: AWS::EC2::Route
+        Properties:
+          RouteTableId: !Ref
+            'Fn::Sub': 'WorkloadRouteTable${AvailabilityZone}'
+          DestinationIpv6CidrBlock: '::/0'
+          EgressOnlyInternetGatewayId: !Ref EIGW
+
+  # Security Group (Instances)
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Instance Security Group
+      VpcId: !Ref VPC
+
+  # For::Each iteration: HTTP (80) & HTTPS (443)
+  'Fn::ForEach::IngressSGRule':
+    - WebProtocol
+    - [HTTP, HTTPS]
+    - 'InstanceSecurityGroupIngressIPv4${WebProtocol}':
+        Type: AWS::EC2::SecurityGroupIngress
+        Properties:
+          GroupId: !Ref InstanceSecurityGroup
+          Description: Allowing Web Traffic (IPv4)
+          IpProtocol: tcp
+          FromPort: !FindInMap [Protocol, !Sub "${WebProtocol}", Port]
+          ToPort: !FindInMap [Protocol, !Sub "${WebProtocol}", Port]
+          SourcePrefixListId: !GetAtt VpcLatticePrefixListIpv4.PrefixListId
+      'InstanceSecurityGroupIngressIPv6${WebProtocol}':
+        Type: AWS::EC2::SecurityGroupIngress
+        Properties:
+          GroupId: !Ref InstanceSecurityGroup
+          Description: Allowing Web Traffic (IPv6)
+          IpProtocol: tcp
+          FromPort: !FindInMap [Protocol, !Sub "${WebProtocol}", Port]
+          ToPort: !FindInMap [Protocol, !Sub "${WebProtocol}", Port]
+          SourcePrefixListId: !GetAtt VpcLatticePrefixListIpv6.PrefixListId
+
+  InstanceSecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      Description: Allowing egress traffic (IPv4)
+      IpProtocol: -1
+      CidrIp: 0.0.0.0/0
+
+  InstanceSecurityGroupEgressIPv6:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref InstanceSecurityGroup
+      Description: Allowing egress traffic (IPv6)
+      IpProtocol: -1
+      CidrIpv6: ::/0
+
+  # ---------- AUTOSCALING GROUP ----------
+  # Launch Template
+  LaunchTemplateWebInstance:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub 'web-template-asg-target'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: t3.micro
+        NetworkInterfaces:
+          - AssociatePublicIpAddress: false
+            Ipv6AddressCount: 1
+            Groups:
+              - !Ref InstanceSecurityGroup
+            DeviceIndex: 0
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              Encrypted: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            # Update system and install httpd
+            sudo yum update -y
+            sudo yum install -y httpd php
+
+            # Ensure httpd listens on both IPv4 and IPv6
+            sudo sed -i '/^Listen /d' /etc/httpd/conf/httpd.conf
+            echo "Listen 0.0.0.0:80" | sudo tee -a /etc/httpd/conf/httpd.conf
+            echo "Listen [::]:80" | sudo tee -a /etc/httpd/conf/httpd.conf
+
+            sudo systemctl start httpd
+            sudo systemctl enable httpd
+            sudo chown -R $USER:$USER /var/www
+
+            # Create index.php to show request source IP
+            cat > /var/www/html/index.php <<'HTML'
+            <html>
+            <body>
+            <h1>Hello from the AutoScaling Group!!</h1>
+            <p><strong>Request IP address:</strong> <?php echo $_SERVER['REMOTE_ADDR']; ?></p>
+            </body>
+            </html>
+            HTML
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub 'provider-instance-asg-target'
+
+  # AutoScaling group
+  WebASG:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub 'web-asg-vpclattice'
+      VPCZoneIdentifier:
+        - !Ref WorkloadSubneta
+        - !Ref WorkloadSubnetb
+      MinSize: 2
+      MaxSize: 2
+      DesiredCapacity: 2
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplateWebInstance
+        Version: !GetAtt LaunchTemplateWebInstance.LatestVersionNumber
+      TrafficSources:
+        - Identifier: !GetAtt VpcLatticeTargetGroup.Arn
+          Type: vpc-lattice
+      Tags:
+        - Key: Name
+          Value: !Sub 'web-asg-vpclattice'
+          PropagateAtLaunch: true
+
+  # ---------- CUSTOM RESOURCE: OBTAIN PREFIX LIST ID FROM NAME ----------
+  # VPC Lattice IPv4
+  VpcLatticePrefixListIpv4:
+    Type: Custom::PrefixListLookup
+    Properties:
+      ServiceToken: !GetAtt PrefixListLookupFunction.Arn
+      PrefixListName: !Sub "com.amazonaws.${AWS::Region}.vpc-lattice"
+
+  # VPC Lattice IPv6
+  VpcLatticePrefixListIpv6:
+    Type: Custom::PrefixListLookup
+    Properties:
+      ServiceToken: !GetAtt PrefixListLookupFunction.Arn
+      PrefixListName: !Sub "com.amazonaws.${AWS::Region}.ipv6.vpc-lattice"
+
+  # AWS Lambda function
+  PrefixListLookupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.14
+      Handler: index.handler
+      Role: !GetAtt PrefixListLookupRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+            if event['RequestType'] in ['Create', 'Update']:
+              try:
+                ec2 = boto3.client('ec2')
+                prefix_list_name = event['ResourceProperties']['PrefixListName']
+
+                # Get all managed prefix lists
+                response = ec2.describe_managed_prefix_lists(
+                  Filters=[{'Name': 'prefix-list-name', 'Values': [prefix_list_name]}]
+                )
+
+                if response['PrefixLists']:
+                  prefix_list_id = response['PrefixLists'][0]['PrefixListId']
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS,
+                                  {'PrefixListId': prefix_list_id})
+                else:
+                  cfnresponse.send(event, context, cfnresponse.FAILED,
+                                  {'Error': f'Prefix list {prefix_list_name} not found'})
+              except Exception as e:
+                cfnresponse.send(event, context, cfnresponse.FAILED,
+                                {'Error': str(e)})
+            else:  # Delete
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+  # IAM role for the Lambda function
+  PrefixListLookupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2PrefixListAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeManagedPrefixLists
+                Resource: '*'
+
+Outputs:
+  ServiceDomainName:
+    Description: VPC Lattice service domain name
+    Value: !GetAtt VpcLatticeService.DnsEntry.DomainName

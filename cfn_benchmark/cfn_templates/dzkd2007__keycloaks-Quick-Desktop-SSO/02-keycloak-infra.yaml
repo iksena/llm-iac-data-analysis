@@ -1,0 +1,597 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Keycloak on ECS Fargate with Aurora Serverless v2 PostgreSQL.
+  Provides OIDC/SAML IdP with LDAP federation to AWS Managed AD.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC ID
+
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: First private subnet (used by Aurora DB subnet group; must be in a different AZ from PrivateSubnet2Id)
+
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second private subnet (used by Aurora DB subnet group; must be in a different AZ from PrivateSubnet1Id)
+
+  EcsSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      Private subnet IDs for ECS Fargate tasks. MUST only contain subnets whose AZ
+      is also covered by the ALB public subnets (otherwise ALB will mark targets as
+      "unused" with reason "AZ is not enabled for the load balancer"). Can be the
+      same as PrivateSubnet1Id alone if the VPC only has one private subnet that
+      matches an ALB AZ.
+
+  PublicSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: First public subnet for ALB
+
+  PublicSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+    Description: Second public subnet for ALB
+
+  CertificateArn:
+    Type: String
+    Description: ACM Certificate ARN for HTTPS on ALB
+
+  KeycloakDomainName:
+    Type: String
+    Default: keycloak.example.com
+    Description: Domain name for Keycloak (must match ACM certificate)
+
+  KeycloakImage:
+    Type: String
+    Default: quay.io/keycloak/keycloak:25.0
+    Description: Keycloak Docker image
+
+  KeycloakAdminUser:
+    Type: String
+    Default: admin
+    Description: Keycloak admin username
+
+  KeycloakAdminPassword:
+    Type: String
+    NoEcho: true
+    Default: changeme123!
+    Description: Keycloak admin password
+
+  DBMasterUsername:
+    Type: String
+    Default: keycloak
+    Description: Aurora PostgreSQL master username
+
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    Default: changeme456!
+    Description: Aurora PostgreSQL master password
+
+  ManagedADDnsIp1:
+    Type: String
+    Description: First DNS IP of Managed AD (for LDAP connection)
+
+  ManagedADDnsIp2:
+    Type: String
+    Description: Second DNS IP of Managed AD (for LDAP connection)
+
+  ManagedADDomainName:
+    Type: String
+    Default: corp.example.com
+    Description: Domain name of the Managed AD
+
+  AlbIngressPrefixListIds:
+    Type: CommaDelimitedList
+    Default: pl-3b927c52
+    Description: >
+      AWS-managed prefix lists allowed to reach the ALB on 80/443. Default is
+      `com.amazonaws.global.cloudfront.origin-facing` (pl-3b927c52 in us-east-1).
+      With CloudFront in front of this ALB the SG stays compliant with the
+      Isengard "no 0.0.0.0/0" rule. If you front-end with another service
+      (e.g. AWS WAF/Global Accelerator) replace with the appropriate prefix list.
+
+  AlbIngressExtraCidr:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+    Description: >
+      Optional additional IPv4 CIDR allowed to reach the ALB on 80/443 (e.g.
+      a corporate egress range for testing). Leave empty in production. MUST
+      NOT be 0.0.0.0/0 — Isengard accounts forbid open ingress.
+
+  TaskCpu:
+    Type: String
+    Default: '2048'
+    AllowedValues: ['512', '1024', '2048', '4096']
+    Description: Fargate task CPU units. Keycloak 25 needs ~2 vCPU per task for healthy boot + Liquibase migration; the AWS samples reference uses 4 vCPU.
+
+  TaskMemory:
+    Type: String
+    Default: '4096'
+    AllowedValues: ['1024', '2048', '3072', '4096', '8192']
+    Description: Fargate task memory (MB). Keycloak's JVM with embedded Infinispan needs ~3GB+; AWS samples reference uses 8GB.
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 10
+    Description: >
+      Number of Keycloak tasks. Default 1 keeps things simple; raise to 2+ ONLY when
+      EcsSubnetIds covers 2+ AZs (otherwise tasks in non-ALB AZs become orphans). The
+      template wires up clustered Infinispan via Cloud Map service discovery so multi-task
+      deployments share session/auth caches and avoid the "200/401 flapping" issue.
+
+Conditions:
+  HasExtraCidr: !Not [!Equals [!Ref AlbIngressExtraCidr, '']]
+
+Resources:
+  #############################################
+  # Security Groups
+  #############################################
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB Security Group for Keycloak (extra-CIDR ingress only)
+      VpcId: !Ref VpcId
+      # Optional small CIDR ingress lives here. The CloudFront prefix-list
+      # ingress lives on its own dedicated SG (ALBPrefixListSecurityGroup)
+      # because referencing the CloudFront origin-facing prefix list expands
+      # to ~70 IP ranges and a single SG only allows 60 rules total.
+      Tags:
+        - Key: Name
+          Value: keycloak-alb-sg
+
+  # Dedicated SG used solely for the CloudFront managed prefix-list ingress.
+  # Splitting into a second SG keeps us under the 60-rule-per-SG quota.
+  ALBPrefixListSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB ingress from approved managed prefix lists (CloudFront)
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: keycloak-alb-pl-sg
+
+  # ALB ingress: HTTPS from CloudFront only.
+  # CloudFront's edge handles viewer HTTP→HTTPS redirect, so origin only needs 443.
+  # Each managed-prefix-list reference counts against the SG's inbound-rules
+  # quota by the prefix list's MaxEntries — the CloudFront origin-facing list
+  # currently has ~45 entries, so 1 ingress rule = ~45 rule slots. Default quota
+  # is 60/SG; if you want HTTP on this SG too, request L-0EA8095F increase.
+  ALBIngressHttpsFromPrefixList1:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ALBPrefixListSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourcePrefixListId: !Select [0, !Ref AlbIngressPrefixListIds]
+      Description: HTTPS from approved managed prefix list (e.g. CloudFront origin-facing)
+
+  # Optional: extra single CIDR (corporate egress / bastion) — never 0.0.0.0/0
+  # Only HTTPS, since the ALB no longer has an HTTP listener.
+  ALBIngressHttpsFromExtraCidr:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasExtraCidr
+    Properties:
+      GroupId: !Ref ALBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: !Ref AlbIngressExtraCidr
+      Description: HTTPS from approved extra CIDR
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS Tasks Security Group for Keycloak
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: HTTP from ALB (extra-CIDR SG)
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBPrefixListSecurityGroup
+          Description: HTTP from ALB (prefix-list SG)
+        - IpProtocol: tcp
+          FromPort: 9000
+          ToPort: 9000
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: Management port (health/metrics) from ALB (extra-CIDR SG)
+        - IpProtocol: tcp
+          FromPort: 9000
+          ToPort: 9000
+          SourceSecurityGroupId: !Ref ALBPrefixListSecurityGroup
+          Description: Management port (health/metrics) from ALB (prefix-list SG)
+      Tags:
+        - Key: Name
+          Value: keycloak-ecs-sg
+
+  # Self-referencing rule for JGroups clustering
+  ECSSecurityGroupSelfIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref ECSSecurityGroup
+      IpProtocol: tcp
+      FromPort: 7800
+      ToPort: 7800
+      SourceSecurityGroupId: !Ref ECSSecurityGroup
+      Description: JGroups clustering between tasks
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora PostgreSQL Security Group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ECSSecurityGroup
+          Description: PostgreSQL from ECS tasks
+      Tags:
+        - Key: Name
+          Value: keycloak-db-sg
+
+  #############################################
+  # Aurora Serverless v2 PostgreSQL
+  #############################################
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Keycloak Aurora
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: '16.6'
+      DatabaseName: keycloak
+      MasterUsername: !Ref DBMasterUsername
+      MasterUserPassword: !Ref DBMasterPassword
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DBSecurityGroup
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 4
+      StorageEncrypted: true
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+
+  AuroraInstance1:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+
+  AuroraInstance2:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+
+  #############################################
+  # Secrets Manager
+  #############################################
+  KeycloakAdminSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: /keycloak/admin-credentials
+      Description: Keycloak admin credentials
+      SecretString: !Sub |
+        {
+          "username": "${KeycloakAdminUser}",
+          "password": "${KeycloakAdminPassword}"
+        }
+
+  KeycloakDBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: /keycloak/db-credentials
+      Description: Keycloak database credentials
+      SecretString: !Sub |
+        {
+          "username": "${DBMasterUsername}",
+          "password": "${DBMasterPassword}",
+          "port": "5432",
+          "dbname": "keycloak"
+        }
+
+  #############################################
+  # ECS Cluster & Service
+  #############################################
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: keycloak-cluster
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # CloudWatch Log Group
+  KeycloakLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/keycloak
+      RetentionInDays: 30
+
+  # ECS Task Execution Role
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref KeycloakAdminSecret
+                  - !Ref KeycloakDBSecret
+
+  # ECS Task Role
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+
+  # ECS Task Definition
+  KeycloakTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: keycloak
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ECSTaskRole.Arn
+      ContainerDefinitions:
+        - Name: keycloak
+          Image: !Ref KeycloakImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+            - ContainerPort: 9000
+              Protocol: tcp
+            - ContainerPort: 7800
+              Protocol: tcp
+          Environment:
+            - Name: KC_DB
+              Value: postgres
+            - Name: KC_DB_URL
+              Value: !Sub
+                - jdbc:postgresql://${DBHost}:5432/keycloak
+                - DBHost: !GetAtt AuroraCluster.Endpoint.Address
+            - Name: KC_DB_USERNAME
+              Value: !Ref DBMasterUsername
+            - Name: KC_DB_PASSWORD
+              Value: !Ref DBMasterPassword
+            - Name: KC_HOSTNAME
+              Value: !Ref KeycloakDomainName
+            - Name: KC_HOSTNAME_STRICT
+              Value: 'false'
+            - Name: KC_PROXY_HEADERS
+              Value: xforwarded
+            - Name: KC_HTTP_ENABLED
+              Value: 'true'
+            - Name: KC_HEALTH_ENABLED
+              Value: 'true'
+            - Name: KC_METRICS_ENABLED
+              Value: 'true'
+            - Name: KEYCLOAK_ADMIN
+              Value: !Ref KeycloakAdminUser
+            - Name: KEYCLOAK_ADMIN_PASSWORD
+              Value: !Ref KeycloakAdminPassword
+            # Use clustered Infinispan with JGroups DNS_PING via Cloud Map.
+            # Each task resolves "keycloak.keycloak.local" to discover sibling
+            # task IPs and form a cluster. Without this, KC_CACHE=local makes
+            # multi-task deploys flap between 200 and 401 because each task
+            # has its own private auth cache and ALB load-balances blindly.
+            - Name: KC_CACHE
+              Value: ispn
+            - Name: KC_CACHE_STACK
+              Value: kubernetes
+            - Name: JAVA_OPTS_APPEND
+              Value: >-
+                -Djgroups.dns.query=keycloak.keycloak.local
+            # LDAP connection info (referenced by the LDAP federation
+            # configured later through the Admin UI / Admin REST). Both DC
+            # IPs are exposed so a redirect-style LDAP URL can use either.
+            - Name: LDAP_URL
+              Value: !Sub ldap://${ManagedADDnsIp1}:389 ldap://${ManagedADDnsIp2}:389
+            - Name: LDAP_DOMAIN
+              Value: !Ref ManagedADDomainName
+          Command:
+            - start
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref KeycloakLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: keycloak
+          # NOTE: do not set ECS container HealthCheck here. The official
+          # quay.io/keycloak/keycloak image is a UBI-minimal image that has
+          # neither curl nor wget, so any shell-based health check fails and
+          # ECS will kill the task in a loop. We rely on the ALB target group
+          # health check (against the management port 9000 /health/ready)
+          # instead.
+
+  # Cloud Map Namespace for service discovery (JGroups clustering)
+  ServiceDiscoveryNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Properties:
+      Name: keycloak.local
+      Vpc: !Ref VpcId
+
+  ServiceDiscoveryService:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: keycloak
+      NamespaceId: !Ref ServiceDiscoveryNamespace
+      DnsConfig:
+        DnsRecords:
+          - Type: A
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  #############################################
+  # Application Load Balancer
+  #############################################
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: keycloak-alb
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+        - !Ref ALBPrefixListSecurityGroup
+      Subnets:
+        - !Ref PublicSubnet1Id
+        - !Ref PublicSubnet2Id
+
+  ALBTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: keycloak-tg
+      Port: 8080
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      # Keycloak 25+ exposes /health/* on the management port 9000 by default
+      HealthCheckPort: '9000'
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health/ready
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: stickiness.enabled
+          Value: 'true'
+        - Key: stickiness.type
+          Value: lb_cookie
+        - Key: stickiness.lb_cookie.duration_seconds
+          Value: '86400'
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+
+  ALBListenerHTTPS:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 443
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ALBTargetGroup
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+
+  # No HTTP listener — CloudFront handles viewer HTTP→HTTPS redirect at the edge.
+  # The ALB only accepts HTTPS from the CloudFront origin-facing prefix list.
+
+  #############################################
+  # ECS Service
+  #############################################
+  KeycloakService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - ALBListenerHTTPS
+    Properties:
+      ServiceName: keycloak
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref KeycloakTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+          Subnets: !Ref EcsSubnetIds
+      LoadBalancers:
+        - ContainerName: keycloak
+          ContainerPort: 8080
+          TargetGroupArn: !Ref ALBTargetGroup
+      ServiceRegistries:
+        - RegistryArn: !GetAtt ServiceDiscoveryService.Arn
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+      # First-time Keycloak boot runs Liquibase schema migration against an
+      # empty Aurora; allow up to 10 min before ALB health checks count.
+      HealthCheckGracePeriodSeconds: 600
+
+Outputs:
+  ALBDnsName:
+    Description: ALB DNS name - create CNAME/Alias record pointing your domain here
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub ${AWS::StackName}-ALBDnsName
+
+  ALBHostedZoneId:
+    Description: ALB Hosted Zone ID (for Route53 Alias record)
+    Value: !GetAtt ALB.CanonicalHostedZoneID
+
+  KeycloakURL:
+    Description: Keycloak URL
+    Value: !Sub https://${KeycloakDomainName}
+
+  KeycloakAdminConsole:
+    Description: Keycloak Admin Console URL
+    Value: !Sub https://${KeycloakDomainName}/admin
+
+  ECSClusterName:
+    Description: ECS Cluster name
+    Value: !Ref ECSCluster
+
+  AuroraEndpoint:
+    Description: Aurora cluster endpoint
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+
+  OIDCDiscoveryURL:
+    Description: OIDC Discovery URL (after realm creation)
+    Value: !Sub https://${KeycloakDomainName}/realms/quicksuite/.well-known/openid-configuration
+
+  SAMLMetadataURL:
+    Description: SAML Metadata URL (after realm creation)
+    Value: !Sub https://${KeycloakDomainName}/realms/quicksuite/protocol/saml/descriptor

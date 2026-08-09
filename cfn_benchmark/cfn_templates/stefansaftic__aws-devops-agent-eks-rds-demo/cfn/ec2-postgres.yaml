@@ -1,0 +1,358 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EKS-FAIL-DEMO - Standalone EC2 Postgres for the cost-optimization scenario
+
+# Single EC2 instance running Postgres, with a separate gp3 data volume
+# whose Iops/Throughput are deliberately over-provisioned. The cost-
+# optimization scenario drops those two properties to expose a real
+# performance regression without touching anything else.
+#
+# pgbench schema (scale 200) is initialised in UserData. The k8s
+# loadgen Deployment in workload/ec2-loadgen.yaml runs read-only
+# pgbench against this instance and pushes TPS to CloudWatch as a
+# custom metric so the dashboard shows the cliff at PR merge time.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: devops-agent-demo
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  VpcCidr:
+    Type: String
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet::Id
+  InstanceType:
+    Type: String
+    Default: m5.large
+    Description: Instance type for the standalone Postgres host.
+  DataVolumeSize:
+    Type: Number
+    Default: 50
+    Description: Size of the Postgres data volume in GiB.
+  ImageId:
+    Type: AWS::EC2::Image::Id
+    # Default is the AmazonLinux 2023 AMI captured at the time the
+    # stack was first deployed. Passing an explicit ID rather than
+    # {{resolve:ssm:/aws/service/ami-amazon-linux-latest/...}} means
+    # CFN doesn't try to REPLACE the instance every time AWS publishes
+    # a new AmazonLinux release. That's important because instance
+    # replacement drops the OS-side Postgres state (initdb happens in
+    # UserData; a replaced instance won't re-init when /data has
+    # existing pgdata).
+    Default: ami-00948338a4aeec604
+    Description: EC2 AMI ID. Pin this to prevent instance replacement on updates.
+  DataVolumeIops:
+    Type: Number
+    Default: 6000
+    MinValue: 3000
+    MaxValue: 16000
+    Description: |
+      Provisioned IOPS for the gp3 data volume. The cost-optimization
+      scenario drops this back to 3000 (the gp3 baseline) and watches
+      pgbench TPS fall.
+  DataVolumeThroughput:
+    Type: Number
+    Default: 250
+    MinValue: 125
+    MaxValue: 1000
+    Description: Provisioned MB/s throughput for the gp3 data volume.
+  DbName:
+    Type: String
+    Default: pgbench
+  DbUser:
+    Type: String
+    Default: pgbench
+  DbPassword:
+    Type: String
+    Default: PgbenchDemo2026!
+    NoEcho: true
+  PgbenchScale:
+    Type: Number
+    Default: 1500
+    Description: |
+      pgbench scale factor (1 = ~16 MB). 1500 = ~22 GB tables; chosen
+      so the working set exceeds m5.large's 8 GB RAM. That forces the
+      OS page cache to miss on cold reads, making the workload I/O-
+      bound and the gp3 IOPS ceiling visible in TPS.
+      Smaller scales (e.g. 200) fit entirely in OS page cache and
+      VolumeReadOps stays near zero -- the IOPS knob then has no
+      visible effect.
+
+Resources:
+  # ----- IAM role for the instance -----
+  # SSM for shell access without SSH; CloudWatch agent for OS-level
+  # metrics; ec2:DescribeVolumes so the agent script in UserData can
+  # tag the data volume after attach.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: TagSelf
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateTags
+                  - ec2:DescribeVolumes
+                  - ec2:DescribeInstances
+                Resource: '*'
+      Tags:
+        - {Key: auto-delete, Value: never}
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  # ----- Security group: 5432 from VPC, no public access -----
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub ${ProjectName} ec2-postgres SG
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Ref VpcCidr
+          Description: Postgres from VPC
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-ec2-pg-sg'}
+        - {Key: auto-delete, Value: never}
+
+  # ----- EBS data volume -----
+  # Created independently so it survives instance replacement (CFN
+  # replaces the instance on InstanceType change). Mounted at /data,
+  # which is where Postgres' data directory lives.
+  DataVolume:
+    Type: AWS::EC2::Volume
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Size: !Ref DataVolumeSize
+      VolumeType: gp3
+      Iops: !Ref DataVolumeIops
+      Throughput: !Ref DataVolumeThroughput
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Encrypted: true
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-ec2-pg-data'}
+        - {Key: auto-delete, Value: never}
+        # The cost-optimization PR removes Iops/Throughput properties.
+        # CFN updates the volume in-place with a ModifyVolume call.
+
+  # ----- The instance itself -----
+  # AmazonLinux 2023 via SSM Parameter — no AMI pinning to track.
+  Instance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      Comment: Postgres + pgbench (scale 200), data on /data (separate gp3 volume)
+    Properties:
+      ImageId: !Ref ImageId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PrivateSubnetA
+      SecurityGroupIds: [!Ref InstanceSecurityGroup]
+      IamInstanceProfile: !Ref InstanceProfile
+      Volumes:
+        - Device: /dev/sdf
+          VolumeId: !Ref DataVolume
+      BlockDeviceMappings:
+        # Root volume (small, ephemeral — replaced on instance recreate).
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+            DeleteOnTermination: true
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -euxo pipefail
+
+          # Wait for the data volume to attach. CFN attaches via the
+          # Volumes property but it's racy with UserData on first boot.
+          DATA_DEV=""
+          for i in $(seq 1 30); do
+            for cand in /dev/nvme1n1 /dev/xvdf /dev/sdf; do
+              if [ -b "$cand" ]; then DATA_DEV=$cand; break; fi
+            done
+            if [ -n "$DATA_DEV" ]; then break; fi
+            sleep 5
+          done
+          if [ -z "$DATA_DEV" ]; then
+            echo "data volume did not appear" >&2
+            exit 1
+          fi
+
+          # Format only on first boot — preserve data across reboots
+          # and instance replacements.
+          if ! blkid "$DATA_DEV"; then
+            mkfs.xfs -f "$DATA_DEV"
+          fi
+          mkdir -p /data
+          if ! grep -q "^$DATA_DEV " /etc/fstab; then
+            UUID=$(blkid -s UUID -o value "$DATA_DEV")
+            echo "UUID=$UUID /data xfs defaults,nofail 0 2" >> /etc/fstab
+          fi
+          mount -a
+
+          dnf install -y postgresql15-server postgresql15-contrib amazon-cloudwatch-agent
+
+          # Initialise Postgres on /data only on first boot.
+          if [ ! -d /data/pgdata/base ]; then
+            mkdir -p /data/pgdata
+            chown -R postgres:postgres /data/pgdata
+            sudo -u postgres /usr/bin/initdb -D /data/pgdata
+            cat >> /data/pgdata/postgresql.conf <<EOF
+          listen_addresses = '*'
+          shared_buffers = 256MB
+          # Keep the cache small enough that cold reads still hit disk
+          # and the IOPS knob actually shows up in TPS.
+          effective_cache_size = 512MB
+          # Log slow queries so the agent can grep them later.
+          log_min_duration_statement = 100
+          log_destination = 'stderr'
+          logging_collector = on
+          log_directory = 'pg_log'
+          EOF
+            cat >> /data/pgdata/pg_hba.conf <<EOF
+          host all all ${VpcCidr} md5
+          EOF
+          fi
+
+          # systemd unit pointing at /data/pgdata
+          cat > /etc/systemd/system/postgresql.service <<'EOF'
+          [Unit]
+          Description=PostgreSQL database server
+          After=network.target
+          [Service]
+          Type=forking
+          User=postgres
+          Group=postgres
+          Environment=PGDATA=/data/pgdata
+          ExecStart=/usr/bin/pg_ctl start -D /data/pgdata -s -w -t 60
+          ExecStop=/usr/bin/pg_ctl stop -D /data/pgdata -s -m fast
+          ExecReload=/usr/bin/pg_ctl reload -D /data/pgdata -s
+          Restart=on-failure
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          systemctl daemon-reload
+          systemctl enable --now postgresql
+
+          # Create the demo db/user/schema only on first boot.
+          if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_database WHERE datname='${DbName}'" | grep -q 1; then
+            sudo -u postgres psql -c "CREATE USER ${DbUser} WITH PASSWORD '${DbPassword}';"
+            sudo -u postgres psql -c "CREATE DATABASE ${DbName} OWNER ${DbUser};"
+            sudo -u postgres pgbench -i -s ${PgbenchScale} -U ${DbUser} ${DbName}
+          fi
+
+          # Nudge CloudWatch into 1-minute resolution for OS metrics.
+          # Detailed monitoring on the instance itself is set in the
+          # Properties block above.
+          cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'EOF'
+          {
+            "metrics": {
+              "namespace": "EksFailDemo/Ec2Postgres",
+              "metrics_collected": {
+                "disk":   {"measurement":["used_percent"], "metrics_collection_interval":60, "resources":["*"]},
+                "diskio": {"measurement":["reads","writes","read_bytes","write_bytes","iops_in_progress"], "metrics_collection_interval":60, "resources":["*"]},
+                "mem":    {"measurement":["mem_used_percent"], "metrics_collection_interval":60}
+              },
+              "append_dimensions": {
+                "InstanceId": "${!aws:InstanceId}"
+              }
+            }
+          }
+          EOF
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+            -a fetch-config -m ec2 -s \
+            -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+      Monitoring: true   # 1-minute EC2 metrics
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-ec2-pg'}
+        - {Key: auto-delete, Value: never}
+        - {Key: scenario, Value: ec2-postgres}
+
+  # ----- CloudWatch dashboard -----
+  # The smoking gun for the cost-optimization scenario is
+  # VolumeReadOps plateauing at the new IOPS ceiling. The dashboard
+  # makes the cliff visible without anyone running aws-cli queries.
+  Dashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${ProjectName}-ec2-postgres
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric", "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "EBS Total IOPS/min (smoking gun: combined R+W)",
+                "metrics": [
+                  ["AWS/EBS","VolumeWriteOps","VolumeId","${DataVolume}",{"stat":"Sum","period":60,"label":"Write ops/min"}],
+                  ["AWS/EBS","VolumeReadOps","VolumeId","${DataVolume}",{"stat":"Sum","period":60,"label":"Read ops/min"}]
+                ],
+                "view": "timeSeries", "stacked": true, "region": "${AWS::Region}",
+                "annotations": {
+                  "horizontal": [
+                    {"label":"6000 IOPS ceiling (per-min sum)","value":360000,"color":"#2ca02c"},
+                    {"label":"3000 IOPS ceiling (per-min sum)","value":180000,"color":"#d62728"}
+                  ]
+                }
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Volume Queue Length (>1 = throttling)",
+                "metrics": [
+                  ["AWS/EBS","VolumeQueueLength","VolumeId","${DataVolume}",{"stat":"Average","period":60}]
+                ],
+                "view": "timeSeries", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric", "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "EBS Bytes/min (read + write, stacked)",
+                "metrics": [
+                  ["AWS/EBS","VolumeWriteBytes","VolumeId","${DataVolume}",{"stat":"Sum","period":60}],
+                  ["AWS/EBS","VolumeReadBytes","VolumeId","${DataVolume}",{"stat":"Sum","period":60}]
+                ],
+                "view": "timeSeries", "stacked": true, "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric", "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "pgbench TPS (custom metric from loadgen)",
+                "metrics": [
+                  ["EksFailDemo/Pgbench","Tps","Target","ec2-postgres",{"stat":"Average","period":60}]
+                ],
+                "view": "timeSeries", "region": "${AWS::Region}"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  Ec2InstanceId:
+    Value: !Ref Instance
+  Ec2PrivateIp:
+    Value: !GetAtt Instance.PrivateIp
+  DataVolumeId:
+    Value: !Ref DataVolume
+  DbConnectionInfo:
+    Value: !Sub "host=${Instance.PrivateIp} dbname=${DbName} user=${DbUser}"
+  DashboardUrl:
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ProjectName}-ec2-postgres

@@ -1,0 +1,183 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: OPTIONAL - Automated Failover Trigger via AWS Health Dashboard (Deploy AFTER manual testing)
+
+Resources:
+  HealthEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: AuroraFailoverHealthTrigger
+      Description: Automatically trigger failover on AWS Health RDS events
+      State: DISABLED  # Start disabled - enable after testing
+      EventPattern:
+        source:
+          - aws.health
+        detail-type:
+          - AWS Health Event
+        detail:
+          service:
+            - RDS
+          eventTypeCategory:
+            - issue
+          eventTypeCode:
+            - AWS_RDS_OPERATIONAL_ISSUE
+            - AWS_RDS_HARDWARE_FAILURE
+            - AWS_RDS_NETWORK_CONNECTIVITY_ISSUE
+      Targets:
+        - Arn: !GetAtt FailoverDecisionFunction.Arn
+          Id: FailoverDecisionTarget
+
+  FailoverDecisionFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FailoverDecisionFunction
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt FailoverDecisionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          TRIGGER_LAMBDA_NAME: TriggerFailover
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+
+          def lambda_handler(event, context):
+              print(f"Health Event Received: {json.dumps(event)}")
+
+              # Extract event details
+              detail = event.get('detail', {})
+              affected_region = detail.get('affectedRegion', '')
+              event_type = detail.get('eventTypeCode', '')
+              service = detail.get('service', '')
+
+              # Decision logic - only failover for critical RDS events
+              if service != 'RDS':
+                  print(f"Ignoring non-RDS event: {service}")
+                  return {'action': 'ignored', 'reason': 'not RDS'}
+
+              # Check if event is in primary region
+              ssm = boto3.client('ssm', region_name='us-east-1')
+              control1 = ssm.get_parameter(Name='/aurora-failover/arc-control-1')['Parameter']['Value']
+              cluster = ssm.get_parameter(Name='/aurora-failover/arc-cluster')['Parameter']['Value']
+
+              config = boto3.client('route53-recovery-control-config', region_name='us-west-2')
+              cluster_info = config.describe_cluster(ClusterArn=cluster)
+              endpoint = cluster_info['Cluster']['ClusterEndpoints'][0]['Endpoint']
+
+              arc = boto3.client('route53-recovery-cluster', endpoint_url=endpoint)
+              state1 = arc.get_routing_control_state(RoutingControlArn=control1)['RoutingControlState']
+
+              active_region = 'us-east-1' if state1 == 'On' else 'us-west-2'
+
+              # Only failover if health event is in active region
+              if affected_region != active_region:
+                  print(f"Event in {affected_region}, but active region is {active_region}. No action.")
+                  return {'action': 'ignored', 'reason': 'event not in active region'}
+
+              # Trigger failover
+              print(f"Critical RDS event in active region {active_region}. Triggering failover...")
+
+              lambda_client = boto3.client('lambda')
+              response = lambda_client.invoke(
+                  FunctionName=os.environ['TRIGGER_LAMBDA_NAME'],
+                  InvocationType='Event'
+              )
+
+              return {
+                  'action': 'failover_triggered',
+                  'affected_region': affected_region,
+                  'event_type': event_type
+              }
+
+  FailoverDecisionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: FailoverDecisionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: FailoverDecisionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:TriggerFailover'
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/aurora-failover/*'
+              - Effect: Allow
+                Action:
+                  - route53-recovery-control-config:DescribeCluster
+                  - route53-recovery-cluster:GetRoutingControlState
+                Resource: '*'
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FailoverDecisionFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HealthEventRule.Arn
+
+  # SNS Topic for notifications (optional - for human awareness)
+  FailoverNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: AuroraFailoverNotifications
+      DisplayName: Aurora Failover Notifications
+
+  FailoverNotificationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: NotifyOnFailover
+      Description: Send notification when failover is triggered
+      EventPattern:
+        source:
+          - aws.health
+        detail-type:
+          - AWS Health Event
+        detail:
+          service:
+            - RDS
+      Targets:
+        - Arn: !Ref FailoverNotificationTopic
+          Id: NotificationTarget
+
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref FailoverNotificationTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref FailoverNotificationTopic
+
+Outputs:
+  EventRuleName:
+    Value: !Ref HealthEventRule
+    Description: EventBridge rule name (currently DISABLED)
+  DecisionFunctionName:
+    Value: !Ref FailoverDecisionFunction
+    Description: Lambda function that decides whether to failover
+  NotificationTopicArn:
+    Value: !Ref FailoverNotificationTopic
+    Description: SNS topic for failover notifications (subscribe your email)
+  Instructions:
+    Value: "1. Test manual failover first. 2. Subscribe to SNS topic. 3. Enable EventBridge rule when ready."

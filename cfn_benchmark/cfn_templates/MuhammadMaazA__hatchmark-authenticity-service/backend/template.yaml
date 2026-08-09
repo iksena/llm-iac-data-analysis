@@ -1,0 +1,516 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Hatchmark Digital Authenticity Service - Complete SAM Application
+
+Globals:
+  Function:
+    Timeout: 30
+    Runtime: python3.12
+    Environment:
+      Variables:
+        PYTHONPATH: /opt/python
+  HttpApi:
+    CorsConfiguration:
+      AllowOrigins:
+        - "http://localhost:3000"
+        - "https://*.vercel.app"
+        - "https://*.hatchmark.io"
+        - "*"
+      AllowHeaders:
+        - "Content-Type"
+        - "Authorization"
+        - "X-Requested-With"
+        - "Accept"
+      AllowMethods:
+        - "GET"
+        - "POST"
+        - "OPTIONS"
+        - "PUT"
+      AllowCredentials: false
+      MaxAge: 86400
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+Resources:
+  # S3 Buckets
+  IngestionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'hatchmark-ingestion-${Environment}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'hatchmark-processed-${Environment}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # DynamoDB Table
+  AssetsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'hatchmark-assets-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: assetId
+          AttributeType: S
+        - AttributeName: perceptualHash
+          AttributeType: S
+      KeySchema:
+        - AttributeName: assetId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: PerceptualHashIndex
+          KeySchema:
+            - AttributeName: perceptualHash
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # SQS Queue
+  WatermarkingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub 'hatchmark-watermarking-${Environment}'
+      VisibilityTimeoutSeconds: 900
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+
+  # Lambda Functions
+  GeneratePresignedUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hatchmark-generate-url-${Environment}'
+      CodeUri: src/handlers/
+      Handler: generate_presigned_url.lambda_handler
+      Environment:
+        Variables:
+          INGESTION_BUCKET: !Ref IngestionBucket
+      Policies:
+        - S3WritePolicy:
+            BucketName: !Ref IngestionBucket
+      Events:
+        HttpPost:
+          Type: HttpApi
+          Properties:
+            Path: /uploads/initiate
+            Method: POST
+
+  HashFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hatchmark-hash-${Environment}'
+      CodeUri: src/handlers/
+      Handler: hashing_handler.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          INGESTION_BUCKET: !Ref IngestionBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref IngestionBucket
+
+  DynamoDBWriteFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hatchmark-dynamodb-write-${Environment}'
+      CodeUri: src/handlers/
+      Handler: dynamodb_write_handler.lambda_handler
+      Environment:
+        Variables:
+          ASSETS_TABLE: !Ref AssetsTable
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref AssetsTable
+
+  VerificationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hatchmark-verify-${Environment}'
+      CodeUri: src/handlers/
+      Handler: verification_handler.lambda_handler
+      Environment:
+        Variables:
+          ASSETS_TABLE: !Ref AssetsTable
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AssetsTable
+        - S3ReadPolicy:
+            BucketName: !Ref ProcessedBucket
+      Events:
+        HttpPost:
+          Type: HttpApi
+          Properties:
+            Path: /verify
+            Method: POST
+
+  DuplicateCheckFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub 'hatchmark-duplicate-check-${Environment}'
+      CodeUri: src/handlers/
+      Handler: duplicate_check_handler.lambda_handler
+      Timeout: 60
+      Environment:
+        Variables:
+          ASSETS_TABLE: !Ref AssetsTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AssetsTable
+      Events:
+        HttpPost:
+          Type: HttpApi
+          Properties:
+            Path: /uploads/check-duplicate
+            Method: POST
+
+  # Step Functions State Machine
+  HatchmarkWorkflow:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub 'HatchmarkWorkflow-${Environment}'
+      DefinitionUri: workflow/state-machine.json
+      DefinitionSubstitutions:
+        HashFunctionArn: !GetAtt HashFunction.Arn
+        DynamoDBWriteFunctionArn: !GetAtt DynamoDBWriteFunction.Arn
+        WatermarkingQueueUrl: !Ref WatermarkingQueue
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref HashFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DynamoDBWriteFunction
+        - SQSSendMessagePolicy:
+            QueueName: !GetAtt WatermarkingQueue.QueueName
+
+  # ECS Fargate Resources
+  HatchmarkCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub 'hatchmark-cluster-${Environment}'
+
+  FargateTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WatermarkingTaskPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt WatermarkingQueue.Arn
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub '${IngestionBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub '${ProcessedBucket}/*'
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt AssetsTable.Arn
+
+  WatermarkingTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub 'hatchmark-watermarker-${Environment}'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: 512
+      Memory: 1024
+      ExecutionRoleArn: !Sub 'arn:aws:iam::${AWS::AccountId}:role/ecsTaskExecutionRole'
+      TaskRoleArn: !Ref FargateTaskRole
+      ContainerDefinitions:
+        - Name: watermarker
+          Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/hatchmark-watermarker:latest'
+          Environment:
+            - Name: SQS_QUEUE_URL
+              Value: !Ref WatermarkingQueue
+            - Name: INGESTION_BUCKET
+              Value: !Ref IngestionBucket
+            - Name: PROCESSED_BUCKET
+              Value: !Ref ProcessedBucket
+            - Name: ASSETS_TABLE
+              Value: !Ref AssetsTable
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WatermarkerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  WatermarkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/ecs/hatchmark-watermarker-${Environment}'
+      RetentionInDays: 14
+
+  WatermarkingService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub 'hatchmark-watermarker-${Environment}'
+      Cluster: !Ref HatchmarkCluster
+      TaskDefinition: !Ref WatermarkingTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: 0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups:
+            - !Ref WatermarkerSecurityGroup
+          Subnets:
+            - !Ref PrivateSubnet1
+            - !Ref PrivateSubnet2
+
+  WatermarkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for watermarker tasks
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  # VPC for Fargate
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt EIPForNAT.AllocationId
+      SubnetId: !Ref PublicSubnet1
+
+  EIPForNAT:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NATGateway
+
+  PrivateSubnetAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnetAssociation2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetAssociation1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  # Auto Scaling for Fargate
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ResourceId: !Sub 'service/${HatchmarkCluster}/${WatermarkingService}'
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: 0
+      MaxCapacity: 10
+      RoleARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService'
+
+  ScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub 'hatchmark-watermarker-scaling-${Environment}'
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref ScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ExactCapacity
+        Cooldown: 300
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            ScalingAdjustment: 1
+          - MetricIntervalUpperBound: 0
+            ScalingAdjustment: 0
+
+  SQSAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'hatchmark-sqs-messages-${Environment}'
+      AlarmDescription: Scale Fargate based on SQS queue depth
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt WatermarkingQueue.QueueName
+      AlarmActions:
+        - !Ref ScalingPolicy
+
+  # CloudWatch Event Rule to trigger Step Functions
+  S3EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub 'hatchmark-s3-events-${Environment}'
+      EventPattern:
+        source:
+          - aws.s3
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          eventName:
+            - ObjectCreated:Put
+            - ObjectCreated:Post
+          requestParameters:
+            bucketName:
+              - !Ref IngestionBucket
+      Targets:
+        - Arn: !Ref HatchmarkWorkflow
+          Id: HatchmarkWorkflowTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref HatchmarkWorkflow
+
+Outputs:
+  HttpApiUrl:
+    Description: "HTTP API Gateway endpoint URL"
+    Value: !Sub "https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com"
+    Export:
+      Name: !Sub "${AWS::StackName}-HttpApiUrl"
+
+  IngestionBucketName:
+    Description: "S3 bucket for file ingestion"
+    Value: !Ref IngestionBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-IngestionBucket"
+
+  ProcessedBucketName:
+    Description: "S3 bucket for processed files"
+    Value: !Ref ProcessedBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-ProcessedBucket"
+
+  WatermarkingQueueUrl:
+    Description: "SQS queue URL for watermarking tasks"
+    Value: !Ref WatermarkingQueue
+    Export:
+      Name: !Sub "${AWS::StackName}-WatermarkingQueue"

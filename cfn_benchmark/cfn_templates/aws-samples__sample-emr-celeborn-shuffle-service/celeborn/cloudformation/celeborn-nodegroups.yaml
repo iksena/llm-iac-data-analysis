@@ -1,0 +1,499 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  EKS managed node groups for Apache Celeborn.
+  Creates a general node group for system pods and a Celeborn-dedicated
+  node group with taints and shared-infra security groups.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: General Node Group
+        Parameters:
+          - GeneralInstanceType
+          - GeneralMinSize
+          - GeneralDesiredSize
+          - GeneralMaxSize
+      - Label:
+          default: Celeborn Node Group
+        Parameters:
+          - CelebornInstanceType
+          - CelebornMinSize
+          - CelebornDesiredSize
+          - CelebornMaxSize
+      - Label:
+          default: Configuration
+        Parameters:
+          - ProjectName
+          - S3BucketName
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: emr-celeborn-demo
+    Description: Project name used to import exports and for tagging
+
+  S3BucketName:
+    Type: String
+    Description: S3 bucket for uploading node bootstrap logs (from shared-infra)
+
+  GeneralInstanceType:
+    Type: String
+    Default: m5.xlarge
+    Description: EC2 instance type for general worker nodes
+
+  GeneralMinSize:
+    Type: Number
+    Default: 2
+    Description: Minimum number of general nodes
+
+  GeneralDesiredSize:
+    Type: Number
+    Default: 2
+    Description: Desired number of general nodes
+
+  GeneralMaxSize:
+    Type: Number
+    Default: 3
+    Description: Maximum number of general nodes
+
+  CelebornInstanceType:
+    Type: String
+    Default: m5d.2xlarge
+    Description: EC2 instance type for Celeborn nodes (should have local NVMe)
+
+  CelebornMinSize:
+    Type: Number
+    Default: 3
+    Description: Minimum number of Celeborn-dedicated nodes
+
+  CelebornDesiredSize:
+    Type: Number
+    Default: 3
+    Description: Desired number of Celeborn-dedicated nodes
+
+  CelebornMaxSize:
+    Type: Number
+    Default: 5
+    Description: Maximum number of Celeborn-dedicated nodes
+
+Resources:
+  # --- Node Group IAM Role ---
+
+  NodeGroupRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit role name required for IRSA trust policy binding in the deploy script. This is a blog post demonstration — resource replacement constraints are not a concern."
+    Properties:
+      RoleName: !Sub "${ProjectName}-celeborn-node-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEKS_CNI_Policy"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+      Policies:
+        - PolicyName: NodeBootstrapLogging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "s3:PutObject"
+                Resource: !Sub "arn:${AWS::Partition}:s3:::${S3BucketName}/logs/celeborn-nodes/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-celeborn-node-role"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # --- EBS CSI Driver IAM Role (trust policy updated via deploy script for IRSA) ---
+
+  EBSCSIDriverRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit role name required for IRSA trust policy binding in the deploy script. This is a blog post demonstration — resource replacement constraints are not a concern."
+    Properties:
+      RoleName: !Sub "${ProjectName}-celeborn-ebs-csi-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy"
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-celeborn-ebs-csi-role"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # --- AWS Load Balancer Controller IAM Role (trust policy updated via deploy script for IRSA) ---
+
+  LBControllerPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W13
+            reason: "Wildcard resource is required by the AWS Load Balancer Controller — EC2 Describe*, ELB Describe*, and Shield/WAF actions do not support resource-level restrictions. This is the standard AWS-published policy for the controller."
+          - id: W28
+            reason: "Explicit policy name required for stable reference from LBControllerRole. This is a blog post demonstration — resource replacement constraints are not a concern."
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: "Wildcard resource required by the AWS Load Balancer Controller — EC2 Describe*, ELB management, and Shield/WAF actions do not support resource-level permissions. This is the standard AWS-published policy."
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-celeborn-lb-controller-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowELBServiceLinkedRole
+            Effect: Allow
+            Action:
+              - "iam:CreateServiceLinkedRole"
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "iam:AWSServiceName": "elasticloadbalancing.amazonaws.com"
+          - Sid: AllowEC2Describe
+            Effect: Allow
+            Action:
+              - "ec2:DescribeAccountAttributes"
+              - "ec2:DescribeAddresses"
+              - "ec2:DescribeAvailabilityZones"
+              - "ec2:DescribeInternetGateways"
+              - "ec2:DescribeVpcs"
+              - "ec2:DescribeVpcPeeringConnections"
+              - "ec2:DescribeSubnets"
+              - "ec2:DescribeSecurityGroups"
+              - "ec2:DescribeInstances"
+              - "ec2:DescribeNetworkInterfaces"
+              - "ec2:DescribeTags"
+              - "ec2:DescribeCoipPools"
+              - "ec2:GetCoipPoolUsage"
+              - "ec2:GetSecurityGroupsForVpc"
+            Resource: "*"
+          - Sid: AllowEC2SecurityGroupManagement
+            Effect: Allow
+            Action:
+              - "ec2:CreateSecurityGroup"
+              - "ec2:AuthorizeSecurityGroupIngress"
+              - "ec2:RevokeSecurityGroupIngress"
+              - "ec2:DeleteSecurityGroup"
+            Resource: "*"
+          - Sid: AllowEC2Tags
+            Effect: Allow
+            Action:
+              - "ec2:CreateTags"
+              - "ec2:DeleteTags"
+            Resource: !Sub "arn:${AWS::Partition}:ec2:*:*:security-group/*"
+            Condition:
+              "Null":
+                "aws:RequestTag/elbv2.k8s.aws/cluster": "false"
+          - Sid: AllowELBManagement
+            Effect: Allow
+            Action:
+              - "elasticloadbalancing:CreateLoadBalancer"
+              - "elasticloadbalancing:CreateTargetGroup"
+              - "elasticloadbalancing:CreateListener"
+              - "elasticloadbalancing:CreateRule"
+              - "elasticloadbalancing:DeleteLoadBalancer"
+              - "elasticloadbalancing:DeleteTargetGroup"
+              - "elasticloadbalancing:DeleteListener"
+              - "elasticloadbalancing:DeleteRule"
+              - "elasticloadbalancing:DeregisterTargets"
+              - "elasticloadbalancing:RegisterTargets"
+              - "elasticloadbalancing:SetIpAddressType"
+              - "elasticloadbalancing:SetSecurityGroups"
+              - "elasticloadbalancing:SetSubnets"
+              - "elasticloadbalancing:ModifyLoadBalancerAttributes"
+              - "elasticloadbalancing:ModifyTargetGroup"
+              - "elasticloadbalancing:ModifyTargetGroupAttributes"
+              - "elasticloadbalancing:ModifyListener"
+              - "elasticloadbalancing:ModifyRule"
+              - "elasticloadbalancing:AddTags"
+              - "elasticloadbalancing:RemoveTags"
+            Resource: "*"
+          - Sid: AllowELBDescribe
+            Effect: Allow
+            Action:
+              - "elasticloadbalancing:DescribeLoadBalancers"
+              - "elasticloadbalancing:DescribeLoadBalancerAttributes"
+              - "elasticloadbalancing:DescribeListeners"
+              - "elasticloadbalancing:DescribeListenerCertificates"
+              - "elasticloadbalancing:DescribeSSLPolicies"
+              - "elasticloadbalancing:DescribeRules"
+              - "elasticloadbalancing:DescribeTargetGroups"
+              - "elasticloadbalancing:DescribeTargetGroupAttributes"
+              - "elasticloadbalancing:DescribeTargetHealth"
+              - "elasticloadbalancing:DescribeTags"
+              - "elasticloadbalancing:DescribeListenerAttributes"
+            Resource: "*"
+          - Sid: AllowShieldWafAcm
+            Effect: Allow
+            Action:
+              - "shield:GetSubscriptionState"
+              - "shield:DescribeProtection"
+              - "shield:CreateProtection"
+              - "shield:DeleteProtection"
+              - "wafv2:GetWebACLForResource"
+              - "wafv2:GetWebACL"
+              - "wafv2:AssociateWebACL"
+              - "wafv2:DisassociateWebACL"
+              - "acm:ListCertificates"
+              - "acm:DescribeCertificate"
+            Resource: "*"
+
+  LBControllerRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit role name required for IRSA trust policy binding in the deploy script. This is a blog post demonstration — resource replacement constraints are not a concern."
+    Properties:
+      RoleName: !Sub "${ProjectName}-celeborn-lb-controller-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: "sts:AssumeRole"
+      ManagedPolicyArns:
+        - !Ref LBControllerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-celeborn-lb-controller-role"
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # --- Launch Template for Celeborn Nodes (attaches shared-infra security groups) ---
+
+  CelebornLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-celeborn-nodes-lt"
+      LaunchTemplateData:
+        # Root EBS volume — explicit sizing prevents inheriting the AMI default (20 GiB).
+        # InstanceType is intentionally omitted here; it is specified on the node group
+        # via InstanceTypes. The two are mutually exclusive — do not add InstanceType here.
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 50
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: "${ProjectName}-CelebornClusterSgId"
+          - !ImportValue
+            Fn::Sub: "${ProjectName}-CelebornMasterSgId"
+          - !ImportValue
+            Fn::Sub: "${ProjectName}-CelebornWorkerSgId"
+        # Format and mount the local NVMe instance store (300 GiB on m5d.2xlarge)
+        # as a single filesystem with 4 subdirectories for Celeborn shuffle storage.
+        # Celeborn worker pods use hostPath volumes pointing to these directories.
+        # AL2023 managed node groups require MIME multipart UserData — a plain bash
+        # script is rejected with Ec2LaunchTemplateInvalidConfiguration.
+        # NVMe device discovery uses sysfs (/sys/block/<dev>/device/model) — no nvme-cli
+        # binary required; nvme-cli is not pre-installed on AL2023 EKS AMIs.
+        UserData:
+          Fn::Base64: !Sub |
+            MIME-Version: 1.0
+            Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+
+            --==BOUNDARY==
+            Content-Type: text/x-shellscript; charset="us-ascii"
+
+            #!/bin/bash
+            set -euxo pipefail
+
+            # Upload cloud-init-output.log to S3 on exit (success or failure) for debugging.
+            # IMDSv2 is required (HttpTokens=required) — must fetch a session token first.
+            IMDS_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" \
+              -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" --max-time 5 || echo "")
+            INSTANCE_ID=$(curl -s --max-time 5 \
+              -H "X-aws-ec2-metadata-token: ${!IMDS_TOKEN}" \
+              http://169.254.169.254/latest/meta-data/instance-id || echo "unknown")
+            upload_logs() {
+              aws s3 cp /var/log/cloud-init-output.log \
+                "s3://${S3BucketName}/logs/celeborn-nodes/${!INSTANCE_ID}/cloud-init-output.log" \
+                --region ${AWS::Region} 2>/dev/null || true
+            }
+            trap upload_logs EXIT
+
+            # Identify the NVMe instance store device using sysfs — no nvme-cli needed.
+            # EBS volumes report "Amazon Elastic Block Store"; instance store reports
+            # "Amazon EC2 NVMe Instance Storage". sysfs is available at early boot
+            # without any additional packages, unlike nvme-cli which is not pre-installed
+            # on all AL2023 AMI builds.
+            NVME_DEV=""
+            for attempt in $(seq 1 30); do
+              for dev in /dev/nvme0n1 /dev/nvme1n1 /dev/nvme2n1 /dev/nvme3n1; do
+                [ -b "$dev" ] || continue
+                devname=$(basename "$dev")
+                model=$(cat "/sys/block/${!devname}/device/model" 2>/dev/null) || true
+                if [[ "$model" == *"Instance Storage"* ]]; then
+                  NVME_DEV="$dev"
+                  break 2
+                fi
+              done
+              sleep 2
+            done
+            if [ -z "$NVME_DEV" ]; then
+              echo "ERROR: No NVMe instance store device found after 60s" >&2
+              exit 1
+            fi
+            MOUNT=/mnt/nvme
+            if ! blkid "$NVME_DEV"; then
+              mkfs.ext4 -F "$NVME_DEV"
+            fi
+            mkdir -p "$MOUNT"
+            if ! mountpoint -q "$MOUNT"; then
+              mount "$NVME_DEV" "$MOUNT"
+            fi
+            # Use UUID in fstab — NVMe device names (nvme0n1/nvme1n1) can swap between
+            # reboots, so a device-name entry would mount the wrong disk after nodeadm reboot.
+            NVME_UUID=$(blkid -s UUID -o value "$NVME_DEV")
+            grep -q "$MOUNT" /etc/fstab || \
+              echo "UUID=${!NVME_UUID} $MOUNT ext4 defaults,nofail 0 2" >> /etc/fstab
+            mkdir -p "$MOUNT/disk1" "$MOUNT/disk2" "$MOUNT/disk3" "$MOUNT/disk4"
+            chmod 777 "$MOUNT/disk1" "$MOUNT/disk2" "$MOUNT/disk3" "$MOUNT/disk4"
+            echo "NVMe setup complete: $NVME_DEV -> $MOUNT"
+
+            --==BOUNDARY==--
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub "${ProjectName}-celeborn-node"
+              - Key: Project
+                Value: !Ref ProjectName
+
+  # --- General Node Group (system pods: CoreDNS, kube-proxy, etc.) ---
+
+  GeneralNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      NodegroupName: !Sub "${ProjectName}-celeborn-general"
+      ClusterName: !ImportValue
+        Fn::Sub: "${ProjectName}-CelebornClusterName"
+      NodeRole: !GetAtt NodeGroupRole.Arn
+      Subnets:
+        - !ImportValue
+          Fn::Sub: "${ProjectName}-PrivateSubnet1Id"
+        - !ImportValue
+          Fn::Sub: "${ProjectName}-PrivateSubnet2Id"
+      InstanceTypes:
+        - !Ref GeneralInstanceType
+      ScalingConfig:
+        MinSize: !Ref GeneralMinSize
+        DesiredSize: !Ref GeneralDesiredSize
+        MaxSize: !Ref GeneralMaxSize
+      AmiType: AL2023_x86_64_STANDARD
+      CapacityType: ON_DEMAND
+      DiskSize: 50
+      UpdateConfig:
+        MaxUnavailablePercentage: 33
+      Labels:
+        node-type: general
+      Tags:
+        Name: !Sub "${ProjectName}-celeborn-general-nodes"
+        Project: !Ref ProjectName
+
+  # --- Celeborn-Dedicated Node Group (tainted to prevent non-Celeborn pods) ---
+
+  CelebornNodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      NodegroupName: !Sub "${ProjectName}-celeborn-dedicated"
+      ClusterName: !ImportValue
+        Fn::Sub: "${ProjectName}-CelebornClusterName"
+      NodeRole: !GetAtt NodeGroupRole.Arn
+      Subnets:
+        - !ImportValue
+          Fn::Sub: "${ProjectName}-PrivateSubnet1Id"
+        - !ImportValue
+          Fn::Sub: "${ProjectName}-PrivateSubnet2Id"
+      LaunchTemplate:
+        Id: !Ref CelebornLaunchTemplate
+        Version: !GetAtt CelebornLaunchTemplate.LatestVersionNumber
+      InstanceTypes:
+        - !Ref CelebornInstanceType
+      ScalingConfig:
+        MinSize: !Ref CelebornMinSize
+        DesiredSize: !Ref CelebornDesiredSize
+        MaxSize: !Ref CelebornMaxSize
+      AmiType: AL2023_x86_64_STANDARD
+      CapacityType: ON_DEMAND
+      UpdateConfig:
+        MaxUnavailablePercentage: 33
+      Labels:
+        node-type: celeborn
+        celeborn-dedicated: "true"
+      Taints:
+        - Key: celeborn-dedicated
+          Value: "true"
+          Effect: NO_SCHEDULE
+      Tags:
+        Name: !Sub "${ProjectName}-celeborn-dedicated-nodes"
+        Project: !Ref ProjectName
+
+  # --- EBS CSI Driver Addon ---
+  # NOTE: The aws-ebs-csi-driver addon is NOT deployed here because it requires
+  # an IRSA trust policy on EBSCSIDriverRole. The OIDC provider is only available
+  # after the EKS cluster stack deploys, so the trust policy cannot be set in
+  # CloudFormation at stack-creation time. Without the correct trust policy, the
+  # addon pods cannot assume the role, they crash-loop, and CloudFormation hangs
+  # indefinitely in CREATE_IN_PROGRESS.
+  # The addon is instead installed via CLI in deploy.sh after OIDC/IRSA setup.
+
+Outputs:
+  GeneralNodeGroupName:
+    Description: Name of the general node group
+    Value: !Ref GeneralNodeGroup
+    Export:
+      Name: !Sub "${ProjectName}-CelebornGeneralNodeGroup"
+
+  CelebornNodeGroupName:
+    Description: Name of the Celeborn-dedicated node group
+    Value: !Ref CelebornNodeGroup
+    Export:
+      Name: !Sub "${ProjectName}-CelebornDedicatedNodeGroup"
+
+  EBSCSIDriverRoleName:
+    Description: IAM role name for EBS CSI driver (trust policy updated by deploy script)
+    Value: !Ref EBSCSIDriverRole
+    Export:
+      Name: !Sub "${ProjectName}-CelebornEBSCSIRoleName"
+
+  LBControllerRoleName:
+    Description: IAM role name for AWS Load Balancer Controller (trust policy updated by deploy script)
+    Value: !Ref LBControllerRole
+    Export:
+      Name: !Sub "${ProjectName}-CelebornLBControllerRoleName"
+
+  LBControllerRoleArn:
+    Description: IAM role ARN for AWS Load Balancer Controller
+    Value: !GetAtt LBControllerRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-CelebornLBControllerRoleArn"

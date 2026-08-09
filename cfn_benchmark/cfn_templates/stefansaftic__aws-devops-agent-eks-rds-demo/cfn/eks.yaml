@@ -1,0 +1,341 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: EKS-FAIL-DEMO - EKS cluster, managed node group across 3 AZs, EBS CSI addon
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: devops-agent-demo
+  KubernetesVersion:
+    Type: String
+    Default: '1.35'
+  PrivateSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  NodeInstanceType:
+    Type: String
+    Default: t3.medium
+  CreateEcrPullThroughCache:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: |
+      Set to 'false' if an ecr-public pull-through cache rule already
+      exists in the account. Only one rule per (prefix, upstream) is
+      allowed and PullThroughCacheRule is not importable.
+
+Conditions:
+  ShouldCreatePullThroughCache: !Equals [!Ref CreateEcrPullThroughCache, 'true']
+
+Resources:
+  # ----- ECR pull-through cache for public.ecr.aws -----
+  # Lets pods reference public.ecr.aws images via the regional ECR
+  # endpoint (which is reachable from our private VPC), instead of
+  # talking to public.ecr.aws over the internet.
+  #
+  # Pod image string transforms from:
+  #   public.ecr.aws/docker/library/postgres:16-alpine
+  # to:
+  #   <account>.dkr.ecr.<region>.amazonaws.com/ecr-public/docker/library/postgres:16-alpine
+  EcrPullThroughCacheRule:
+    Condition: ShouldCreatePullThroughCache
+    Type: AWS::ECR::PullThroughCacheRule
+    Properties:
+      EcrRepositoryPrefix: ecr-public
+      UpstreamRegistryUrl: public.ecr.aws
+      Tags:
+        - {Key: auto-delete, Value: never}
+
+  # ----- Cluster IAM role -----
+  ClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: eks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSClusterPolicy
+      Tags:
+        - {Key: auto-delete, Value: never}
+
+  ClusterSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EKS control plane SG
+      VpcId: !Ref VpcId
+      Tags:
+        - {Key: Name, Value: !Sub '${ProjectName}-cluster-sg'}
+        - {Key: auto-delete, Value: never}
+
+  # ----- Cluster -----
+  Cluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ProjectName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt ClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds: !Ref PrivateSubnetIds
+        SecurityGroupIds: [!Ref ClusterSecurityGroup]
+        # Public API endpoint enabled so kubectl works from your laptop.
+        # Workload nodes still have no public IPs (they sit in private subnets).
+        # For a prod-like setup, set EndpointPublicAccess: false and access
+        # the API via VPN / Direct Connect / SSM port-forward.
+        EndpointPublicAccess: true
+        EndpointPrivateAccess: true
+        PublicAccessCidrs: [0.0.0.0/0]
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      # auto-delete=never opts the cluster out of automated cleanup.
+      Tags:
+        - Key: auto-delete
+          Value: never
+
+  # ----- OIDC provider for IRSA -----
+  OidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: !GetAtt Cluster.OpenIdConnectIssuerUrl
+      ClientIdList: [sts.amazonaws.com]
+      ThumbprintList: [9e99a48a9960b14926bb7f3b02e22da2b0ab7280]
+
+  # ----- Node IAM role -----
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - {Key: auto-delete, Value: never}
+      Policies:
+        - PolicyName: EcrPullThroughCache
+          # First-time pull of a new tag through the pull-through cache
+          # requires BatchImportUpstreamImage so AWS can fetch from the
+          # upstream registry on our behalf. Subsequent pulls use the
+          # cached copy and fall back to standard ECR read perms.
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:BatchImportUpstreamImage
+                  - ecr:CreateRepository
+                Resource: !Sub arn:aws:ecr:${AWS::Region}:${AWS::AccountId}:repository/ecr-public/*
+
+  # ----- Managed node group across 3 AZs -----
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    Properties:
+      ClusterName: !Ref Cluster
+      NodeRole: !GetAtt NodeRole.Arn
+      Subnets: !Ref PrivateSubnetIds
+      InstanceTypes: [!Ref NodeInstanceType]
+      AmiType: AL2023_x86_64_STANDARD
+      ScalingConfig:
+        MinSize: 3
+        MaxSize: 6
+        DesiredSize: 3
+      UpdateConfig:
+        MaxUnavailable: 1
+      Labels:
+        workload: demo
+      # Tags propagate from EKS -> ASG -> EC2 instances, which is what
+      # automated cleanup tools inspect when deciding what to remove.
+      Tags:
+        Name: !Sub ${ProjectName}-node
+        auto-delete: never
+
+  # ----- EBS CSI driver IRSA role -----
+  # IRSA trust policy must reference the OIDC issuer URL as a key inside
+  # the Condition block. CloudFormation can't use intrinsic functions as
+  # map keys, so we Fn::Sub the entire policy document as JSON.
+  EbsCsiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-ebs-csi-role
+      AssumeRolePolicyDocument:
+        Fn::Sub:
+          - |
+            {
+              "Version": "2012-10-17",
+              "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Federated": "${OidcArn}"},
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "${OidcUrl}:sub": "system:serviceaccount:kube-system:ebs-csi-controller-sa",
+                    "${OidcUrl}:aud": "sts.amazonaws.com"
+                  }
+                }
+              }]
+            }
+          - OidcArn: !Ref OidcProvider
+            OidcUrl: !Select [1, !Split ['//', !GetAtt Cluster.OpenIdConnectIssuerUrl]]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+      Tags:
+        - {Key: auto-delete, Value: never}
+
+  EbsCsiAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: aws-ebs-csi-driver
+      ServiceAccountRoleArn: !GetAtt EbsCsiRole.Arn
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - {Key: auto-delete, Value: never}
+
+  # ----- Container Insights (pod logs + metrics to CloudWatch) -----
+  CloudWatchAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-cwagent-role
+      AssumeRolePolicyDocument:
+        Fn::Sub:
+          - |
+            {
+              "Version": "2012-10-17",
+              "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Federated": "${OidcArn}"},
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "${OidcUrl}:sub": "system:serviceaccount:amazon-cloudwatch:cloudwatch-agent",
+                    "${OidcUrl}:aud": "sts.amazonaws.com"
+                  }
+                }
+              }]
+            }
+          - OidcArn: !Ref OidcProvider
+            OidcUrl: !Select [1, !Split ['//', !GetAtt Cluster.OpenIdConnectIssuerUrl]]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - {Key: auto-delete, Value: never}
+
+  ContainerInsightsAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: amazon-cloudwatch-observability
+      ServiceAccountRoleArn: !GetAtt CloudWatchAgentRole.Arn
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - {Key: auto-delete, Value: never}
+
+  # Core addons (CoreDNS, kube-proxy, vpc-cni) — needed for pods to work
+  VpcCniAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - {Key: auto-delete, Value: never}
+
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - {Key: auto-delete, Value: never}
+
+  CoreDnsAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref Cluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - {Key: auto-delete, Value: never}
+
+  # ----- IRSA role for the EC2-Postgres load generator -----
+  # The loadgen Deployment in workload/ec2-loadgen.yaml runs read-only
+  # pgbench against the standalone EC2 Postgres and publishes TPS to
+  # CloudWatch. This role lets that ServiceAccount call PutMetricData.
+  Ec2PgLoadgenRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-ec2-pg-loadgen-role
+      AssumeRolePolicyDocument:
+        Fn::Sub:
+          - |
+            {
+              "Version": "2012-10-17",
+              "Statement": [{
+                "Effect": "Allow",
+                "Principal": {"Federated": "${OidcArn}"},
+                "Action": "sts:AssumeRoleWithWebIdentity",
+                "Condition": {
+                  "StringEquals": {
+                    "${OidcUrl}:sub": "system:serviceaccount:api-demo:ec2-pg-loadgen",
+                    "${OidcUrl}:aud": "sts.amazonaws.com"
+                  }
+                }
+              }]
+            }
+          - OidcArn: !Ref OidcProvider
+            OidcUrl: !Select [1, !Split ['//', !GetAtt Cluster.OpenIdConnectIssuerUrl]]
+      Policies:
+        - PolicyName: PutMetricData
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: EksFailDemo/Pgbench
+      Tags:
+        - {Key: auto-delete, Value: never}
+
+Outputs:
+  ClusterName:
+    Value: !Ref Cluster
+  ClusterArn:
+    Value: !GetAtt Cluster.Arn
+  ClusterEndpoint:
+    Value: !GetAtt Cluster.Endpoint
+  ClusterSecurityGroupId:
+    Value: !GetAtt Cluster.ClusterSecurityGroupId
+  NodeRoleArn:
+    Value: !GetAtt NodeRole.Arn
+  NodeGroupName:
+    Value: !Ref NodeGroup
+  EbsCsiRoleArn:
+    Value: !GetAtt EbsCsiRole.Arn
+  EbsCsiRoleName:
+    Value: !Ref EbsCsiRole
+  Ec2PgLoadgenRoleArn:
+    Value: !GetAtt Ec2PgLoadgenRole.Arn
+  OidcIssuerUrl:
+    Value: !GetAtt Cluster.OpenIdConnectIssuerUrl

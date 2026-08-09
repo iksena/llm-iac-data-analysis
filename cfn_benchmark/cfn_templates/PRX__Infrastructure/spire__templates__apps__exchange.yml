@@ -1,0 +1,2429 @@
+# stacks/apps/exchange.yml
+# 200A
+#
+# The names of the SQS queues created by this template are intended to
+# implicitly match some configuration that exists within the CMS application.
+# The only part of the queue names that is passed to the application is the
+# prefix; if the stems change in other the template or the app config, things
+# will not function as expected.
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >-
+  Creates an ECS service for the public Exchange web server, along with target
+  group and listener rule for the shared ALB. Also creates an IAM user and
+  SES credentials for it. Also creates ECS services for SayWhen and the
+  Exchange workers. Assumes that SES has been configured in the region.
+
+Parameters:
+  kWebContainerName:
+    Type: String
+    Default: exchange-web
+  kWorkerContainerName:
+    Type: String
+    Default: exchange-worker
+  kWebApplicationPort:
+    Type: Number
+    Default: 3000
+  #######
+  NestedChangeSetScrubbingResourcesState: { Type: String }
+  AlbFullName: { Type: String }
+  AlbHttpsListenerArn: { Type: String }
+  EcsClusterArn: { Type: String }
+  EcsClusterName: { Type: String }
+  EnvironmentType: { Type: String }
+  EnvironmentTypeAbbreviation: { Type: String }
+  EnvironmentTypeLowercase: { Type: String }
+  RegionMode: { Type: String }
+  RootStackName: { Type: String }
+  RootStackId: { Type: String }
+  VpcId: { Type: AWS::EC2::VPC::Id }
+  VpcPublicSubnet1Id: { Type: AWS::EC2::Subnet::Id }
+  VpcPublicSubnet2Id: { Type: AWS::EC2::Subnet::Id }
+  VpcPublicSubnet3Id: { Type: AWS::EC2::Subnet::Id }
+  VpcPrivateSubnet1Id: { Type: AWS::EC2::Subnet::Id }
+  VpcPrivateSubnet2Id: { Type: AWS::EC2::Subnet::Id }
+  VpcPrivateSubnet3Id: { Type: AWS::EC2::Subnet::Id }
+  EcrImageTag: { Type: AWS::SSM::Parameter::Value<String> }
+  CodeS3Bucket: { Type: String }
+  FtpAuthorizerLambdaCodeS3ObjectKey: { Type: AWS::SSM::Parameter::Value<String> }
+  AlbListenerRulePriorityPrefix: { Type: String }
+  AmazonSesSmtpCredentialsGeneratorServiceToken: { Type: String }
+  TransferServerIpFinderServiceToken: { Type: String }
+  S3SigningEndpointUrl: { Type: String }
+  S3SigningAccessKeyId: { Type: String }
+  SharedMysqlClientSecurityGroupId: { Type: AWS::EC2::SecurityGroup::Id }
+  SharedMemcachedEndpointAddress: { Type: String }
+  SharedMemcachedEndpointPort: { Type: String }
+  SharedAuroraMysqlEndpoint: { Type: String }
+  SharedAuroraMysqlPort: { Type: String }
+  SlackMessageRelaySnsTopicArn: { Type: String }
+  EchoServiceToken: { Type: String }
+  AnnounceResourcePrefix: { Type: String }
+  PorterJobExecutionSnsTopicArn: { Type: String }
+  MediajointS3BucketArn: { Type: AWS::SSM::Parameter::Value<String> }
+  TransferS3BucketArn: { Type: AWS::SSM::Parameter::Value<String> }
+  FixerHostname: { Type: String }
+  IdHostname: { Type: String }
+  CmsHostname: { Type: String }
+  ExchangeHostname: { Type: String }
+  ExchangeTransferHostname: { Type: String }
+  BetaHostname: { Type: String }
+  TheCountHostname: { Type: String }
+  TheCastleHostname: { Type: String }
+  Aarch64AsgCapacityProviderName: { Type: String }
+  SharedGlueDatabaseName: { Type: String }
+
+Conditions:
+  IsProduction: !Equals [!Ref EnvironmentType, Production]
+  IsStaging: !Equals [!Ref EnvironmentType, Staging]
+  IsPrimaryRegion: !Equals [!Ref RegionMode, Primary]
+  HasAuroraEndpoint: !Not [!Equals [!Ref SharedAuroraMysqlEndpoint, ""]]
+  EnableWorkers: !And [!Condition HasAuroraEndpoint, !Condition IsPrimaryRegion]
+  EnableNestedChangeSetScrubbingResources: !Equals [!Ref NestedChangeSetScrubbingResourcesState, Enabled]
+
+Resources:
+  NestedChangeSetScrubber: { Type: AWS::SNS::Topic, Condition: EnableNestedChangeSetScrubbingResources }
+
+  Constants:
+    Type: Custom::Echo
+    Properties:
+      ServiceToken: !Ref EchoServiceToken
+      # Provides a namespace for Exchange-specific queues
+      SqsQueuePrefix: !Sub ${AnnounceResourcePrefix}_exchange_
+
+  ExchangeWildcardHostHeaderListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref WebTargetGroup
+          Type: forward
+      Conditions:
+        - Field: host-header
+          Values:
+            - exchange.*
+      ListenerArn: !Ref AlbHttpsListenerArn
+      Priority: !Join ["", [!Ref AlbListenerRulePriorityPrefix, "01"]]
+  ApiWildcardHostHeaderListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      Actions:
+        - TargetGroupArn: !Ref WebTargetGroup
+          Type: forward
+      Conditions:
+        - Field: host-header
+          Values:
+            - api.*
+      ListenerArn: !Ref AlbHttpsListenerArn
+      Priority: !Join ["", [!Ref AlbListenerRulePriorityPrefix, "11"]]
+
+  SesSendingUser:
+    Type: AWS::IAM::User
+    Properties:
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  SesSendingAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref SesSendingUser
+  SesSendingPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: ses:SendRawEmail
+            Effect: Allow
+            Resource: "*"
+        Version: "2012-10-17"
+      PolicyName: SesSendingPolicy
+      Users:
+        - !Ref SesSendingUser
+  SesSendingSmtpCredentials:
+    Type: Custom::AmazonSesSmtpPasswordGenerator
+    Properties:
+      ServiceToken: !Ref AmazonSesSmtpCredentialsGeneratorServiceToken
+      AccessKeyId: !Ref SesSendingAccessKey
+      SecretAccessKey: !GetAtt SesSendingAccessKey.SecretAccessKey
+      Region: !Ref AWS::Region
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 15
+      HealthCheckPath: /ping
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 3
+      Port: 80
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      TargetType: instance
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  WebTargetGroupHttp5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub ERROR [Exchange] Web server <${EnvironmentTypeAbbreviation}> RETURNING 5XX ERRORS (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Exchange's Rails server is returning 5XX errors from
+        the ECS service to the load balancer.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref AlbFullName
+        - Name: TargetGroup
+          Value: !GetAtt WebTargetGroup.TargetGroupFullName
+      EvaluationPeriods: 1
+      MetricName: HTTPCode_Target_5XX_Count
+      Namespace: AWS/ApplicationELB
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:ops:cloudwatch-log-group-name, Value: !Ref WebTaskLogGroup }
+        - { Key: prx:dev:application, Value: Exchange }
+      Threshold: 5
+      TreatMissingData: notBreaching
+
+  TaskUser:
+    # TODO Someday when the AWS client within the Exchange app has support for
+    # role-based authentication, these policies should be moved into the task
+    # role, and the user should be removed
+    Type: AWS::IAM::User
+    Properties:
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action: sns:Publish
+                Effect: Allow
+                Resource: !Ref PorterJobExecutionSnsTopicArn
+                Sid: AllowPorterJobExecution
+            Version: "2012-10-17"
+          PolicyName: Porter
+        - PolicyDocument:
+            Statement:
+              - Action: sns:Publish
+                Effect: Allow
+                Resource: !Ref SlackMessageRelaySnsTopicArn
+                Sid: AllowSlackMessaging
+            Version: "2012-10-17"
+          PolicyName: Slack
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - s3:Get*
+                  - s3:ListBucket*
+                  - s3:Put*
+                Effect: Allow
+                Resource: !Ref MediajointS3BucketArn
+                Sid: AllowBucketActions
+              - Action:
+                  - s3:AbortMultipartUpload
+                  - s3:Delete*
+                  - s3:Get*
+                  - s3:List*
+                  - s3:Put*
+                  - s3:RestoreObject
+                Effect: Allow
+                Resource: !Sub ${MediajointS3BucketArn}/*
+                Sid: AllowObjectActions
+            Version: "2012-10-17"
+          PolicyName: MediajointBucket
+        - PolicyDocument:
+            Statement:
+              - Action: sqs:ListQueues
+                Effect: Allow
+                Resource: "*"
+                Sid: AllowSqsList
+              - Action:
+                  - sqs:ChangeMessageVisibility
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:ReceiveMessage
+                  - sqs:SendMessage
+                Effect: Allow
+                Resource: !Sub arn:${AWS::Partition}:sqs:${AWS::Region}:${AWS::AccountId}:${Constants.SqsQueuePrefix}*
+                Sid: AllowActiveMessaging
+            Version: "2012-10-17"
+          PolicyName: AppQueues
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  TaskUserAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref TaskUser
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action: ssm:GetParameters
+                Effect: Allow
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/*
+                  - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/global/Spire/new-relic-lite-api-key
+                Sid: AllowAppParameterRead
+            Version: "2012-10-17"
+          PolicyName: ContainerSecrets
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+        Version: "2012-10-17"
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - ssmmessages:CreateControlChannel
+                  - ssmmessages:CreateDataChannel
+                  - ssmmessages:OpenControlChannel
+                  - ssmmessages:OpenDataChannel
+                Effect: Allow
+                Resource: "*"
+                Sid: AllowSsmChannels
+            Version: "2012-10-17"
+          PolicyName: EcsExec
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  AutoScalingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: application-autoscaling.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceAutoscaleRole
+
+  WebEcsService:
+    Type: AWS::ECS::Service
+    Condition: HasAuroraEndpoint # See README
+    Properties:
+      CapacityProviderStrategy:
+        - Base: 0
+          CapacityProvider: !Ref Aarch64AsgCapacityProviderName
+          Weight: 1
+      Cluster: !Ref EcsClusterArn
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      DesiredCount: !If [IsPrimaryRegion, !If [IsProduction, 5, 2], 0]
+      EnableECSManagedTags: true
+      EnableExecuteCommand: true
+      LoadBalancers:
+        - ContainerName: !Ref kWebContainerName
+          ContainerPort: !Ref kWebApplicationPort
+          TargetGroupArn: !Ref WebTargetGroup
+      PlacementConstraints:
+        - Type: memberOf
+          Expression: attribute:ecs.cpu-architecture == arm64
+      PropagateTags: TASK_DEFINITION
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      TaskDefinition: !Ref WebTaskDefinition
+  WebTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  WebTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Command:
+            - web
+          Cpu: !If [IsProduction, 200, 128]
+          Environment:
+            - Name: APP_NAME
+              Value: exchange
+            - Name: APP_ENV
+              Value: !Ref EnvironmentTypeAbbreviation
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+            - Name: AWS_SIGNER_URL
+              Value: !Ref S3SigningEndpointUrl
+            - Name: AWS_SIGNER_KEY
+              Value: !Ref S3SigningAccessKeyId
+            - Name: DB_PORT_3306_TCP_ADDR
+              Value: !Ref SharedAuroraMysqlEndpoint
+            - Name: DB_PORT_3306_TCP_PORT
+              Value: !Ref SharedAuroraMysqlPort
+            - Name: MEMCACHED_PORT_11211_TCP_ADDR
+              Value: !Ref SharedMemcachedEndpointAddress
+            - Name: MEMCACHED_PORT_11211_TCP_PORT
+              Value: !Ref SharedMemcachedEndpointPort
+            - Name: SMTP_ADDRESS
+              Value: !Sub email-smtp.${AWS::Region}.amazonaws.com
+            - Name: SMTP_AUTHENTICATION
+              Value: login
+            - Name: SMTP_PORT
+              Value: "587"
+            - Name: SMTP_DOMAIN
+              Value: prx.org
+            - Name: SMTP_USER_NAME
+              Value: !GetAtt SesSendingSmtpCredentials.UserName
+            - Name: SMTP_PASSWORD
+              Value: !GetAtt SesSendingSmtpCredentials.Password
+            - Name: SQS_PREFIX
+              Value: !GetAtt Constants.SqsQueuePrefix
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: AWS_ACCOUNT_ID
+              Value: !Ref AWS::AccountId
+            - Name: AWS_ACCESS_KEY_ID
+              Value: !Ref TaskUserAccessKey
+            - Name: AWS_SECRET_ACCESS_KEY
+              Value: !GetAtt TaskUserAccessKey.SecretAccessKey
+            - Name: AWS_BUCKET
+              Value: !Select [5, !Split [":", !Ref MediajointS3BucketArn]]
+            - Name: AUTH_HOST
+              Value: !Ref IdHostname
+            - Name: ASSET_HOST
+              Value: !If [IsProduction, assets2.prx.org, !Ref ExchangeHostname]
+            - Name: CASTLE_HOST
+              Value: !Ref TheCastleHostname
+            - Name: CASTLE_PORT
+              Value: "80"
+            - Name: CMS_HOST
+              Value: !Ref CmsHostname
+            - Name: COUNT_HOST
+              Value: !Ref TheCountHostname
+            - Name: PRX_HOST
+              Value: !Ref BetaHostname
+            - Name: SITE_HOST
+              Value: !Ref ExchangeHostname
+            - Name: PORTER_SNS_TOPIC
+              Value: !Ref PorterJobExecutionSnsTopicArn
+            - Name: PORTER_AUDIO_PROCESSING
+              Value: "true"
+            - Name: PORTER_DELIVERIES
+              Value: "true"
+            - Name: PORTER_DELIVERY_BUCKET
+              Value: !If [IsProduction, production.prxtransfer.org, testing.prxtransfer.org]
+            - Name: PULL_DELIVERY_BUCKET
+              Value: !If [IsProduction, production.prxtransfer.org, testing.prxtransfer.org]
+            - Name: PULL_DELIVERY_FTP_DOMAIN
+              Value: !If [IsProduction, prxtransfer.org, staging.prxtransfer.org]
+            - Name: SLACK_SNS_TOPIC
+              Value: !Ref SlackMessageRelaySnsTopicArn
+            - Name: SLACK_SUPPORT_CHANNEL_ID
+              Value: C0491PALPRP
+            - Name: RAILS_LOG_STDOUT
+              Value: "true"
+            - Name: LOG_LEVEL
+              Value: !If [IsProduction, WARN, DEBUG]
+            - Name: MODEL_SITE_HOST
+              Value: !Ref ExchangeHostname
+            - Name: DATABASE_POOL_SIZE
+              Value: "5"
+            - Name: NEW_RELIC_NAME
+              Value: !If [IsProduction, Exchange Production, Exchange Staging]
+            - Name: CMS_API_VERSION
+              Value: v1
+            - Name: DATABASE_SOCKET
+              Value: ""
+            - Name: FIXER_HOST
+              Value: !Ref FixerHostname
+            - Name: FIXER_PORT
+              Value: "80"
+            - Name: RAILS_ENV
+              Value: !Ref EnvironmentTypeLowercase
+            - Name: CACHE_STORE
+              Value: mem_cache_store
+            - Name: RUBYOPT
+              Value: "-W0"
+          Essential: true
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrImageTag}
+          LinuxParameters:
+            InitProcessEnabled: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WebTaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Memory: !If [IsProduction, 2000, 1000]
+          MemoryReservation: !If [IsProduction, 1000, 500]
+          Name: !Ref kWebContainerName
+          PortMappings:
+            - ContainerPort: !Ref kWebApplicationPort
+              HostPort: 0
+          Secrets:
+            - Name: FTP_AUTH_TOKEN
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/ftp-auth-endpoint-token
+            - Name: AUTH_CLIENT_ID
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/auth-client-id
+            - Name: CASTLE_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/castle-key
+            - Name: CASTLE_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/castle-secret
+            - Name: DB_ENV_MYSQL_DATABASE
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/database-name
+            - Name: DB_ENV_MYSQL_PASSWORD
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/database-password
+            - Name: DB_ENV_MYSQL_USER
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/database-username
+            - Fn::If:
+                - IsProduction
+                - Name: FEATURED_SERIES_PLAYLIST_ID
+                  ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/featured-series-playlist-id
+                - !Ref AWS::NoValue
+            - Name: FIXER_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/fixer-key
+            - Name: FIXER_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/fixer-secret
+            - Name: GOOGLE_MAPS_API_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/google-maps-api-key
+            - Name: PUBLIC_URL_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/public-url-secret
+            - Name: RAILS_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/rails-secret
+            - Name: RAILS_SESSION_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/rails-session-secret
+            - Fn::If:
+                - IsProduction
+                - Name: RECAPTCHA_PRIVATE_KEY
+                  ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/recaptcha-private-key
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - IsProduction
+                - Name: RECAPTCHA_PUBLIC_KEY
+                  ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/recaptcha-public-key
+                - !Ref AWS::NoValue
+            - Name: RECAPTCHA_SECRET_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/recaptcha-secret-key
+            - Name: RECAPTCHA_SITE_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/recaptcha-site-key
+            - Name: SOLR_URL
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/solr-url
+            - Name: STRIPE_API_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/stripe-api-key
+            - Name: STRIPE_PUBLISHABLE_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/stripe-publishable-key
+            - Name: WHATS_INSIDE_PLAYLIST_ID
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/whats-inside-playlist-id
+            - Fn::If:
+                - IsProduction
+                - Name: CHEF_CLIENT_CERT
+                  ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/chef-client-certificate
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - IsProduction
+                - Name: CHEF_VALIDATION_CERT
+                  ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/chef-validation-certificate
+                - !Ref AWS::NoValue
+            - Name: NEW_RELIC_LICENSE_KEY
+              ValueFrom: /prx/global/Spire/new-relic-lite-api-key
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      NetworkMode: bridge
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      TaskRoleArn: !GetAtt TaskRole.Arn
+
+  WorkerEcsService:
+    Type: AWS::ECS::Service
+    Condition: EnableWorkers # See README
+    Properties:
+      CapacityProviderStrategy:
+        - Base: 0
+          CapacityProvider: !Ref Aarch64AsgCapacityProviderName
+          Weight: 1
+      Cluster: !Ref EcsClusterArn
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+      DesiredCount: !If [IsProduction, 6, 1]
+      EnableECSManagedTags: true
+      EnableExecuteCommand: true
+      PlacementConstraints:
+        - Type: memberOf
+          Expression: attribute:ecs.cpu-architecture == arm64
+      PropagateTags: TASK_DEFINITION
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      TaskDefinition: !Ref WorkerTaskDefinition
+  WorkerTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      ContainerDefinitions:
+        - Command:
+            - worker
+          Cpu: !If [IsProduction, 200, 128]
+          Environment:
+            - Name: APP_NAME
+              Value: exchange
+            - Name: APP_ENV
+              Value: !Ref EnvironmentTypeAbbreviation
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+            - Name: AWS_SIGNER_URL
+              Value: !Ref S3SigningEndpointUrl
+            - Name: AWS_SIGNER_KEY
+              Value: !Ref S3SigningAccessKeyId
+            - Name: DB_PORT_3306_TCP_ADDR
+              Value: !Ref SharedAuroraMysqlEndpoint
+            - Name: DB_PORT_3306_TCP_PORT
+              Value: !Ref SharedAuroraMysqlPort
+            - Name: MEMCACHED_PORT_11211_TCP_ADDR
+              Value: !Ref SharedMemcachedEndpointAddress
+            - Name: MEMCACHED_PORT_11211_TCP_PORT
+              Value: !Ref SharedMemcachedEndpointPort
+            - Name: SMTP_ADDRESS
+              Value: !Sub email-smtp.${AWS::Region}.amazonaws.com
+            - Name: SMTP_AUTHENTICATION
+              Value: login
+            - Name: SMTP_PORT
+              Value: "587"
+            - Name: SMTP_DOMAIN
+              Value: prx.org
+            - Name: SMTP_USER_NAME
+              Value: !GetAtt SesSendingSmtpCredentials.UserName
+            - Name: SMTP_PASSWORD
+              Value: !GetAtt SesSendingSmtpCredentials.Password
+            - Name: SQS_PREFIX
+              Value: !GetAtt Constants.SqsQueuePrefix
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: AWS_ACCOUNT_ID
+              Value: !Ref AWS::AccountId
+            - Name: AWS_ACCESS_KEY_ID
+              Value: !Ref TaskUserAccessKey
+            - Name: AWS_SECRET_ACCESS_KEY
+              Value: !GetAtt TaskUserAccessKey.SecretAccessKey
+            - Name: AWS_BUCKET
+              Value: !Select [5, !Split [":", !Ref MediajointS3BucketArn]]
+            - Name: AUTH_HOST
+              Value: !Ref IdHostname
+            - Name: ASSET_HOST
+              Value: !If [IsProduction, assets2.prx.org, !Ref ExchangeHostname]
+            - Name: CASTLE_HOST
+              Value: !Ref TheCastleHostname
+            - Name: CASTLE_PORT
+              Value: "80"
+            - Name: CMS_HOST
+              Value: !Ref CmsHostname
+            - Name: COUNT_HOST
+              Value: !Ref TheCountHostname
+            - Name: PRX_HOST
+              Value: !Ref BetaHostname
+            - Name: SITE_HOST
+              Value: !Ref ExchangeHostname
+            - Name: PORTER_SNS_TOPIC
+              Value: !Ref PorterJobExecutionSnsTopicArn
+            - Name: PORTER_AUDIO_PROCESSING
+              Value: "true"
+            - Name: PORTER_DELIVERIES
+              Value: "true"
+            - Name: PORTER_DELIVERY_BUCKET
+              Value: !If [IsProduction, production.prxtransfer.org, testing.prxtransfer.org]
+            - Name: PULL_DELIVERY_BUCKET
+              Value: !If [IsProduction, production.prxtransfer.org, testing.prxtransfer.org]
+            - Name: PULL_DELIVERY_FTP_DOMAIN
+              Value: !If [IsProduction, prxtransfer.org, staging.prxtransfer.org]
+            - Name: SLACK_SNS_TOPIC
+              Value: !Ref SlackMessageRelaySnsTopicArn
+            - Name: SLACK_SUPPORT_CHANNEL_ID
+              Value: C0491PALPRP
+            - Name: RAILS_LOG_STDOUT
+              Value: "true"
+            - Name: LOG_LEVEL
+              Value: !If [IsProduction, WARN, DEBUG]
+            - Name: MODEL_SITE_HOST
+              Value: !Ref ExchangeHostname
+            - Name: DATABASE_POOL_SIZE
+              Value: "5"
+            - Name: NEW_RELIC_NAME
+              Value: !If [IsProduction, Exchange Production, Exchange Staging]
+            - Name: CMS_API_VERSION
+              Value: v1
+            - Name: DATABASE_SOCKET
+              Value: ""
+            - Name: FIXER_HOST
+              Value: !Ref FixerHostname
+            - Name: FIXER_PORT
+              Value: "80"
+            - Name: RAILS_ENV
+              Value: !Ref EnvironmentTypeLowercase
+            - Name: CACHE_STORE
+              Value: mem_cache_store
+            - Name: RUBYOPT
+              Value: "-W0"
+          Essential: true
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrImageTag}
+          LinuxParameters:
+            InitProcessEnabled: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkerTaskLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          Memory: !If [IsProduction, 2000, 1000]
+          MemoryReservation: !If [IsProduction, 1000, 500]
+          Name: !Ref kWorkerContainerName
+          Secrets:
+            - Name: FTP_AUTH_TOKEN
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/ftp-auth-endpoint-token
+            - Name: AUTH_CLIENT_ID
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/auth-client-id
+            - Name: CASTLE_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/castle-key
+            - Name: CASTLE_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/castle-secret
+            - Name: DB_ENV_MYSQL_DATABASE
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/database-name
+            - Name: DB_ENV_MYSQL_PASSWORD
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/database-password
+            - Name: DB_ENV_MYSQL_USER
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/database-username
+            - Fn::If:
+                - IsProduction
+                - Name: FEATURED_SERIES_PLAYLIST_ID
+                  ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/featured-series-playlist-id
+                - !Ref AWS::NoValue
+            - Name: FIXER_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/fixer-key
+            - Name: FIXER_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/fixer-secret
+            - Name: GOOGLE_MAPS_API_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/google-maps-api-key
+            - Name: PUBLIC_URL_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/public-url-secret
+            - Name: RAILS_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/rails-secret
+            - Name: RAILS_SESSION_SECRET
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/rails-session-secret
+            - Fn::If:
+                - IsProduction
+                - Name: RECAPTCHA_PRIVATE_KEY
+                  ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/recaptcha-private-key
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - IsProduction
+                - Name: RECAPTCHA_PUBLIC_KEY
+                  ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/recaptcha-public-key
+                - !Ref AWS::NoValue
+            - Name: RECAPTCHA_SECRET_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/recaptcha-secret-key
+            - Name: RECAPTCHA_SITE_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/recaptcha-site-key
+            - Name: SOLR_URL
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/solr-url
+            - Name: STRIPE_API_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/stripe-api-key
+            - Name: STRIPE_PUBLISHABLE_KEY
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/stripe-publishable-key
+            - Name: WHATS_INSIDE_PLAYLIST_ID
+              ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/whats-inside-playlist-id
+            - Fn::If:
+                - IsProduction
+                - Name: CHEF_CLIENT_CERT
+                  ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/chef-client-certificate
+                - !Ref AWS::NoValue
+            - Fn::If:
+                - IsProduction
+                - Name: CHEF_VALIDATION_CERT
+                  ValueFrom: !Sub /prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/chef-validation-certificate
+                - !Ref AWS::NoValue
+            - Name: NEW_RELIC_LICENSE_KEY
+              ValueFrom: /prx/global/Spire/new-relic-lite-api-key
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      NetworkMode: bridge
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      TaskRoleArn: !GetAtt TaskRole.Arn
+
+  WorkerEcsServiceScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Condition: EnableWorkers # See README
+    Properties:
+      MinCapacity: !If [IsProduction, 2, 1]
+      MaxCapacity: !If [IsProduction, 20, 4]
+      ResourceId: !Sub service/${EcsClusterName}/${WorkerEcsService.Name}
+      RoleARN: !GetAtt AutoScalingRole.Arn
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+  WorkerEcsServiceStepScaleInPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: EnableWorkers # See README
+    Properties:
+      PolicyName: ExchangeWorkerScaleIn
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref WorkerEcsServiceScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 60
+        MetricAggregationType: Average
+        StepAdjustments:
+          - MetricIntervalLowerBound: -9
+            MetricIntervalUpperBound: 0
+            ScalingAdjustment: -1
+          - MetricIntervalUpperBound: -9
+            ScalingAdjustment: -2
+  WorkerEcsServiceStepScaleInAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableWorkers # See README
+    Properties:
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref WorkerEcsServiceStepScaleInPolicy
+      AlarmDescription: Scale in exchange workers
+      ComparisonOperator: LessThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ExchangePorterCallbackQueue.QueueName
+      EvaluationPeriods: 1
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Average
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      Threshold: 10
+      TreatMissingData: notBreaching
+  WorkerEcsServiceStepScaleOutPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Condition: EnableWorkers # See README
+    Properties:
+      PolicyName: ExchangeWorkerScaleOut
+      PolicyType: StepScaling
+      ScalingTargetId: !Ref WorkerEcsServiceScalableTarget
+      StepScalingPolicyConfiguration:
+        AdjustmentType: ChangeInCapacity
+        Cooldown: 120
+        MetricAggregationType: Average
+        StepAdjustments:
+          - MetricIntervalLowerBound: 0
+            MetricIntervalUpperBound: 80
+            ScalingAdjustment: 2
+          - MetricIntervalLowerBound: 80
+            MetricIntervalUpperBound: 380
+            ScalingAdjustment: 4
+          - MetricIntervalLowerBound: 380
+            ScalingAdjustment: 6
+  WorkerEcsServiceStepScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: EnableWorkers # See README
+    Properties:
+      ActionsEnabled: true
+      AlarmActions:
+        - !Ref WorkerEcsServiceStepScaleOutPolicy
+      AlarmDescription: Scale out exchange workers
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ExchangePorterCallbackQueue.QueueName
+      EvaluationPeriods: 1
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 60
+      Statistic: Average
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      Threshold: 20
+      TreatMissingData: notBreaching
+
+  SayWhenTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  SayWhenEventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+        Version: "2012-10-17"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceEventsRole
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  SayWhenScheduledRule:
+    Type: AWS::Events::Rule
+    Condition: EnableWorkers # See README
+    Properties:
+      Description: !Sub Periodically runs ${EnvironmentType} SayWhen jobs
+      ScheduleExpression: rate(1 hour)
+      State: ENABLED
+      Targets:
+        - Arn: !Ref EcsClusterArn
+          EcsParameters:
+            CapacityProviderStrategy:
+              - Base: 0
+                CapacityProvider: !Ref Aarch64AsgCapacityProviderName
+                Weight: 1
+            TaskCount: 1
+            TaskDefinitionArn: !Ref WorkerTaskDefinition
+          Id: SayWhenRuleTarget
+          Input: !Sub | # containerOverrides comes from the ECS run-task API
+            {
+              "containerOverrides": [
+                {
+                  "name": "${kWorkerContainerName}",
+                  "command": ["process_jobs"]
+                }
+              ]
+            }
+          RoleArn: !GetAtt SayWhenEventsRole.Arn
+
+  SayWhenQueueHighVisibleMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub FATAL [Exchange] SayWhen queue <${EnvironmentTypeAbbreviation}> MANY VISIBLE MESSAGES (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Exchange's SayWhen queue contains an unusually high
+        number of messages, which likely means processing has fallen behind or
+        has stopped entirely.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt SayWhenQueue.QueueName
+      EvaluationPeriods: 12
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 300
+      Statistic: Average
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      Threshold: 50
+      TreatMissingData: !If [IsPrimaryRegion, missing, notBreaching]
+
+  DeliveryUpdateQueueAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub FATAL [Exchange] Delivery update queue <${EnvironmentTypeAbbreviation}> MANY VISIBLE MESSAGES (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Exchange's delivery updates queue contains an
+        unusually high number of messages, which likely means audio file
+        deliveries to stations are falling behind.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeliveryUpdateQueue.QueueName
+      EvaluationPeriods: 12
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Period: 300
+      Statistic: Average
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      Threshold: 100
+      TreatMissingData: !If [IsPrimaryRegion, missing, notBreaching]
+
+  FixerAudioQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}FixerAudio
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  PerformSolrSaveQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}PerformSolrSave
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  PerformSolrDestroyQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}PerformSolrDestroy
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  PublishPieceQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}PublishPiece
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  UnpublishPieceQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}UnpublishPiece
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  PurchasePieceQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}PurchasePiece
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  DropBoxFileQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}DropBoxFile
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  UpdateUserTypeQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}UpdateUserType
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  EmailUsersQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}EmailUsers
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  UpdatePieceLengthQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}UpdatePieceLength
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  EmailGroupQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}EmailGroup
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  # TODO: remove
+  SayWhenQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}SayWhen
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  DeliveryUpdateQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}DeliveryUpdate
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  StationPasswordQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}StationPassword
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  ApproveSubscriptionQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}ApproveSubscription
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  EmailNotificationsQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}EmailNotifications
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+  ExchangePorterCallbackQueue:
+    Type: AWS::SQS::Queue
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DelaySeconds: 0
+      MessageRetentionPeriod: 345600 # 4 days
+      QueueName: !Sub ${Constants.SqsQueuePrefix}porter_callback
+      ReceiveMessageWaitTimeSeconds: 0
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VisibilityTimeout: 5400 # 1.5 hour
+
+  FtpUserAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: transfer.amazonaws.com
+        Version: "2012-10-17"
+      Policies:
+        # The interection of these policies and the policies retured by the
+        # auth function determine a session's permissions. The function alone
+        # cannot provide access to the bucket.
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - s3:ListBucket
+                Effect: Allow
+                Resource: !Ref TransferS3BucketArn
+                Sid: AllowBucketReadOnly
+              - Action:
+                  - s3:GetObject
+                  - s3:GetObjectAttributes
+                  - s3:GetObjectVersion
+                  - s3:GetObjectVersionAttributes
+                Effect: Allow
+                Resource: !Sub ${TransferS3BucketArn}/*
+                Sid: AllowObjectReadOnly
+            Version: "2012-10-17"
+          PolicyName: TransferUserBasePolicy
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  FtpServerAuthorizerFunctionSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub >-
+        The security group for ${EnvironmentType} FTP Authorizer
+        Lambda function that allows all outbound traffic
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: "-1"
+        - CidrIpv6: ::/0
+          IpProtocol: "-1"
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_ftp-auth-function" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VpcId: !Ref VpcId
+
+  FtpServerAuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Architectures: [arm64]
+      CodeUri:
+        Bucket: !Ref CodeS3Bucket
+        Key: !Ref FtpAuthorizerLambdaCodeS3ObjectKey
+      Description: !Sub ${EnvironmentType} FTP transfer server authorizer
+      Environment:
+        Variables:
+          FTP_USER_ACCESS_ROLE: !GetAtt FtpUserAccessRole.Arn
+          S3_BUCKET_ARN: !Ref TransferS3BucketArn
+          FTP_AUTH_TOKEN_PARAMETER_ARN: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/ftp-auth-endpoint-token
+          DB_NAME_PARAMETER_ARN: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/database-name
+          DB_USERNAME_PARAMETER_ARN: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/database-username
+          DB_PASSWORD_PARAMETER_ARN: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/database-password
+          EXCHANGE_HOSTNAME: !Ref ExchangeHostname
+          MYSQL_ENDPOINT: !Ref SharedAuroraMysqlEndpoint
+          APP_ENVIRONMENT: !Ref EnvironmentTypeLowercase
+          MEDIAJOINT_S3_BUCKET_ARN: !Ref MediajointS3BucketArn
+          ENCRYPTION_SECRET_PARAMETER_ARN: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/ftp-auth-capture-encryption-secret
+      Handler: index.handler
+      MemorySize: 128
+      Policies:
+        - Statement:
+            - Action: ssm:Get*
+              Effect: Allow
+              Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/*
+              Sid: AllowParameterReadOnly
+            - Action: cloudwatch:GetMetricData
+              Effect: Allow
+              Resource: "*"
+              Sid: AllowMetricsRead
+            - Action: events:PutEvents
+              Effect: Allow
+              Resource: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default
+              Sid: AllowDefaultEventBusPut
+            - Action: s3:GetObject
+              Effect: Allow
+              Resource: !Sub ${MediajointS3BucketArn}/ftp_authorizer/enc_cred.json
+              Sid: AllowCrentialCaptureRead
+      Runtime: nodejs24.x
+      Tags:
+        prx:meta:tagging-version: "2021-04-07"
+        prx:cloudformation:stack-name: !Ref AWS::StackName
+        prx:cloudformation:stack-id: !Ref AWS::StackId
+        prx:cloudformation:root-stack-name: !Ref RootStackName
+        prx:cloudformation:root-stack-id: !Ref RootStackId
+        prx:ops:environment: !Ref EnvironmentType
+        prx:dev:application: Exchange
+      Timeout: 30
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt FtpServerAuthorizerFunctionSecurityGroup.GroupId
+          - !Ref SharedMysqlClientSecurityGroupId
+        SubnetIds:
+          - !Ref VpcPrivateSubnet1Id
+          - !Ref VpcPrivateSubnet2Id
+          - !Ref VpcPrivateSubnet3Id
+  FtpServerAuthorizerFunctionElevatedErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub WARN [Exchange] FTP authorizer function <${EnvironmentTypeAbbreviation}> INVOCATIONS ERRORS (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Exchange FTP Server authorizer Lambda function is
+        failing, which could be preventing stations from pulling audio files.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FtpServerAuthorizerFunction
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      Threshold: 0
+      TreatMissingData: notBreaching
+  FtpServerAuthorizerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${FtpServerAuthorizerFunction}
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  FtpServerAuthorizerFunctionPermission:
+    Type: AWS::Lambda::Permission
+    # TODO This should have a condition
+    # https://docs.aws.amazon.com/transfer/latest/userguide/custom-identity-provider-users.html#lambda-resource-policy
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !GetAtt FtpServerAuthorizerFunction.Arn
+      Principal: transfer.amazonaws.com
+  FtpServerCredentialCaptureFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Architectures: [arm64]
+      CodeUri:
+        Bucket: !Ref CodeS3Bucket
+        Key: !Ref FtpAuthorizerLambdaCodeS3ObjectKey
+      Description: !Sub ${EnvironmentType} FTP transfer credential capture
+      Environment:
+        Variables:
+          DB_NAME_PARAMETER_ARN: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/database-name
+          DB_USERNAME_PARAMETER_ARN: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/database-username
+          DB_PASSWORD_PARAMETER_ARN: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/database-password
+          MYSQL_ENDPOINT: !Ref SharedAuroraMysqlEndpoint
+          ENCRYPTION_SECRET_PARAMETER_ARN: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/ftp-auth-capture-encryption-secret
+          MEDIAJOINT_S3_BUCKET_ARN: !Ref MediajointS3BucketArn
+      Events:
+        ScheduleTrigger:
+          Properties:
+            Schedule: rate(15 minutes)
+            State: !If [IsPrimaryRegion, ENABLED,  DISABLED]
+          Type: Schedule
+      Handler: capture.handler
+      MemorySize: 512
+      Policies:
+        - Statement:
+            - Action: ssm:Get*
+              Effect: Allow
+              Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/prx/${EnvironmentTypeAbbreviation}/Spire/Exchange/*
+              Sid: AllowParameterReadOnly
+            - Action: s3:PutObject
+              Effect: Allow
+              Resource: !Sub ${MediajointS3BucketArn}/ftp_authorizer/enc_cred.json
+              Sid: AllowCrentialCapture
+      Runtime: nodejs24.x
+      Tags:
+        prx:meta:tagging-version: "2021-04-07"
+        prx:cloudformation:stack-name: !Ref AWS::StackName
+        prx:cloudformation:stack-id: !Ref AWS::StackId
+        prx:cloudformation:root-stack-name: !Ref RootStackName
+        prx:cloudformation:root-stack-id: !Ref RootStackId
+        prx:ops:environment: !Ref EnvironmentType
+        prx:dev:application: Exchange
+      Timeout: 60
+      VpcConfig:
+        SecurityGroupIds:
+          - !GetAtt FtpServerAuthorizerFunctionSecurityGroup.GroupId
+          - !Ref SharedMysqlClientSecurityGroupId
+        SubnetIds:
+          - !Ref VpcPrivateSubnet1Id
+          - !Ref VpcPrivateSubnet2Id
+          - !Ref VpcPrivateSubnet3Id
+  FtpServerCredentialCaptureFunctionElevatedErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: IsProduction
+    Properties:
+      AlarmName: !Sub WARN [Exchange] FTP credential capture function <${EnvironmentTypeAbbreviation}> INVOCATIONS ERRORS (${RootStackName})
+      AlarmDescription: !Sub >-
+        ${EnvironmentType} Exchange FTP Server credential capture Lambda
+        function is failing, which could be preventing stations from pulling
+        audio files if any credentials change.
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref FtpServerCredentialCaptureFunction
+      EvaluationPeriods: 1
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Period: 60
+      Statistic: Sum
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      Threshold: 0
+      TreatMissingData: notBreaching
+  FtpServerCredentialCaptureFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${FtpServerCredentialCaptureFunction}
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  FtpServerLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service: transfer.amazonaws.com
+        Version: "2012-10-17"
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                Effect: Allow
+                Resource: arn:aws:logs:*:*:log-group:/aws/transfer/*
+                Sid: AllowLogging
+            Version: "2012-10-17"
+          PolicyName: TransferActivityLogging
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  FtpServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Controls access to and from FTP server
+      SecurityGroupIngress:
+        # FTP control port
+        - CidrIp: 0.0.0.0/0
+          FromPort: 21
+          IpProtocol: tcp
+          ToPort: 21
+        # SSH port for SFTP
+        - CidrIp: 0.0.0.0/0
+          FromPort: 22
+          IpProtocol: tcp
+          ToPort: 22
+        # Data channel ports used by AWS Transfer Family
+        - CidrIp: 0.0.0.0/0
+          FromPort: 8192
+          IpProtocol: tcp
+          ToPort: 8200
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_ftp" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      VpcId: !Ref VpcId
+  FtpServer:
+    Type: AWS::Transfer::Server
+    Properties:
+      Certificate: !Ref FtpServerCertificate
+      Domain: S3
+      EndpointDetails:
+        SecurityGroupIds:
+          - !GetAtt FtpServerSecurityGroup.GroupId
+        SubnetIds:
+          - !Ref VpcPublicSubnet1Id
+          - !Ref VpcPublicSubnet2Id
+          - !Ref VpcPublicSubnet3Id
+        VpcId: !Ref VpcId
+      EndpointType: VPC
+      IdentityProviderDetails:
+        Function: !GetAtt FtpServerAuthorizerFunction.Arn
+      IdentityProviderType: AWS_LAMBDA
+      LoggingRole: !GetAtt FtpServerLoggingRole.Arn
+      PostAuthenticationLoginBanner: "For use by authorized PRX users only. "
+      PreAuthenticationLoginBanner: "Hello. "
+      ProtocolDetails:
+        PassiveIp: !Ref FtpServerNblElasticIp
+        TlsSessionResumptionMode: ENABLED
+      Protocols:
+        - SFTP
+        - !If [IsProduction, FTP, !Ref AWS::NoValue]
+        - !If [IsProduction, FTPS, !Ref AWS::NoValue]
+      SecurityPolicyName: TransferSecurityPolicy-2020-06
+      StructuredLogDestinations: !If [IsStaging, [!GetAtt FtpServerStructuredLogGroup.Arn], !Ref AWS::NoValue]
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  FtpServerLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/transfer/${FtpServer.ServerId}
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  FtpServerStructuredLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: IsStaging
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/transfer/${EnvironmentTypeAbbreviation}/exchange
+      RetentionInDays: 14
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  FtpServerLogGroupTransformer:
+    Type: AWS::Logs::Transformer
+    Properties:
+      LogGroupIdentifier: !Ref FtpServerLogGroup
+      TransformerConfig:
+        - Grok:
+            # https://docs.aws.amazon.com/AmazonCloudWatch/latest/logs/CloudWatch-Logs-Transformation-Processors.html#Grok-Patterns
+            Match: "%{NOTSPACE:user_and_session} %{DATA:op} Path=%{DATA:filepath} BytesOut=%{POSINT:bytes_out}"
+            Source: "@message"
+        - SplitString:
+            Entries:
+              - Delimiter: "."
+                Source: "user_and_session"
+        - AddKeys:
+            Entries:
+              - Key: env
+                Value: !Ref EnvironmentTypeLowercase
+  FtpUserBytesOutFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      ApplyOnTransformedLogs: true
+      FilterPattern: '{ $.filepath != "not_a_real_file" }' # BytesOut logs should already be filtered by the grok pattern, so this is meant to match all transformed logs
+      LogGroupName: !Ref FtpServerLogGroup
+      MetricTransformations:
+        - Dimensions:
+            - Key: Environment
+              Value: $.env
+            - Key: Station
+              Value: $.user_and_session[0]
+          MetricName: BytesOut
+          MetricNamespace: PRX/Transfer
+          MetricValue: $.bytes_out
+          Unit: Bytes
+  # In order to return the correct IP from PASV commands, the NLB must have a
+  # single IP that is configured as the FTP server's PassiveIP.
+  FtpServerNblElasticIp:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_ftp-nlb" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+  # Creates a TLS certificate for use with FTPS connections.
+  FtpServerCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Sub "*.${ExchangeTransferHostname}"
+      SubjectAlternativeNames:
+        - !Sub "*.station.${ExchangeTransferHostname}"
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_ftp" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      ValidationMethod: DNS
+  # AWS Transfer Family does not allow public servers with insecure FTP
+  # enabled. Putting the server behind an NLB allows forwarding of public FTP
+  # requests to a private server.
+  NlbAccessLogsBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - ExpirationInDays: !If [IsProduction, 14, 3]
+            Status: Enabled
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Common }
+  NlbAccessLogsBucketPolicy:
+    # https://docs.aws.amazon.com/elasticloadbalancing/latest/network/enable-access-logs.html#access-logging-bucket-requirements
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref NlbAccessLogsBucket
+      PolicyDocument:
+        Statement:
+          - Action: s3:GetBucketAcl
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Resource: !GetAtt NlbAccessLogsBucket.Arn
+          - Action: s3:PutObject
+            Condition:
+              StringEquals:
+                s3:x-amz-acl: bucket-owner-full-control
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Resource: !Sub ${NlbAccessLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*
+          - Action: s3:PutObject
+            Effect: Allow
+            Principal:
+              Service: logdelivery.elasticloadbalancing.amazonaws.com
+            Resource: !Sub ${NlbAccessLogsBucket.Arn}/AWSLogs/${AWS::AccountId}/*
+        Version: "2012-10-17"
+  NlbAccessLogsGlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref SharedGlueDatabaseName
+      TableInput:
+        Description: !Sub >-
+          ${EnvironmentType} Exchange FTP server NLB logs
+        Name: exchange-ftp-nlb
+        Parameters:
+          projection.enabled: "true"
+          projection.date.type: date
+          projection.date.range: 2021/01/01,NOW
+          projection.date.format: yyyy/MM/dd
+          projection.date.interval: "1"
+          projection.date.interval.unit: DAYS
+          storage.location.template: !Sub s3://${NlbAccessLogsBucket}/AWSLogs/${AWS::AccountId}/elasticloadbalancing/${AWS::Region}/${!date}
+        PartitionKeys:
+          - Name: date
+            Type: string
+        StorageDescriptor:
+          Columns:
+            - Name: type
+              Type: string
+            - Name: version
+              Type: string
+            - Name: time
+              Type: string
+            - Name: elb
+              Type: string
+            - Name: listener
+              Type: string
+            - Name: client_ip
+              Type: string
+            - Name: client_port
+              Type: int
+            - Name: target_ip
+              Type: string
+            - Name: target_port
+              Type: int
+            - Name: tcp_connection_time_ms
+              Type: double
+            - Name: tls_handshake_time_ms
+              Type: double
+            - Name: received_bytes
+              Type: bigint
+            - Name: sent_bytes
+              Type: bigint
+            - Name: incoming_tls_alert
+              Type: int
+            - Name: chosen_cert_arn
+              Type: string
+            - Name: chosen_cert_serial
+              Type: string
+            - Name: tls_cipher_suite
+              Type: string
+            - Name: tls_protocol_version
+              Type: string
+            - Name: tls_named_group
+              Type: string
+            - Name: domain_name
+              Type: string
+            - Name: alpn_fe_protocol
+              Type: string
+            - Name: alpn_be_protocol
+              Type: string
+            - Name: alpn_client_preference_list
+              Type: string
+            - Name: tls_connection_creation_time
+              Type: string
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          Location: !Sub s3://${NlbAccessLogsBucket}/AWSLogs/${AWS::AccountId}/elasticloadbalancing/${AWS::Region}/
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            Parameters:
+              input.regex: >-
+                ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*):([0-9]*) ([^ ]*):([0-9]*) ([-.0-9]*) ([-.0-9]*) ([-0-9]*) ([-0-9]*) ([-0-9]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ([^ ]*) ?([^ ]*)?( .*)?
+              serialization.format: "1"
+            SerializationLibrary: org.apache.hadoop.hive.serde2.RegexSerDe
+        TableType: EXTERNAL_TABLE
+  AccessLogsRecentQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Database: !Ref SharedGlueDatabaseName
+      Description: >-
+        View recent FTP NLB requests using the table's date partitions
+      Name: !Sub ${EnvironmentType} FTP NLB Recent Requests
+      QueryString: !Sub >-
+        SELECT *
+        FROM "${SharedGlueDatabaseName}"."${NlbAccessLogsGlueTable}"
+        WHERE "date" > date_format(current_date - interval '1' day, '%Y/%m/%d')
+        ORDER BY time ASC
+  FtpServerNlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - NlbAccessLogsBucketPolicy # Don't try to create the NLB until the bucket grants logging permissions
+    Properties:
+      IpAddressType: ipv4
+      LoadBalancerAttributes:
+        # https://docs.aws.amazon.com/elasticloadbalancing/latest/network/load-balancer-access-logs.html
+        - Key: access_logs.s3.enabled
+          Value: "true"
+        - Key: access_logs.s3.bucket
+          Value: !Ref NlbAccessLogsBucket
+      Scheme: internet-facing
+      SubnetMappings:
+        - AllocationId: !GetAtt FtpServerNblElasticIp.AllocationId
+          SubnetId: !Ref VpcPublicSubnet1Id
+      Tags:
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      Type: network
+  FtpServerIpAddresses:
+    Type: Custom::TransferServerIpFinder
+    Properties:
+      ServiceToken: !Ref TransferServerIpFinderServiceToken
+      ServerId: !GetAtt FtpServer.ServerId
+  FtpServerFtpTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: FtpServerNlb
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPort: 21
+      HealthyThresholdCount: 3
+      Port: 21
+      Protocol: TCP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      Targets:
+        - Id: !Select [0, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [1, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [2, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+      TargetType: ip
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_ftp" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  FtpServerFtpNlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FtpServerFtpTargetGroup
+      LoadBalancerArn: !Ref FtpServerNlb
+      Port: 21
+      Protocol: TCP
+  FtpServerSftpTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: FtpServerNlb
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPort: 22
+      HealthyThresholdCount: 3
+      Port: 22
+      Protocol: TCP
+      Targets:
+        - Id: !Select [0, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [1, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [2, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      TargetType: ip
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_sftp" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  FtpServerSftpNlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FtpServerSftpTargetGroup
+      LoadBalancerArn: !Ref FtpServerNlb
+      Port: 22
+      Protocol: TCP
+  # Each data port in the range 8192-8200 that AWS Transfer Family uses needs
+  # its own target group and listener on the NLB
+  FtpServerFtpData8192TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: FtpServerNlb
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPort: 21
+      HealthyThresholdCount: 3
+      Port: 8192
+      Protocol: TCP
+      Targets:
+        - Id: !Select [0, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [1, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [2, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      TargetType: ip
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_ftp-8192" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  FtpServerFtpData8192NlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FtpServerFtpData8192TargetGroup
+      LoadBalancerArn: !Ref FtpServerNlb
+      Port: 8192
+      Protocol: TCP
+  FtpServerFtpData8193TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: FtpServerNlb
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPort: 21
+      HealthyThresholdCount: 3
+      Port: 8193
+      Protocol: TCP
+      Targets:
+        - Id: !Select [0, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [1, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [2, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      TargetType: ip
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_ftp-8193" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  FtpServerFtpData8193NlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FtpServerFtpData8193TargetGroup
+      LoadBalancerArn: !Ref FtpServerNlb
+      Port: 8193
+      Protocol: TCP
+  FtpServerFtpData8194TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: FtpServerNlb
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPort: 21
+      HealthyThresholdCount: 3
+      Port: 8194
+      Protocol: TCP
+      Targets:
+        - Id: !Select [0, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [1, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [2, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      TargetType: ip
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_ftp-8194" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  FtpServerFtpData8194NlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FtpServerFtpData8194TargetGroup
+      LoadBalancerArn: !Ref FtpServerNlb
+      Port: 8194
+      Protocol: TCP
+  FtpServerFtpData8195TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: FtpServerNlb
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPort: 21
+      HealthyThresholdCount: 3
+      Port: 8195
+      Protocol: TCP
+      Targets:
+        - Id: !Select [0, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [1, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [2, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      TargetType: ip
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_ftp-8195" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  FtpServerFtpData8195NlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FtpServerFtpData8195TargetGroup
+      LoadBalancerArn: !Ref FtpServerNlb
+      Port: 8195
+      Protocol: TCP
+  FtpServerFtpData8196TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: FtpServerNlb
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPort: 21
+      HealthyThresholdCount: 3
+      Port: 8196
+      Protocol: TCP
+      Targets:
+        - Id: !Select [0, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [1, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [2, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      TargetType: ip
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_ftp-8196" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  FtpServerFtpData8196NlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FtpServerFtpData8196TargetGroup
+      LoadBalancerArn: !Ref FtpServerNlb
+      Port: 8196
+      Protocol: TCP
+  FtpServerFtpData8197TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: FtpServerNlb
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPort: 21
+      HealthyThresholdCount: 3
+      Port: 8197
+      Protocol: TCP
+      Targets:
+        - Id: !Select [0, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [1, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [2, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      TargetType: ip
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_ftp-8197" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  FtpServerFtpData8197NlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FtpServerFtpData8197TargetGroup
+      LoadBalancerArn: !Ref FtpServerNlb
+      Port: 8197
+      Protocol: TCP
+  FtpServerFtpData8198TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: FtpServerNlb
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPort: 21
+      HealthyThresholdCount: 3
+      Port: 8198
+      Protocol: TCP
+      Targets:
+        - Id: !Select [0, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [1, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [2, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      TargetType: ip
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_ftp-8198" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  FtpServerFtpData8198NlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FtpServerFtpData8198TargetGroup
+      LoadBalancerArn: !Ref FtpServerNlb
+      Port: 8198
+      Protocol: TCP
+  FtpServerFtpData8199TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: FtpServerNlb
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPort: 21
+      HealthyThresholdCount: 3
+      Port: 8199
+      Protocol: TCP
+      Targets:
+        - Id: !Select [0, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [1, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [2, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      TargetType: ip
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_ftp-8199" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  FtpServerFtpData8199NlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FtpServerFtpData8199TargetGroup
+      LoadBalancerArn: !Ref FtpServerNlb
+      Port: 8199
+      Protocol: TCP
+  FtpServerFtpData8200TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: FtpServerNlb
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPort: 21
+      HealthyThresholdCount: 3
+      Port: 8200
+      Protocol: TCP
+      Targets:
+        - Id: !Select [0, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [1, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+        - Id: !Select [2, !GetAtt FtpServerIpAddresses.PrivateIpAddresses]
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+      TargetType: ip
+      Tags:
+        - { Key: Name, Value: !Sub "${RootStackName}_exchange_ftp-8200" }
+        - { Key: prx:meta:tagging-version, Value: "2021-04-07" }
+        - { Key: prx:cloudformation:stack-name, Value: !Ref AWS::StackName }
+        - { Key: prx:cloudformation:stack-id, Value: !Ref AWS::StackId }
+        - { Key: prx:cloudformation:root-stack-name, Value: !Ref RootStackName }
+        - { Key: prx:cloudformation:root-stack-id, Value: !Ref RootStackId }
+        - { Key: prx:ops:environment, Value: !Ref EnvironmentType }
+        - { Key: prx:dev:application, Value: Exchange }
+      UnhealthyThresholdCount: 3
+      VpcId: !Ref VpcId
+  FtpServerFtpData8200NlbListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FtpServerFtpData8200TargetGroup
+      LoadBalancerArn: !Ref FtpServerNlb
+      Port: 8200
+      Protocol: TCP
+
+Outputs:
+  WebTargetGroupFullName:
+    Value: !GetAtt WebTargetGroup.TargetGroupFullName
+  FtpServerId:
+    Value: !GetAtt FtpServer.ServerId
+  FtpServerPublicIp:
+    Value: !Ref FtpServerNblElasticIp
+  FtpServerPublicIpAllocationId:
+    Value: !GetAtt FtpServerNblElasticIp.AllocationId
+  FtpServerNlbArn:
+    Value: !Ref FtpServerNlb
+  FtpServerNlbName:
+    Value: !GetAtt FtpServerNlb.LoadBalancerName
+  FtpServerNlbDnsName:
+    Value: !GetAtt FtpServerNlb.DNSName

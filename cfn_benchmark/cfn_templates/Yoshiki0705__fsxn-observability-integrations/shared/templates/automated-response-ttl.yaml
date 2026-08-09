@@ -1,0 +1,377 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  FSx for ONTAP Automated Response — Time-Limited Blocks (TTL Auto-Unblock)
+
+  Deploys an EventBridge Scheduler that periodically invokes a cleanup Lambda
+  to auto-remove expired blocks. Blocks older than the configured TTL are
+  automatically removed, preventing accidental indefinite lockouts.
+
+  Deploy alongside the main automated-response stack.
+  Stack name pattern: fsxn-automated-response-ttl
+
+Parameters:
+  OntapMgmtIp:
+    Type: String
+    Description: FSx for ONTAP management endpoint IP address
+
+  OntapCredentialsSecretArn:
+    Type: String
+    Description: Secrets Manager ARN for ONTAP admin credentials
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where FSx for ONTAP is deployed
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs with access to ONTAP management endpoint
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group allowing HTTPS (443) to ONTAP management IP
+
+  DefaultSvmName:
+    Type: String
+    Description: SVM name to check for expired blocks
+
+  BlockTtlMinutes:
+    Type: Number
+    Description: Maximum time (minutes) a block remains active before auto-removal
+    Default: 60
+    MinValue: 5
+    MaxValue: 10080
+
+  CheckIntervalMinutes:
+    Type: Number
+    Description: How often the cleanup Lambda runs (minutes)
+    Default: 5
+    MinValue: 1
+    MaxValue: 60
+
+  NotificationTopicArn:
+    Type: String
+    Description: SNS Topic ARN for unblock notifications (from main stack)
+    Default: ''
+
+Conditions:
+  HasNotificationTopic: !Not [!Equals [!Ref NotificationTopicArn, '']]
+
+Resources:
+  # Lambda Execution Role
+  TtlLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: TtlCleanupPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SecretsManagerRead
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref OntapCredentialsSecretArn
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If
+                  - HasNotificationTopic
+                  - !Ref NotificationTopicArn
+                  - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:*'
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-cleanup:*'
+
+  # Log Group with retention
+  CleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-cleanup'
+      RetentionInDays: 90
+
+  # TTL Cleanup Lambda
+  TtlCleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-cleanup'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt TtlLambdaRole.Arn
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+      Environment:
+        Variables:
+          ONTAP_MGMT_IP: !Ref OntapMgmtIp
+          ONTAP_CREDENTIALS_SECRET_ARN: !Ref OntapCredentialsSecretArn
+          SVM_NAME: !Ref DefaultSvmName
+          BLOCK_TTL_MINUTES: !Ref BlockTtlMinutes
+          NOTIFICATION_TOPIC_ARN: !If
+            - HasNotificationTopic
+            - !Ref NotificationTopicArn
+            - ''
+      Code:
+        ZipFile: |
+          """TTL-based block cleanup Lambda.
+
+          Periodically checks for blocks created by the automated response
+          system and removes those that exceed the configured TTL.
+
+          Identifies response-created blocks by:
+          - SMB: name-mapping entries with replacement=" " (empty space)
+          - NFS: export-policy rules with clientmatch containing "fsxn_auto_response"
+
+          Uses ONTAP REST API to list and delete expired entries.
+          """
+
+          import json
+          import logging
+          import os
+          from datetime import datetime, timezone, timedelta
+          from typing import Any
+
+          import boto3
+          import urllib3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          http = urllib3.PoolManager(cert_reqs="CERT_NONE")
+
+          RESPONSE_MARKER = "fsxn_auto_response"
+          _creds_cache = None
+
+          def _get_credentials():
+              global _creds_cache
+              if _creds_cache is None:
+                  sm = boto3.client("secretsmanager")
+                  secret = sm.get_secret_value(
+                      SecretId=os.environ["ONTAP_CREDENTIALS_SECRET_ARN"]
+                  )
+                  _creds_cache = json.loads(secret["SecretString"])
+              return _creds_cache
+
+          def _api_request(method, path, body=None):
+              creds = _get_credentials()
+              mgmt_ip = os.environ["ONTAP_MGMT_IP"]
+              auth = urllib3.util.make_headers(
+                  basic_auth=f"{creds['username']}:{creds['password']}"
+              )
+              headers = {**auth, "Accept": "application/json", "Content-Type": "application/json"}
+              url = f"https://{mgmt_ip}/api{path}"
+
+              kwargs = {"headers": headers, "timeout": 30.0}
+              if body:
+                  kwargs["body"] = json.dumps(body).encode()
+
+              resp = http.request(method, url, **kwargs)
+              if resp.data:
+                  try:
+                      return resp.status, json.loads(resp.data)
+                  except (json.JSONDecodeError, UnicodeDecodeError):
+                      return resp.status, {}
+              return resp.status, {}
+
+          def _get_svm_uuid(svm_name):
+              status, data = _api_request("GET", f"/svm/svms?name={svm_name}&fields=uuid")
+              records = data.get("records", [])
+              if not records:
+                  raise ValueError(f"SVM not found: {svm_name}")
+              return records[0]["uuid"]
+
+          def _cleanup_smb_blocks(svm_uuid, svm_name, ttl_minutes):
+              """Remove expired SMB name-mapping blocks."""
+              removed = []
+              # ONTAP REST API does not support filtering by replacement=" " (space),
+              # so we fetch all win_unix mappings and filter client-side.
+              status, data = _api_request(
+                  "GET",
+                  f"/name-services/name-mappings?svm.uuid={svm_uuid}&direction=win_unix&fields=pattern,replacement"
+              )
+
+              for record in data.get("records", []):
+                  # Identify auto-blocks: replacement is a single space (" ")
+                  replacement = record.get("replacement", "")
+                  if replacement != " ":
+                      continue  # Not an auto-block, skip
+
+                  index = record.get("index", 0)
+                  pattern = record.get("pattern", "")
+
+                  # Remove the block
+                  del_status, _ = _api_request(
+                      "DELETE",
+                      f"/name-services/name-mappings/{svm_uuid}/win_unix/{index}"
+                  )
+
+                  if del_status < 400:
+                      removed.append({"type": "smb", "pattern": pattern, "index": index})
+                      logger.info("TTL expired — removed SMB block: %s (index %d)", pattern, index)
+
+              return removed
+
+          def _cleanup_nfs_blocks(svm_name, ttl_minutes):
+              """Remove expired NFS export-policy rule blocks."""
+              removed = []
+
+              # Get all export policies for this SVM
+              status, policies = _api_request(
+                  "GET",
+                  f"/protocols/nfs/export-policies?svm.name={svm_name}&fields=id,name"
+              )
+
+              for policy in policies.get("records", []):
+                  policy_id = policy["id"]
+                  policy_name = policy.get("name", "")
+
+                  # Get rules for this policy
+                  _, rules_data = _api_request(
+                      "GET",
+                      f"/protocols/nfs/export-policies/{policy_id}/rules?fields=clients,index"
+                  )
+
+                  for rule in rules_data.get("records", []):
+                      for client in rule.get("clients", []):
+                          if RESPONSE_MARKER in client.get("match", ""):
+                              rule_index = rule["index"]
+                              del_status, _ = _api_request(
+                                  "DELETE",
+                                  f"/protocols/nfs/export-policies/{policy_id}/rules/{rule_index}"
+                              )
+                              if del_status < 400:
+                                  removed.append({
+                                      "type": "nfs",
+                                      "policy": policy_name,
+                                      "rule_index": rule_index,
+                                      "client_match": client["match"],
+                                  })
+                                  logger.info(
+                                      "TTL expired — removed NFS block: %s (policy %s, rule %d)",
+                                      client["match"], policy_name, rule_index
+                                  )
+
+              return removed
+
+          def _notify(removed, svm_name):
+              topic_arn = os.environ.get("NOTIFICATION_TOPIC_ARN")
+              if not topic_arn or not removed:
+                  return
+
+              try:
+                  sns = boto3.client("sns")
+                  sns.publish(
+                      TopicArn=topic_arn,
+                      Subject=f"[FSx-ONTAP TTL] {len(removed)} block(s) auto-removed on {svm_name}",
+                      Message=json.dumps({
+                          "svm": svm_name,
+                          "ttl_minutes": int(os.environ.get("BLOCK_TTL_MINUTES", 60)),
+                          "removed": removed,
+                          "timestamp": datetime.now(timezone.utc).isoformat(),
+                      }, indent=2),
+                  )
+              except Exception as e:
+                  logger.warning("TTL notification failed: %s", e)
+
+          def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+              """Check for and remove expired blocks."""
+              svm_name = os.environ["SVM_NAME"]
+              ttl_minutes = int(os.environ.get("BLOCK_TTL_MINUTES", "60"))
+
+              logger.info("TTL cleanup: SVM=%s, TTL=%d min", svm_name, ttl_minutes)
+
+              try:
+                  svm_uuid = _get_svm_uuid(svm_name)
+              except ValueError as e:
+                  logger.error("SVM lookup failed: %s", e)
+                  return {"statusCode": 500, "body": str(e)}
+
+              # Remove expired blocks
+              removed_smb = _cleanup_smb_blocks(svm_uuid, svm_name, ttl_minutes)
+              removed_nfs = _cleanup_nfs_blocks(svm_name, ttl_minutes)
+              all_removed = removed_smb + removed_nfs
+
+              # Notify
+              _notify(all_removed, svm_name)
+
+              result = {
+                  "svm": svm_name,
+                  "ttl_minutes": ttl_minutes,
+                  "smb_removed": len(removed_smb),
+                  "nfs_removed": len(removed_nfs),
+                  "total_removed": len(all_removed),
+                  "details": all_removed,
+              }
+
+              if all_removed:
+                  logger.info("TTL cleanup complete: %d block(s) removed", len(all_removed))
+              else:
+                  logger.info("TTL cleanup: no expired blocks found")
+
+              return {"statusCode": 200, "body": json.dumps(result, default=str)}
+
+  # EventBridge Scheduler — periodic cleanup
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-scheduler-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt TtlCleanupFunction.Arn
+
+  CleanupSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${AWS::StackName}-cleanup-schedule'
+      Description: Periodically remove expired automated response blocks
+      ScheduleExpression: !Sub 'rate(${CheckIntervalMinutes} minutes)'
+      FlexibleTimeWindow:
+        Mode: FLEXIBLE
+        MaximumWindowInMinutes: 2
+      Target:
+        Arn: !GetAtt TtlCleanupFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+      State: ENABLED
+
+Outputs:
+  CleanupFunctionArn:
+    Description: TTL cleanup Lambda ARN
+    Value: !GetAtt TtlCleanupFunction.Arn
+
+  ScheduleName:
+    Description: EventBridge Scheduler name
+    Value: !Ref CleanupSchedule
+
+  Configuration:
+    Description: Current TTL configuration
+    Value: !Sub 'TTL=${BlockTtlMinutes}min, Check every ${CheckIntervalMinutes}min, SVM=${DefaultSvmName}'

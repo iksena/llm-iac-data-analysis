@@ -1,0 +1,991 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Step Functions state machine for IAM Access Key management with human approval in management account'
+
+Parameters:
+  StateMachineName:
+    Type: String
+    Default: 'AccessKeyManagementStateMachine'
+    Description: 'Name for the Step Functions state machine'
+
+  ExecutionRoleName:
+    Type: String
+    Default: 'StepFunctionsAccessKeyManagementRole'
+    Description: 'Name for the Step Functions execution role'
+
+  AnalyzerArn:
+    Type: String
+    Description: 'ARN of the Access Analyzer to use for finding unused access keys'
+    AllowedPattern: 'arn:aws:access-analyzer:[a-z0-9-]+:[0-9]{12}:analyzer/[a-zA-Z0-9_.-]+'
+    ConstraintDescription: 'Must be a valid Access Analyzer ARN'
+
+  HoldPeriod:
+    Type: Number
+    Default: 7
+    Description: 'Number of days to wait between disabling and requesting approval'
+    MinValue: 1
+    MaxValue: 90
+    ConstraintDescription: 'Must be between 1 and 90 days'
+
+  ApprovalTimeout:
+    Type: Number
+    Default: 7
+    Description: 'Number of days to wait for human approval before execution expires'
+    MinValue: 1
+    MaxValue: 30
+    ConstraintDescription: 'Must be between 1 and 30 days'
+
+  NotificationEmail:
+    Type: String
+    Description: 'Email address to receive notifications and approval requests'
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: 'Must be a valid email address'
+
+  OrganizationId:
+    Type: String
+    Description: 'AWS Organization ID to restrict cross-account access (e.g., o-1234567890)'
+    AllowedPattern: '^o-[a-z0-9]{10}$'
+    ConstraintDescription: 'Must be a valid AWS Organization ID starting with o- followed by 10 alphanumeric characters'
+
+  ScheduleIntervalDays:
+    Type: Number
+    Default: 7
+    Description: 'Number of days between automatic Step Functions executions'
+    MinValue: 1
+    MaxValue: 365
+    ConstraintDescription: 'Must be between 1 and 365 days'
+
+  EnableScheduler:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: 'Enable automatic scheduling of Step Functions execution'
+
+Resources:
+
+  # Lambda Execution Role for Approval Functions
+  ApprovalLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${StateMachineName}-ApprovalLambdaRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SNSPublishPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AccessKeyNotificationTopic
+        - PolicyName: StepFunctionsCallbackPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:SendTaskSuccess
+                  - states:SendTaskFailure
+                Resource: !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${StateMachineName}'
+      Tags:
+        - Key: Purpose
+          Value: AccessKeyManagement
+        - Key: Component
+          Value: ApprovalLambdaRole
+
+  # Lambda Function: Send Approval Request
+  ApprovalRequestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${StateMachineName}-ApprovalRequest'
+      Description: 'Sends approval request email with approval link'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ApprovalLambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref AccessKeyNotificationTopic
+          API_GATEWAY_URL: !Sub 'https://${ApprovalApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod'
+          NOTIFICATION_EMAIL: !Ref NotificationEmail
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+          from urllib.parse import quote
+
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              task_token = event['TaskToken']
+              access_keys = event['AccessKeys']
+              notification_email = event.get('NotificationEmail', os.environ.get('NOTIFICATION_EMAIL'))
+              api_gateway_url = os.environ['API_GATEWAY_URL']
+
+              approval_url = f"{api_gateway_url}/approve?token={quote(task_token, safe='')}"
+
+              key_details = []
+              for key in access_keys:
+                  key_details.append(
+                      f"  - User: {key['UserName']}, "
+                      f"Key: {key['AccessKeyId']}, "
+                      f"Account: {key['AccountId']}"
+                  )
+
+              key_list = "\n".join(key_details)
+
+              subject = "🔐 ACTION REQUIRED: Approve IAM Access Key Deletion"
+
+              message = f"""
+          URGENT: Human Approval Required for IAM Access Key Deletion
+
+          The following unused IAM access keys have been disabled and are scheduled for permanent deletion:
+
+          {key_list}
+
+          Total Keys: {len(access_keys)}
+
+          ⚠️ ACTION REQUIRED ⚠️
+
+          To APPROVE the deletion of these access keys, click the link below:
+
+          {approval_url}
+
+          IMPORTANT NOTES:
+          - This approval link is valid for 7 days
+          - If you do not approve within 7 days, the deletion will be CANCELLED automatically
+          - Once approved, the keys will be permanently deleted and cannot be recovered
+          - The approval link can only be used once
+
+          If you do NOT want to delete these keys:
+          - Simply ignore this email
+          - The Step Functions execution will expire after 7 days
+          - No keys will be deleted
+
+          Timestamp: {datetime.utcnow().isoformat()}Z
+          Execution ARN: {context.invoked_function_arn}
+
+          ---
+          This is an automated message from AWS IAM Access Key Management System
+          """
+
+              try:
+                  response = sns.publish(
+                      TopicArn=os.environ['SNS_TOPIC_ARN'],
+                      Subject=subject,
+                      Message=message
+                  )
+
+                  print(f"Approval request sent successfully. MessageId: {response['MessageId']}")
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps({
+                          'message': 'Approval request sent',
+                          'messageId': response['MessageId'],
+                          'keysCount': len(access_keys)
+                      })
+                  }
+
+              except Exception as e:
+                  print(f"Error sending approval request: {str(e)}")
+                  raise
+      Tags:
+        - Key: Purpose
+          Value: AccessKeyManagement
+        - Key: Component
+          Value: ApprovalRequestFunction
+
+  # Lambda Function: Handle Approval Callback
+  ApprovalCallbackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${StateMachineName}-ApprovalCallback'
+      Description: 'Handles approval callback from API Gateway'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt ApprovalLambdaExecutionRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import re
+          import html
+          from urllib.parse import unquote
+
+          stepfunctions = boto3.client('stepfunctions')
+          def validate_task_token(token):
+              if not token or len (token) < 100 or len(token) > 2000:
+                  return False
+              if not re.match(r'^[A-Za-z0-9+/=]+$', token):
+                  return False
+              return True
+
+          def lambda_handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+
+              query_params = event.get('queryStringParameters', {})
+
+              if not query_params or 'token' not in query_params:
+                  return {
+                      'statusCode': 400,
+                      'headers': {'Content-Type': 'text/html'},
+                      'body': generate_error_page('Missing approval token')
+                  }
+
+              task_token = unquote(query_params['token'])
+
+              if not validate_task_token(task_token):
+                  return {
+                    'statusCode': 400,
+                    'headers': {'Content-Type': 'text/html'},
+                    'body': generate_error_page('Invalid token format')
+                  }
+
+              try:
+                  stepfunctions.send_task_success(
+                      taskToken=task_token,
+                      output=json.dumps({
+                          'approved': True,
+                          'approvedAt': context.aws_request_id,
+                          'approver': 'human-approval'
+                      })
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'text/html'},
+                      'body': generate_success_page()
+                  }
+
+              except stepfunctions.exceptions.InvalidToken:
+                  print(f"Invalid or expired task token received")
+                  return {
+                      'statusCode': 400,
+                      'headers': {'Content-Type': 'text/html'},
+                      'body': generate_error_page('Invalid or expired approval token. The approval link may have already been used or the execution has expired.')
+                  }
+
+              except stepfunctions.exceptions.TaskTimedOut:
+                  print(f"Task timed out for token")
+                  return {
+                      'statusCode': 400,
+                      'headers': {'Content-Type': 'text/html'},
+                      'body': generate_error_page('Approval timeout expired. The Step Functions execution has already completed or expired.')
+                  }
+
+              except Exception as e:
+                  print(f"Error processing approval: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {'Content-Type': 'text/html'},
+                      'body': generate_error_page(f'An unexpected error occurred. Please contact your administrator')
+                  }
+
+          def generate_success_page():
+              return """
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Approval Successful</title>
+              <style>
+                  body {
+                      font-family: Arial, sans-serif;
+                      max-width: 600px;
+                      margin: 50px auto;
+                      padding: 20px;
+                      background-color: #f5f5f5;
+                  }
+                  .container {
+                      background-color: white;
+                      padding: 30px;
+                      border-radius: 8px;
+                      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                  }
+                  .success {
+                      color: #28a745;
+                      font-size: 24px;
+                      margin-bottom: 20px;
+                  }
+                  .icon {
+                      font-size: 48px;
+                      margin-bottom: 20px;
+                  }
+                  .message {
+                      color: #333;
+                      line-height: 1.6;
+                  }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <div class="icon">✅</div>
+                  <div class="success">Approval Successful</div>
+                  <div class="message">
+                      <p>You have successfully approved the deletion of the IAM access keys.</p>
+                      <p>The Step Functions workflow will now proceed to permanently delete the unused access keys.</p>
+                      <p><strong>Note:</strong> This approval link cannot be used again.</p>
+                      <p>You can safely close this window.</p>
+                  </div>
+              </div>
+          </body>
+          </html>
+          """
+
+          def generate_error_page(error_message):
+              error_message = html.escape(error_message)
+              return f"""
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>Approval Error</title>
+              <style>
+                  body {{
+                      font-family: Arial, sans-serif;
+                      max-width: 600px;
+                      margin: 50px auto;
+                      padding: 20px;
+                      background-color: #f5f5f5;
+                  }}
+                  .container {{
+                      background-color: white;
+                      padding: 30px;
+                      border-radius: 8px;
+                      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+                  }}
+                  .error {{
+                      color: #dc3545;
+                      font-size: 24px;
+                      margin-bottom: 20px;
+                  }}
+                  .icon {{
+                      font-size: 48px;
+                      margin-bottom: 20px;
+                  }}
+                  .message {{
+                      color: #333;
+                      line-height: 1.6;
+                  }}
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <div class="icon">❌</div>
+                  <div class="error">Approval Failed</div>
+                  <div class="message">
+                      <p><strong>Error:</strong> {error_message}</p>
+                      <p>If you believe this is an error, please contact your AWS administrator.</p>
+                      <p>You can safely close this window.</p>
+                  </div>
+              </div>
+          </body>
+          </html>
+          """
+      Tags:
+        - Key: Purpose
+          Value: AccessKeyManagement
+        - Key: Component
+          Value: ApprovalCallbackFunction
+
+  # API Gateway REST API
+  ApprovalApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${StateMachineName}-ApprovalAPI'
+      Description: 'API Gateway for IAM Access Key deletion approval'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      Tags:
+        - Key: Purpose
+          Value: AccessKeyManagement
+        - Key: Component
+          Value: ApprovalAPI
+
+  # API Gateway Resource
+  ApprovalResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApprovalApiGateway
+      ParentId: !GetAtt ApprovalApiGateway.RootResourceId
+      PathPart: 'approve'
+
+  # API Gateway Method
+  ApprovalMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApprovalApiGateway
+      ResourceId: !Ref ApprovalResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApprovalCallbackFunction.Arn}/invocations'
+
+  # API Gateway Deployment
+  ApprovalApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApprovalMethod
+    Properties:
+      RestApiId: !Ref ApprovalApiGateway
+
+  # API Gateway Stage
+  ApprovalApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApprovalApiGateway
+      DeploymentId: !Ref ApprovalApiDeployment
+      StageName: prod
+      MethodSettings:
+        - ThrottlingRateLimit: 1
+          ThrottlingBurstLimit: 1
+
+  # Lambda Permission for API Gateway
+  ApprovalLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApprovalCallbackFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApprovalApiGateway}/*/*'
+
+  # Step Functions Execution Role
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref ExecutionRoleName
+      Tags:
+        - Key: Purpose
+          Value: AccessKeyManagement
+        - Key: Component
+          Value: StepFunctionsExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AccessAnalyzerPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - access-analyzer:ListFindings
+                  - access-analyzer:ListFindingsV2
+                  - access-analyzer:GetFinding
+                  - access-analyzer:GetFindingV2
+                Resource: !Ref AnalyzerArn
+        - PolicyName: CrossAccountAssumeRole
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: 'arn:aws:iam::*:role/AccessKeyManagementRole'
+                Condition:
+                  StringEquals:
+                    'aws:PrincipalOrgID': !Ref OrganizationId
+        - PolicyName: SNSNotifications
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref AccessKeyNotificationTopic
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${StateMachineName}-ApprovalRequest'
+        - PolicyName: StepFunctionsIntrinsicFunctions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                  - states:DescribeStateMachine
+                  - states:GetExecutionHistory
+                Resource:
+                  - !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:stateMachine:${StateMachineName}'
+                  - !Sub 'arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${StateMachineName}:*'
+
+  # Step Functions State Machine with Human Approval
+  AccessKeyManagementStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Ref StateMachineName
+      StateMachineType: STANDARD
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      Tags:
+        - Key: Purpose
+          Value: AccessKeyManagement
+        - Key: Component
+          Value: StateMachine
+      TracingConfiguration:
+        Enabled: true
+      DefinitionString: !Sub |
+        {
+          "Comment": "IAM Access Analyzer - Unused Access Key Management with Human Approval",
+          "StartAt": "ListFindingsV2",
+          "States": {
+            "ListFindingsV2": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:accessanalyzer:listFindingsV2",
+              "Parameters": {
+                "AnalyzerArn": "${AnalyzerArn}",
+                "Filter": {
+                  "findingType": {
+                    "Eq": ["UnusedIAMUserAccessKey"]
+                  },
+                  "status": {
+                    "Eq": ["ACTIVE"]
+                  }
+                }
+              },
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.TaskFailed"],
+                  "Next": "HandleListFindingsError",
+                  "ResultPath": "$.Error"
+                }
+              ],
+              "Next": "CheckFindings"
+            },
+            "CheckFindings": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Findings",
+                  "IsPresent": false,
+                  "Next": "NoFindingsFound"
+                },
+                {
+                  "Variable": "$.Findings",
+                  "IsNull": true,
+                  "Next": "NoFindingsFound"
+                }
+              ],
+              "Default": "ProcessFindings"
+            },
+            "NoFindingsFound": {
+              "Type": "Pass",
+              "Result": {
+                "Status": "Success",
+                "Message": "No unused IAM access keys found",
+                "UpdatedAccessKeys": []
+              },
+              "End": true
+            },
+            "HandleListFindingsError": {
+              "Type": "Pass",
+              "Parameters": {
+                "Status": "Failed",
+                "Stage": "ListFindings",
+                "Error.$": "$.Error",
+                "Message": "Failed to list Access Analyzer findings"
+              },
+              "End": true
+            },
+            "ProcessFindings": {
+              "Type": "Map",
+              "ItemsPath": "$.Findings",
+              "MaxConcurrency": 10,
+              "Iterator": {
+                "StartAt": "GetFindingV2",
+                "States": {
+                  "GetFindingV2": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:accessanalyzer:getFindingV2",
+                    "Parameters": {
+                      "AnalyzerArn": "${AnalyzerArn}",
+                      "Id.$": "$.Id"
+                    },
+                    "ResultSelector": {
+                      "AccessKeyId.$": "$.FindingDetails[0].UnusedIamUserAccessKeyDetails.AccessKeyId",
+                      "UserName.$": "States.ArrayGetItem(States.StringSplit($.Resource, '/'), 1)",
+                      "AccountId.$": "States.ArrayGetItem(States.StringSplit($.Resource, ':'), 3)"
+                    },
+                    "End": true
+                  }
+                }
+              },
+              "ResultSelector": {
+                "AccessKeyData.$": "$[*]",
+                "HoldPeriod": ${HoldPeriod}
+              },
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleWorkflowError",
+                  "ResultPath": "$.Error"
+                }
+              ],
+              "Next": "FilterManagementAccountKeys"
+            },
+            "FilterManagementAccountKeys": {
+              "Type": "Pass",
+              "Parameters": {
+                "AccessKeyData.$": "$.AccessKeyData[?(@.AccountId != '${AWS::AccountId}')]",
+                "HoldPeriod.$": "$.HoldPeriod"
+              },
+              "Next": "CheckFilteredKeys"
+            },
+            "CheckFilteredKeys": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.AccessKeyData[0]",
+                  "IsPresent": false,
+                  "Next": "NoMemberAccountKeysFound"
+                }
+              ],
+              "Default": "UpdateAccessKeys"
+            },
+            "NoMemberAccountKeysFound": {
+              "Type": "Pass",
+              "Result": {
+                "Status": "Success",
+                "Message": "No unused IAM access keys found in member accounts (management account keys excluded)",
+                "UpdatedAccessKeys": []
+              },
+              "End": true
+            },
+            "UpdateAccessKeys": {
+              "Type": "Map",
+              "ItemsPath": "$.AccessKeyData",
+              "MaxConcurrency": 5,
+              "Iterator": {
+                "StartAt": "UpdateAccessKey",
+                "States": {
+                  "UpdateAccessKey": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:iam:updateAccessKey",
+                    "Parameters": {
+                      "AccessKeyId.$": "$.AccessKeyId",
+                      "UserName.$": "$.UserName",
+                      "Status": "Inactive"
+                    },
+                    "Credentials": {
+                      "RoleArn.$": "States.Format('{}{}{}', 'arn:aws:iam::', $.AccountId, ':role/AccessKeyManagementRole')"
+                    },
+                    "ResultPath": "$.UpdateResult",
+                    "End": true
+                  }
+                }
+              },
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleWorkflowError",
+                  "ResultPath": "$.Error"
+                }
+              ],
+              "ResultSelector": {
+                "UpdateResults.$": "$",
+                "SuccessfulUpdates.$": "$[?(@.UpdateResult)]",
+                "HoldPeriod": ${HoldPeriod}
+              },
+              "Next": "CalculateWaitDuration"
+            },
+            "CalculateWaitDuration": {
+              "Type": "Pass",
+              "QueryLanguage": "JSONata",
+              "Output": {
+                "SuccessfulUpdates": "{% $states.input.SuccessfulUpdates %}",
+                "HoldPeriod": "{% $states.input.HoldPeriod %}",
+                "WaitDuration": "{% $states.input.HoldPeriod *86400 %}",
+                "UserList": "{% $states.input.SuccessfulUpdates[*].UserName %}",
+                "AccountList": "{% $states.input.SuccessfulUpdates[*].AccountId %}"
+              },
+              "Next": "SendNotification"
+            },
+            "SendNotification": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "TopicArn": "${AccessKeyNotificationTopic}",
+                "Subject": "⚠️ NOTICE: Access Keys Disabled - Approval Required Soon",
+                "Message.$": "States.Format('Access keys have been disabled for users: {} in accounts: {}. You will receive an approval request in {} days.', $.UserList, $.AccountList, $.HoldPeriod)"
+              },
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleWorkflowError",
+                  "ResultPath": "$.Error"
+                }
+              ],
+              "ResultPath": "$.NotificationResult",
+              "Next": "WaitBeforeApprovalRequest"
+            },
+            "WaitBeforeApprovalRequest": {
+              "Type": "Wait",
+              "SecondsPath": "$.WaitDuration",
+              "Next": "RequestApproval"
+            },
+            "RequestApproval": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+              "Parameters": {
+                "FunctionName": "${ApprovalRequestFunction.Arn}",
+                "Payload": {
+                  "TaskToken.$": "$$.Task.Token",
+                  "AccessKeys.$": "$.SuccessfulUpdates",
+                  "NotificationEmail": "${NotificationEmail}"
+                }
+              },
+              "TimeoutSeconds": 604800,
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.Timeout"],
+                  "Next": "ApprovalTimeout",
+                  "ResultPath": "$.Error"
+                },
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleWorkflowError",
+                  "ResultPath": "$.Error"
+                }
+              ],
+              "ResultPath": "$.ApprovalResult",
+              "Next": "DeleteAccessKeys"
+            },
+            "ApprovalTimeout": {
+              "Type": "Pass",
+              "Parameters": {
+                "Status": "Cancelled",
+                "Message": "Approval timeout expired - no keys were deleted",
+                "AccessKeys.$": "$.SuccessfulUpdates"
+              },
+              "End": true
+            },
+            "DeleteAccessKeys": {
+              "Type": "Map",
+              "ItemsPath": "$.SuccessfulUpdates",
+              "MaxConcurrency": 5,
+              "Iterator": {
+                "StartAt": "DeleteAccessKey",
+                "States": {
+                  "DeleteAccessKey": {
+                    "Type": "Task",
+                    "Resource": "arn:aws:states:::aws-sdk:iam:deleteAccessKey",
+                    "Parameters": {
+                      "AccessKeyId.$": "$.AccessKeyId",
+                      "UserName.$": "$.UserName"
+                    },
+                    "Credentials": {
+                      "RoleArn.$": "States.Format('{}{}{}', 'arn:aws:iam::', $.AccountId, ':role/AccessKeyManagementRole')"
+                    },
+                    "ResultPath": "$.DeleteResult",
+                    "End": true
+                  }
+                }
+              },
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleWorkflowError",
+                  "ResultPath": "$.Error"
+                }
+              ],
+              "Next": "ProcessFinalResults"
+            },
+            "ProcessFinalResults": {
+              "Type": "Pass",
+              "Parameters": {
+                "DeletedAccessKeys.$": "$[?(@.DeleteResult)].AccessKeyId",
+                "TotalProcessed.$": "States.ArrayLength($)",
+                "Status": "Completed",
+                "Message": "Access keys successfully deleted after approval"
+              },
+              "End": true
+            },
+            "HandleWorkflowError": {
+              "Type": "Pass",
+              "Parameters": {
+                "Status": "Failed",
+                "Error.$": "$.Error",
+                "Message": "Workflow failed during execution"
+              },
+              "End": true
+            }
+          }
+        }
+
+  # SNS Topic for notifications
+  AccessKeyNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${StateMachineName}-notifications'
+      DisplayName: 'Access Key Management Notifications'
+      KmsMasterKeyId: 'alias/aws/sns'
+      Tags:
+        - Key: Purpose
+          Value: AccessKeyManagement
+        - Key: Component
+          Value: NotificationTopic
+
+  # SNS Subscription for email notifications
+  AccessKeyNotificationSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AccessKeyNotificationTopic
+      Protocol: email
+      Endpoint: !Ref NotificationEmail
+
+  # CloudWatch Alarm for Step Functions failures
+  StepFunctionsFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${StateMachineName}-ExecutionFailures'
+      AlarmDescription: 'Alarm for Step Functions execution failures'
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref AccessKeyManagementStateMachine
+      AlarmActions:
+        - !Ref AccessKeyNotificationTopic
+      Tags:
+        - Key: Purpose
+          Value: AccessKeyManagement
+        - Key: Component
+          Value: FailureAlarm
+
+  # EventBridge Role for Step Functions execution
+  EventBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Condition: EnableScheduling
+    Properties:
+      RoleName: !Sub '${StateMachineName}-EventBridgeRole'
+      Description: 'Role for EventBridge to execute Step Functions'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref AccessKeyManagementStateMachine
+      Tags:
+        - Key: Purpose
+          Value: AccessKeyManagement
+        - Key: Component
+          Value: EventBridgeRole
+
+  # EventBridge Rule for scheduled execution
+  ScheduledExecutionRule:
+    Type: AWS::Events::Rule
+    Condition: EnableScheduling
+    Properties:
+      Name: !Sub '${StateMachineName}-ScheduledExecution'
+      Description: !Sub 'Scheduled execution of ${StateMachineName} Step Functions'
+      ScheduleExpression: !Sub 'rate(${ScheduleIntervalDays} days)'
+      State: !If [EnableScheduling, 'ENABLED', 'DISABLED']
+      Targets:
+        - Arn: !Ref AccessKeyManagementStateMachine
+          Id: 'AccessKeyManagementTarget'
+          RoleArn: !GetAtt EventBridgeExecutionRole.Arn
+          Input: '{}'
+      Tags:
+        - Key: Purpose
+          Value: AccessKeyManagement
+        - Key: Component
+          Value: ScheduledExecution
+
+Conditions:
+  EnableScheduling: !Equals [!Ref EnableScheduler, 'true']
+
+Outputs:
+  StateMachineArn:
+    Description: 'ARN of the Step Functions state machine'
+    Value: !Ref AccessKeyManagementStateMachine
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineArn'
+
+  ExecutionRoleArn:
+    Description: 'ARN of the Step Functions execution role'
+    Value: !GetAtt StepFunctionsExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ExecutionRoleArn'
+
+  StateMachineName:
+    Description: 'Name of the Step Functions state machine'
+    Value: !Ref StateMachineName
+    Export:
+      Name: !Sub '${AWS::StackName}-StateMachineName'
+
+  NotificationTopicArn:
+    Description: 'ARN of the SNS topic for notifications'
+    Value: !Ref AccessKeyNotificationTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-NotificationTopicArn'
+
+  ApprovalApiUrl:
+    Description: 'URL of the Approval API Gateway'
+    Value: !Sub 'https://${ApprovalApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/approve'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApprovalApiUrl'
+
+  ApprovalRequestFunctionArn:
+    Description: 'ARN of the Approval Request Lambda function'
+    Value: !GetAtt ApprovalRequestFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ApprovalRequestFunctionArn'
+
+  ApprovalCallbackFunctionArn:
+    Description: 'ARN of the Approval Callback Lambda function'
+    Value: !GetAtt ApprovalCallbackFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ApprovalCallbackFunctionArn'
+
+  ScheduledExecutionRuleArn:
+    Condition: EnableScheduling
+    Description: 'ARN of the EventBridge rule for scheduled execution'
+    Value: !GetAtt ScheduledExecutionRule.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ScheduledExecutionRuleArn'
+
+  EventBridgeExecutionRoleArn:
+    Condition: EnableScheduling
+    Description: 'ARN of the EventBridge execution role'
+    Value: !GetAtt EventBridgeExecutionRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-EventBridgeExecutionRoleArn'
+
+  ApprovalTimeoutDays:
+    Description: 'Number of days before approval request expires'
+    Value: !Ref ApprovalTimeout
+    Export:
+      Name: !Sub '${AWS::StackName}-ApprovalTimeoutDays'

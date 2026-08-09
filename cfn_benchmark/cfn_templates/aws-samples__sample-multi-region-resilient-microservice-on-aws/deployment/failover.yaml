@@ -1,0 +1,309 @@
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+AWSTemplateFormatVersion: "2010-09-09"
+Description: 'ARC Region Switch Plan for Multi-Region Failover'
+
+Parameters:
+  Env:
+    Type: String
+    Default: ''
+    Description: String to enable multiple deployments per AWS region
+  PrimaryRegion:
+    Type: String
+    Description: Enter the Primary Region
+    Default: "us-east-1"
+  StandbyRegion:
+    Type: String
+    Description: Enter the Standby Region
+    Default: "us-west-2"
+  DomainName:
+    Type: String
+    Description: The domain name for the Route53 hosted zone
+    Default: "demo.io"
+  PrimaryClusterArn:
+    Type: String
+    Description: ARN of the ECS cluster in the primary region
+  StandbyClusterArn:
+    Type: String
+    Description: ARN of the ECS cluster in the standby region
+  PrimaryCatalogDbArn:
+    Type: String
+    Description: ARN of the Aurora catalog DB cluster in the primary region
+  StandbyCatalogDbArn:
+    Type: String
+    Description: ARN of the Aurora catalog DB cluster in the standby region
+  HostedZoneId:
+    Type: String
+    Description: Route 53 hosted zone ID for DNS failover
+
+Resources:
+  RegionSwitchExecutionRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: "ARC Region Switch requires broad permissions for cross-service failover orchestration."
+    Properties:
+      RoleName: !Sub 'RegionSwitchExecutionRole${Env}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: arc-region-switch.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RegionSwitchPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "arc-region-switch:GetPlan"
+                  - "arc-region-switch:GetPlanExecution"
+                  - "arc-region-switch:ListPlanExecutions"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "iam:SimulatePrincipalPolicy"
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/RegionSwitchExecutionRole${Env}'
+              - Effect: Allow
+                Action:
+                  - "cloudwatch:DescribeAlarms"
+                  - "cloudwatch:DescribeAlarmHistory"
+                  - "cloudwatch:GetMetricStatistics"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "ecs:DescribeServices"
+                  - "ecs:UpdateService"
+                Resource:
+                  - !Sub
+                    - 'arn:aws:ecs:${PrimaryRegion}:${AWS::AccountId}:service/${ClusterName}/*'
+                    - ClusterName: !Select [1, !Split ["/", !Ref PrimaryClusterArn]]
+                  - !Sub
+                    - 'arn:aws:ecs:${StandbyRegion}:${AWS::AccountId}:service/${ClusterName}/*'
+                    - ClusterName: !Select [1, !Split ["/", !Ref StandbyClusterArn]]
+              - Effect: Allow
+                Action:
+                  - "ecs:DescribeClusters"
+                Resource:
+                  - !Ref PrimaryClusterArn
+                  - !Ref StandbyClusterArn
+              - Effect: Allow
+                Action:
+                  - "ecs:ListServices"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "application-autoscaling:DescribeScalableTargets"
+                  - "application-autoscaling:RegisterScalableTarget"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "rds:DescribeGlobalClusters"
+                  - "rds:DescribeDBClusters"
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - "rds:FailoverGlobalCluster"
+                  - "rds:SwitchoverGlobalCluster"
+                Resource:
+                  - !Sub 'arn:aws:rds::${AWS::AccountId}:global-cluster:catalog-global-db-cluster${Env}'
+                  - !Ref PrimaryCatalogDbArn
+                  - !Ref StandbyCatalogDbArn
+              - Effect: Allow
+                Action:
+                  - "route53:ChangeResourceRecordSets"
+                  - "route53:GetHostedZone"
+                  - "route53:ListResourceRecordSets"
+                Resource:
+                  - !Sub
+                    - 'arn:aws:route53:::hostedzone/${HostedZoneId}'
+                    - HostedZoneId: !Ref HostedZoneId
+              - Effect: Allow
+                Action:
+                  - "route53:GetHealthCheck"
+                  - "route53:UpdateHealthCheck"
+                Resource: "arn:aws:route53:::healthcheck/*"
+
+  RegionSwitchPlan:
+    Type: AWS::ARCRegionSwitch::Plan
+    Properties:
+      # ARC RegionSwitch Plan Name has a 32-char max; the previous
+      # 'retail-store-ar-region-switch${Env}' was 29 chars + ENV and
+      # overflowed as soon as ENV was more than 3 chars. Shortened to
+      # leave ~24 chars of ENV headroom (we use a 7-char sha so current
+      # usage is 10 + 8 = 18 chars).
+      Name: !Sub 'mr-rs-plan${Env}'
+      ExecutionRole: !GetAtt RegionSwitchExecutionRole.Arn
+      RecoveryApproach: activeActive
+      PrimaryRegion: !Ref PrimaryRegion
+      Regions:
+        - !Ref PrimaryRegion
+        - !Ref StandbyRegion
+      Workflows:
+        - WorkflowTargetAction: deactivate
+          WorkflowDescription: "Scale up remaining region, failover catalog database, shift DNS away"
+          Steps:
+            - Name: scale-up-ecs-services
+              ExecutionBlockType: Parallel
+              ExecutionBlockConfiguration:
+                ParallelConfig:
+                  Steps:
+                    - Name: scale-carts
+                      ExecutionBlockType: ECSServiceScaling
+                      ExecutionBlockConfiguration:
+                        EcsCapacityIncreaseConfig:
+                          Services:
+                            - ClusterArn: !Ref PrimaryClusterArn
+                              ServiceArn:
+                                !Sub
+                                  - 'arn:aws:ecs:${PrimaryRegion}:${AWS::AccountId}:service/${ClusterName}/carts${Env}'
+                                  - ClusterName: !Select [1, !Split ["/", !Ref PrimaryClusterArn]]
+                            - ClusterArn: !Ref StandbyClusterArn
+                              ServiceArn:
+                                !Sub
+                                  - 'arn:aws:ecs:${StandbyRegion}:${AWS::AccountId}:service/${ClusterName}/carts${Env}'
+                                  - ClusterName: !Select [1, !Split ["/", !Ref StandbyClusterArn]]
+                          TargetPercent: 200
+                          CapacityMonitoringApproach: containerInsightsMaxInLast24Hours
+                          TimeoutMinutes: 15
+                    - Name: scale-orders
+                      ExecutionBlockType: ECSServiceScaling
+                      ExecutionBlockConfiguration:
+                        EcsCapacityIncreaseConfig:
+                          Services:
+                            - ClusterArn: !Ref PrimaryClusterArn
+                              ServiceArn:
+                                !Sub
+                                  - 'arn:aws:ecs:${PrimaryRegion}:${AWS::AccountId}:service/${ClusterName}/orders${Env}'
+                                  - ClusterName: !Select [1, !Split ["/", !Ref PrimaryClusterArn]]
+                            - ClusterArn: !Ref StandbyClusterArn
+                              ServiceArn:
+                                !Sub
+                                  - 'arn:aws:ecs:${StandbyRegion}:${AWS::AccountId}:service/${ClusterName}/orders${Env}'
+                                  - ClusterName: !Select [1, !Split ["/", !Ref StandbyClusterArn]]
+                          TargetPercent: 200
+                          CapacityMonitoringApproach: containerInsightsMaxInLast24Hours
+                          TimeoutMinutes: 15
+                    - Name: scale-assets
+                      ExecutionBlockType: ECSServiceScaling
+                      ExecutionBlockConfiguration:
+                        EcsCapacityIncreaseConfig:
+                          Services:
+                            - ClusterArn: !Ref PrimaryClusterArn
+                              ServiceArn:
+                                !Sub
+                                  - 'arn:aws:ecs:${PrimaryRegion}:${AWS::AccountId}:service/${ClusterName}/assets${Env}'
+                                  - ClusterName: !Select [1, !Split ["/", !Ref PrimaryClusterArn]]
+                            - ClusterArn: !Ref StandbyClusterArn
+                              ServiceArn:
+                                !Sub
+                                  - 'arn:aws:ecs:${StandbyRegion}:${AWS::AccountId}:service/${ClusterName}/assets${Env}'
+                                  - ClusterName: !Select [1, !Split ["/", !Ref StandbyClusterArn]]
+                          TargetPercent: 200
+                          CapacityMonitoringApproach: containerInsightsMaxInLast24Hours
+                          TimeoutMinutes: 15
+                    - Name: scale-catalog
+                      ExecutionBlockType: ECSServiceScaling
+                      ExecutionBlockConfiguration:
+                        EcsCapacityIncreaseConfig:
+                          Services:
+                            - ClusterArn: !Ref PrimaryClusterArn
+                              ServiceArn:
+                                !Sub
+                                  - 'arn:aws:ecs:${PrimaryRegion}:${AWS::AccountId}:service/${ClusterName}/catalog${Env}'
+                                  - ClusterName: !Select [1, !Split ["/", !Ref PrimaryClusterArn]]
+                            - ClusterArn: !Ref StandbyClusterArn
+                              ServiceArn:
+                                !Sub
+                                  - 'arn:aws:ecs:${StandbyRegion}:${AWS::AccountId}:service/${ClusterName}/catalog${Env}'
+                                  - ClusterName: !Select [1, !Split ["/", !Ref StandbyClusterArn]]
+                          TargetPercent: 200
+                          CapacityMonitoringApproach: containerInsightsMaxInLast24Hours
+                          TimeoutMinutes: 15
+                    - Name: scale-checkout
+                      ExecutionBlockType: ECSServiceScaling
+                      ExecutionBlockConfiguration:
+                        EcsCapacityIncreaseConfig:
+                          Services:
+                            - ClusterArn: !Ref PrimaryClusterArn
+                              ServiceArn:
+                                !Sub
+                                  - 'arn:aws:ecs:${PrimaryRegion}:${AWS::AccountId}:service/${ClusterName}/checkout${Env}'
+                                  - ClusterName: !Select [1, !Split ["/", !Ref PrimaryClusterArn]]
+                            - ClusterArn: !Ref StandbyClusterArn
+                              ServiceArn:
+                                !Sub
+                                  - 'arn:aws:ecs:${StandbyRegion}:${AWS::AccountId}:service/${ClusterName}/checkout${Env}'
+                                  - ClusterName: !Select [1, !Split ["/", !Ref StandbyClusterArn]]
+                          TargetPercent: 200
+                          CapacityMonitoringApproach: containerInsightsMaxInLast24Hours
+                          TimeoutMinutes: 15
+                    - Name: scale-ui
+                      ExecutionBlockType: ECSServiceScaling
+                      ExecutionBlockConfiguration:
+                        EcsCapacityIncreaseConfig:
+                          Services:
+                            - ClusterArn: !Ref PrimaryClusterArn
+                              ServiceArn:
+                                !Sub
+                                  - 'arn:aws:ecs:${PrimaryRegion}:${AWS::AccountId}:service/${ClusterName}/ui${Env}'
+                                  - ClusterName: !Select [1, !Split ["/", !Ref PrimaryClusterArn]]
+                            - ClusterArn: !Ref StandbyClusterArn
+                              ServiceArn:
+                                !Sub
+                                  - 'arn:aws:ecs:${StandbyRegion}:${AWS::AccountId}:service/${ClusterName}/ui${Env}'
+                                  - ClusterName: !Select [1, !Split ["/", !Ref StandbyClusterArn]]
+                          TargetPercent: 200
+                          CapacityMonitoringApproach: containerInsightsMaxInLast24Hours
+                          TimeoutMinutes: 15
+            - Name: failover-catalog-db
+              ExecutionBlockType: AuroraGlobalDatabase
+              ExecutionBlockConfiguration:
+                GlobalAuroraConfig:
+                  GlobalClusterIdentifier: !Sub 'catalog-global-db-cluster${Env}'
+                  DatabaseClusterArns:
+                    - !Ref PrimaryCatalogDbArn
+                    - !Ref StandbyCatalogDbArn
+                  Behavior: switchoverOnly
+                  Ungraceful:
+                    Ungraceful: failover
+                  TimeoutMinutes: 20
+            - Name: shift-dns-traffic-away
+              ExecutionBlockType: Route53HealthCheck
+              ExecutionBlockConfiguration:
+                Route53HealthCheckConfig:
+                  HostedZoneId: !Ref HostedZoneId
+                  RecordName: !Sub 'store.${DomainName}'
+                  RecordSets:
+                    - RecordSetIdentifier: PrimaryRegion
+                      Region: !Ref PrimaryRegion
+                    - RecordSetIdentifier: StandbyRegion
+                      Region: !Ref StandbyRegion
+                  TimeoutMinutes: 5
+        - WorkflowTargetAction: activate
+          WorkflowDescription: "Re-enable region in DNS"
+          Steps:
+            - Name: restore-dns-traffic
+              ExecutionBlockType: Route53HealthCheck
+              ExecutionBlockConfiguration:
+                Route53HealthCheckConfig:
+                  HostedZoneId: !Ref HostedZoneId
+                  RecordName: !Sub 'store.${DomainName}'
+                  RecordSets:
+                    - RecordSetIdentifier: PrimaryRegion
+                      Region: !Ref PrimaryRegion
+                    - RecordSetIdentifier: StandbyRegion
+                      Region: !Ref StandbyRegion
+                  TimeoutMinutes: 5
+
+Outputs:
+  RegionSwitchPlanArn:
+    Description: ARN of the ARC Region Switch Plan
+    Value: !Ref RegionSwitchPlan
+  RegionSwitchExecutionRoleArn:
+    Description: ARN of the Region Switch Execution Role
+    Value: !GetAtt RegionSwitchExecutionRole.Arn

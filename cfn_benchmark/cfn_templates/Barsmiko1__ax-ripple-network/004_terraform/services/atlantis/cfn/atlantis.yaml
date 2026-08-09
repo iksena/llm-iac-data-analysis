@@ -1,0 +1,229 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  Atlantis Service — ECS Task, Service, IAM, Logs
+  Deploys Atlantis into the shared ECS cluster for PR-driven Terraform automation.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  PrivateSubnetIds:
+    Type: CommaDelimitedList
+  AtlantisSGId:
+    Type: String
+  ECSClusterArn:
+    Type: String
+    Description: Shared ECS Cluster ARN
+  ECSTaskExecutionRoleArn:
+    Type: String
+    Description: Shared ECS Task Execution Role ARN
+  ServiceDiscoveryNamespaceId:
+    Type: String
+    Description: Shared Service Discovery namespace ID
+  AtlantisImage:
+    Type: String
+    Default: "ghcr.io/runatlantis/atlantis:v0.28.0"
+  GitHubTokenSecretArn:
+    Type: String
+    Description: Secrets Manager ARN for GitHub token
+  GitHubWebhookSecretArn:
+    Type: String
+    Description: Secrets Manager ARN for GitHub webhook secret
+  AtlantisRepoAllowlist:
+    Type: String
+    Description: Repos Atlantis is allowed to manage
+  GitHubUser:
+    Type: String
+    Description: GitHub username or bot account for Atlantis to comment on PRs
+  AtlantisURL:
+    Type: String
+    Description: Public URL for Atlantis (used by GitHub webhooks)
+    Default: ""
+  TaskCpu:
+    Type: String
+    Default: "512"
+  TaskMemory:
+    Type: String
+    Default: "1024"
+
+Conditions:
+  HasAtlantisURL: !Not [!Equals [!Ref AtlantisURL, ""]]
+
+Resources:
+  # ===========================================================================
+  # CloudWatch Log Group
+  # ===========================================================================
+  AtlantisLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/ecs/ax-ripple-${Environment}/atlantis"
+      RetentionInDays: 30
+
+  # ===========================================================================
+  # Service Discovery
+  # ===========================================================================
+  AtlantisServiceDiscovery:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: atlantis
+      NamespaceId: !Ref ServiceDiscoveryNamespaceId
+      DnsConfig:
+        RoutingPolicy: MULTIVALUE
+        DnsRecords:
+          - Type: A
+            TTL: 10
+      HealthCheckCustomConfig:
+        FailureThreshold: 1
+
+  # ===========================================================================
+  # IAM — Atlantis Task Role (needs Terraform + CFN + state access)
+  # ===========================================================================
+  AtlantisTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ax-ripple-${Environment}-atlantis-task"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AtlantisTerraformPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # Terraform state access
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:s3:::ax-ripple-network-terraform-state"
+                  - !Sub "arn:${AWS::Partition}:s3:::ax-ripple-network-terraform-state/*"
+              # DynamoDB state locking
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/ax-ripple-network-terraform-locks"
+              # CloudFormation (Terraform provisions CFN stacks)
+              - Effect: Allow
+                Action:
+                  - cloudformation:*
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/ax-ripple-*"
+              # EC2, ECS, IAM, ECR, etc. for CFN stack resources
+              - Effect: Allow
+                Action:
+                  - ec2:*
+                  - ecs:*
+                  - ecr:*
+                  - iam:*
+                  - logs:*
+                  - elasticfilesystem:*
+                  - servicediscovery:*
+                  - autoscaling:*
+                  - ssm:GetParameter*
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                  - secretsmanager:ListSecrets
+                  - secretsmanager:GetResourcePolicy
+                Resource: "*"
+
+  # ===========================================================================
+  # ECS Task Definition
+  # ===========================================================================
+  AtlantisTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "ax-ripple-${Environment}-atlantis"
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      ExecutionRoleArn: !Ref ECSTaskExecutionRoleArn
+      TaskRoleArn: !GetAtt AtlantisTaskRole.Arn
+      ContainerDefinitions:
+        - Name: atlantis
+          Image: !Ref AtlantisImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: 4141
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AtlantisLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: atlantis
+          HealthCheck:
+            Command: ["CMD-SHELL", "curl -sf http://localhost:4141/healthz || exit 1"]
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 30
+          Environment:
+            - Name: ATLANTIS_PORT
+              Value: "4141"
+            - Name: ATLANTIS_GH_USER
+              Value: !Ref GitHubUser
+            - Name: ATLANTIS_REPO_ALLOWLIST
+              Value: !Ref AtlantisRepoAllowlist
+            - Name: ATLANTIS_ATLANTIS_URL
+              Value: !If
+                - HasAtlantisURL
+                - !Ref AtlantisURL
+                - !Sub "http://atlantis.${Environment}.local:4141"
+            - Name: ATLANTIS_REPO_CONFIG_JSON
+              Value: '{"repos":[{"id":"/.*/","allowed_overrides":["workflow","apply_requirements"],"allow_custom_workflows":true}]}'
+            - Name: TF_PLUGIN_CACHE_DIR
+              Value: ""
+          Secrets:
+            - Name: ATLANTIS_GH_TOKEN
+              ValueFrom: !Ref GitHubTokenSecretArn
+            - Name: ATLANTIS_GH_WEBHOOK_SECRET
+              ValueFrom: !Ref GitHubWebhookSecretArn
+
+  # ===========================================================================
+  # ECS Service
+  # ===========================================================================
+  AtlantisService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "ax-ripple-${Environment}-atlantis"
+      Cluster: !Ref ECSClusterArn
+      TaskDefinition: !Ref AtlantisTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PrivateSubnetIds
+          SecurityGroups:
+            - !Ref AtlantisSGId
+      ServiceRegistries:
+        - RegistryArn: !GetAtt AtlantisServiceDiscovery.Arn
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      EnableExecuteCommand: true
+
+Outputs:
+  AtlantisServiceName:
+    Description: Atlantis ECS Service Name
+    Value: !GetAtt AtlantisService.Name
+    Export:
+      Name: !Sub "${AWS::StackName}-AtlantisServiceName"
+
+  AtlantisURL:
+    Description: Atlantis webhook/UI endpoint
+    Value: !Sub "http://atlantis.${Environment}.local:4141"
+    Export:
+      Name: !Sub "${AWS::StackName}-AtlantisURL"

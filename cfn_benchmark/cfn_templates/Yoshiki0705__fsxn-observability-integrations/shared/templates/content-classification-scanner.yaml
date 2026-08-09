@@ -1,0 +1,536 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  FSx for ONTAP Content-Level PII Classification Scanner (CSF 2.0 Identify).
+  Scans files via an S3 Access Point using Amazon Comprehend
+  DetectPiiEntities. QUICK START: leave VpcId empty to deploy outside any
+  VPC — this is the simplest path and requires only an internet-origin S3
+  Access Point (check with `aws s3control get-access-point --account-id
+  <id> --name <ap-name> --query NetworkOrigin`; "Internet" works with the
+  default parameters below, "VPC" requires setting VpcId/SubnetIds/
+  SecurityGroupId/RouteTableIds to the VPC the access point is bound to).
+  No FSx control-plane API calls are made by this stack, so it has no
+  dependency on any FSx Interface VPC Endpoint even when VpcId is set.
+  Stack name pattern: fsxn-content-classification
+
+Parameters:
+  VpcId:
+    Type: String
+    Description: >-
+      VPC ID to run the scanner Lambda inside. Leave empty (default) to
+      deploy outside any VPC — the simplest path, and the only requirement
+      is that the access_point_arn you invoke with is an Internet-origin
+      S3 Access Point (verify with `aws s3control get-access-point
+      --account-id <account-id> --name <ap-name> --query NetworkOrigin`).
+      Set this ONLY if the access_point_arn you plan to scan is VPC-scoped
+      (NetworkOrigin=VPC, e.g., one created by restore-verification.yaml's
+      AttachAccessPoint step) — a VPC-scoped access point has no route from
+      outside its bound VPC, so the Lambda must run inside that same VPC.
+      When set, also set SubnetIds/SecurityGroupId/RouteTableIds below to
+      match that VPC.
+    Default: ''
+    AllowedPattern: '^(vpc-[0-9a-f]{8,17})?$'
+
+  SubnetIds:
+    Type: CommaDelimitedList
+    Description: >-
+      Private subnet IDs for the scanner Lambda. Required if VpcId is set;
+      ignored otherwise. Leave as the default single empty-string entry
+      when VpcId is empty.
+    Default: ''
+
+  SecurityGroupId:
+    Type: String
+    Description: >-
+      Security Group ID for the scanner Lambda (egress to VPC Endpoints).
+      Required if VpcId is set; ignored otherwise.
+    Default: ''
+    AllowedPattern: '^(sg-[0-9a-f]{8,17})?$'
+
+  RouteTableIds:
+    Type: CommaDelimitedList
+    Description: >-
+      Route table IDs associated with SubnetIds. Used to attach the S3 and
+      DynamoDB Gateway VPC Endpoints the scanner needs when running inside
+      a VPC. Required if VpcId is set and CreateVpcEndpoints=true; ignored
+      otherwise.
+    Default: ''
+
+  CreateVpcEndpoints:
+    Type: String
+    Description: >-
+      When VpcId is set, create VPC Endpoints for S3 and DynamoDB (Gateway)
+      plus Comprehend and SNS (Interface) so the in-VPC scanner Lambda can
+      reach the access point, report table, PII detection API, and
+      notifications. Set to 'false' if your VPC already has all four —
+      check first with `aws ec2 describe-vpc-endpoints --filters
+      Name=vpc-id,Values=<your-vpc-id>` (a second Interface Endpoint for a
+      service that already has one fails with a PrivateDnsEnabled conflict
+      and rolls back this whole stack). If reusing restore-verification.
+      yaml's VPC: that stack creates Secrets Manager/STS/FSx/S3-Gateway
+      endpoints, none of which overlap with this stack's Comprehend/
+      DynamoDB/SNS/S3-Gateway set except S3 — if that stack's
+      CreateS3GatewayEndpoint was 'true', check for that existing S3
+      Gateway Endpoint before setting this to 'true' (a second S3 Gateway
+      Endpoint bound to the same route tables is rejected as a duplicate).
+      Ignored if VpcId is empty.
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  LambdaMemorySize:
+    Type: Number
+    Description: Lambda memory size in MB for the scanner function
+    Default: 512
+    AllowedValues: [256, 512, 1024, 2048]
+
+  LambdaTimeoutSeconds:
+    Type: Number
+    Description: >-
+      Lambda timeout in seconds. Scanning many/large files against
+      Comprehend can take time — size this to your expected file count.
+    Default: 600
+    MinValue: 60
+    MaxValue: 900
+
+  DefaultLanguageCode:
+    Type: String
+    Description: Default Amazon Comprehend language code for DetectPiiEntities
+    Default: en
+    AllowedValues: [en, es, fr, de, it, pt, ar, hi, ja, ko, zh, zh-TW]
+
+  DefaultMaxFiles:
+    Type: Number
+    Description: Default cap on files scanned per invocation (cost/runtime control)
+    Default: 500
+    MinValue: 1
+    MaxValue: 10000
+
+  NotificationTopicArn:
+    Type: String
+    Description: >-
+      SNS Topic ARN for classification report notifications. Leave empty
+      to skip notifications.
+    Default: ''
+
+Conditions:
+  HasNotificationTopic: !Not [!Equals [!Ref NotificationTopicArn, '']]
+  HasVpc: !Not [!Equals [!Ref VpcId, '']]
+  ShouldCreateVpcEndpoints: !And
+    - !Condition HasVpc
+    - !Equals [!Ref CreateVpcEndpoints, 'true']
+
+Resources:
+  # ================================================================
+  # VPC Endpoints — only created when VpcId is set and
+  # CreateVpcEndpoints=true. Required so the in-VPC scanner Lambda can
+  # reach: the VPC-scoped S3 Access Point being scanned (S3 Gateway), the
+  # DynamoDB report table (DynamoDB Gateway), Comprehend DetectPiiEntities
+  # (Comprehend Interface), and SNS notifications (SNS Interface).
+  # ================================================================
+  S3GatewayVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: !Ref RouteTableIds
+
+  DynamoDbGatewayVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.dynamodb'
+      VpcEndpointType: Gateway
+      RouteTableIds: !Ref RouteTableIds
+
+  ComprehendVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.comprehend'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  SnsVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sns'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: ShouldCreateVpcEndpoints
+    Properties:
+      GroupDescription: Allow scanner Lambda to access Interface VPC Endpoints (Comprehend, SNS)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref SecurityGroupId
+          Description: Lambda SG to VPC Endpoint (HTTPS)
+
+  # ================================================================
+  # DynamoDB — classification report ledger
+  # ================================================================
+  ClassificationReportTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-reports'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: access_point_arn
+          AttributeType: S
+        - AttributeName: started_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: access_point_arn
+          KeyType: HASH
+        - AttributeName: started_at
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: fsxn-observability
+        - Key: Purpose
+          Value: content-classification-report
+
+  # ================================================================
+  # Lambda Execution Role
+  # ================================================================
+  ScannerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      # Attached unconditionally — harmless when VpcId is empty (the
+      # scanner Lambda simply won't have ENIs to manage), and avoids a
+      # Fn::If on ManagedPolicyArns.
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: ContentClassificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3AccessPointObjectRead
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:${AWS::Region}:${AWS::AccountId}:accesspoint/*'
+                  - !Sub 'arn:aws:s3:${AWS::Region}:${AWS::AccountId}:accesspoint/*/object/*'
+              - Sid: ComprehendDetectPii
+                Effect: Allow
+                Action:
+                  - comprehend:DetectPiiEntities
+                Resource: '*'
+                # DetectPiiEntities does not support resource-level
+                # permissions (it is a synchronous, stateless inference
+                # API with no addressable resource).
+              - Sid: DynamoDbReportLedger
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt ClassificationReportTable.Arn
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If
+                  - HasNotificationTopic
+                  - !Ref NotificationTopicArn
+                  - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:*'
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-scanner:*'
+
+  ScannerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-scanner'
+      RetentionInDays: 365  # classification reports double as CSF 2.0 Identify evidence
+
+  # ================================================================
+  # Lambda — Content Classification Scanner
+  # ================================================================
+  ScannerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-scanner'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeoutSeconds
+      Role: !GetAtt ScannerLambdaRole.Arn
+      # Only set VpcConfig when VpcId is provided. A VPC-scoped S3 Access
+      # Point (e.g., from restore-verification.yaml's AttachAccessPoint
+      # step) has no route from outside its bound VPC, so scanning one
+      # requires this Lambda to run inside that VPC — see the Description
+      # above and Security Considerations in content-classification-scanner.md.
+      VpcConfig: !If
+        - HasVpc
+        - SubnetIds: !Ref SubnetIds
+          SecurityGroupIds:
+            - !Ref SecurityGroupId
+        - !Ref 'AWS::NoValue'
+      Environment:
+        Variables:
+          REPORT_TABLE_NAME: !Ref ClassificationReportTable
+          DEFAULT_LANGUAGE_CODE: !Ref DefaultLanguageCode
+          DEFAULT_MAX_FILES: !Ref DefaultMaxFiles
+          NOTIFICATION_TOPIC_ARN: !If [HasNotificationTopic, !Ref NotificationTopicArn, '']
+      Code:
+        ZipFile: |
+          """Content-level PII discovery scanner (CSF 2.0 Identify function).
+
+          Invocation input (direct Lambda invoke or Step Functions task):
+          {
+              "access_point_arn": "arn:aws:s3:...:accesspoint/...",  // required
+              "language_code": "en",                                  // optional
+              "max_files": 500                                        // optional
+          }
+
+          Scans scannable text/structured-data files exposed via the given
+          S3 Access Point for PII entities using Amazon Comprehend
+          DetectPiiEntities, aggregates findings, writes a report to
+          DynamoDB, and optionally notifies via SNS.
+
+          Does NOT create or manage the S3 Access Point itself — pass the
+          ARN of an existing one (e.g., from restore-verification.yaml's
+          AttachAccessPoint step, or any other FSx for ONTAP S3 Access Point
+          you want to classify).
+          """
+          import json
+          import logging
+          import os
+          from dataclasses import dataclass, field
+          from datetime import datetime, timezone
+          from typing import Any
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          s3 = boto3.client("s3")
+          comprehend = boto3.client("comprehend")
+          dynamodb = boto3.resource("dynamodb")
+          sns = boto3.client("sns")
+
+          COMPREHEND_MAX_BYTES = 100_000
+          CHUNK_SAFETY_MARGIN_BYTES = 2_000
+          CHUNK_TARGET_BYTES = COMPREHEND_MAX_BYTES - CHUNK_SAFETY_MARGIN_BYTES
+
+          SCANNABLE_EXTENSIONS = frozenset({
+              ".txt", ".csv", ".tsv", ".json", ".xml", ".log", ".md",
+              ".yaml", ".yml", ".ini", ".conf", ".sql", ".html", ".htm",
+          })
+
+          DEFAULT_MAX_FILE_BYTES = 5_000_000
+          DEFAULT_SAMPLE_BYTES = 500_000
+
+          COMPREHEND_SUPPORTED_LANGUAGES = frozenset({
+              "en", "es", "fr", "de", "it", "pt", "ar", "hi", "ja", "ko", "zh", "zh-TW",
+          })
+
+          def _chunk_text(text, target_bytes=CHUNK_TARGET_BYTES):
+              if not text:
+                  return []
+              chunks = []
+              current_lines, current_bytes = [], 0
+              for line in text.splitlines(keepends=True):
+                  line_bytes = len(line.encode("utf-8"))
+                  if line_bytes > target_bytes:
+                      if current_lines:
+                          chunks.append("".join(current_lines))
+                          current_lines, current_bytes = [], 0
+                      encoded = line.encode("utf-8")
+                      for i in range(0, len(encoded), target_bytes):
+                          chunks.append(encoded[i:i + target_bytes].decode("utf-8", errors="ignore"))
+                      continue
+                  if current_bytes + line_bytes > target_bytes and current_lines:
+                      chunks.append("".join(current_lines))
+                      current_lines, current_bytes = [], 0
+                  current_lines.append(line)
+                  current_bytes += line_bytes
+              if current_lines:
+                  chunks.append("".join(current_lines))
+              return chunks
+
+          def _classify_object(access_point_arn, key, size_bytes, language_code):
+              sampled = size_bytes > DEFAULT_MAX_FILE_BYTES
+              finding = {"key": key, "size_bytes": size_bytes, "sampled": sampled,
+                         "entity_counts": {}, "highest_confidence_by_type": {}, "error": ""}
+
+              try:
+                  if sampled:
+                      resp = s3.get_object(Bucket=access_point_arn, Key=key,
+                                           Range=f"bytes=0-{DEFAULT_SAMPLE_BYTES - 1}")
+                  else:
+                      resp = s3.get_object(Bucket=access_point_arn, Key=key)
+                  raw = resp["Body"].read()
+              except ClientError as e:
+                  finding["error"] = f"read_failed: {e}"
+                  return finding
+
+              text = raw.decode("utf-8", errors="ignore")
+              if not text.strip():
+                  return finding
+
+              for chunk in _chunk_text(text):
+                  if not chunk.strip():
+                      continue
+                  try:
+                      resp = comprehend.detect_pii_entities(Text=chunk, LanguageCode=language_code)
+                  except ClientError as e:
+                      finding["error"] = f"comprehend_failed: {e}"
+                      continue
+                  for entity in resp.get("Entities", []):
+                      etype = entity.get("Type", "UNKNOWN")
+                      score = entity.get("Score", 0.0)
+                      finding["entity_counts"][etype] = finding["entity_counts"].get(etype, 0) + 1
+                      finding["highest_confidence_by_type"][etype] = max(
+                          finding["highest_confidence_by_type"].get(etype, 0.0), score
+                      )
+
+              return finding
+
+          def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+              access_point_arn = event["access_point_arn"]
+              language_code = event.get("language_code", os.environ.get("DEFAULT_LANGUAGE_CODE", "en"))
+              max_files = int(event.get("max_files", os.environ.get("DEFAULT_MAX_FILES", "500")))
+
+              if language_code not in COMPREHEND_SUPPORTED_LANGUAGES:
+                  raise ValueError(
+                      f"Unsupported language_code '{language_code}' — must be one of "
+                      f"{sorted(COMPREHEND_SUPPORTED_LANGUAGES)}"
+                  )
+
+              started_at = datetime.now(timezone.utc).isoformat()
+              files_scanned = 0
+              files_skipped_unscannable = 0
+              files_sampled_too_large = 0
+              files_with_pii = 0
+              pii_density_by_type = {}
+              findings = []
+
+              paginator = s3.get_paginator("list_objects_v2")
+              for page in paginator.paginate(Bucket=access_point_arn, MaxKeys=1000):
+                  for obj in page.get("Contents", []):
+                      if files_scanned >= max_files:
+                          break
+                      key = obj["Key"]
+                      size_bytes = obj.get("Size", 0)
+                      lower_key = key.lower()
+
+                      if not any(lower_key.endswith(ext) for ext in SCANNABLE_EXTENSIONS):
+                          files_skipped_unscannable += 1
+                          continue
+                      if size_bytes == 0:
+                          continue
+
+                      finding = _classify_object(access_point_arn, key, size_bytes, language_code)
+                      files_scanned += 1
+
+                      if finding["sampled"]:
+                          files_sampled_too_large += 1
+                      if finding["entity_counts"]:
+                          files_with_pii += 1
+                          findings.append(finding)
+                          for etype, count in finding["entity_counts"].items():
+                              pii_density_by_type[etype] = pii_density_by_type.get(etype, 0) + count
+                      elif finding["error"]:
+                          findings.append(finding)
+                  if files_scanned >= max_files:
+                      break
+
+              completed_at = datetime.now(timezone.utc).isoformat()
+              report = {
+                  "access_point_arn": access_point_arn,
+                  "started_at": started_at,
+                  "completed_at": completed_at,
+                  "language_code": language_code,
+                  "files_scanned": files_scanned,
+                  "files_skipped_unscannable": files_skipped_unscannable,
+                  "files_sampled_too_large": files_sampled_too_large,
+                  "files_with_pii": files_with_pii,
+                  "pii_density_by_type": pii_density_by_type,
+                  "findings": findings[:100],
+                  "finding_count": len(findings),
+              }
+
+              table = dynamodb.Table(os.environ["REPORT_TABLE_NAME"])
+              table.put_item(Item=json.loads(json.dumps(report), parse_float=str))
+
+              logger.info(
+                  "Classification complete: %d files scanned, %d with PII, %d unscannable skipped",
+                  files_scanned, files_with_pii, files_skipped_unscannable,
+              )
+
+              topic_arn = os.environ.get("NOTIFICATION_TOPIC_ARN")
+              if topic_arn and files_with_pii > 0:
+                  try:
+                      sns.publish(
+                          TopicArn=topic_arn,
+                          Subject=f"[FSx-ONTAP PII Scan] {files_with_pii} file(s) with PII found"[:100],
+                          Message=json.dumps(
+                              {k: v for k, v in report.items() if k != "findings"},
+                              indent=2, default=str,
+                          ),
+                      )
+                  except Exception as e:
+                      logger.warning("Notification failed: %s", e)
+
+              return report
+
+Outputs:
+  ScannerFunctionArn:
+    Description: >-
+      Content classification scanner Lambda ARN. Invoke directly with
+      {"access_point_arn": "..."} or chain after the restore-verification.yaml
+      workflow's AttachAccessPoint step (e.g., via Step Functions or a
+      scheduled EventBridge rule targeting an S3 Access Point you manage
+      separately). If VpcId was set at deploy time, this function only
+      reaches VPC-scoped access points bound to that same VPC (and
+      internet-origin ones, via the VPC's own internet/NAT path if
+      present) — if VpcId was left empty, this function only reaches
+      internet-origin access points.
+    Value: !GetAtt ScannerFunction.Arn
+
+  ReportTableName:
+    Description: DynamoDB table name for classification reports
+    Value: !Ref ClassificationReportTable
+
+  InvokeExample:
+    Description: Example AWS CLI command to invoke the scanner
+    Value: !Sub >-
+      aws lambda invoke --function-name ${ScannerFunction}
+      --payload '{"access_point_arn":"arn:aws:s3:REGION:ACCOUNT:accesspoint/NAME","language_code":"en","max_files":500}'
+      --cli-binary-format raw-in-base64-out response.json

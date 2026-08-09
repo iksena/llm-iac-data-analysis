@@ -1,0 +1,685 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Vehicle Catalog API - Phase 1.
+  HTTP API + healthcheck Lambda (Phase 0), plus the stateful foundation:
+  a DynamoDB table with a make->model sort index, a private uploads bucket,
+  and a private archive bucket that auto-expires objects after 30 days.
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - prod
+    Description: Deployment stage name.
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures:
+      - arm64
+    MemorySize: 256
+    Timeout: 10
+    Tracing: Active
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: vehicle-catalog
+        POWERTOOLS_METRICS_NAMESPACE: VehicleCatalog
+        LOG_LEVEL: INFO
+  Api:
+    Cors:
+      AllowMethods: "'GET,POST,PATCH,DELETE,OPTIONS'"
+      AllowHeaders: "'Content-Type,Authorization'"
+      AllowOrigin: "'*'"
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Data: one DynamoDB table for car-type records.
+  # Primary key: carId (UUID). On-demand billing = no capacity to manage and
+  # effectively free at demo scale. One GSI supports "list all cars sorted by
+  # make then model" with clean pagination (all items share entityType="CAR",
+  # sorted by makeModelSort). begins_with(make#) on that index also enables
+  # filtering by make later, without a second index.
+  # ---------------------------------------------------------------------------
+  CarsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub 'vehicle-catalog-cars-${Stage}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: carId
+          AttributeType: S
+        - AttributeName: entityType
+          AttributeType: S
+        - AttributeName: makeModelSort
+          AttributeType: S
+      KeySchema:
+        - AttributeName: carId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: makeModelIndex
+          KeySchema:
+            - AttributeName: entityType
+              KeyType: HASH
+            - AttributeName: makeModelSort
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # Files: private bucket for uploaded images/documents.
+  # Public access fully blocked; encrypted at rest. CORS allows the browser to
+  # PUT directly to S3 via presigned URLs (added in Phase 3).
+  # ---------------------------------------------------------------------------
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods:
+              - GET
+              - PUT
+              - HEAD
+            AllowedOrigins:
+              - '*'
+            AllowedHeaders:
+              - '*'
+            ExposedHeaders:
+              - ETag
+
+  # ---------------------------------------------------------------------------
+  # Archive: deleted records + their files are copied here (Phase 4). A
+  # lifecycle rule permanently deletes anything older than 30 days - no code,
+  # no scheduled job. Private and encrypted.
+  # ---------------------------------------------------------------------------
+  ArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAfter30Days
+            Status: Enabled
+            ExpirationInDays: 30
+
+  # ---------------------------------------------------------------------------
+  # API + healthcheck (from Phase 0).
+  # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # Authentication (Cognito). Users are created by an administrator - there is
+  # no public sign-up, since this pool guards the internal manage console.
+  # API Gateway validates the JWT natively, so no auth code runs in Lambda.
+  # ---------------------------------------------------------------------------
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub 'vehicle-catalog-users-${Stage}'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: !Sub 'vehicle-catalog-web-${Stage}'
+      # Public browser client: no secret, username/password auth flow.
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Stage
+      Auth:
+        # Declared but NOT set as the default: read routes stay public and
+        # write routes opt in individually.
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+              audience:
+                - !Ref UserPoolClient
+      CorsConfiguration:
+        AllowMethods:
+          - GET
+          - POST
+          - PATCH
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        AllowOrigins:
+          - '*'
+
+  HealthCheckFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: node22
+        Sourcemap: false
+        EntryPoints:
+          - handlers/healthcheck.ts
+    Properties:
+      CodeUri: src/
+      Handler: healthcheck.handler
+      Description: Simple healthcheck to verify the deploy pipeline.
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /health
+            Method: GET
+
+  # ---------------------------------------------------------------------------
+  # CRUD functions (Phase 2). One Lambda per endpoint, each with least-
+  # privilege access to the table via SAM policy templates.
+  # ---------------------------------------------------------------------------
+  CreateCarFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: node22
+        Sourcemap: false
+        EntryPoints:
+          - handlers/createCar.ts
+        External:
+          - '@aws-sdk/*'
+    Properties:
+      CodeUri: src/
+      Handler: createCar.handler
+      Description: Create a car (rejects duplicate make+model+year).
+      Environment:
+        Variables:
+          CARS_TABLE_NAME: !Ref CarsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CarsTable
+      Events:
+        Create:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cars
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  GetAllCarsFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: node22
+        Sourcemap: false
+        EntryPoints:
+          - handlers/getAllCars.ts
+        External:
+          - '@aws-sdk/*'
+    Properties:
+      CodeUri: src/
+      Handler: getAllCars.handler
+      Description: List all cars, sorted by make then model, paginated.
+      Environment:
+        Variables:
+          CARS_TABLE_NAME: !Ref CarsTable
+          UPLOADS_BUCKET: !Ref UploadsBucket
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CarsTable
+        - S3ReadPolicy:
+            BucketName: !Ref UploadsBucket
+      Events:
+        GetAll:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cars
+            Method: GET
+
+  GetCarByIdFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: node22
+        Sourcemap: false
+        EntryPoints:
+          - handlers/getCarById.ts
+        External:
+          - '@aws-sdk/*'
+    Properties:
+      CodeUri: src/
+      Handler: getCarById.handler
+      Description: Get one car by id, with presigned view URLs for its files.
+      Environment:
+        Variables:
+          CARS_TABLE_NAME: !Ref CarsTable
+          UPLOADS_BUCKET: !Ref UploadsBucket
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref CarsTable
+        - S3ReadPolicy:
+            BucketName: !Ref UploadsBucket
+      Events:
+        GetById:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cars/{id}
+            Method: GET
+
+  UpdateCarFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: node22
+        Sourcemap: false
+        EntryPoints:
+          - handlers/updateCar.ts
+        External:
+          - '@aws-sdk/*'
+    Properties:
+      CodeUri: src/
+      Handler: updateCar.handler
+      Description: Partially update a car (PATCH) with optimistic locking.
+      Environment:
+        Variables:
+          CARS_TABLE_NAME: !Ref CarsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CarsTable
+      Events:
+        Update:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cars/{id}
+            Method: PATCH
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  DeleteCarFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: node22
+        Sourcemap: false
+        EntryPoints:
+          - handlers/deleteCar.ts
+        External:
+          - '@aws-sdk/*'
+    Properties:
+      CodeUri: src/
+      Handler: deleteCar.handler
+      Description: Delete a car by id, archiving the record and its files first.
+      Environment:
+        Variables:
+          CARS_TABLE_NAME: !Ref CarsTable
+          UPLOADS_BUCKET: !Ref UploadsBucket
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CarsTable
+        - S3CrudPolicy:
+            BucketName: !Ref UploadsBucket
+        - S3WritePolicy:
+            BucketName: !Ref ArchiveBucket
+      Events:
+        Delete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cars/{id}
+            Method: DELETE
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ---------------------------------------------------------------------------
+  # File upload (Phase 3). Issues a presigned PUT URL so the client uploads
+  # straight to S3, and records the file's object key on the car record.
+  # ---------------------------------------------------------------------------
+  RequestUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: node22
+        Sourcemap: false
+        EntryPoints:
+          - handlers/requestUploadUrl.ts
+        External:
+          - '@aws-sdk/*'
+    Properties:
+      CodeUri: src/
+      Handler: requestUploadUrl.handler
+      Description: Issue a presigned S3 upload URL and record the file reference.
+      Environment:
+        Variables:
+          CARS_TABLE_NAME: !Ref CarsTable
+          UPLOADS_BUCKET: !Ref UploadsBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CarsTable
+        - S3WritePolicy:
+            BucketName: !Ref UploadsBucket
+      Events:
+        Upload:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cars/{id}/files
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ---------------------------------------------------------------------------
+  # Delete a single file from a car (Phase: file management).
+  # ---------------------------------------------------------------------------
+  DeleteFileFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: node22
+        Sourcemap: false
+        EntryPoints:
+          - handlers/deleteFile.ts
+        External:
+          - '@aws-sdk/*'
+    Properties:
+      CodeUri: src/
+      Handler: deleteFile.handler
+      Description: Archive one file to the 30-day bucket, then remove it from the car.
+      Environment:
+        Variables:
+          CARS_TABLE_NAME: !Ref CarsTable
+          UPLOADS_BUCKET: !Ref UploadsBucket
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref CarsTable
+        - S3CrudPolicy:
+            BucketName: !Ref UploadsBucket
+        - S3WritePolicy:
+            BucketName: !Ref ArchiveBucket
+      Events:
+        DeleteFile:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /cars/{id}/files
+            Method: DELETE
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ---------------------------------------------------------------------------
+  # Deleted-cars listing + restore (soft-delete recovery).
+  # ---------------------------------------------------------------------------
+  ListDeletedFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: node22
+        Sourcemap: false
+        EntryPoints:
+          - handlers/listDeleted.ts
+        External:
+          - '@aws-sdk/*'
+    Properties:
+      CodeUri: src/
+      Handler: listDeleted.handler
+      Description: List archived (deleted) cars available for restore.
+      Environment:
+        Variables:
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref ArchiveBucket
+      Events:
+        ListDeleted:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /deleted
+            Method: GET
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  RestoreCarFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: node22
+        Sourcemap: false
+        EntryPoints:
+          - handlers/restoreCar.ts
+        External:
+          - '@aws-sdk/*'
+    Properties:
+      CodeUri: src/
+      Handler: restoreCar.handler
+      Description: Restore an archived car (record + files) back to the catalog.
+      Environment:
+        Variables:
+          CARS_TABLE_NAME: !Ref CarsTable
+          UPLOADS_BUCKET: !Ref UploadsBucket
+          ARCHIVE_BUCKET: !Ref ArchiveBucket
+      Policies:
+        - DynamoDBWritePolicy:
+            TableName: !Ref CarsTable
+        - S3CrudPolicy:
+            BucketName: !Ref ArchiveBucket
+        - S3WritePolicy:
+            BucketName: !Ref UploadsBucket
+      Events:
+        Restore:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /deleted/{id}/restore
+            Method: POST
+            Auth:
+              Authorizer: CognitoAuthorizer
+
+  # ---------------------------------------------------------------------------
+  # Observability (Phase 5): alert when the API returns server errors.
+  # ---------------------------------------------------------------------------
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: !Sub 'vehicle-catalog-alarms-${Stage}'
+
+  ApiServerErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'vehicle-catalog-api-5xx-${Stage}'
+      AlarmDescription: The API returned one or more HTTP 5xx responses.
+      Namespace: AWS/ApiGatewayV2
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref HttpApi
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  # ---------------------------------------------------------------------------
+  # Static site hosting (Phase 7): private S3 bucket served through CloudFront
+  # via Origin Access Control. The bucket is never public - only CloudFront can
+  # read it. CloudFront supplies HTTPS and a global CDN, both free-tier.
+  # ---------------------------------------------------------------------------
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub 'vehicle-catalog-site-oac-${Stage}'
+        Description: Grants the CloudFront distribution read access to the site bucket.
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'Vehicle Catalog site (${Stage})'
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        Origins:
+          - Id: SiteS3Origin
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+        DefaultCacheBehavior:
+          TargetOriginId: SiteS3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          # AWS managed policy: CachingOptimized
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        # Single-page app: React Router owns the routes, so any path that S3
+        # can't find must still return index.html with a 200.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipalReadOnly
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub '${SiteBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceArn': !Sub 'arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}'
+
+Outputs:
+  ApiBaseUrl:
+    Description: Base URL of the deployed HTTP API.
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}'
+  HealthCheckUrl:
+    Description: Full URL of the healthcheck endpoint.
+    Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}/health'
+  CarsTableName:
+    Description: DynamoDB table for car-type records.
+    Value: !Ref CarsTable
+  UploadsBucketName:
+    Description: Private S3 bucket for uploaded images/documents.
+    Value: !Ref UploadsBucket
+  ArchiveBucketName:
+    Description: Private S3 bucket for 30-day archive of deleted records.
+    Value: !Ref ArchiveBucket
+  AlarmTopicArn:
+    Description: SNS topic that receives CloudWatch alarm notifications.
+    Value: !Ref AlarmTopic
+  UserPoolId:
+    Description: Cognito user pool id (set as VITE_COGNITO_USER_POOL_ID).
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Cognito app client id (set as VITE_COGNITO_CLIENT_ID).
+    Value: !Ref UserPoolClient
+  SiteUrl:
+    Description: Public HTTPS URL of the deployed catalog app.
+    Value: !Sub 'https://${SiteDistribution.DomainName}'
+  SiteBucketName:
+    Description: S3 bucket holding the built frontend assets.
+    Value: !Ref SiteBucket
+  SiteDistributionId:
+    Description: CloudFront distribution id (used to invalidate the cache).
+    Value: !Ref SiteDistribution

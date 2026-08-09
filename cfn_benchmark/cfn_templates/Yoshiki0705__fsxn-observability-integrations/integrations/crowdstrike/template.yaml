@@ -1,0 +1,319 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  FSx for ONTAP CrowdStrike Falcon LogScale Integration - Audit log shipping via HEC.
+  Uses LogScale's Splunk HEC-compatible endpoint (/api/v1/ingest/hec).
+
+Parameters:
+  FsxS3AccessPointArn:
+    Type: String
+    Description: ARN of the S3 Access Point for FSx for ONTAP audit logs
+    AllowedPattern: 'arn:aws:s3:[a-z0-9-]+:\d{12}:accesspoint/.+'
+
+  LogScaleIngestTokenSecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing the LogScale Ingest Token
+    AllowedPattern: 'arn:aws:secretsmanager:[a-z0-9-]+:\d{12}:secret:.+'
+
+  LogScaleUrl:
+    Type: String
+    Description: LogScale base URL (e.g., https://cloud.us.humio.com)
+    Default: https://cloud.us.humio.com
+    AllowedPattern: 'https://.+'
+
+  ScheduleInterval:
+    Type: String
+    Default: rate(5 minutes)
+    Description: EventBridge Scheduler interval for audit log polling
+
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues: [DEBUG, INFO, WARNING, ERROR]
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 256
+    MinValue: 128
+    MaxValue: 3008
+
+  LambdaTimeout:
+    Type: Number
+    Default: 300
+    MinValue: 30
+    MaxValue: 900
+
+  HecPath:
+    Type: String
+    Default: /api/v1/ingest/hec
+    Description: HEC endpoint path (LogScale default /api/v1/ingest/hec, Splunk /services/collector/event)
+
+Resources:
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3AccessPointRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${FsxS3AccessPointArn}/object/*'
+                  - !Ref FsxS3AccessPointArn
+        - PolicyName: SecretsManagerRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref LogScaleIngestTokenSecretArn
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-shipper:*'
+        - PolicyName: SQSSendMessage
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt DeadLetterQueue.Arn
+
+  LogShipperFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-shipper'
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              raise NotImplementedError("Deploy actual handler code via scripts/deploy.sh")
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      DeadLetterConfig:
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Environment:
+        Variables:
+          LOGSCALE_URL: !Ref LogScaleUrl
+          INGEST_TOKEN_SECRET_ARN: !Ref LogScaleIngestTokenSecretArn
+          S3_ACCESS_POINT_ARN: !Ref FsxS3AccessPointArn
+          LOG_LEVEL: !Ref LogLevel
+          SOURCE: fsxn-ontap
+          SOURCETYPE: 'fsxn:audit'
+          INDEX: fsxn_audit
+          HEC_PATH: !Ref HecPath
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-shipper'
+      RetentionInDays: 30
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt LogShipperFunction.Arn
+
+  AuditLogScheduler:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub '${AWS::StackName}-scheduler'
+      ScheduleExpression: !Ref ScheduleInterval
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !GetAtt LogShipperFunction.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"source": "scheduler"}'
+
+  ErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-errors'
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 600
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LogShipperFunction
+
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-dlq-depth'
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt DeadLetterQueue.QueueName
+
+  HecFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-hec-failure'
+      AlarmDescription: HEC delivery failures detected. Check Lambda logs and LogScale endpoint availability.
+      MetricName: HecFailure
+      Namespace: FSxONTAP/CrowdStrike/Pipeline
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LogShipperFunction
+
+  DeliveryLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-delivery-latency'
+      AlarmDescription: Pipeline delivery latency exceeds 60 seconds. Check S3 AP throughput and LogScale endpoint.
+      MetricName: DeliveryLatencyMs
+      Namespace: FSxONTAP/CrowdStrike/Pipeline
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 60000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref LogShipperFunction
+
+  PipelineDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-pipeline'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "Events Parsed vs Sent",
+                "metrics": [
+                  ["FSxONTAP/CrowdStrike/Pipeline", "EventsParsed", "FunctionName", "${LogShipperFunction}"],
+                  ["FSxONTAP/CrowdStrike/Pipeline", "EventsSent", "FunctionName", "${LogShipperFunction}"]
+                ],
+                "period": 300, "stat": "Sum", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 0, "width": 12, "height": 6,
+              "properties": {
+                "title": "HEC Success / Failure",
+                "metrics": [
+                  ["FSxONTAP/CrowdStrike/Pipeline", "HecSuccess", "FunctionName", "${LogShipperFunction}"],
+                  ["FSxONTAP/CrowdStrike/Pipeline", "HecFailure", "FunctionName", "${LogShipperFunction}"]
+                ],
+                "period": 300, "stat": "Sum", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "Delivery Latency (ms)",
+                "metrics": [
+                  ["FSxONTAP/CrowdStrike/Pipeline", "DeliveryLatencyMs", "FunctionName", "${LogShipperFunction}"]
+                ],
+                "period": 300, "stat": "Average", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 6, "width": 12, "height": 6,
+              "properties": {
+                "title": "DLQ Depth",
+                "metrics": [
+                  ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "${DeadLetterQueue.QueueName}"]
+                ],
+                "period": 300, "stat": "Sum", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Files Scanned / Processed",
+                "metrics": [
+                  ["FSxONTAP/CrowdStrike/Pipeline", "FilesScanned", "FunctionName", "${LogShipperFunction}"],
+                  ["FSxONTAP/CrowdStrike/Pipeline", "FilesProcessed", "FunctionName", "${LogShipperFunction}"]
+                ],
+                "period": 300, "stat": "Sum", "region": "${AWS::Region}"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12, "y": 12, "width": 12, "height": 6,
+              "properties": {
+                "title": "Lambda Errors & Duration",
+                "metrics": [
+                  ["AWS/Lambda", "Errors", "FunctionName", "${LogShipperFunction}"],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${LogShipperFunction}"]
+                ],
+                "period": 300, "stat": "Sum", "region": "${AWS::Region}"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  LambdaFunctionArn:
+    Value: !GetAtt LogShipperFunction.Arn
+  DeadLetterQueueUrl:
+    Value: !Ref DeadLetterQueue
+  LogGroupName:
+    Value: !Ref LogGroup
+  DashboardUrl:
+    Value: !Sub 'https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${AWS::StackName}-pipeline'

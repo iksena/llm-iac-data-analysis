@@ -1,0 +1,447 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AgentOps E-commerce Analytics Demo — Aurora PostgreSQL Serverless v2
+  (AWS Seoul Summit 2026).
+  Provisions a single-instance Aurora cluster in the default VPC with a public
+  endpoint (CIDR-restricted) and credentials stored in Secrets Manager.
+
+Parameters:
+  DBClusterName:
+    Type: String
+    Default: agentops-ecommerce
+    Description: Aurora cluster identifier.
+
+  DBName:
+    Type: String
+    Default: ecommerce
+    Description: Initial database name.
+
+  DBMasterUsername:
+    Type: String
+    Default: agentops_admin
+    Description: Master username for the cluster.
+
+  BackupRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+    Description: Number of days to retain automated backups.
+
+  DeletionProtection:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Enable deletion protection on the cluster.
+
+  MinCapacity:
+    Type: Number
+    Default: 0.5
+    MinValue: 0.5
+    MaxValue: 16
+    Description: Min Aurora Serverless v2 Capacity Units (ACU).
+
+  MaxCapacity:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 16
+    Description: Max Aurora Serverless v2 Capacity Units (ACU).
+
+Resources:
+  # Customer-managed KMS key for at-rest encryption of secrets + DynamoDB tables
+  # (satisfies CKV_AWS_119 / CKV_AWS_149 — AWS-managed keys won't pass these checks).
+  DataKey:
+    Type: AWS::KMS::Key
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Description: !Sub "CMK for ${DBClusterName} (Secrets Manager + DynamoDB)"
+      EnableKeyRotation: true
+      PendingWindowInDays: 7
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIAMUserPermissions
+            Effect: Allow
+            Principal: {AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"}
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: AllowAwsServicesViaIAM
+            Effect: Allow
+            Principal: {AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"}
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                "kms:ViaService":
+                  - !Sub "secretsmanager.${AWS::Region}.amazonaws.com"
+                  - !Sub "dynamodb.${AWS::Region}.amazonaws.com"
+
+  DataKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${DBClusterName}-data"
+      TargetKeyId: !Ref DataKey
+
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${DBClusterName}/master"
+      Description: Aurora PostgreSQL master credentials for AgentOps demo.
+      KmsKeyId: !Ref DataKey
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username":"${DBMasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludeCharacters: '"@/\$`'
+
+  # DB는 Public 접근을 허용하지 않음. 클라이언트는 RDS Data API(HTTPS)를 통해 연결.
+  # 보안그룹은 VPC 내부 리소스(Lambda/ECS 등)에서만 접근 허용 — 필요 시 SG ID 참조 방식으로 추가.
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: "AgentOps Aurora - no public ingress, Data API only"
+      SecurityGroupIngress: []
+
+  ClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: Enforce SSL/TLS for all client connections.
+      Family: aurora-postgresql16
+      Parameters:
+        rds.force_ssl: "1"
+
+  DBCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Ref DBClusterName
+      Engine: aurora-postgresql
+      EngineVersion: "16.4"
+      DatabaseName: !Ref DBName
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DBSecret}::username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DBSecret}::password}}"
+      VpcSecurityGroupIds:
+        - !GetAtt DBSecurityGroup.GroupId
+      DBClusterParameterGroupName: !Ref ClusterParameterGroup
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref MinCapacity
+        MaxCapacity: !Ref MaxCapacity
+      EnableCloudwatchLogsExports:
+        - postgresql
+      EnableIAMDatabaseAuthentication: true
+      EnableHttpEndpoint: true  # RDS Data API 활성화 (HTTPS 기반 쿼리)
+      StorageEncrypted: true
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      DeletionProtection: !Ref DeletionProtection
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      DBInstanceIdentifier: !Sub "${DBClusterName}-1"
+      DBClusterIdentifier: !Ref DBCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false  # Data API로만 접근, 공개 IP 할당 안 함
+
+  DBSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DBSecret
+      TargetId: !Ref DBCluster
+      TargetType: AWS::RDS::DBCluster
+
+  # --- Tool Router Lambda (AgentCore Gateway 타겟) ---
+
+  ToolRouterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AuroraDataApi
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rds-data:ExecuteStatement
+                  - rds-data:BatchExecuteStatement
+                Resource: !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DBClusterName}"
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DBSecret
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                Resource: !GetAtt DataKey.Arn
+              - Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/*"
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*"
+                  - "arn:aws:bedrock:*::foundation-model/*"
+                  - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*"
+              - Effect: Allow
+                Action: bedrock-agentcore:InvokeAgentRuntime
+                Resource: !Sub "arn:aws:bedrock-agentcore:${AWS::Region}:${AWS::AccountId}:runtime/*"
+
+  ToolRouterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${DBClusterName}-tool-router"
+      Runtime: python3.12
+      Handler: handler.lambda_handler
+      Role: !GetAtt ToolRouterRole.Arn
+      Timeout: 60
+      MemorySize: 1024
+      Environment:
+        Variables:
+          DB_CLUSTER_ARN: !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DBClusterName}"
+          DB_SECRET_ARN: !Ref DBSecret
+          DB_NAME: !Ref DBName
+          AWS_REGION_NAME: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              return {"statusCode": 200, "body": "placeholder - deploy via deploy.sh"}
+
+  # --- DynamoDB: User/Team 사용량 추적 (Work B) ---
+
+  UsageTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${DBClusterName}-usage"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      AttributeDefinitions:
+        - {AttributeName: user_id, AttributeType: S}
+        - {AttributeName: sort_key, AttributeType: S}
+        - {AttributeName: team_id, AttributeType: S}
+        - {AttributeName: date_bucket, AttributeType: S}
+        - {AttributeName: cost_usd_sort, AttributeType: N}
+      KeySchema:
+        - {AttributeName: user_id, KeyType: HASH}
+        - {AttributeName: sort_key, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: gsi-team
+          KeySchema:
+            - {AttributeName: team_id, KeyType: HASH}
+            - {AttributeName: sort_key, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: gsi-date-cost
+          KeySchema:
+            - {AttributeName: date_bucket, KeyType: HASH}
+            - {AttributeName: cost_usd_sort, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  DirectoryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${DBClusterName}-directory"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - {AttributeName: entity_id, AttributeType: S}
+        - {AttributeName: entity_type, AttributeType: S}
+        - {AttributeName: team_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: entity_id, KeyType: HASH}
+      GlobalSecondaryIndexes:
+        - IndexName: gsi-type
+          KeySchema:
+            - {AttributeName: entity_type, KeyType: HASH}
+          Projection: {ProjectionType: ALL}
+        - IndexName: gsi-team
+          KeySchema:
+            - {AttributeName: team_id, KeyType: HASH}
+          Projection: {ProjectionType: ALL}
+
+  BudgetStateTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${DBClusterName}-budget-state"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      AttributeDefinitions:
+        - {AttributeName: entity_id, AttributeType: S}
+        - {AttributeName: period, AttributeType: S}
+      KeySchema:
+        - {AttributeName: entity_id, KeyType: HASH}
+        - {AttributeName: period, KeyType: RANGE}
+
+  # --- DynamoDB: Persistence Layer (in-memory state migration) ---
+
+  ChatHistoryTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${DBClusterName}-chat-history"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      AttributeDefinitions:
+        - {AttributeName: session_id, AttributeType: S}
+        - {AttributeName: sort_key, AttributeType: S}
+        - {AttributeName: date_bucket, AttributeType: S}
+        - {AttributeName: timestamp, AttributeType: S}
+      KeySchema:
+        - {AttributeName: session_id, KeyType: HASH}
+        - {AttributeName: sort_key, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: gsi-timestamp
+          KeySchema:
+            - {AttributeName: date_bucket, KeyType: HASH}
+            - {AttributeName: timestamp, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  EvaluationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${DBClusterName}-evaluations"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      AttributeDefinitions:
+        - {AttributeName: turn_id, AttributeType: S}
+        - {AttributeName: sort_key, AttributeType: S}
+        - {AttributeName: date_bucket, AttributeType: S}
+        - {AttributeName: timestamp, AttributeType: S}
+      KeySchema:
+        - {AttributeName: turn_id, KeyType: HASH}
+        - {AttributeName: sort_key, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: gsi-timestamp
+          KeySchema:
+            - {AttributeName: date_bucket, KeyType: HASH}
+            - {AttributeName: timestamp, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      TableName: !Sub "${DBClusterName}-sessions"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref DataKey
+      AttributeDefinitions:
+        - {AttributeName: session_id, AttributeType: S}
+      KeySchema:
+        - {AttributeName: session_id, KeyType: HASH}
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  AnalyticsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /agentops/analytics
+      RetentionInDays: 14
+
+Outputs:
+  ClusterArn:
+    Description: Aurora cluster ARN (required for RDS Data API).
+    Value: !Sub "arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${DBClusterName}"
+
+  SecretArn:
+    Description: ARN of Secrets Manager entry holding DB credentials.
+    Value: !Ref DBSecret
+
+  DatabaseName:
+    Description: Initial database name.
+    Value: !Ref DBName
+
+  ToolRouterFunctionArn:
+    Description: Lambda ARN for AgentCore Gateway target.
+    Value: !GetAtt ToolRouterFunction.Arn
+
+  UsageTableName:
+    Description: DynamoDB table for per-user usage records.
+    Value: !Ref UsageTable
+
+  DirectoryTableName:
+    Description: DynamoDB table for user/team directory.
+    Value: !Ref DirectoryTable
+
+  BudgetStateTableName:
+    Description: DynamoDB table for budget counters.
+    Value: !Ref BudgetStateTable
+
+  ChatHistoryTableName:
+    Description: DynamoDB table for chat history persistence.
+    Value: !Ref ChatHistoryTable
+
+  EvaluationsTableName:
+    Description: DynamoDB table for evaluation results.
+    Value: !Ref EvaluationsTable
+
+  SessionsTableName:
+    Description: DynamoDB table for session state.
+    Value: !Ref SessionsTable
+
+  AnalyticsLogGroupName:
+    Description: CloudWatch Log Group for analytics events.
+    Value: !Ref AnalyticsLogGroup

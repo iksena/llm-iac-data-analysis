@@ -1,0 +1,492 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AgentWatch - AWS CloudWatch Monitoring Agent
+  Deploys Lambda, API Gateway, EventBridge, and Cognito for Slack integration
+
+Parameters:
+  SlackWebhookUrl:
+    Type: String
+    Description: Slack incoming webhook URL for posting monitoring updates
+    NoEcho: true
+
+  SlackSigningSecret:
+    Type: String
+    Description: Slack app signing secret for request verification
+    NoEcho: true
+
+  AgentCoreRuntimeUrl:
+    Type: String
+    Description: >
+      AgentCore runtime invocation URL. Deploy AgentCore first using 'agentcore deploy',
+      then use the URL from: https://bedrock-agentcore.<region>.amazonaws.com/runtimes/<agent-arn>/invocations?qualifier=DEFAULT
+    Default: ''
+
+  MonitoringSchedule:
+    Type: String
+    Description: How often to run scheduled monitoring checks
+    Default: 'rate(15 minutes)'
+    AllowedValues:
+      - 'rate(5 minutes)'
+      - 'rate(15 minutes)'
+      - 'rate(30 minutes)'
+      - 'rate(1 hour)'
+
+  CognitoDomainPrefix:
+    Type: String
+    Description: Unique prefix for Cognito domain (lowercase, alphanumeric, hyphens only)
+    AllowedPattern: ^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$
+    ConstraintDescription: Must be lowercase alphanumeric with optional hyphens
+
+Resources:
+  #############################################
+  # Cognito User Pool for M2M Authentication
+  #############################################
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-user-pool'
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      MfaConfiguration: 'OFF'
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoDomainPrefix
+      UserPoolId: !Ref CognitoUserPool
+
+  CognitoResourceServer:
+    Type: AWS::Cognito::UserPoolResourceServer
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      Identifier: !Sub '${AWS::StackName}-gateway'
+      Name: AgentWatch Gateway
+      Scopes:
+        - ScopeName: 'gateway:read'
+          ScopeDescription: 'Read access to agent'
+        - ScopeName: 'gateway:write'
+          ScopeDescription: 'Write access to agent'
+
+  CognitoM2MClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: CognitoResourceServer
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientName: !Sub '${AWS::StackName}-m2m-client'
+      GenerateSecret: true
+      AllowedOAuthFlows:
+        - client_credentials
+      AllowedOAuthScopes:
+        - !Sub '${AWS::StackName}-gateway/gateway:read'
+        - !Sub '${AWS::StackName}-gateway/gateway:write'
+      AllowedOAuthFlowsUserPoolClient: true
+      SupportedIdentityProviders:
+        - COGNITO
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  #############################################
+  # IAM Role for Lambda
+  #############################################
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchMonitoringAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudwatch:DescribeAlarms
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListDashboards
+                  - cloudwatch:GetDashboard
+                  - logs:DescribeLogGroups
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-scheduled-monitor'
+
+  #############################################
+  # Lambda Function
+  #############################################
+
+  MonitoringLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-scheduled-monitor'
+      Description: Ambient agent Lambda for scheduled monitoring and Slack integration
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 900
+      MemorySize: 1024
+      Environment:
+        Variables:
+          AGENTCORE_RUNTIME_URL: !Ref AgentCoreRuntimeUrl
+          SLACK_WEBHOOK_URL: !Ref SlackWebhookUrl
+          SLACK_SIGNING_SECRET: !Ref SlackSigningSecret
+          COGNITO_DOMAIN_URL: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+          M2M_CLIENT_ID: !Ref CognitoM2MClient
+          M2M_CLIENT_SECRET: !GetAtt CognitoM2MClient.ClientSecret
+          RESOURCE_SERVER_ID: !Sub '${AWS::StackName}-gateway'
+      Code:
+        ZipFile: |
+          import os
+          import json
+          import urllib3
+          import hashlib
+          import hmac
+          import time
+          import base64
+          from urllib.parse import parse_qs
+
+          http = urllib3.PoolManager()
+
+          def lambda_handler(event, context):
+              """Lambda handler for monitoring checks - supports EventBridge and Slack."""
+
+              # Async self-invocation for Slack processing
+              if event.get('async_slack'):
+                  handle_async_slack(event)
+                  return {'statusCode': 200}
+
+              # Determine trigger type
+              is_slack_request = 'body' in event or 'requestContext' in event
+
+              if is_slack_request:
+                  return handle_slack_request(event, context)
+              else:
+                  return handle_scheduled_check(event, context)
+
+          def handle_scheduled_check(event, context):
+              """Handle scheduled EventBridge invocation."""
+              default_prompt = """Provide a brief AWS environment health summary:
+              1. Check CloudWatch alarms status
+              2. Scan recent logs for errors
+              3. List any actionable recommendations
+              Keep response concise for Slack."""
+
+              try:
+                  response_text = invoke_agent(default_prompt)
+                  post_to_slack(response_text, is_scheduled=True)
+                  return {'statusCode': 200, 'body': json.dumps({'status': 'success'})}
+              except Exception as e:
+                  error_msg = f"Scheduled check failed: {str(e)}"
+                  post_to_slack(f"⚠️ {error_msg}", is_scheduled=True)
+                  return {'statusCode': 500, 'body': json.dumps({'error': error_msg})}
+
+          def handle_slack_request(event, context):
+              """Handle Slack slash command."""
+              try:
+                  body = event.get('body', '')
+                  if event.get('isBase64Encoded'):
+                      body = base64.b64decode(body).decode('utf-8')
+
+                  params = parse_qs(body)
+                  user_text = params.get('text', [''])[0]
+                  user_name = params.get('user_name', ['user'])[0]
+                  response_url = params.get('response_url', [''])[0]
+
+                  if not user_text:
+                      return {
+                          'statusCode': 200,
+                          'headers': {'Content-Type': 'application/json'},
+                          'body': json.dumps({
+                              'response_type': 'ephemeral',
+                              'text': 'Please provide a question. Usage: /ask <your question>'
+                          })
+                      }
+
+                  # Invoke self asynchronously to process the request
+                  import boto3
+                  lambda_client = boto3.client('lambda')
+                  lambda_client.invoke(
+                      FunctionName=context.function_name,
+                      InvocationType='Event',
+                      Payload=json.dumps({
+                          'async_slack': True,
+                          'user_text': user_text,
+                          'user_name': user_name,
+                          'response_url': response_url
+                      })
+                  )
+
+                  # Return acknowledgment to Slack immediately
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({
+                          'response_type': 'in_channel',
+                          'text': f"🔍 Processing request from @{user_name}..."
+                      })
+                  }
+
+              except Exception as e:
+                  return {
+                      'statusCode': 200,
+                      'headers': {'Content-Type': 'application/json'},
+                      'body': json.dumps({'text': f'Error: {str(e)}'})
+                  }
+
+          def handle_async_slack(event):
+              """Handle the async portion of a Slack request."""
+              user_text = event['user_text']
+              user_name = event['user_name']
+              response_url = event['response_url']
+              try:
+                  response_text = invoke_agent(user_text)
+                  if response_url:
+                      post_to_response_url(response_url, response_text, user_name)
+              except Exception as e:
+                  if response_url:
+                      post_to_response_url(response_url, f"❌ Error: {str(e)}", user_name)
+
+          def get_bearer_token():
+              """Get OAuth2 token using M2M client credentials."""
+              domain_url = os.environ.get('COGNITO_DOMAIN_URL')
+              client_id = os.environ.get('M2M_CLIENT_ID')
+              client_secret = os.environ.get('M2M_CLIENT_SECRET')
+              resource_server_id = os.environ.get('RESOURCE_SERVER_ID')
+
+              if not all([domain_url, client_id]):
+                  raise Exception("Cognito M2M credentials not configured")
+
+              token_url = f"{domain_url}/oauth2/token"
+              credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+
+              response = http.request(
+                  'POST',
+                  token_url,
+                  body=f"grant_type=client_credentials&scope={resource_server_id}/gateway:read",
+                  headers={
+                      'Content-Type': 'application/x-www-form-urlencoded',
+                      'Authorization': f'Basic {credentials}'
+                  }
+              )
+
+              if response.status != 200:
+                  raise Exception(f"Token request failed: {response.status}")
+
+              return json.loads(response.data.decode())['access_token']
+
+          def invoke_agent(prompt):
+              """Invoke the AgentCore runtime."""
+              agentcore_url = os.environ.get('AGENTCORE_RUNTIME_URL')
+              if not agentcore_url:
+                  return "AgentCore URL not configured. Please update the stack with the AgentCore runtime URL."
+
+              bearer_token = get_bearer_token()
+
+              response = http.request(
+                  'POST',
+                  agentcore_url,
+                  body=json.dumps({'prompt': prompt}),
+                  headers={
+                      'Content-Type': 'application/json',
+                      'Authorization': f'Bearer {bearer_token}'
+                  }
+              )
+
+              if response.status != 200:
+                  raise Exception(f"AgentCore request failed: {response.status} - {response.data.decode()}")
+
+              return response.data.decode()
+
+          def format_for_slack(text):
+              """Convert agent markdown response to Slack mrkdwn format."""
+              import re
+              # Decode escaped newlines to real newlines
+              text = text.replace('\\n', '\n')
+              # Strip wrapping quotes if present
+              text = text.strip('"')
+              # Convert markdown headers to Slack bold
+              text = re.sub(r'^#{1,3}\s+(.+)$', r'*\1*', text, flags=re.MULTILINE)
+              # Convert **bold** to *bold*
+              text = re.sub(r'\*\*(.+?)\*\*', r'*\1*', text)
+              return text
+
+          def post_to_slack(message, is_scheduled=False):
+              """Post message to Slack webhook."""
+              webhook_url = os.environ.get('SLACK_WEBHOOK_URL')
+              if not webhook_url:
+                  return
+
+              timestamp = time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())
+              prefix = "📊 *Scheduled Monitoring Report*" if is_scheduled else "🤖 *Agent Response*"
+              formatted = format_for_slack(message)
+
+              slack_message = {
+                  'blocks': [
+                      {'type': 'section', 'text': {'type': 'mrkdwn', 'text': prefix}},
+                      {'type': 'section', 'text': {'type': 'mrkdwn', 'text': formatted[:2900]}},
+                      {'type': 'context', 'elements': [{'type': 'mrkdwn', 'text': f"Time: {timestamp}"}]}
+                  ]
+              }
+
+              http.request('POST', webhook_url, body=json.dumps(slack_message),
+                          headers={'Content-Type': 'application/json'})
+
+          def post_to_response_url(response_url, message, user_name):
+              """Post response to Slack response URL."""
+              formatted = format_for_slack(message)
+              slack_message = {
+                  'response_type': 'in_channel',
+                  'text': f"Response for @{user_name}:\n{formatted[:2900]}"
+              }
+              http.request('POST', response_url, body=json.dumps(slack_message),
+                          headers={'Content-Type': 'application/json'})
+
+  #############################################
+  # EventBridge Rule for Scheduled Monitoring
+  #############################################
+
+  ScheduledMonitoringRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-scheduled-check'
+      Description: Triggers ambient agent monitoring check
+      ScheduleExpression: !Ref MonitoringSchedule
+      State: ENABLED
+      Targets:
+        - Id: MonitoringLambdaTarget
+          Arn: !GetAtt MonitoringLambdaFunction.Arn
+
+  LambdaEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MonitoringLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledMonitoringRule.Arn
+
+  #############################################
+  # API Gateway for Slack Slash Commands
+  #############################################
+
+  SlackApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${AWS::StackName}-slack-api'
+      Description: API Gateway for AgentWatch Slack slash commands
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  SlackCommandResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SlackApiGateway
+      ParentId: !GetAtt SlackApiGateway.RootResourceId
+      PathPart: slack-command
+
+  SlackCommandMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SlackApiGateway
+      ResourceId: !Ref SlackCommandResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MonitoringLambdaFunction.Arn}/invocations'
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: SlackCommandMethod
+    Properties:
+      RestApiId: !Ref SlackApiGateway
+      StageName: prod
+
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref MonitoringLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${SlackApiGateway}/*/*'
+
+  #############################################
+  # Store M2M Client Secret in Secrets Manager
+  #############################################
+
+  M2MClientSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/m2m-client-secret'
+      Description: Cognito M2M client secret for AgentWatch
+      SecretString: !Sub |
+        {
+          "client_id": "${CognitoM2MClient}",
+          "user_pool_id": "${CognitoUserPool}",
+          "domain_url": "https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com",
+          "resource_server_id": "${AWS::StackName}-gateway"
+        }
+
+Outputs:
+  SlackCommandEndpoint:
+    Description: URL for Slack slash command configuration
+    Value: !Sub 'https://${SlackApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/slack-command'
+    Export:
+      Name: !Sub '${AWS::StackName}-SlackEndpoint'
+
+  CognitoDomainUrl:
+    Description: Cognito domain URL for OAuth2 token endpoint
+    Value: !Sub 'https://${CognitoDomainPrefix}.auth.${AWS::Region}.amazoncognito.com'
+    Export:
+      Name: !Sub '${AWS::StackName}-CognitoDomain'
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub '${AWS::StackName}-UserPoolId'
+
+  M2MClientId:
+    Description: M2M Client ID for AgentCore authentication
+    Value: !Ref CognitoM2MClient
+    Export:
+      Name: !Sub '${AWS::StackName}-M2MClientId'
+
+  M2MSecretArn:
+    Description: ARN of the Secrets Manager secret containing M2M credentials
+    Value: !Ref M2MClientSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-M2MSecretArn'
+
+  LambdaFunctionName:
+    Description: Name of the monitoring Lambda function
+    Value: !Ref MonitoringLambdaFunction
+
+  ResourceServerId:
+    Description: Cognito Resource Server ID for OAuth scopes
+    Value: !Sub '${AWS::StackName}-gateway'
+
+  NextSteps:
+    Description: Instructions to complete setup
+    Value: !Sub |
+      1. Deploy AgentCore: cd to project root and run './deployment/deploy_agentcore.sh'
+      2. Get the AgentCore URL and update this stack's AgentCoreRuntimeUrl parameter
+      3. Configure Slack slash command with endpoint: https://${SlackApiGateway}.execute-api.${AWS::Region}.amazonaws.com/prod/slack-command
+      4. Retrieve M2M client secret from Secrets Manager: ${M2MClientSecret}

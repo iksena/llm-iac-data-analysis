@@ -1,0 +1,387 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Optional Tier 2 — REST API Gateway + Lambda for processing the lightweight
+  client-side Stop hook. Cognito authorizer ensures verified identity.
+  WAFv2 protects the API with managed rules + rate limiting.
+
+Parameters:
+  OrgName:
+    Type: String
+    Default: my-org
+
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+
+  CognitoUserPoolArn:
+    Type: String
+    Description: ARN of the Cognito User Pool (from cognito-stack outputs).
+
+  CognitoAppClientId:
+    Type: String
+    Description: App Client ID for token validation.
+
+  ProcessedBucket:
+    Type: String
+    Description: S3 bucket for processed telemetry data (from bedrock-logging outputs).
+
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ''
+    Description: ARN of IAM Permissions Boundary (required for accounts with restrictive SCPs).
+
+Conditions:
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, '']]
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # REST API Gateway (v1 — supports WAFv2 association)
+  # ---------------------------------------------------------------------------
+  HookApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'claude-code-hook-${OrgName}-${Environment}'
+      Description: Optional Tier 2 API for client-side session hook data
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # ---------------------------------------------------------------------------
+  # Cognito Authorizer
+  # ---------------------------------------------------------------------------
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      RestApiId: !Ref HookApi
+      Name: CognitoJWT
+      Type: COGNITO_USER_POOLS
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !Ref CognitoUserPoolArn
+
+  # ---------------------------------------------------------------------------
+  # API Resources: /hook/session
+  # ---------------------------------------------------------------------------
+  HookResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HookApi
+      ParentId: !GetAtt HookApi.RootResourceId
+      PathPart: hook
+
+  SessionResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref HookApi
+      ParentId: !Ref HookResource
+      PathPart: session
+
+  # ---------------------------------------------------------------------------
+  # POST /hook/session — Cognito-authorized Lambda proxy
+  # ---------------------------------------------------------------------------
+  SessionPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HookApi
+      ResourceId: !Ref SessionResource
+      HttpMethod: POST
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${HookProcessorFunction.Arn}/invocations'
+
+  # ---------------------------------------------------------------------------
+  # OPTIONS /hook/session — CORS preflight (unauthenticated)
+  # ---------------------------------------------------------------------------
+  SessionOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref HookApi
+      ResourceId: !Ref SessionResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Authorization,Content-Type,Content-Encoding'"
+              method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ---------------------------------------------------------------------------
+  # Deployment + Stage
+  # ---------------------------------------------------------------------------
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - SessionPostMethod
+      - SessionOptionsMethod
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W68
+            reason: "Internal API — usage plan not required for Cognito-authorized endpoints"
+    Properties:
+      RestApiId: !Ref HookApi
+
+  # Account-level CloudWatch role (required for REST API access logging)
+  ApiGatewayLoggingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !If
+        - HasPermissionsBoundary
+        - !Ref PermissionsBoundaryArn
+        - !Ref AWS::NoValue
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayLoggingRole.Arn
+
+  # checkov:skip=CKV_AWS_120:Caching not needed for real-time hook processing
+  # checkov:skip=CKV_AWS_73:X-Ray tracing optional — enable in production for debugging
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    DependsOn: ApiGatewayAccount
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W64
+            reason: "Internal API — usage plan not required for Cognito-authorized endpoints"
+    Properties:
+      RestApiId: !Ref HookApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+      MethodSettings:
+        - HttpMethod: '*'
+          ResourcePath: '/*'
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 20
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "user":"$context.authorizer.claims.email","method":"$context.httpMethod",
+          "path":"$context.path","status":"$context.status",
+          "latency":"$context.responseLatency"}
+
+  # checkov:skip=CKV_AWS_158:Sample uses default encryption — production deployments should add KMS
+  ApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Sample uses default encryption — production deployments should add KMS"
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/claude-code-hook-${OrgName}'
+      RetentionInDays: !Ref LogRetentionDays
+
+  # ---------------------------------------------------------------------------
+  # Hook Processor Lambda
+  # ---------------------------------------------------------------------------
+  # checkov:skip=CKV_AWS_117:Lambdas call AWS APIs only — VPC adds NAT Gateway cost with no benefit
+  # checkov:skip=CKV_AWS_116:Synchronous invocation — DLQ not applicable
+  # checkov:skip=CKV_AWS_173:Environment variables contain config (table names, ARNs), not secrets
+  HookProcessorFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Lambda calls AWS APIs only — VPC adds cost with no benefit"
+          - id: W92
+            reason: "ReservedConcurrentExecutions set on function"
+    Properties:
+      FunctionName: !Sub 'claude-code-hook-processor-${OrgName}-${Environment}'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt HookProcessorRole.Arn
+      Environment:
+        Variables:
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          ORG_NAME: !Ref OrgName
+          CW_LOG_GROUP: !Sub '/aws/claude-code/hook-metrics/${OrgName}'
+      Code:
+        # Stub — full implementation in lambda/hook_processor/index.py
+        ZipFile: |
+          def handler(event, context):
+              print("Deploy the full hook processor from lambda/hook_processor/")
+              return {"statusCode": 200}
+
+  HookProcessorRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name required for deploy.sh cross-stack references"
+    Properties:
+      RoleName: !Sub 'claude-code-hook-processor-role-${OrgName}-${Environment}'
+      PermissionsBoundary: !If
+        - HasPermissionsBoundary
+        - !Ref PermissionsBoundaryArn
+        - !Ref AWS::NoValue
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Write
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub 'arn:aws:s3:::${ProcessedBucket}/processed/sessions/*'
+        - PolicyName: KMSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                  - kms:Decrypt
+                Resource: !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+                Condition:
+                  StringLike:
+                    kms:ViaService: !Sub 's3.${AWS::Region}.amazonaws.com'
+        - PolicyName: CloudWatchWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/claude-code/hook-metrics/${OrgName}:*'
+                  - !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/claude-code-hook-processor-${OrgName}-${Environment}:*'
+
+  HookProcessorApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt HookProcessorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HookApi}/*'
+
+  # ---------------------------------------------------------------------------
+  # WAFv2 WebACL — managed rules + rate limiting
+  # ---------------------------------------------------------------------------
+  HookApiWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub 'claude-code-hook-waf-${OrgName}'
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub 'claude-code-hook-waf-${OrgName}'
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSet
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: KnownBadInputsRuleSet
+        - Name: RateLimit
+          Priority: 3
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 300
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimit
+
+  HookApiWAFAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn: ApiStage
+    Properties:
+      ResourceArn: !Sub 'arn:aws:apigateway:${AWS::Region}::/restapis/${HookApi}/stages/prod'
+      WebACLArn: !GetAtt HookApiWebACL.Arn
+
+  # ---------------------------------------------------------------------------
+  # Hook metrics log group
+  # ---------------------------------------------------------------------------
+  # checkov:skip=CKV_AWS_158:Sample uses default encryption — production deployments should add KMS
+  HookMetricsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W84
+            reason: "Sample uses default encryption — production deployments should add KMS"
+    Properties:
+      LogGroupName: !Sub '/aws/claude-code/hook-metrics/${OrgName}'
+      RetentionInDays: !Ref LogRetentionDays
+
+Outputs:
+  HookApiEndpoint:
+    Description: API Gateway endpoint for the optional session hook
+    Value: !Sub 'https://${HookApi}.execute-api.${AWS::Region}.amazonaws.com/prod/hook/session'
+    Export:
+      Name: !Sub '${AWS::StackName}-HookEndpoint'
+
+  HookApiId:
+    Description: API Gateway ID
+    Value: !Ref HookApi

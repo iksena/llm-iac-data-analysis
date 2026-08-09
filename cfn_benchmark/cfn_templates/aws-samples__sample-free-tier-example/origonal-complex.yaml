@@ -1,0 +1,546 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Workshop - EC2, Lambda, DynamoDB, and Bedrock Demo'
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: EC2 instance type
+
+  MyIPAddress:
+    Type: String
+    Description: Your IP address for secure access (format x.x.x.x/32)
+#    Default: 0.0.0.0/0
+    AllowedPattern: '^([0-9]{1,3}\.){3}[0-9]{1,3}/[0-9]{1,2}$'
+    ConstraintDescription: Must be a valid IP address in CIDR format (e.g., 203.0.113.25/32)
+
+Resources:
+  # Security Group for EC2
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for workshop web server
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref MyIPAddress
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MyIPAddress
+
+  # IAM Role for EC2
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAndRDSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/amazon.titan-text-express-v1'
+              - Effect: Allow
+                Action:
+                  - rds-data:ExecuteStatement
+                  - rds-data:BatchExecuteStatement
+                  - rds-data:BeginTransaction
+                  - rds-data:CommitTransaction
+                  - rds-data:RollbackTransaction
+                Resource: !Sub 'arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:${WorkshopDBCluster}'
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref WorkshopDBSecret
+
+  # Aurora DB Secret
+  WorkshopDBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: workshop-aurora-secret
+      Description: Aurora database credentials
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+
+  # Aurora Serverless v2 Cluster
+  WorkshopDBCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBClusterIdentifier: workshop-aurora-cluster2
+      Engine: aurora-mysql
+      StorageEncrypted: true
+      MasterUsername: !Sub '{{resolve:secretsmanager:${WorkshopDBSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${WorkshopDBSecret}:SecretString:password}}'
+      EnableHttpEndpoint: true
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 1
+      Tags:
+        - Key: Name
+          Value: workshop-aurora-cluster2
+
+  # Aurora Serverless v2 DB Instance
+  WorkshopDBInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.serverless
+      DBClusterIdentifier: !Ref WorkshopDBCluster
+      Engine: aurora-mysql
+      PubliclyAccessible: false
+
+  # Lambda Function
+  WorkshopLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: workshop-function
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Environment:
+        Variables:
+          DB_CLUSTER_ARN: !Sub '${WorkshopDBCluster.DBClusterArn}'
+          DB_SECRET_ARN: !Ref WorkshopDBSecret
+          DATABASE_NAME: workshop
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          from datetime import datetime
+
+          def lambda_handler(event, context):
+              # Initialize variables
+              user_input = 'Hello from workshop!'
+              ai_response = 'Default response'
+              timestamp = datetime.now().isoformat()
+
+              try:
+                  # Parse input
+                  if 'body' in event and isinstance(event['body'], str):
+                      body = json.loads(event['body'])
+                  else:
+                      body = event
+
+                  user_input = body.get('user_input', 'Hello from workshop!')
+
+                  # Call Bedrock for AI response
+                  bedrock = boto3.client('bedrock-runtime', region_name='us-east-1')
+
+                  response = bedrock.invoke_model(
+                      modelId='amazon.titan-text-express-v1',
+                      body=json.dumps({
+                          "inputText": f"You are a helpful AWS assistant. Respond briefly to: {user_input}",
+                          "textGenerationConfig": {
+                              "maxTokenCount": 100,
+                              "temperature": 0.7,
+                              "topP": 0.9
+                          }
+                      })
+                  )
+
+                  ai_response = json.loads(response['body'].read())['results'][0]['outputText'].strip()
+
+                  # Store in Aurora using RDS Data API
+                  rds_data = boto3.client('rds-data')
+
+                  timestamp = datetime.now().isoformat()
+                  interaction_id = str(uuid.uuid4())
+
+                  # Create database first
+                  try:
+                      rds_data.execute_statement(
+                          resourceArn=os.environ['DB_CLUSTER_ARN'],
+                          secretArn=os.environ['DB_SECRET_ARN'],
+                          sql=f"CREATE DATABASE IF NOT EXISTS {os.environ['DATABASE_NAME']}"
+                      )
+                  except:
+                      pass  # Database might already exist
+
+                  # Create table
+                  rds_data.execute_statement(
+                      resourceArn=os.environ['DB_CLUSTER_ARN'],
+                      secretArn=os.environ['DB_SECRET_ARN'],
+                      database=os.environ['DATABASE_NAME'],
+                      sql="CREATE TABLE IF NOT EXISTS interactions (id VARCHAR(36) PRIMARY KEY, timestamp VARCHAR(50), user_input TEXT, ai_response TEXT)"
+                  )
+
+                  # Insert data using parameters to avoid SQL injection
+                  rds_data.execute_statement(
+                      resourceArn=os.environ['DB_CLUSTER_ARN'],
+                      secretArn=os.environ['DB_SECRET_ARN'],
+                      database=os.environ['DATABASE_NAME'],
+                      sql="INSERT INTO interactions (id, timestamp, user_input, ai_response) VALUES (:id, :timestamp, :user_input, :ai_response)",
+                      parameters=[
+                          {'name': 'id', 'value': {'stringValue': interaction_id}},
+                          {'name': 'timestamp', 'value': {'stringValue': timestamp}},
+                          {'name': 'user_input', 'value': {'stringValue': user_input}},
+                          {'name': 'ai_response', 'value': {'stringValue': ai_response}}
+                      ]
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({
+                          'message': 'Success!',
+                          'ai_response': ai_response,
+                          'timestamp': timestamp,
+                          'stored_in': 'Aurora Serverless'
+                      })
+                  }
+
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Content-Type': 'application/json'
+                      },
+                      'body': json.dumps({
+                          'error': str(e),
+                          'user_input': user_input,
+                          'timestamp': timestamp
+                      })
+                  }
+
+  # Add Lambda invoke permission to EC2 Role
+  EC2LambdaPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: LambdaInvokeAccess
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource: !GetAtt WorkshopLambda.Arn
+      Roles:
+        - !Ref EC2Role
+
+  # EC2 Instance
+  WebServerInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0c02fb55956c7d316  # Amazon Linux 2 AMI
+      InstanceType: !Ref InstanceType
+      SecurityGroupIds:
+        - !Ref WebServerSecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          echo "Starting UserData script"
+
+          # Wait for any existing yum processes to complete
+          echo "Waiting for yum lock to be available"
+          while pgrep yum > /dev/null; do
+              echo "Waiting for yum process to complete..."
+              sleep 5
+          done
+
+          # Function to retry yum commands
+          retry_yum() {
+              local cmd="$1"
+              local max_attempts=5
+              local attempt=1
+
+              while [ $attempt -le $max_attempts ]; do
+                  echo "Attempt $attempt: $cmd"
+                  if eval "$cmd"; then
+                      echo "Success: $cmd"
+                      return 0
+                  else
+                      echo "Failed attempt $attempt: $cmd"
+                      if [ $attempt -lt $max_attempts ]; then
+                          echo "Waiting 10 seconds before retry..."
+                          sleep 10
+                      fi
+                  fi
+                  attempt=$((attempt + 1))
+              done
+
+              echo "ERROR: All attempts failed for: $cmd"
+              return 1
+          }
+
+          # Update system with retry
+          echo "Updating system packages"
+          retry_yum "yum update -y"
+
+          # Install Apache and Python with retry
+          echo "Installing httpd and python3-pip"
+          retry_yum "yum install -y httpd python3-pip"
+          if [ $? -ne 0 ]; then
+              echo "ERROR: Failed to install packages after all retries"
+              exit 1
+          fi
+
+          # Install boto3
+          echo "Installing boto3"
+          pip3 install boto3
+
+          # Start Apache
+          echo "Starting Apache"
+          systemctl start httpd
+          systemctl enable httpd
+
+          # Check if Apache is running
+          if ! systemctl is-active --quiet httpd; then
+              echo "ERROR: Apache failed to start"
+              exit 1
+          fi
+
+          echo "Apache started successfully"
+
+          # Create simple web page
+          echo "Creating web page"
+          cat > /var/www/html/index.html << 'EOF'
+          <!DOCTYPE html>
+          <html>
+          <head>
+              <title>AWS Workshop Demo</title>
+              <style>
+                  body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+                  .container { max-width: 600px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+                  h1 { color: #232f3e; text-align: center; }
+                  .service-box { background: #f8f9fa; padding: 15px; margin: 10px 0; border-radius: 5px; border-left: 4px solid #ff9900; }
+                  button { background: #ff9900; color: white; padding: 12px 24px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin: 10px 5px; }
+                  button:hover { background: #e88b00; }
+                  #response { margin-top: 20px; padding: 15px; background: #e8f5e8; border-radius: 5px; display: none; }
+                  input[type="text"] { width: 100%; padding: 10px; margin: 10px 0; border: 1px solid #ddd; border-radius: 5px; }
+              </style>
+          </head>
+          <body>
+              <div class="container">
+                  <h1>🚀 AWS Services Workshop</h1>
+                  <p>This web application demonstrates:</p>
+
+                  <div class="service-box">
+                      <strong>EC2:</strong> Hosting this web page
+                  </div>
+                  <div class="service-box">
+                      <strong>Lambda:</strong> Processing your requests
+                  </div>
+                  <div class="service-box">
+                      <strong>Aurora:</strong> Storing interaction data
+                  </div>
+                  <div class="service-box">
+                      <strong>Bedrock:</strong> AI-powered responses
+                  </div>
+
+                  <hr>
+                  <h3>Try it out!</h3>
+                  <input type="text" id="userInput" placeholder="Ask the AI something..." value="What is AWS?">
+                  <br>
+                  <button onclick="callLambda()">🤖 Ask AI via Lambda</button>
+                  <button onclick="getStats()">📊 View Workshop Info</button>
+
+                  <div id="response"></div>
+              </div>
+
+              <script>
+                  async function callLambda() {
+                      const userInput = document.getElementById('userInput').value;
+                      const responseDiv = document.getElementById('response');
+
+                      responseDiv.style.display = 'block';
+                      responseDiv.innerHTML = '⏳ Calling Lambda + Bedrock...';
+
+                      try {
+                          const response = await fetch('/invoke-lambda', {
+                              method: 'POST',
+                              headers: {
+                                  'Content-Type': 'application/json'
+                              },
+                              body: JSON.stringify({ user_input: userInput })
+                          });
+
+                          const data = await response.json();
+
+                          if (response.ok) {
+                              responseDiv.innerHTML =
+                                  '<h4>✅ Success!</h4>' +
+                                  '<p><strong>You asked:</strong> ' + userInput + '</p>' +
+                                  '<p><strong>AI Response:</strong> ' + data.ai_response + '</p>' +
+                                  '<p><strong>Stored at:</strong> ' + data.timestamp + '</p>' +
+                                  '<p><strong>Database:</strong> ' + data.stored_in + '</p>' +
+                                  '<hr>' +
+                                  '<small>🔄 Flow: Browser → EC2 → Lambda → Bedrock + Aurora → Response</small>';
+                          } else {
+                              responseDiv.innerHTML = '<h4>❌ Error:</h4><p>' + (data.error || 'Unknown error') + '</p>';
+                          }
+                      } catch (error) {
+                          responseDiv.innerHTML = '<h4>❌ Network Error:</h4><p>' + error.message + '</p>';
+                      }
+                  }
+
+                  function getStats() {
+                      const responseDiv = document.getElementById('response');
+                      responseDiv.style.display = 'block';
+                      responseDiv.innerHTML =
+                          '<h4>📊 Workshop Architecture</h4>' +
+                          '<p>Each interaction:</p>' +
+                          '<ul>' +
+                              '<li>Triggers a Lambda function</li>' +
+                              '<li>Calls Amazon Bedrock for AI response</li>' +
+                              '<li>Stores data in Aurora Serverless (MySQL database)</li>' +
+                              '<li>Returns response to this EC2-hosted webpage</li>' +
+                          '</ul>' +
+                          '<p><em>Check AWS CloudWatch Logs to see Lambda executions!</em></p>';
+                  }
+              </script>
+          </body>
+          </html>
+          EOF
+
+          # Create Python CGI script to invoke Lambda
+          echo "Creating CGI script"
+          mkdir -p /var/www/cgi-bin
+          cat > /var/www/cgi-bin/invoke-lambda.py << 'PYTHON_EOF'
+          #!/usr/bin/env python3
+          import json
+          import boto3
+          import cgi
+          import cgitb
+          import sys
+          import os
+
+          # Enable CGI error reporting
+          cgitb.enable()
+
+          # Set content type
+          print("Content-Type: application/json")
+          print("Access-Control-Allow-Origin: *")
+          print("Access-Control-Allow-Methods: POST, OPTIONS")
+          print("Access-Control-Allow-Headers: Content-Type")
+          print()  # Empty line required
+
+          try:
+              # Handle OPTIONS request for CORS
+              if os.environ.get('REQUEST_METHOD') == 'OPTIONS':
+                  print(json.dumps({"status": "ok"}))
+                  sys.exit(0)
+
+              # Read POST data
+              content_length = int(os.environ.get('CONTENT_LENGTH', 0))
+              if content_length > 0:
+                  post_data = sys.stdin.read(content_length)
+                  data = json.loads(post_data)
+              else:
+                  data = {"user_input": "Hello AWS!"}
+
+              # Invoke Lambda function
+              lambda_client = boto3.client('lambda', region_name='us-east-1')
+
+              response = lambda_client.invoke(
+                  FunctionName='${WorkshopLambda}',
+                  InvocationType='RequestResponse',
+                  Payload=json.dumps(data)
+              )
+
+              # Parse Lambda response
+              lambda_response = json.loads(response['Payload'].read())
+
+              if response['StatusCode'] == 200:
+                  if 'body' in lambda_response:
+                      # Lambda returned HTTP response format
+                      result = json.loads(lambda_response['body'])
+                  else:
+                      # Lambda returned direct response
+                      result = lambda_response
+                  print(json.dumps(result))
+              else:
+                  print(json.dumps({"error": "Lambda invocation failed"}))
+
+          except Exception as e:
+              print(json.dumps({"error": str(e)}))
+          PYTHON_EOF
+
+          chmod +x /var/www/cgi-bin/invoke-lambda.py
+
+          # Configure Apache for CGI
+          echo "Configuring Apache for CGI"
+          cat >> /etc/httpd/conf/httpd.conf << 'APACHE_EOF'
+
+          # Enable CGI
+          LoadModule cgi_module modules/mod_cgi.so
+          ScriptAlias /invoke-lambda /var/www/cgi-bin/invoke-lambda.py
+
+          <Directory "/var/www/cgi-bin">
+              AllowOverride None
+              Options ExecCGI
+              Require all granted
+          </Directory>
+          APACHE_EOF
+
+          echo "Restarting Apache"
+          systemctl restart httpd
+
+          if systemctl is-active --quiet httpd; then
+              echo "SUCCESS: UserData script completed successfully"
+          else
+              echo "ERROR: Apache failed to restart"
+              exit 1
+          fi
+      Tags:
+        - Key: Name
+          Value: workshop-web-server
+
+Outputs:
+  WebsiteURL:
+    Description: URL of the workshop website
+    Value: !Sub 'http://${WebServerInstance.PublicDnsName}'
+
+  AuroraClusterEndpoint:
+    Description: Aurora cluster endpoint
+    Value: !GetAtt WorkshopDBCluster.Endpoint.Address
+
+  LambdaFunctionName:
+    Description: Lambda function name
+    Value: !Ref WorkshopLambda
+
+  AuroraClusterArn:
+    Description: Aurora cluster ARN
+    Value: !Sub '${WorkshopDBCluster.DBClusterArn}'

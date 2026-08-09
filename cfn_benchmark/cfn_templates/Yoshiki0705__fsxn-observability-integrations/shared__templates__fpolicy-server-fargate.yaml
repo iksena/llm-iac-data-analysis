@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  FPolicy External Server on ECS Fargate.
+  Runs the FPolicy TCP protocol handler that receives ONTAP FPolicy events
+  and forwards them to SQS for downstream processing by vendor Lambdas.
+  ONTAP connects directly to the Fargate task Private IP (not via NLB).
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where FSx for ONTAP resides
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnets for Fargate task (same subnet as FSx for ONTAP SVM data LIF recommended)
+
+  FsxnSvmSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID of the FSx for ONTAP SVM (used as inbound source)
+
+  ContainerImage:
+    Type: String
+    Description: >-
+      FPolicy Server container image URI (ECR).
+      IMPORTANT: Image MUST be built for linux/amd64 platform.
+      Use: docker buildx build --platform linux/amd64 -t <uri> --push .
+      Apple Silicon builds produce arm64-only images which will FAIL on Fargate.
+
+  FPolicyPort:
+    Type: Number
+    Default: 9898
+    Description: FPolicy TCP listening port
+
+  WriteCompleteDelaySec:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 60
+    Description: NFSv3 write-complete wait seconds
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 0
+    MaxValue: 3
+    Description: Number of Fargate tasks
+
+  Cpu:
+    Type: String
+    Default: "256"
+    AllowedValues: ["256", "512", "1024"]
+    Description: Fargate task CPU units
+
+  Memory:
+    Type: String
+    Default: "512"
+    AllowedValues: ["512", "1024", "2048"]
+    Description: Fargate task memory (MB)
+
+  EventBusName:
+    Type: String
+    Default: default
+    Description: EventBridge bus name for FPolicy events
+
+Resources:
+  # ============================================================
+  # SQS Queue for FPolicy events
+  # ============================================================
+  FPolicyQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-fpolicy-queue"
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+
+  # ============================================================
+  # ECS Cluster
+  # ============================================================
+  FPolicyCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # ============================================================
+  # Security Group for FPolicy Server
+  # ============================================================
+  FPolicyServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: FPolicy Server - allows inbound TCP from FSx for ONTAP SVM
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref FPolicyPort
+          ToPort: !Ref FPolicyPort
+          SourceSecurityGroupId: !Ref FsxnSvmSecurityGroupId
+          Description: FPolicy TCP from FSx for ONTAP SVM
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS outbound (SQS, ECR, CloudWatch)
+
+  # ============================================================
+  # IAM Role for ECS Task
+  # ============================================================
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-task-exec-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-task-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SQSSendMessage
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt FPolicyQueue.Arn
+
+  # ============================================================
+  # CloudWatch Log Group
+  # ============================================================
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}"
+      RetentionInDays: 30
+
+  # ============================================================
+  # ECS Task Definition
+  # ============================================================
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: fpolicy-server
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref FPolicyPort
+              Protocol: tcp
+          Environment:
+            - Name: FPOLICY_PORT
+              Value: !Sub "${FPolicyPort}"
+            - Name: SQS_QUEUE_URL
+              Value: !Ref FPolicyQueue
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: MODE
+              Value: realtime
+            - Name: WRITE_COMPLETE_DELAY_SEC
+              Value: !Sub "${WriteCompleteDelaySec}"
+            - Name: SCHEMA_PATH
+              Value: /app/schemas/fpolicy-event-schema.json
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: fpolicy
+
+  # ============================================================
+  # ECS Service
+  # ============================================================
+  FPolicyService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${AWS::StackName}-service"
+      Cluster: !Ref FPolicyCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref FPolicyServerSecurityGroup
+
+  # ============================================================
+  # EventBridge Rule: FPolicy events (for future EventBridge Pipe routing)
+  # NOTE: The PRIMARY event flow is SQS → Lambda (event source mapping).
+  # This rule exists for future use cases where EventBridge routing
+  # to multiple consumers is needed.
+  # ============================================================
+  SqsToEventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "${AWS::StackName}-fpolicy-events"
+      Description: >-
+        FPolicy event pattern for future EventBridge-based routing.
+        Primary flow uses SQS event source mapping to Lambda directly.
+      EventBusName: !Ref EventBusName
+      EventPattern:
+        source:
+          - fpolicy.fsxn
+        detail-type:
+          - FPolicy File Operation
+      State: DISABLED
+
+Outputs:
+  ClusterArn:
+    Description: ECS Cluster ARN
+    Value: !GetAtt FPolicyCluster.Arn
+
+  ServiceName:
+    Description: ECS Service name
+    Value: !Sub "${AWS::StackName}-service"
+
+  FPolicyQueueUrl:
+    Description: SQS Queue URL for FPolicy events
+    Value: !Ref FPolicyQueue
+
+  FPolicyQueueArn:
+    Description: SQS Queue ARN
+    Value: !GetAtt FPolicyQueue.Arn
+
+  SecurityGroupId:
+    Description: FPolicy Server Security Group ID
+    Value: !Ref FPolicyServerSecurityGroup
+
+  LogGroupName:
+    Description: CloudWatch Log Group for FPolicy server
+    Value: !Ref LogGroup
+
+  TaskDefinitionArn:
+    Description: ECS Task Definition ARN
+    Value: !Ref TaskDefinition

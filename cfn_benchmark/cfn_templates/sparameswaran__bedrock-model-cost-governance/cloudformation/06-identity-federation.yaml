@@ -1,0 +1,380 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Bedrock Governance Identity Federation — Cognito User Pool as OIDC provider,
+  IAM OIDC trust, and federated developer role. Developers authenticate via
+  browser-based OAuth2/PKCE flow and receive short-lived STS credentials with
+  their identity attributes (email, team, project) as session tags.
+
+Parameters:
+  CognitoDomain:
+    Type: String
+    Default: "{{COGNITO_DOMAIN}}"
+    Description: Cognito hosted UI domain prefix (must be globally unique)
+  CallbackUrl:
+    Type: String
+    Default: "http://localhost:9876/callback"
+    Description: OAuth2 callback URL for the CLI credential helper
+  SessionDurationSeconds:
+    Type: Number
+    Default: 43200
+    Description: Max session duration for federated role (12 hours)
+  TagKeyProject:
+    Type: String
+    Default: "{{TAG_KEY_PROJECT}}"
+  TagKeyTeam:
+    Type: String
+    Default: "{{TAG_KEY_TEAM}}"
+  TagKeyOwner:
+    Type: String
+    Default: "{{TAG_KEY_OWNER}}"
+  TagKeyCostCenter:
+    Type: String
+    Default: "{{TAG_KEY_COST_CENTER}}"
+
+Resources:
+
+  # ─────────────────────────────────────────────────────────
+  # Cognito User Pool
+  # ─────────────────────────────────────────────────────────
+  DeveloperUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: bedrock-developers
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: false
+        - Name: team
+          AttributeDataType: String
+          Mutable: true
+          StringAttributeConstraints:
+            MaxLength: "64"
+        - Name: project
+          AttributeDataType: String
+          Mutable: true
+          StringAttributeConstraints:
+            MaxLength: "64"
+        - Name: cost_center
+          AttributeDataType: String
+          Mutable: true
+          StringAttributeConstraints:
+            MaxLength: "64"
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      LambdaConfig:
+        PreTokenGeneration: !GetAtt PreTokenGenerationFunction.Arn
+
+  # ─────────────────────────────────────────────────────────
+  # Pre-Token Generation Lambda
+  # Injects https://aws.amazon.com/tags claim into ID token
+  # so that STS maps Cognito attributes to session tags.
+  # ─────────────────────────────────────────────────────────
+  PreTokenGenerationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: bedrock-pre-token-gen-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  PreTokenGenerationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: bedrock-governance-pre-token-gen
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt PreTokenGenerationRole.Arn
+      Timeout: 5
+      Environment:
+        Variables:
+          TAG_KEY_OWNER: !Ref TagKeyOwner
+          TAG_KEY_TEAM: !Ref TagKeyTeam
+          TAG_KEY_PROJECT: !Ref TagKeyProject
+          TAG_KEY_COST_CENTER: !Ref TagKeyCostCenter
+      Code:
+        ZipFile: |
+          import os
+
+          def handler(event, context):
+              """Inject session tags claim into Cognito ID token.
+
+              AWS STS reads the 'https://aws.amazon.com/tags' claim from OIDC
+              tokens to populate session tags when AssumeRoleWithWebIdentity
+              is called with sts:TagSession permission.
+              """
+              user_attrs = event['request'].get('userAttributes', {})
+
+              tags = {
+                  os.environ['TAG_KEY_OWNER']: user_attrs.get('email', 'unknown'),
+                  os.environ['TAG_KEY_TEAM']: user_attrs.get('custom:team', 'unassigned'),
+                  os.environ['TAG_KEY_PROJECT']: user_attrs.get('custom:project', 'general'),
+                  os.environ['TAG_KEY_COST_CENTER']: user_attrs.get('custom:cost_center', 'unassigned'),
+              }
+
+              # Format per AWS spec:
+              # https://docs.aws.amazon.com/IAM/latest/UserGuide/id_session-tags.html
+              event['response']['claimsOverrideDetails'] = {
+                  'claimsToAddOrOverride': {
+                      'https://aws.amazon.com/tags': '{"principal_tags":' +
+                          '{' + ','.join(f'"{k}":["{v}"]' for k, v in tags.items()) + '}' +
+                          ',"transitive_tag_keys":["' + os.environ['TAG_KEY_OWNER'] + '"]}'
+                  }
+              }
+
+              return event
+
+  PreTokenGenerationPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PreTokenGenerationFunction
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt DeveloperUserPool.Arn
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoDomain
+      UserPoolId: !Ref DeveloperUserPool
+
+  # ─────────────────────────────────────────────────────────
+  # App Client (public client — PKCE, no secret)
+  # ─────────────────────────────────────────────────────────
+  CliAppClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: claude-code-cli
+      UserPoolId: !Ref DeveloperUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      CallbackURLs:
+        - !Ref CallbackUrl
+      SupportedIdentityProviders:
+        - COGNITO
+      PreventUserExistenceErrors: ENABLED
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  # ─────────────────────────────────────────────────────────
+  # IAM OIDC Identity Provider (trusts Cognito's JWT)
+  # ─────────────────────────────────────────────────────────
+  CognitoOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${DeveloperUserPool}"
+      ClientIdList:
+        - !Ref CliAppClient
+      ThumbprintList:
+        - "0000000000000000000000000000000000000000"
+
+  # ─────────────────────────────────────────────────────────
+  # Federated Developer Role
+  # ─────────────────────────────────────────────────────────
+  FederatedDeveloperRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: bedrock-federated-developer
+      MaxSessionDuration: !Ref SessionDurationSeconds
+      AssumeRolePolicyDocument:
+        Fn::Sub:
+          - |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Federated": "${OidcProviderArn}"
+                  },
+                  "Action": "sts:AssumeRoleWithWebIdentity",
+                  "Condition": {
+                    "StringEquals": {
+                      "cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}:aud": "${ClientId}"
+                    },
+                    "ForAnyValue:StringLike": {
+                      "cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}:amr": "authenticated"
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Principal": {
+                    "Federated": "${OidcProviderArn}"
+                  },
+                  "Action": "sts:TagSession",
+                  "Condition": {
+                    "StringEquals": {
+                      "cognito-idp.${AWS::Region}.amazonaws.com/${UserPoolId}:aud": "${ClientId}"
+                    }
+                  }
+                },
+                {
+                  "Effect": "Allow",
+                  "Principal": {
+                    "AWS": "arn:aws:iam::${AWS::AccountId}:role/bedrock-federated-developer"
+                  },
+                  "Action": ["sts:AssumeRole", "sts:TagSession"],
+                  "Condition": {
+                    "StringEquals": {
+                      "aws:PrincipalAccount": "${AWS::AccountId}"
+                    }
+                  }
+                }
+              ]
+            }
+          - OidcProviderArn: !GetAtt CognitoOidcProvider.Arn
+            UserPoolId: !Ref DeveloperUserPool
+            ClientId: !Ref CliAppClient
+      Policies:
+        - PolicyName: BedrockInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - "arn:aws:bedrock:*::foundation-model/anthropic.claude-*"
+                  - "arn:aws:bedrock:*:*:inference-profile/*"
+              - Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                Resource: "*"
+        - PolicyName: ApprovalLookup
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                Resource:
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/bedrock-governance-requests"
+                  - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/bedrock-governance-requests/index/*"
+        - PolicyName: DenySelfTagModification
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Deny
+                Action:
+                  - iam:TagUser
+                  - iam:TagRole
+                  - iam:UntagUser
+                  - iam:UntagRole
+                Resource: "*"
+                Condition:
+                  "ForAnyValue:StringEquals":
+                    "aws:TagKeys":
+                      - !Ref TagKeyProject
+                      - !Ref TagKeyTeam
+                      - !Ref TagKeyOwner
+                      - !Ref TagKeyCostCenter
+                      - "model-tier"
+      Tags:
+        - Key: !Ref TagKeyProject
+          Value: "claude-code"
+        - Key: !Ref TagKeyTeam
+          Value: "platform"
+
+  # ─────────────────────────────────────────────────────────
+  # SSM Parameters (for credential helper discovery)
+  # ─────────────────────────────────────────────────────────
+  UserPoolIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /bedrock-governance/cognito/user-pool-id
+      Type: String
+      Value: !Ref DeveloperUserPool
+
+  ClientIdParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /bedrock-governance/cognito/client-id
+      Type: String
+      Value: !Ref CliAppClient
+
+  IssuerUrlParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /bedrock-governance/cognito/issuer-url
+      Type: String
+      Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${DeveloperUserPool}"
+
+  RoleArnParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /bedrock-governance/federation/role-arn
+      Type: String
+      Value: !GetAtt FederatedDeveloperRole.Arn
+
+Outputs:
+  UserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref DeveloperUserPool
+    Export:
+      Name: bedrock-governance-user-pool-id
+
+  ClientId:
+    Description: CLI app client ID (public, no secret)
+    Value: !Ref CliAppClient
+    Export:
+      Name: bedrock-governance-client-id
+
+  IssuerUrl:
+    Description: OIDC issuer URL for IAM federation
+    Value: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${DeveloperUserPool}"
+    Export:
+      Name: bedrock-governance-issuer-url
+
+  FederatedRoleArn:
+    Description: IAM role ARN for federated developers
+    Value: !GetAtt FederatedDeveloperRole.Arn
+    Export:
+      Name: bedrock-governance-federated-role-arn
+
+  CognitoLoginUrl:
+    Description: Hosted UI login URL for developers
+    Value: !Sub "https://${CognitoDomain}.auth.${AWS::Region}.amazoncognito.com/oauth2/authorize?client_id=${CliAppClient}&response_type=code&scope=openid+email+profile&redirect_uri=${CallbackUrl}"
+
+  SwapInstructions:
+    Description: To use an external IdP instead of Cognito native
+    Value: >
+      To connect Okta/Azure AD: create a SAML or OIDC identity provider in the
+      Cognito User Pool console, then update the CliAppClient's
+      SupportedIdentityProviders. The IAM OIDC trust and role remain unchanged.

@@ -1,0 +1,236 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Amazon S3 Find and Forget Deletion Flow
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 900
+    Layers: !Ref CommonLayers
+    Environment:
+      Variables:
+        Cluster: !Ref ECSCluster
+        LogLevel: !Ref LogLevel
+
+Parameters:
+  CommonLayers:
+    Type: CommaDelimitedList
+  LogLevel:
+    Type: String
+    Default: INFO
+    AllowedValues:
+    - CRITICAL
+    - FATAL
+    - ERROR
+    - WARNING
+    - INFO
+    - DEBUG
+    - NOTSET
+  DeletionTaskCPU:
+    Type: String
+  DeletionTaskMemory:
+    Type: String
+  EnableContainerInsights:
+    Type: String
+  JobTableName:
+    Description: Table name for Jobs Table
+    Type: String
+  KMSKeyArns:
+    Type: String
+  LogRetentionInDays:
+    Type: Number
+    Default: 7
+  ManifestsBucket:
+    Type: String
+  ResourcePrefix:
+    Type: String
+  VpcSecurityGroups:
+    Type: CommaDelimitedList
+  VpcSubnets:
+    Type: CommaDelimitedList
+
+Conditions:
+  WithContainerInsights: !Equals [!Ref EnableContainerInsights, "true"]
+  WithKMS: !Not [!Equals [!Ref KMSKeyArns, ""]]
+
+Resources:
+
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: !If
+            - WithContainerInsights
+            - enabled
+            - disabled
+
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+      - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  DelObjQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      ContentBasedDeduplication: true
+      FifoQueue: true
+      ReceiveMessageWaitTimeSeconds: 0
+      KmsMasterKeyId: alias/aws/sqs
+      VisibilityTimeout: 10800
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DLQ.Arn
+        maxReceiveCount: 1
+
+  DelObjQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref DelObjQ
+      PolicyDocument:
+        Id: FargateConsumerPolicy
+        Statement:
+          - Sid: AllowFargateAccess
+            Effect: Allow
+            Principal:
+              AWS:
+                - !GetAtt DeleteTaskRole.Arn
+            Action:
+              - sqs:ChangeMessageVisibility
+              - sqs:DeleteMessage
+              - sqs:GetQueueAttributes
+              - sqs:ReceiveMessage
+            Resource: !GetAtt DelObjQ.Arn
+
+  DeleteTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      TaskRoleArn: !Ref DeleteTaskRole
+      ExecutionRoleArn: !GetAtt ECSTaskExecutionRole.Arn
+      NetworkMode: awsvpc
+      Memory: !Ref DeletionTaskMemory
+      Cpu: !Ref DeletionTaskCPU
+      RequiresCompatibilities:
+        - FARGATE
+      ContainerDefinitions:
+        - Name: !Sub ${ResourcePrefix}_DeleteTask
+          Essential: true
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.${AWS::URLSuffix}/${ECRRepository}:latest
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref DeleteTaskLogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: !Ref 'AWS::StackName'
+          Environment:
+            - Name: AWS_STS_REGIONAL_ENDPOINTS
+              Value: regional
+            - Name: AWS_URL_SUFFIX
+              Value: !Ref AWS::URLSuffix
+            - Name: DELETE_OBJECTS_QUEUE
+              Value: !Ref DelObjQ
+            - Name: ECS_ENABLE_CONTAINER_METADATA
+              Value: 'true'
+            - Name: LOG_LEVEL
+              Value: !Ref LogLevel
+            - Name: JobTable
+              Value: !Ref JobTableName
+
+  DeleteService:
+    Type: AWS::ECS::Service
+    Properties:
+      Cluster: !GetAtt ECSCluster.Arn
+      DesiredCount: 0
+      LaunchType: FARGATE
+      PlatformVersion: 1.4.0
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          SecurityGroups: !Ref VpcSecurityGroups
+          Subnets: !Ref VpcSubnets
+      TaskDefinition: !Ref DeleteTaskDefinition
+
+  DeleteTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+      - PolicyName: ReadWriteExecutionPolicy
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            Effect: Allow
+            Resource: !Sub "arn:${AWS::Partition}:dynamodb:${AWS::Region}:${AWS::AccountId}:table/${JobTableName}"
+          - Action:
+            - logs:DescribeLogStreams
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Effect: Allow
+            Resource: !Sub "arn:${AWS::Partition}:logs:*:*:*"
+          - Action: sts:AssumeRole
+            Effect: Allow
+            Resource: !Sub "arn:${AWS::Partition}:iam::*:role/S3F2DataAccessRole"
+          - Action: s3:GetObject*
+            Effect: Allow
+            Resource: !Sub arn:${AWS::Partition}:s3:::${ManifestsBucket}/manifests/*
+          - !If
+            - WithKMS
+            - Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              Effect: Allow
+              Resource: !Split [",", !Ref KMSKeyArns]
+            - !Ref AWS::NoValue
+
+  DeleteTaskLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: !Ref LogRetentionInDays
+
+  DLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      ContentBasedDeduplication: true
+      FifoQueue: true
+      KmsMasterKeyId: alias/aws/sqs
+      ReceiveMessageWaitTimeSeconds: 0
+
+Outputs:
+  DeleteObjectsQueueUrl:
+    Value: !Ref DelObjQ
+  DeleteServiceName:
+    Value: !GetAtt DeleteService.Name
+  DeleteTaskRole:
+    Value: !Ref DeleteTaskRole
+  DeleteTaskRoleArn:
+    Value: !GetAtt DeleteTaskRole.Arn
+  DLQUrl:
+    Value: !Ref DLQ
+  ECSCluster:
+    Value: !Ref ECSCluster
+  ECRRepository:
+    Value: !Ref ECRRepository

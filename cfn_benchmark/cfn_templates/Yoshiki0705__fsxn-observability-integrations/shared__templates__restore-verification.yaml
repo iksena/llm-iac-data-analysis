@@ -1,0 +1,1272 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  FSx for ONTAP Verified-Clean Recovery Point Workflow (CSF 2.0 RC.RP).
+
+  A protective snapshot existing is a Protect-phase artifact, not evidence
+  it is actually clean and restorable. Step Functions orchestrates:
+  FlexClone -> S3 Access Point attach -> ransomware-indicator scan -> verdict
+  (DynamoDB) -> guaranteed cleanup, for any candidate snapshot.
+
+  Deploy alongside automated-response.yaml, in the same VPC/subnets.
+
+  BEFORE YOU DEPLOY: run `aws ec2 describe-vpc-endpoints` and check which
+  of Secrets Manager/STS/S3-Gateway endpoints exist, then set the three
+  CreateXxxEndpoint params accordingly — a duplicate rolls back the stack.
+  Target SVM must have no existing ONTAP-native S3 server (structural, not
+  timing). Target volume must be UNIX security style. See the Guide.
+
+  Stack name pattern: fsxn-restore-verification
+
+Parameters:
+  OntapMgmtIp:
+    Type: String
+    Description: FSx for ONTAP management endpoint IP address
+    AllowedPattern: '^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$'
+
+  OntapCredentialsSecretArn:
+    Type: String
+    Description: Secrets Manager ARN for ONTAP admin credentials (JSON with username/password)
+    AllowedPattern: '^arn:aws:secretsmanager:.*'
+
+  FileSystemId:
+    Type: String
+    Description: FSx for ONTAP file system ID (fs-xxxxxxxxxxxxxxxxx)
+    AllowedPattern: '^fs-[0-9a-f]{17}$'
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID where FSx for ONTAP is deployed. Also used to scope the verification S3 Access Point.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Private subnet IDs with access to ONTAP management endpoint
+
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group ID that allows HTTPS (443) to ONTAP management IP
+
+  RouteTableIds:
+    Type: CommaDelimitedList
+    Description: >-
+      Route table IDs associated with SubnetIds. Used to attach the S3
+      Gateway VPC Endpoint (only if CreateS3GatewayEndpoint=true) that
+      ScanForIndicators needs to reach the VPC-scoped S3 Access Point.
+      Still required even if CreateS3GatewayEndpoint=false — the value is
+      simply unused by CloudFormation in that case, but the parameter has
+      no default, so pass your route table IDs regardless.
+
+  UnixUser:
+    Type: String
+    Description: UNIX identity for the S3 Access Point (volume must be UNIX security style)
+    Default: root
+
+  LambdaMemorySize:
+    Type: Number
+    Description: Lambda memory size in MB for the verification steps
+    Default: 512
+    AllowedValues: [256, 512, 1024]
+
+  StepTimeoutSeconds:
+    Type: Number
+    Description: Timeout for each Step Functions Lambda task (create-clone/scan/record-verdict/cleanup)
+    Default: 180
+    MinValue: 60
+    MaxValue: 900
+
+  AttachAccessPointTimeoutSeconds:
+    Type: Number
+    Description: >-
+      Timeout for the AttachAccessPoint Lambda itself (one attempt per
+      invocation — see its docstring). The FSx-ONTAP sync delay this step
+      waits out (AWS docs: "may take up to several minutes"; this
+      project's own measurements: ~12/24/36 min across 3 runs, increasing)
+      is absorbed by the state machine's Retry block, not by this timeout
+      — this value only needs to cover one Lambda invocation's own API
+      calls, not the full sync wait.
+    Default: 60
+    MinValue: 30
+    MaxValue: 900
+
+  FsxSyncWaitSeconds:
+    Type: Number
+    Description: >-
+      Static wait time (seconds) BEFORE polling starts for FSx API to
+      discover the ONTAP-created FlexClone. ONTAP creates the clone
+      instantly, but FSx API sync takes 12-36 minutes (measured). This
+      Wait state is free (no Lambda invocation) and avoids generating
+      noise in CloudWatch Logs from repeated failed polling attempts
+      during the period when discovery is guaranteed to fail. After this
+      wait, WaitForFsxDiscovery polls at intervals until discovery
+      succeeds. Total budget = FsxSyncWaitSeconds + polling retries.
+      Set to 0 to skip the static wait (all delay absorbed by polling).
+    Default: 600
+    MinValue: 0
+    MaxValue: 2400
+
+  SuspiciousRatioThreshold:
+    Type: Number
+    Description: >-
+      Fraction of scanned objects (0.0-1.0) with ransomware-associated
+      extensions required to flag a snapshot as "suspicious"
+    Default: 0.05
+    MinValue: 0.01
+    MaxValue: 1
+
+  SuspiciousMinCount:
+    Type: Number
+    Description: >-
+      Minimum absolute count of suspicious objects required to flag a
+      snapshot as "suspicious" (avoids false positives on small volumes)
+    Default: 20
+    MinValue: 1
+
+  NotificationTopicArn:
+    Type: String
+    Description: >-
+      SNS Topic ARN for verdict notifications (e.g., the ResponseNotificationTopic
+      output from automated-response.yaml). Leave empty to skip notifications.
+    Default: ''
+
+  CreateSecretsManagerEndpoint:
+    Type: String
+    Description: >-
+      Create an Interface VPC Endpoint for Secrets Manager (com.amazonaws.
+      <region>.secretsmanager). Set to 'false' if your VPC already has one —
+      a second Interface Endpoint for the SAME service with PrivateDnsEnabled
+      fails to create (CloudFormation error: "private-dns-enabled cannot be
+      set because there is already a conflicting DNS domain..."). This is
+      the single most common deployment failure for this stack: if you are
+      layering this template onto a VPC that already runs
+      automated-response.yaml, or any other stack/console action that
+      created a Secrets Manager endpoint, set this to 'false'. Check first —
+      see "Before You Deploy" in the Verified-Clean Recovery Point Guide for
+      the exact `aws ec2 describe-vpc-endpoints` command.
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  CreateStsEndpoint:
+    Type: String
+    Description: >-
+      Create an Interface VPC Endpoint for STS (com.amazonaws.<region>.sts).
+      Set to 'false' if your VPC already has one, for the same
+      PrivateDnsEnabled-conflict reason described under
+      CreateSecretsManagerEndpoint. STS is used by the AWS SDK's default
+      credential chain in some configurations; most deployments do need this
+      endpoint unless one already exists.
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+  CreateS3GatewayEndpoint:
+    Type: String
+    Description: >-
+      Create an S3 Gateway VPC Endpoint, required for ScanForIndicators to
+      reach the VPC-scoped S3 Access Point — a VPC-scoped access point has
+      no route from outside the bound VPC (see Security Considerations in
+      the Verified-Clean Recovery Point Guide). Set to 'false' if your VPC
+      already has an S3 Gateway Endpoint bound to RouteTableIds (Gateway
+      Endpoints are commonly shared across stacks since, unlike Interface
+      Endpoints, they don't set PrivateDnsEnabled and rarely conflict — but
+      confirm your route tables are covered; a Gateway Endpoint bound to a
+      DIFFERENT route table than RouteTableIds will not help this stack).
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+
+Conditions:
+  HasNotificationTopic: !Not [!Equals [!Ref NotificationTopicArn, '']]
+  ShouldCreateSecretsManagerEndpoint: !Equals [!Ref CreateSecretsManagerEndpoint, 'true']
+  ShouldCreateStsEndpoint: !Equals [!Ref CreateStsEndpoint, 'true']
+  ShouldCreateS3GatewayEndpoint: !Equals [!Ref CreateS3GatewayEndpoint, 'true']
+  ShouldCreateAnyInterfaceEndpoint: !Or
+    - !Condition ShouldCreateSecretsManagerEndpoint
+    - !Condition ShouldCreateStsEndpoint
+
+Resources:
+  # ================================================================
+  # VPC Endpoints — each created independently based on its own
+  # CreateXxxEndpoint parameter, so you can reuse whichever endpoints your
+  # VPC already has (e.g., from automated-response.yaml) and only create
+  # what's missing. See "Before You Deploy" in the Guide for the discovery
+  # command — guessing wrong triggers a full stack rollback.
+  #
+  # Only 2 of the 5 Lambdas run inside the VPC:
+  #   - CreateClone calls the ONTAP REST API directly (management-IP route
+  #     via SubnetIds/SecurityGroupId) and Secrets Manager (credentials).
+  #   - Scan calls ListObjectsV2 against the VPC-scoped S3 Access Point —
+  #     needs the S3 Gateway Endpoint below (a VPC-scoped AP has no route
+  #     from outside its bound VPC).
+  # AttachAccessPoint / RecordVerdict / Cleanup call only public AWS APIs
+  # (FSx control-plane, DynamoDB, SNS) and run outside the VPC — no FSx
+  # Interface Endpoint is needed anywhere in this stack.
+  # ================================================================
+  SecretsManagerVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateSecretsManagerEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.secretsmanager'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  StsVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateStsEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.sts'
+      VpcEndpointType: Interface
+      SubnetIds: !Ref SubnetIds
+      SecurityGroupIds:
+        - !Ref VpcEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  S3GatewayVpcEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Condition: ShouldCreateS3GatewayEndpoint
+    Properties:
+      VpcId: !Ref VpcId
+      ServiceName: !Sub 'com.amazonaws.${AWS::Region}.s3'
+      VpcEndpointType: Gateway
+      RouteTableIds: !Ref RouteTableIds
+      # Gateway endpoint policy is intentionally permissive (S3 is scoped by
+      # IAM + the S3 Access Point's own resource policy, not by this
+      # endpoint policy); tighten with a Condition on aws:sourceVpce if your
+      # organization requires endpoint-level restriction in addition to IAM.
+
+  # Shared by whichever Interface Endpoints are actually created above —
+  # created once if at least one of Secrets Manager/STS/FSx is being
+  # created, regardless of which specific combination.
+  VpcEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: ShouldCreateAnyInterfaceEndpoint
+    Properties:
+      GroupDescription: Allow Lambda to access Interface VPC Endpoints (Secrets Manager, STS)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref SecurityGroupId
+          Description: Lambda SG to VPC Endpoint (HTTPS)
+
+  # ================================================================
+  # DynamoDB — verification verdict ledger
+  # ================================================================
+  VerificationLedgerTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-ledger'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: snapshot_key
+          AttributeType: S
+        - AttributeName: started_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: snapshot_key
+          KeyType: HASH
+        - AttributeName: started_at
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Project
+          Value: fsxn-observability
+        - Key: Purpose
+          Value: restore-verification-ledger
+
+  # ================================================================
+  # Lambda Execution Role (shared by all verification steps)
+  # ================================================================
+  VerificationLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: RestoreVerificationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: SecretsManagerRead
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref OntapCredentialsSecretArn
+              - Sid: FsxS3AccessPointLifecycle
+                Effect: Allow
+                Action:
+                  - fsx:CreateAndAttachS3AccessPoint
+                  - fsx:DetachAndDeleteS3AccessPoint
+                  - fsx:DescribeS3AccessPointAttachments
+                  - fsx:DescribeVolumes
+                Resource: '*'
+                # fsx:*S3AccessPoint* actions lack resource-level perms as of
+                # this writing; scoping via condition keys isn't available.
+              - Sid: FsxVolumeDelete
+                Effect: Allow
+                Action:
+                  - fsx:DeleteVolume
+                Resource: !Sub 'arn:aws:fsx:${AWS::Region}:${AWS::AccountId}:volume/${FileSystemId}/*'
+                # Cleanup deletes via FSx API, not ONTAP REST API — ONTAP
+                # delete fails for FSx-backup-managed volumes (see docstring).
+              - Sid: S3AccessPointLifecycle
+                Effect: Allow
+                Action:
+                  - s3:CreateAccessPoint
+                  - s3:DeleteAccessPoint
+                  - s3:GetAccessPoint
+                # fsx:*AttachS3AccessPoint calls these on caller's behalf —
+                # FSx-side perms alone aren't sufficient (observed denied).
+                Resource: !Sub 'arn:aws:s3:${AWS::Region}:${AWS::AccountId}:accesspoint/*'
+              - Sid: S3AccessPointObjectRead
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:GetObject
+                Resource:
+                  - !Sub 'arn:aws:s3:${AWS::Region}:${AWS::AccountId}:accesspoint/*'
+                  - !Sub 'arn:aws:s3:${AWS::Region}:${AWS::AccountId}:accesspoint/*/object/*'
+              - Sid: DynamoDbLedger
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt VerificationLedgerTable.Arn
+              - Sid: SNSPublish
+                Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !If
+                  - HasNotificationTopic
+                  - !Ref NotificationTopicArn
+                  - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:*'
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*:*'
+
+  # ================================================================
+  # Log Groups (90-day retention — operational; the ledger is the record)
+  # ================================================================
+  CreateCloneLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-create-clone'
+      RetentionInDays: 90
+
+  AttachApLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-attach-ap'
+      RetentionInDays: 90
+
+  ScanLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-scan'
+      RetentionInDays: 90
+
+  CleanupLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-cleanup'
+      RetentionInDays: 90
+
+  RecordVerdictLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-record-verdict'
+      RetentionInDays: 365  # verdict recording doubles as compliance evidence
+
+  # ================================================================
+  # Lambda — Step 1: Create FlexClone from candidate snapshot
+  # ================================================================
+  CreateCloneFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-create-clone'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref StepTimeoutSeconds
+      Role: !GetAtt VerificationLambdaRole.Arn
+      # VpcConfig required: calls the ONTAP management endpoint directly
+      # (volume create) over the network path provided by SubnetIds/
+      # SecurityGroupId. Does not call the FSx control-plane API, so it
+      # needs no FSx Interface Endpoint.
+      VpcConfig:
+        SubnetIds: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref SecurityGroupId
+      Environment:
+        Variables:
+          ONTAP_MGMT_IP: !Ref OntapMgmtIp
+          ONTAP_CREDENTIALS_SECRET_ARN: !Ref OntapCredentialsSecretArn
+      Code:
+        ZipFile: |
+          """Step 1: Create a FlexClone volume from the candidate snapshot.
+
+          Input:  {"svm_name", "volume_name", "snapshot_name"}
+          Output: {"clone_name", "svm_name", "volume_uuid", "parent_volume",
+                    "parent_snapshot"}
+          """
+          import json
+          import logging
+          import os
+          import time
+          from datetime import datetime, timezone
+          from typing import Any
+
+          import boto3
+          import urllib3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          http = urllib3.PoolManager(cert_reqs="CERT_NONE")
+          _creds_cache = None
+
+          def _get_credentials():
+              global _creds_cache
+              if _creds_cache is None:
+                  sm = boto3.client("secretsmanager")
+                  secret = sm.get_secret_value(SecretId=os.environ["ONTAP_CREDENTIALS_SECRET_ARN"])
+                  _creds_cache = json.loads(secret["SecretString"])
+              return _creds_cache
+
+          def _request(method, path, body=None):
+              creds = _get_credentials()
+              mgmt_ip = os.environ["ONTAP_MGMT_IP"]
+              auth = urllib3.util.make_headers(basic_auth=f"{creds['username']}:{creds['password']}")
+              headers = {**auth, "Accept": "application/json", "Content-Type": "application/json"}
+              url = f"https://{mgmt_ip}/api{path}"
+              kwargs = {"headers": headers, "timeout": 30.0}
+              if body is not None:
+                  kwargs["body"] = json.dumps(body).encode()
+              resp = http.request(method, url, **kwargs)
+              data = {}
+              if resp.data:
+                  try:
+                      data = json.loads(resp.data)
+                  except (json.JSONDecodeError, UnicodeDecodeError):
+                      data = {}
+              if resp.status >= 400:
+                  raise RuntimeError(f"ONTAP API {method} {path} failed: HTTP {resp.status} {data}")
+              return data
+
+          def _wait_for_job(job_uuid, max_wait_seconds=120, poll_interval=3.0):
+              deadline = time.monotonic() + max_wait_seconds
+              while time.monotonic() < deadline:
+                  data = _request("GET", f"/cluster/jobs/{job_uuid}")
+                  state = data.get("state", "")
+                  if state == "success":
+                      return
+                  if state in ("failure", "error"):
+                      raise RuntimeError(f"ONTAP job {job_uuid} failed: {data.get('message', 'unknown')}")
+                  time.sleep(poll_interval)
+              raise RuntimeError(f"ONTAP job {job_uuid} did not complete within {max_wait_seconds}s")
+
+          def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+              svm_name = event["svm_name"]
+              volume_name = event["volume_name"]
+              snapshot_name = event["snapshot_name"]
+
+              # --- Pre-flight: AD DC reachability check ---
+              # If the SVM has CIFS enabled (AD-joined), S3 AP data operations
+              # require AD DC connectivity for unix->win reverse name-mapping.
+              # If AD is unreachable, S3 AP ListObjectsV2/GetObject will return
+              # AccessDenied at the file-system layer — a confusing error that
+              # looks like a policy issue but is actually AD connectivity.
+              # Fail fast here with a clear message instead of waiting 30+ min
+              # for clone creation + FSx discovery only to hit AccessDenied.
+              cifs_data = _request("GET", f"/protocols/cifs/services?svm.name={svm_name}&fields=ad_domain.fqdn")
+              cifs_records = cifs_data.get("records", [])
+              if cifs_records:
+                  ad_fqdn = cifs_records[0].get("ad_domain", {}).get("fqdn", "unknown")
+                  logger.info("SVM '%s' has CIFS enabled (AD: %s)", svm_name, ad_fqdn)
+                  # Also check DNS connectivity to AD by verifying domain
+                  # controller reachability via ONTAP's own diagnostic
+                  try:
+                      dc_check = _request("GET", f"/protocols/cifs/domains?svm.name={svm_name}&fields=discovered_servers")
+                      dc_records = dc_check.get("records", [])
+                      if dc_records:
+                          servers = dc_records[0].get("discovered_servers", None)
+                          if servers is not None and len(servers) == 0:
+                              raise RuntimeError(
+                                  f"AD CONNECTIVITY FAILURE: SVM '{svm_name}' is AD-joined "
+                                  f"(domain: {ad_fqdn}) but cannot discover any domain controllers. "
+                                  f"S3 Access Point data operations will fail with AccessDenied. "
+                                  f"Verify AD ({ad_fqdn}) is running and DNS IPs are reachable "
+                                  f"from the SVM's network interfaces."
+                              )
+                          elif servers is not None:
+                              logger.info("AD domain controllers reachable: %d servers discovered", len(servers))
+                          else:
+                              # Field not returned by this ONTAP version — cannot verify
+                              logger.info("AD DC reachability check: discovered_servers field not available (proceeding)")
+                      else:
+                          logger.info("No CIFS domain records found — proceeding without DC verification")
+                  except RuntimeError as e:
+                      if "AD CONNECTIVITY" in str(e):
+                          raise
+                      # If the domains API is unavailable (older ONTAP), fall through
+                      logger.warning("Could not verify AD DC reachability (API unavailable): %s", e)
+
+              timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+              clone_name = f"verify_{volume_name}_{timestamp}"[:203]
+
+              logger.info("Creating FlexClone %s from %s/%s@%s", clone_name, svm_name, volume_name, snapshot_name)
+
+              # nas.path mounts the clone at creation time. Without it,
+              # ONTAP may leave the volume unmounted, and AttachAccessPoint
+              # then fails: "unable to attach S3 access point because the
+              # volume is not mounted" (observed in E2E verification).
+              body = {
+                  "name": clone_name,
+                  "svm": {"name": svm_name},
+                  "nas": {"path": f"/{clone_name}"},
+                  "clone": {
+                      "parent_volume": {"name": volume_name},
+                      "parent_snapshot": {"name": snapshot_name},
+                      "is_flexclone": True,
+                  },
+              }
+              data = _request("POST", "/storage/volumes", body=body)
+              job = data.get("job", {})
+              if job.get("uuid"):
+                  _wait_for_job(job["uuid"])
+
+              lookup = _request("GET", f"/storage/volumes?name={clone_name}&svm.name={svm_name}&fields=uuid")
+              records = lookup.get("records", [])
+              if not records:
+                  raise RuntimeError(f"FlexClone {clone_name} was created but could not be resolved")
+
+              # Preserve the full input event (notably "vpc_id", which the
+              # next step — AttachAccessPoint — requires) rather than
+              # returning only this step's own new fields. Downstream
+              # steps in this workflow all follow the same
+              # dict(event) + update(...) pattern for the same reason.
+              result = dict(event)
+              result.update({
+                  "clone_name": clone_name,
+                  "svm_name": svm_name,
+                  "volume_uuid": records[0]["uuid"],
+                  "parent_volume": volume_name,
+                  "parent_snapshot": snapshot_name,
+              })
+              return result
+
+  # ================================================================
+  # Lambda — Step 1b: Wait for FSx API to discover the FlexClone
+  # ================================================================
+  WaitForFsxDiscoveryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-wait-fsx-discovery'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: 256
+      Timeout: 60
+      Role: !GetAtt VerificationLambdaRole.Arn
+      # No VpcConfig: only calls the FSx control-plane API (public AWS API)
+      Environment:
+        Variables:
+          FILE_SYSTEM_ID: !Ref FileSystemId
+      Code:
+        ZipFile: |
+          """Step 1b: Poll FSx API until the ONTAP-created FlexClone is visible.
+
+          ONTAP REST API creates the clone instantly, but FSx periodically
+          syncs with ONTAP — "it may take up to several minutes for these
+          changes to be reflected" (AWS docs). This step absorbs that sync
+          delay as a dedicated state so that AttachAccessPoint can focus
+          solely on its own responsibility.
+
+          Input:  {"clone_name", "volume_uuid", ...(passthrough from step 1)}
+          Output: {"fsvol_id", ...(passthrough)}
+          Errors: FsxDiscoveryPending (retried by Step Functions)
+          """
+          import logging
+          import os
+          from typing import Any
+
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          fsx = boto3.client("fsx")
+
+          class FsxDiscoveryPending(Exception):
+              """FSx has not yet discovered the ONTAP-API-created clone volume."""
+
+          def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+              clone_name = event["clone_name"]
+              file_system_id = os.environ["FILE_SYSTEM_ID"]
+
+              paginator = fsx.get_paginator("describe_volumes")
+              for page in paginator.paginate(
+                  Filters=[{"Name": "file-system-id", "Values": [file_system_id]}]
+              ):
+                  for volume in page.get("Volumes", []):
+                      if volume.get("Name") == clone_name and volume.get("Lifecycle") in (
+                          "AVAILABLE", "CREATED",
+                      ):
+                          fsvol_id = volume["VolumeId"]
+                          logger.info(
+                              "FSx discovered clone volume '%s' (VolumeId=%s)",
+                              clone_name, fsvol_id,
+                          )
+                          result = dict(event)
+                          result["fsvol_id"] = fsvol_id
+                          return result
+
+              logger.info(
+                  "FSx has not yet discovered clone volume '%s' — will retry "
+                  "(expected: ONTAP->FSx sync can take several minutes)",
+                  clone_name,
+              )
+              raise FsxDiscoveryPending(
+                  f"Clone volume '{clone_name}' not yet visible via FSx API"
+              )
+
+  WaitForFsxDiscoveryLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-wait-fsx-discovery'
+      RetentionInDays: 90
+
+  # ================================================================
+  # Lambda — Step 2: Attach S3 Access Point to the clone
+  # ================================================================
+  AttachAccessPointFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-attach-ap'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref AttachAccessPointTimeoutSeconds
+      Role: !GetAtt VerificationLambdaRole.Arn
+      # No VpcConfig: only calls the FSx control-plane API (public AWS API)
+      # — never talks to ONTAP directly. No Lambda in this stack needs an
+      # FSx Interface Endpoint.
+      Environment:
+        Variables:
+          FILE_SYSTEM_ID: !Ref FileSystemId
+          UNIX_USER: !Ref UnixUser
+      Code:
+        ZipFile: |
+          """Step 2: Attach a VPC-scoped S3 Access Point to the FlexClone.
+
+          Input:  {"clone_name", "vpc_id", "fsvol_id", ...(passthrough)}
+          Output: {"access_point_name", "access_point_arn", ...(passthrough)}
+
+          PREREQUISITE: WaitForFsxDiscovery must have already confirmed that
+          FSx API can see the clone volume and provided "fsvol_id" in the
+          event. This step no longer handles FsxDiscoveryPending.
+
+          RETRY DESIGN: One attempt per invocation. Raises S3AttachPending
+          when the access point is not yet AVAILABLE — Step Functions Retry
+          re-invokes on an interval.
+
+          IMPORTANT: always sets FileSystemIdentity.Type=UNIX — only
+          authorizes UNIX-security-style volumes.
+          """
+          import logging
+          import os
+          import re
+          from typing import Any
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          fsx = boto3.client("fsx")
+
+          class S3AttachPending(Exception):
+              """The S3 Access Point was created but has not reached AVAILABLE yet."""
+
+          def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+              clone_name = event["clone_name"]
+              vpc_id = event["vpc_id"]
+              fsvol_id = event["fsvol_id"]
+              unix_user = os.environ.get("UNIX_USER", "root")
+              access_point_name = re.sub(r"[^a-z0-9-]", "-", clone_name.lower())[:50]
+
+              # Idempotent check: has this access point already been
+              # requested by an earlier retry attempt?
+              try:
+                  existing = fsx.describe_s3_access_point_attachments(
+                      Names=[access_point_name]
+                  ).get("S3AccessPointAttachments", [])
+              except ClientError as e:
+                  error_code = e.response.get("Error", {}).get("Code", "")
+                  if "NotFound" not in error_code:
+                      raise
+                  existing = []
+
+              if not existing:
+                  logger.info("Requesting S3 Access Point %s for volume %s", access_point_name, fsvol_id)
+                  try:
+                      # Internet-origin AP: accessible from VPC-external Lambda
+                      # without needing a VPC endpoint. This matches the verified
+                      # pattern from FSx-for-ONTAP-S3AccessPoints-Serverless-Patterns.
+                      # VPC-origin AP + Gateway EP causes AccessDenied in Lambda
+                      # (observed and confirmed in E2E testing — see AGENTS.md).
+                      fsx.create_and_attach_s3_access_point(
+                          Name=access_point_name,
+                          Type="ONTAP",
+                          OntapConfiguration={
+                              "VolumeId": fsvol_id,
+                              "FileSystemIdentity": {"Type": "UNIX", "UnixUser": {"Name": unix_user}},
+                          },
+                      )
+                  except ClientError as e:
+                      raise RuntimeError(f"Failed to create S3 Access Point: {e}") from e
+
+                  raise S3AttachPending(
+                      f"S3 Access Point {access_point_name} just requested, polling for AVAILABLE"
+                  )
+
+              lifecycle = existing[0].get("Lifecycle")
+              if lifecycle == "AVAILABLE":
+                  ap = existing[0].get("S3AccessPoint", {})
+                  ap_arn = ap.get("ResourceARN", "")
+                  # FSx for ONTAP S3 APs do NOT require an explicit resource
+                  # policy for same-account access. IAM identity policy alone
+                  # is sufficient (verified in FSx-for-ONTAP-S3AccessPoints-
+                  # Serverless-Patterns repo). Calling put_access_point_policy
+                  # on FSx ONTAP APs caused persistent AccessDenied in E2E
+                  # testing — the policy either doesn't propagate or conflicts
+                  # with FSx's internal authorization layer.
+                  ap_alias = ap.get("Alias", "")
+                  logger.info("S3 Access Point AVAILABLE: ARN=%s, Alias=%s", ap_arn, ap_alias)
+                  result = dict(event)
+                  result.update({
+                      "access_point_name": access_point_name,
+                      "access_point_arn": ap_arn,
+                      "access_point_alias": ap_alias,
+                      "fsvol_id": fsvol_id,
+                  })
+                  return result
+              if lifecycle in ("FAILED", "MISCONFIGURED"):
+                  raise RuntimeError(f"S3 Access Point {access_point_name} entered {lifecycle} state")
+
+              raise S3AttachPending(f"S3 Access Point {access_point_name} not yet AVAILABLE (currently {lifecycle})")
+
+  # ================================================================
+  # Lambda — Step 3: Scan for ransomware indicators via the access point
+  # ================================================================
+  ScanFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-scan'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref StepTimeoutSeconds
+      Role: !GetAtt VerificationLambdaRole.Arn
+      # No VpcConfig: S3 AP is Internet-origin (not VPC-scoped), so Lambda
+      # accesses it via the public S3 endpoint. This is the verified pattern
+      # from FSx-for-ONTAP-S3AccessPoints-Serverless-Patterns:
+      # "VPC-external Lambda for Internet-origin S3AP access (no VpcConfig)"
+      Environment:
+        Variables:
+          SUSPICIOUS_RATIO_THRESHOLD: !Ref SuspiciousRatioThreshold
+          SUSPICIOUS_MIN_COUNT: !Ref SuspiciousMinCount
+      Code:
+        ZipFile: |
+          """Step 3: List objects through the S3 Access Point and flag
+          ransomware-associated file extensions.
+
+          This is a fast pre-filter, not a substitute for ONTAP ARP's entropy
+          analysis (which runs against the live volume). It answers "is this
+          snapshot dominated by ransomware-renamed files" — a coarse signal
+          for an automated go/no-go gate before a human reviews borderline
+          cases.
+
+          Input:  {"access_point_arn", "access_point_alias", ...(passthrough)}
+          Output: {"objects_scanned", "suspicious_objects", "suspicious_ratio",
+                    "verdict", "reason", ...(passthrough)}
+          """
+          import logging
+          import os
+          from typing import Any
+
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          s3 = boto3.client("s3")
+
+          SUSPICIOUS_EXTENSIONS = frozenset({
+              ".encrypted", ".locked", ".crypt", ".crypted", ".enc", ".ransom",
+              ".wcry", ".wncry", ".locky", ".zzz", ".ezz", ".exx", ".ecc",
+              ".cerber", ".cerber3", ".crab", ".vault", ".conti",
+          })
+
+          def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+              # Prefer alias for VPC-scoped AP (avoids AccessDenied from ARN-based
+              # routing when Gateway Endpoint is involved); fall back to ARN
+              access_point_alias = event.get("access_point_alias") or event.get("access_point_arn")
+              access_point_arn = event["access_point_arn"]
+              logger.info("Scanning via: %s (ARN: %s)", access_point_alias, access_point_arn)
+              ratio_threshold = float(os.environ.get("SUSPICIOUS_RATIO_THRESHOLD", "0.05"))
+              min_count = int(os.environ.get("SUSPICIOUS_MIN_COUNT", "20"))
+
+              total_objects = 0
+              suspicious = []
+
+              paginator = s3.get_paginator("list_objects_v2")
+              for page in paginator.paginate(Bucket=access_point_alias, MaxKeys=1000):
+                  for obj in page.get("Contents", []):
+                      total_objects += 1
+                      key = obj["Key"]
+                      lower_key = key.lower()
+                      if any(lower_key.endswith(ext) for ext in SUSPICIOUS_EXTENSIONS):
+                          suspicious.append(key)
+
+              ratio = (len(suspicious) / total_objects) if total_objects else 0.0
+              is_suspicious = len(suspicious) >= min_count and ratio >= ratio_threshold
+
+              if is_suspicious:
+                  verdict = "suspicious"
+                  reason = (
+                      f"{len(suspicious)} objects ({ratio:.1%}) have ransomware-associated "
+                      f"extensions — this snapshot likely captured an in-progress or "
+                      f"completed encryption event, not a clean recovery point"
+                  )
+                  logger.warning("Verification: SUSPICIOUS — %s", reason)
+              else:
+                  verdict = "clean"
+                  reason = (
+                      f"Scanned {total_objects} objects; {len(suspicious)} flagged "
+                      f"({ratio:.1%}, below {ratio_threshold:.0%} threshold)"
+                  )
+                  logger.info("Verification: CLEAN — %s", reason)
+
+              result = dict(event)
+              result.update({
+                  "objects_scanned": total_objects,
+                  "suspicious_objects": suspicious[:50],
+                  "suspicious_object_count": len(suspicious),
+                  "suspicious_ratio": ratio,
+                  "verdict": verdict,
+                  "reason": reason,
+              })
+              return result
+
+  # ================================================================
+  # Lambda — Step 4: Record verdict in DynamoDB ledger + notify
+  # ================================================================
+  RecordVerdictFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-record-verdict'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref StepTimeoutSeconds
+      Role: !GetAtt VerificationLambdaRole.Arn
+      Environment:
+        Variables:
+          LEDGER_TABLE_NAME: !Ref VerificationLedgerTable
+          NOTIFICATION_TOPIC_ARN: !If [HasNotificationTopic, !Ref NotificationTopicArn, '']
+      Code:
+        ZipFile: |
+          """Step 4: Persist the verification verdict and notify.
+
+          Input:  full accumulated state from steps 1-3, plus an optional
+                   "error" key if invoked from the Step Functions catch path.
+          Output: the same state, augmented with started_at/completed_at.
+          """
+          import json
+          import logging
+          import os
+          from datetime import datetime, timezone
+          from typing import Any
+
+          import boto3
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          dynamodb = boto3.resource("dynamodb")
+          sns = boto3.client("sns")
+
+          def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+              now = datetime.now(timezone.utc).isoformat()
+              verdict = event.get("verdict", "error")
+              snapshot_name = event.get("snapshot_name", "unknown")
+              volume_name = event.get("volume_name", "unknown")
+              svm_name = event.get("svm_name", "unknown")
+
+              table = dynamodb.Table(os.environ["LEDGER_TABLE_NAME"])
+              item = {
+                  "snapshot_key": f"{svm_name}/{volume_name}/{snapshot_name}",
+                  "started_at": event.get("started_at", now),
+                  "completed_at": now,
+                  "svm_name": svm_name,
+                  "volume_name": volume_name,
+                  "snapshot_name": snapshot_name,
+                  "clone_name": event.get("clone_name", ""),
+                  "access_point_name": event.get("access_point_name", ""),
+                  "verdict": verdict,
+                  "objects_scanned": event.get("objects_scanned", 0),
+                  "suspicious_object_count": event.get("suspicious_object_count", 0),
+                  "suspicious_ratio": str(event.get("suspicious_ratio", 0)),
+                  "reason": event.get("reason", event.get("error", "")),
+              }
+              table.put_item(Item=item)
+              logger.info("Recorded verdict %s for %s", verdict, item["snapshot_key"])
+
+              topic_arn = os.environ.get("NOTIFICATION_TOPIC_ARN")
+              if topic_arn:
+                  try:
+                      sns.publish(
+                          TopicArn=topic_arn,
+                          Subject=f"[FSx-ONTAP Recovery Verification] {snapshot_name}: {verdict}"[:100],
+                          Message=json.dumps(item, indent=2, default=str),
+                      )
+                  except Exception as e:
+                      logger.warning("Verdict notification failed: %s", e)
+
+              result = dict(event)
+              result["started_at"] = item["started_at"]
+              result["completed_at"] = now
+              return result
+
+  # ================================================================
+  # Lambda — Step 5: Guaranteed cleanup (S3 AP + FlexClone deletion)
+  # ================================================================
+  CleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-cleanup'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref StepTimeoutSeconds
+      Role: !GetAtt VerificationLambdaRole.Arn
+      # No VpcConfig: only calls the FSx control-plane API (public API).
+      Code:
+        ZipFile: |
+          """Step 5: Best-effort teardown of the S3 Access Point and FlexClone.
+
+          Always invoked (success path or Step Functions catch path) so a
+          verification run never leaves a clone volume or access point
+          behind. Missing keys (e.g., cleanup runs after an early failure
+          before the clone was created) are treated as no-ops, not errors.
+
+          IMPORTANT: Deletes via fsx.delete_volume, NOT ONTAP REST API —
+          FSx-backup-managed volumes can't be deleted via ONTAP CLI/REST
+          (SnapMirror relationship blocks it, ONTAP error 917858, job
+          state "failure", invisible to code checking only HTTP 202).
+
+          Input:  accumulated state (may be partial if an earlier step failed)
+          Output: same state, plus "cleaned_up": bool
+          """
+          import logging
+          import time
+          from typing import Any
+
+          import boto3
+          from botocore.exceptions import ClientError
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          fsx = boto3.client("fsx")
+
+          def _wait_for_ap_gone(access_point_name, max_wait_seconds=60, poll_interval=3.0):
+              # detach_and_delete is async (returns DELETING) — delete_volume
+              # fails ("Cannot delete volume while it has ... access points")
+              # if called before detach completes (observed in E2E verification).
+              deadline = time.monotonic() + max_wait_seconds
+              while time.monotonic() < deadline:
+                  try:
+                      fsx.describe_s3_access_point_attachments(Names=[access_point_name])
+                  except ClientError as e:
+                      if "NotFound" in e.response.get("Error", {}).get("Code", ""):
+                          return True
+                      raise
+                  time.sleep(poll_interval)
+              return False
+
+          def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+              success = True
+
+              access_point_name = event.get("access_point_name")
+              if access_point_name:
+                  try:
+                      fsx.detach_and_delete_s3_access_point(Name=access_point_name)
+                      logger.info("Detach requested for S3 Access Point %s", access_point_name)
+                      if not _wait_for_ap_gone(access_point_name):
+                          logger.error("S3 Access Point %s did not finish deleting in time", access_point_name)
+                          success = False
+                      else:
+                          logger.info("S3 Access Point %s fully deleted", access_point_name)
+                  except ClientError as e:
+                      error_code = e.response.get("Error", {}).get("Code", "")
+                      if "NotFound" not in error_code:
+                          logger.error("Failed to detach S3 Access Point %s: %s", access_point_name, e)
+                          success = False
+
+              # fsvol_id is set by AttachAccessPoint once FSx discovers the
+              # clone. If the workflow failed before that, fsvol_id is
+              # absent and the orphaned clone needs manual cleanup via
+              # `aws fsx describe-volumes` + `delete-volume` (see the Guide).
+              fsvol_id = event.get("fsvol_id")
+              if fsvol_id:
+                  try:
+                      # SkipFinalBackup=True: otherwise FSx backs up this
+                      # throwaway clone by default (extra cost; a failed
+                      # backup attempt can also leave it FAILED, blocking
+                      # deletion — observed in E2E testing).
+                      fsx.delete_volume(VolumeId=fsvol_id, OntapConfiguration={"SkipFinalBackup": True})
+                      logger.info("Requested FSx deletion of clone volume %s (async)", fsvol_id)
+                  except ClientError as e:
+                      error_code = e.response.get("Error", {}).get("Code", "")
+                      if "NotFound" not in error_code:
+                          logger.error("Failed to delete FSx volume %s: %s", fsvol_id, e)
+                          success = False
+              elif event.get("volume_uuid"):
+                  # Do NOT fall back to ONTAP-API delete (fails for
+                  # FSx-backup-managed volumes). Resolve manually instead.
+                  logger.warning(
+                      "volume_uuid %s present but fsvol_id missing — orphaned clone, "
+                      "requires manual FSx-API cleanup once FSx discovers it",
+                      event["volume_uuid"],
+                  )
+                  success = False
+
+              result = dict(event)
+              result["cleaned_up"] = success
+              return result
+
+  # ================================================================
+  # Step Functions — orchestrates the full verify -> cleanup workflow
+  # ================================================================
+  StateMachineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-sfn-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'states.${AWS::Region}.amazonaws.com'
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeVerificationLambdas
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt CreateCloneFunction.Arn
+                  - !GetAtt WaitForFsxDiscoveryFunction.Arn
+                  - !GetAtt AttachAccessPointFunction.Arn
+                  - !GetAtt ScanFunction.Arn
+                  - !GetAtt RecordVerdictFunction.Arn
+                  - !GetAtt CleanupFunction.Arn
+        # Required because LoggingConfiguration below sets Level: ALL —
+        # Step Functions execution-history logging to CloudWatch Logs needs
+        # these broad log-delivery actions on Resource: '*' per AWS's own
+        # documented IAM policy for state machine logging (the API only
+        # accepts wildcard-scoped log-delivery permissions here, not a
+        # LogGroup-scoped ARN, because CloudWatch Logs delivery is managed
+        # through the account-level log delivery service, not directly by
+        # the state machine's own execution role).
+        - PolicyName: StateMachineLogging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                  - logs:PutResourcePolicy
+                  - logs:DescribeResourcePolicies
+                  - logs:DescribeLogGroups
+                Resource: '*'
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/${AWS::StackName}'
+      RetentionInDays: 365
+
+  VerificationStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-workflow'
+      RoleArn: !GetAtt StateMachineExecutionRole.Arn
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+        IncludeExecutionData: true
+        Level: ALL
+      DefinitionString: !Sub |
+        {
+          "Comment": "Verified-clean recovery point workflow (CSF 2.0 RC.RP)",
+          "StartAt": "CreateFlexClone",
+          "States": {
+            "CreateFlexClone": {
+              "Type": "Task",
+              "Resource": "${CreateCloneFunction.Arn}",
+              "ResultPath": "$",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "RecordErrorVerdict"
+                }
+              ],
+              "Next": "WaitForFsxSync"
+            },
+            "WaitForFsxSync": {
+              "Type": "Wait",
+              "Seconds": ${FsxSyncWaitSeconds},
+              "Comment": "Static wait before polling — FSx API sync takes 12-36 min (measured). This state is free (no Lambda invocation) and avoids CloudWatch Logs noise from guaranteed-to-fail polling attempts.",
+              "Next": "WaitForFsxDiscovery"
+            },
+            "WaitForFsxDiscovery": {
+              "Type": "Task",
+              "Resource": "${WaitForFsxDiscoveryFunction.Arn}",
+              "Comment": "Polls FSx API until it discovers the ONTAP-created FlexClone. Most of the sync delay is absorbed by the preceding WaitForFsxSync state.",
+              "ResultPath": "$",
+              "Retry": [
+                {
+                  "ErrorEquals": ["FsxDiscoveryPending"],
+                  "IntervalSeconds": 120,
+                  "BackoffRate": 1.0,
+                  "MaxAttempts": 25
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "CleanupAfterError"
+                }
+              ],
+              "Next": "AttachAccessPoint"
+            },
+            "AttachAccessPoint": {
+              "Type": "Task",
+              "Resource": "${AttachAccessPointFunction.Arn}",
+              "ResultPath": "$",
+              "Retry": [
+                {
+                  "ErrorEquals": ["S3AttachPending"],
+                  "IntervalSeconds": 15,
+                  "BackoffRate": 1.5,
+                  "MaxAttempts": 12,
+                  "MaxDelaySeconds": 60
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "CleanupAfterError"
+                }
+              ],
+              "Next": "ScanForIndicators"
+            },
+            "ScanForIndicators": {
+              "Type": "Task",
+              "Resource": "${ScanFunction.Arn}",
+              "ResultPath": "$",
+              "Retry": [
+                {
+                  "ErrorEquals": ["AccessDenied"],
+                  "IntervalSeconds": 15,
+                  "BackoffRate": 2.0,
+                  "MaxAttempts": 5,
+                  "Comment": "S3 AP resource policy eventual consistency — propagation takes a few seconds after put_access_point_policy"
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.error",
+                  "Next": "CleanupAfterError"
+                }
+              ],
+              "Next": "RecordVerdict"
+            },
+            "RecordVerdict": {
+              "Type": "Task",
+              "Resource": "${RecordVerdictFunction.Arn}",
+              "ResultPath": "$",
+              "Next": "Cleanup"
+            },
+            "Cleanup": {
+              "Type": "Task",
+              "Resource": "${CleanupFunction.Arn}",
+              "ResultPath": "$",
+              "End": true
+            },
+            "CleanupAfterError": {
+              "Type": "Task",
+              "Resource": "${CleanupFunction.Arn}",
+              "ResultPath": "$",
+              "Next": "RecordErrorVerdict"
+            },
+            "RecordErrorVerdict": {
+              "Type": "Task",
+              "Resource": "${RecordVerdictFunction.Arn}",
+              "ResultPath": "$",
+              "Next": "VerificationFailed"
+            },
+            "VerificationFailed": {
+              "Type": "Fail",
+              "Error": "RestoreVerificationFailed",
+              "Cause": "See the CleanupAfterError/RecordErrorVerdict output and the DynamoDB ledger for details."
+            }
+          }
+        }
+
+Outputs:
+  StateMachineArn:
+    Description: Step Functions state machine ARN — start an execution to verify a snapshot
+    Value: !Ref VerificationStateMachine
+
+  LedgerTableName:
+    Description: DynamoDB table name for the verification verdict ledger
+    Value: !Ref VerificationLedgerTable
+
+  StartExecutionExample:
+    Description: Example AWS CLI command to start a verification execution
+    Value: !Sub >-
+      aws stepfunctions start-execution --state-machine-arn ${VerificationStateMachine}
+      --input '{"svm_name":"svm-prod-01","volume_name":"vol_data","snapshot_name":"incident_response_20260708_143022","vpc_id":"${VpcId}"}'

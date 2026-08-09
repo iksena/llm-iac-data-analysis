@@ -1,0 +1,380 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  FPolicy External Server on ECS Fargate + NLB (health check only).
+  ONTAP FPolicy TCP サーバーを Fargate で稼働させる。
+  重要: ONTAP FPolicy は NLB TCP パススルー経由では動作しない（バイナリフレーミング非互換）。
+  ONTAP external-engine には Fargate タスクの直接 Private IP を指定すること。
+  NLB はヘルスチェック + サービスディスカバリ用途のみ。
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: FPolicy Server を配置する VPC ID（FSx for ONTAP と同一 VPC）
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Fargate タスクを配置する Private Subnet（FSx for ONTAP SVM data LIF と同一サブネット推奨）
+
+  FsxnSvmSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: FSx for ONTAP SVM の Security Group ID（インバウンド許可元）
+
+  SqsQueueUrl:
+    Type: String
+    Description: FPolicy イベント送信先 SQS Queue URL
+
+  ContainerImage:
+    Type: String
+    Description: FPolicy Server コンテナイメージ URI（ECR）
+    Default: ""
+
+  FPolicyPort:
+    Type: Number
+    Default: 9898
+    Description: FPolicy TCP リスニングポート
+
+  # --- VPC Endpoints 要件 ---
+  # ECS Fargate (Private Subnet) が正常動作するには以下の VPC Endpoints が必要:
+  # 1. com.amazonaws.<region>.ecr.dkr (Interface) — コンテナイメージプル
+  # 2. com.amazonaws.<region>.ecr.api (Interface) — ECR 認証
+  # 3. com.amazonaws.<region>.s3 (Gateway) — ECR イメージレイヤー取得
+  # 4. com.amazonaws.<region>.logs (Interface) — CloudWatch Logs
+  # 5. com.amazonaws.<region>.sts (Interface) — IAM ロール認証
+  # 6. com.amazonaws.<region>.sqs (Interface) — SQS メッセージ送信（realtime モード時）★必須
+  # deploy_generic_ucs.sh の VPC Endpoint auto-detect が利用可能
+  #
+  # ★ SQS VPC Endpoint がないと FPolicy イベントは受信できるが SQS 送信がタイムアウトする
+  #
+  # NFS マウント要件:
+  # - NFSv4.1 でマウント推奨 (mount -o vers=4.1)
+  # - NFSv3 も動作する (mount -o vers=3)
+  # - vers=4 は使用禁止（NFSv4.2 にネゴシエートされ FPolicy 非サポート）
+  # - NFSv4.2 は ONTAP FPolicy monitoring 非サポート（NetApp KB 明記）
+
+  WriteCompleteDelaySec:
+    Type: Number
+    Default: 5
+    MinValue: 0
+    MaxValue: 60
+    Description: NFSv3 write-complete 待機秒数
+
+  Mode:
+    Type: String
+    Default: "realtime"
+    AllowedValues: ["realtime", "batch"]
+    Description: 動作モード（realtime=即時SQS Push, batch=ログ書き込み）
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 3
+    Description: Fargate タスク数
+
+  # --- Cpu/Memory パラメータが String 型である理由 ---
+  # Fargate は特定の CPU/Memory 組み合わせのみサポートする（例: 256 CPU → 512/1024/2048 Memory）。
+  # String 型 + AllowedValues を使用することで:
+  #   1. 無効な組み合わせを CloudFormation デプロイ前にバリデーションできる
+  #   2. Number 型では AllowedValues による列挙制約が直感的でない
+  #   3. cfn-lint の警告は意図的に無視している（設計上の選択）
+  Cpu:
+    Type: String
+    Default: "256"
+    AllowedValues: ["256", "512", "1024"]
+    Description: Fargate タスク CPU（256=0.25vCPU）
+
+  Memory:
+    Type: String
+    Default: "512"
+    AllowedValues: ["512", "1024", "2048"]
+    Description: Fargate タスクメモリ（MB）
+
+Conditions:
+  HasContainerImage: !Not [!Equals [!Ref ContainerImage, ""]]
+
+Resources:
+  # --- Security Group ---
+  # セキュリティ改善: CIDR ベースから Security Group ベースに変更
+  # SourceSecurityGroupId を使用することで、FSx for ONTAP SVM の Security Group に属する
+  # リソースからのみアクセスを許可する（VPC 全体の 10.0.0.0/8 より厳密）
+  FPolicyServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: FPolicy External Server - allows TCP from FSx for ONTAP SVM Security Group
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        # Primary: FSx for ONTAP SVM Security Group からのアクセスのみ許可（推奨）
+        - IpProtocol: tcp
+          FromPort: !Ref FPolicyPort
+          ToPort: !Ref FPolicyPort
+          SourceSecurityGroupId: !Ref FsxnSvmSecurityGroupId
+          Description: FPolicy TCP from FSx for ONTAP SVM Security Group (primary-servers connection)
+        # Legacy (参考): 以前は CIDR ベースで許可していた
+        # NLB ヘルスチェックは NLB 自体の IP から来るため、NLB を使用する場合は
+        # 別途 NLB サブネットの CIDR を追加するか、以下のルールを有効化する
+        # - IpProtocol: tcp
+        #   FromPort: !Ref FPolicyPort
+        #   ToPort: !Ref FPolicyPort
+        #   CidrIp: "10.0.0.0/8"
+        #   Description: FPolicy TCP from VPC (NLB health checks + FSx for ONTAP SVM data LIFs)
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to SQS/CloudWatch/ECR (via VPC Endpoint or NAT)
+      Tags:
+        - Key: Name
+          Value: !Sub "fsxn-fpolicy-server-sg-${AWS::StackName}"
+
+  # --- NLB ---
+  FPolicyNLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "fp-nlb-${AWS::StackName}"
+      Scheme: internal
+      Type: network
+      Subnets: !Ref SubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub "fsxn-fpolicy-nlb-${AWS::StackName}"
+
+  FPolicyTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "fp-tg-${AWS::StackName}"
+      Port: !Ref FPolicyPort
+      Protocol: TCP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckProtocol: TCP
+      HealthCheckPort: !Sub "${FPolicyPort}"
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 2
+      HealthCheckIntervalSeconds: 30
+      TargetGroupAttributes:
+        - Key: preserve_client_ip.enabled
+          Value: "false"
+
+  FPolicyListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref FPolicyNLB
+      Port: !Ref FPolicyPort
+      Protocol: TCP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FPolicyTargetGroup
+
+  # --- ECS Cluster ---
+  FPolicyCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "fsxn-fpolicy-${AWS::StackName}"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  # --- ECS Task Definition ---
+  FPolicyTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Condition: HasContainerImage
+    Properties:
+      Family: !Sub "fsxn-fpolicy-server-${AWS::StackName}"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref Cpu
+      Memory: !Ref Memory
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: fpolicy-server
+          Image: !Ref ContainerImage
+          Essential: true
+          PortMappings:
+            - ContainerPort: !Ref FPolicyPort
+              Protocol: tcp
+          Environment:
+            - Name: FPOLICY_PORT
+              Value: !Sub "${FPolicyPort}"
+            - Name: SQS_QUEUE_URL
+              Value: !Ref SqsQueueUrl
+            - Name: AWS_REGION
+              Value: !Ref "AWS::Region"
+            - Name: MODE
+              Value: !Ref Mode
+            - Name: WRITE_COMPLETE_DELAY_SEC
+              Value: !Sub "${WriteCompleteDelaySec}"
+            - Name: SVM_NAME
+              Value: "FSxN_OnPre"
+            - Name: VOLUME_NAME
+              Value: "vol1"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref FPolicyLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: fpolicy-server
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - !Sub "python -c \"import socket; s=socket.socket(); s.settimeout(2); s.connect(('localhost', ${FPolicyPort})); s.close()\""
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+
+  # --- ECS Service ---
+  FPolicyService:
+    Type: AWS::ECS::Service
+    Condition: HasContainerImage
+    DependsOn: FPolicyListener
+    Properties:
+      ServiceName: !Sub "fsxn-fpolicy-server-${AWS::StackName}"
+      Cluster: !Ref FPolicyCluster
+      TaskDefinition: !Ref FPolicyTaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref FPolicyServerSecurityGroup
+          Subnets: !Ref SubnetIds
+      LoadBalancers:
+        - ContainerName: fpolicy-server
+          ContainerPort: !Ref FPolicyPort
+          TargetGroupArn: !Ref FPolicyTargetGroup
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+      EnableExecuteCommand: true
+
+  # --- CloudWatch Log Group ---
+  FPolicyLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/fsxn-fpolicy-server-${AWS::StackName}"
+      RetentionInDays: 30
+
+  # --- IAM: Task Execution Role (ECR pull, CloudWatch Logs) ---
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "fsxn-fpolicy-exec-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  # --- IAM: Task Role (SQS, CloudWatch Metrics) ---
+  # =========================================================================
+  # SQS Policy 注意事項:
+  #   - SQS Queue ARN は実際のキュー名と一致する必要がある
+  #   - 過去のバグ: パターン `fsxn-fpolicy-*` が実際のキュー名 `FPolicy_Q` に
+  #     マッチせず AccessDenied が発生した
+  #   - 修正: ワイルドカード `*` を使用して全 SQS キューへの送信を許可
+  #   - より厳密にする場合は SqsQueueArn パラメータを追加して正確な ARN を渡す
+  #
+  # KMS Decrypt 権限について:
+  #   - SQS が `SqsManagedSseEnabled: true`（AWS マネージド SSE-SQS）を使用する場合:
+  #     → kms:Decrypt は不要（暗号化/復号は SQS サービスが透過的に処理）
+  #   - SQS が `KmsMasterKeyId: alias/aws/sqs`（CMK）を使用する場合:
+  #     → kms:Decrypt が必要（送信側は kms:GenerateDataKey も必要）
+  #   - 現在の構成: SqsQueueUrl パラメータで外部キューを参照。
+  #     キューの暗号化設定に応じて kms:Decrypt の追加を検討すること。
+  #     solutions/event-driven/fpolicy/template*.yaml では SqsManagedSseEnabled: true を
+  #     使用しているため、kms:Decrypt は不要。
+  # =========================================================================
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "fsxn-fpolicy-task-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FPolicyServerAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:*"
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource:
+                  - !Sub "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:*"
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: "FSxN-S3AP-Patterns"
+
+Outputs:
+  # IMPORTANT: When Fargate task restarts, the Private IP changes.
+  # You must update the ONTAP FPolicy engine's primary_servers:
+  #   1. Disable FPolicy policy
+  #   2. PATCH engine primary_servers with new IP
+  #   3. Re-enable FPolicy policy
+  # See: docs/operational-runbooks/phase12-operations.md section 2
+
+  NLBDnsName:
+    Description: >
+      NLB DNS 名（ヘルスチェック用のみ）。
+      重要: ONTAP external-engine には NLB IP ではなく Fargate タスクの直接 IP を使用すること。
+      タスク IP 取得: aws ecs describe-tasks --cluster <cluster> --tasks <task_arn>
+      --query 'tasks[0].attachments[0].details[?name==`privateIPv4Address`].value'
+    Value: !GetAtt FPolicyNLB.DNSName
+    Export:
+      Name: !Sub "${AWS::StackName}-NLBDnsName"
+
+  NLBArn:
+    Description: NLB ARN
+    Value: !Ref FPolicyNLB
+
+  FPolicyServerSecurityGroupId:
+    Description: FPolicy Server Security Group ID
+    Value: !Ref FPolicyServerSecurityGroup
+    Export:
+      Name: !Sub "${AWS::StackName}-SecurityGroupId"
+
+  ClusterArn:
+    Description: ECS Cluster ARN
+    Value: !GetAtt FPolicyCluster.Arn
+
+  NLBPrivateIPs:
+    Description: >
+      NLB の Private IP を取得するには以下のコマンドを実行:
+      aws ec2 describe-network-interfaces --filters Name=description,Values="ELB net/fpolicy-nlb-*" --query 'NetworkInterfaces[*].PrivateIpAddress'
+    Value: "See description for CLI command"
+
+  OntapExternalEngineCommand:
+    Description: >
+      ONTAP FPolicy external-engine 作成コマンド（ONTAP 9.11+ 推奨形式）。
+      重要: <FARGATE_TASK_IP> には Fargate タスクの直接 Private IP を指定すること（NLB IP は不可）。
+      タスク IP 取得コマンド:
+        TASK_ARN=$(aws ecs list-tasks --cluster <cluster> --desired-status RUNNING --query 'taskArns[0]' --output text)
+        aws ecs describe-tasks --cluster <cluster> --tasks $TASK_ARN --query 'tasks[0].attachments[0].details[?name==`privateIPv4Address`].value' --output text
+      注: `vserver` プレフィックスは ONTAP 9.11+ で非推奨だが後方互換性のため引き続き動作する。
+    Value: !Sub |
+      fpolicy policy external-engine create \
+        -vserver <SVM_NAME> \
+        -engine-name fpolicy_aws_engine \
+        -primary-servers <FARGATE_TASK_IP> \
+        -port ${FPolicyPort} \
+        -extern-engine-type asynchronous

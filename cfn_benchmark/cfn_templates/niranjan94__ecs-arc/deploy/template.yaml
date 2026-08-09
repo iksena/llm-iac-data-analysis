@@ -1,0 +1,359 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  ECS Actions Runner Controller (ecs-arc) - Deploys a controller service that
+  autoscales GitHub Actions self-hosted runners as ECS tasks. Runner task
+  definitions are managed dynamically from TOML config in SSM Parameter Store.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    Description: Environment name used as a prefix for all resources
+
+  GitHubAppClientId:
+    Type: String
+    Description: GitHub App Client ID (e.g. Iv1.abc123)
+
+  GitHubAppInstallationId:
+    Type: String
+    Description: GitHub App Installation ID
+
+  GitHubAppId:
+    Type: String
+    Description: >-
+      Numeric GitHub App ID (e.g. 1234567). Different from GitHubAppClientId
+      (which is a string like "Iv23li..."). Find it under Settings > Developer
+      settings > GitHub Apps > (your app) > "App ID" field at the top.
+
+  OfflineRunnerReaperInterval:
+    Type: String
+    Default: ""
+    Description: >-
+      How often the controller sweeps stale GitHub runner registrations.
+      Go duration string (e.g. "30m", "1h"). Leave empty for default (30m).
+
+  OfflineRunnerMinAge:
+    Type: String
+    Default: ""
+    Description: >-
+      Minimum time a runner must be observed offline before it is eligible
+      for deregistration. Go duration string. Leave empty for default (1h).
+
+  GitHubAppPrivateKeyArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing the GitHub App private key
+
+  GitHubOrg:
+    Type: String
+    Description: GitHub organization name
+
+  ControllerImageUri:
+    Type: String
+    Default: "ghcr.io/niranjan94/ecs-arc:latest"
+    Description: Container image URI for the ecs-arc controller
+
+  PrivateSubnetIds:
+    Type: String
+    Default: ""
+    Description: Private subnet IDs for the controller service, comma-separated (required for FARGATE and FARGATE_SPOT)
+
+  ServiceSecurityGroupId:
+    Type: String
+    Default: ""
+    Description: Security group ID for the controller service (required for FARGATE and FARGATE_SPOT)
+
+  ControllerLaunchType:
+    Type: String
+    Default: FARGATE_SPOT
+    AllowedValues: [FARGATE, FARGATE_SPOT, EXTERNAL]
+    Description: >-
+      How the controller service itself runs. FARGATE uses on-demand Fargate.
+      FARGATE_SPOT uses Fargate Spot via a capacity provider strategy (cheaper
+      but may be interrupted). EXTERNAL uses ECS Anywhere. Runner task
+      definitions are managed dynamically from the TOML config in SSM
+      Parameter Store and are independent of this setting.
+
+  ExistingClusterName:
+    Type: String
+    Default: ""
+    Description: Name of an existing ECS cluster. Leave empty to create a new one.
+
+  RunnerExtraLabels:
+    Type: String
+    Default: ""
+    Description: >-
+      Additional GitHub Actions labels to apply to all runner scale sets,
+      comma-separated (e.g. "self-hosted,custom-label").
+
+  RunnerLogGroupRetentionDays:
+    Type: Number
+    Default: 14
+    Description: Number of days to retain runner logs in CloudWatch
+
+  SSMParameterName:
+    Type: String
+    Default: "/prod/ecs-arc/runners"
+    AllowedPattern: "^/.+"
+    Description: >-
+      Full SSM Parameter Store parameter name (must start with "/") that holds
+      the TOML runner configuration. The parameter is created by this stack.
+
+Conditions:
+  UseFargateSpot: !Equals [!Ref ControllerLaunchType, FARGATE_SPOT]
+  UseExternal: !Equals [!Ref ControllerLaunchType, EXTERNAL]
+  CreateCluster: !Equals [!Ref ExistingClusterName, ""]
+  HasPrivateSubnets: !Not [!Equals [!Ref PrivateSubnetIds, ""]]
+  HasSecurityGroup: !Not [!Equals [!Ref ServiceSecurityGroupId, ""]]
+  HasRunnerExtraLabels: !Not [!Equals [!Ref RunnerExtraLabels, ""]]
+  HasOfflineRunnerReaperInterval: !Not [!Equals [!Ref OfflineRunnerReaperInterval, ""]]
+  HasOfflineRunnerMinAge: !Not [!Equals [!Ref OfflineRunnerMinAge, ""]]
+
+Resources:
+  # --- ECS Cluster ---
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Condition: CreateCluster
+    Properties:
+      ClusterName: !Sub "${Environment}-ecs-arc"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      Tags:
+        - Key: Project
+          Value: ecs-arc
+        - Key: Environment
+          Value: !Ref Environment
+
+  # --- CloudWatch Log Groups ---
+  ControllerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${Environment}-ecs-arc/controller"
+      RetentionInDays: 30
+
+  RunnerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${Environment}-ecs-arc/runners"
+      RetentionInDays: !Ref RunnerLogGroupRetentionDays
+
+  # --- IAM Roles ---
+  ControllerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-ecs-arc-controller-execution"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref GitHubAppPrivateKeyArn
+
+  ControllerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-ecs-arc-controller-task"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EcsRunnerManagement
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecs:RunTask
+                  - ecs:StopTask
+                  - ecs:DescribeTasks
+                  - ecs:ListTasks
+                  - ecs:TagResource
+                Resource: "*"
+                Condition:
+                  ArnEquals:
+                    ecs:cluster: !If
+                      - CreateCluster
+                      - !GetAtt EcsCluster.Arn
+                      - !Sub "arn:aws:ecs:${AWS::Region}:${AWS::AccountId}:cluster/${ExistingClusterName}"
+              - Effect: Allow
+                Action:
+                  - ecs:RegisterTaskDefinition
+                  - ecs:DeregisterTaskDefinition
+                  - ecs:DescribeTaskDefinition
+                  - ecs:ListTaskDefinitionFamilies
+                  - ecs:ListTaskDefinitions
+                  - ecs:TagResource
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${SSMParameterName}"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource:
+                  - !GetAtt RunnerExecutionRole.Arn
+                  - !GetAtt RunnerTaskRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: ecs-tasks.amazonaws.com
+
+  RunnerExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-ecs-arc-runner-execution"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+
+  RunnerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-ecs-arc-runner-task"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      # Add workflow-specific permissions here
+
+  # --- Controller Task Definition ---
+  ControllerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${Environment}-ecs-arc-controller"
+      Cpu: "256"
+      Memory: "512"
+      NetworkMode: !If [UseExternal, bridge, awsvpc]
+      RequiresCompatibilities:
+        - !If [UseExternal, EXTERNAL, FARGATE]
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt ControllerExecutionRole.Arn
+      TaskRoleArn: !GetAtt ControllerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: controller
+          Image: !Ref ControllerImageUri
+          Essential: true
+          Environment:
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: GITHUB_APP_CLIENT_ID
+              Value: !Ref GitHubAppClientId
+            - Name: GITHUB_APP_INSTALLATION_ID
+              Value: !Ref GitHubAppInstallationId
+            - Name: GITHUB_APP_ID
+              Value: !Ref GitHubAppId
+            - Name: GITHUB_ORG
+              Value: !Ref GitHubOrg
+            - Name: ECS_CLUSTER
+              Value: !If
+                - CreateCluster
+                - !Ref EcsCluster
+                - !Ref ExistingClusterName
+            - Name: SSM_PARAMETER_NAME
+              Value: !Ref SSMParameterName
+            - Name: RUNNER_EXECUTION_ROLE_ARN
+              Value: !GetAtt RunnerExecutionRole.Arn
+            - Name: RUNNER_TASK_ROLE_ARN
+              Value: !GetAtt RunnerTaskRole.Arn
+            - Name: RUNNER_LOG_GROUP
+              Value: !Ref RunnerLogGroup
+            - !If
+              - HasRunnerExtraLabels
+              - Name: RUNNER_EXTRA_LABELS
+                Value: !Ref RunnerExtraLabels
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasOfflineRunnerReaperInterval
+              - Name: OFFLINE_RUNNER_REAPER_INTERVAL
+                Value: !Ref OfflineRunnerReaperInterval
+              - !Ref "AWS::NoValue"
+            - !If
+              - HasOfflineRunnerMinAge
+              - Name: OFFLINE_RUNNER_MIN_AGE
+                Value: !Ref OfflineRunnerMinAge
+              - !Ref "AWS::NoValue"
+          Secrets:
+            - Name: GITHUB_APP_PRIVATE_KEY
+              ValueFrom: !Ref GitHubAppPrivateKeyArn
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ControllerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: controller
+
+  # --- Controller Service ---
+  ControllerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${Environment}-ecs-arc-controller"
+      Cluster: !If
+        - CreateCluster
+        - !Ref EcsCluster
+        - !Ref ExistingClusterName
+      TaskDefinition: !Ref ControllerTaskDefinition
+      DesiredCount: 1
+      LaunchType: !If
+        - UseFargateSpot
+        - !Ref "AWS::NoValue"
+        - !If [UseExternal, EXTERNAL, FARGATE]
+      CapacityProviderStrategy: !If
+        - UseFargateSpot
+        - - CapacityProvider: FARGATE_SPOT
+            Weight: 1
+        - !Ref "AWS::NoValue"
+      NetworkConfiguration: !If
+        - UseExternal
+        - !Ref "AWS::NoValue"
+        - AwsvpcConfiguration:
+            Subnets: !If
+              - HasPrivateSubnets
+              - !Split [",", !Ref PrivateSubnetIds]
+              - !Ref "AWS::NoValue"
+            SecurityGroups: !If
+              - HasSecurityGroup
+              - - !Ref ServiceSecurityGroupId
+              - !Ref "AWS::NoValue"
+            AssignPublicIp: DISABLED
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: 0
+
+Outputs:
+  ClusterName:
+    Value: !If
+      - CreateCluster
+      - !Ref EcsCluster
+      - !Ref ExistingClusterName
+
+  ControllerServiceName:
+    Value: !GetAtt ControllerService.Name

@@ -1,0 +1,762 @@
+# Copyright OpenSearch Contributors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Agent Health — CloudFormation template for managed observability infrastructure.
+# Deploys an Amazon OpenSearch Service domain and OpenSearch Ingestion (OSIS) pipeline
+# for collecting OpenTelemetry traces from AI agents.
+#
+# Launch Stack URL pattern (replace REGION):
+#   https://console.aws.amazon.com/cloudformation/home?region=REGION#/stacks/create/template?stackName=AgentHealthObservability&templateURL=https://agent-health-cfn-REGION.s3.REGION.amazonaws.com/agent-health-observability.yaml
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Agent Health Observability Stack — Amazon OpenSearch Service domain with
+  OpenSearch Ingestion (OSIS) pipeline for OTLP trace collection from AI agents.
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  DomainName:
+    Type: String
+    Default: ah-traces
+    Description: >-
+      Name for the OpenSearch Service domain. Keep ≤21 chars because OSIS
+      pipeline names are "${DomainName}-traces" with a 28-char max.
+    AllowedPattern: '[a-z][a-z0-9\-]+'
+    MinLength: 3
+    MaxLength: 21
+
+  InstanceType:
+    Type: String
+    Default: r8g.large.search
+    Description: OpenSearch instance type
+    AllowedValues:
+      - t3.small.search
+      - t3.medium.search
+      - r8g.large.search
+      - r8g.xlarge.search
+      - r8g.2xlarge.search
+
+  VolumeSize:
+    Type: Number
+    Default: 100
+    Description: EBS volume size in GB per data node
+    MinValue: 10
+    MaxValue: 1000
+
+  PipelineMinUnits:
+    Type: Number
+    Default: 1
+    Description: Minimum OSIS pipeline capacity units
+    MinValue: 1
+    MaxValue: 96
+
+  PipelineMaxUnits:
+    Type: Number
+    Default: 4
+    Description: Maximum OSIS pipeline capacity units
+    MinValue: 1
+    MaxValue: 96
+
+  AdminRoleARN:
+    Type: String
+    Description: >-
+      Optional IAM role ARN to grant OpenSearch all_access (e.g., your Admin role).
+      The domain master user is always the internal RoleMappingFunctionRole;
+      this parameter adds an additional role with full access via backend role mapping.
+    Default: ''
+
+# =============================================================================
+# Conditions
+# =============================================================================
+Conditions:
+  HasAdminRoleARN: !Not [!Equals [!Ref AdminRoleARN, '']]
+  # Note: Domain MasterUserARN is always RoleMappingFunctionRole (not conditional)
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # IAM Role — FGAC Role Mapping Custom Resource (also used as MasterUserARN)
+  # Defined first because the OpenSearch domain references it as master user.
+  # ---------------------------------------------------------------------------
+  RoleMappingFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DomainName}-${AWS::Region}-role-mapping-cr-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: OpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'es:ESHttp*'
+                Resource:
+                  - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}/*'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: agent-health
+          Value: observability
+        - Key: ManagedBy
+          Value: AgentHealthCFN
+
+  # ---------------------------------------------------------------------------
+  # OpenSearch Service Domain
+  # ---------------------------------------------------------------------------
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DomainName: !Ref DomainName
+      EngineVersion: OpenSearch_3.5
+      ClusterConfig:
+        InstanceType: !Ref InstanceType
+        InstanceCount: 3
+        DedicatedMasterEnabled: true
+        DedicatedMasterType: !Ref InstanceType
+        DedicatedMasterCount: 3
+        ZoneAwarenessEnabled: true
+        ZoneAwarenessConfig:
+          AvailabilityZoneCount: 3
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: !Ref VolumeSize
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: Policy-Min-TLS-1-2-PFS-2023-10
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: false
+        MasterUserOptions:
+          MasterUserARN: !GetAtt RoleMappingFunctionRole.Arn
+      # "Only use fine-grained access control" — open domain policy,
+      # all authorization is handled by the OpenSearch Security plugin (FGAC).
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: '*'
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}/*'
+      Tags:
+        - Key: agent-health
+          Value: observability
+        - Key: ManagedBy
+          Value: AgentHealthCFN
+
+  # ---------------------------------------------------------------------------
+  # IAM Role — OSIS Pipeline Execution
+  # ---------------------------------------------------------------------------
+  OSISPipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DomainName}-${AWS::Region}-osis-pipeline-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: osis-pipelines.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: OSISToOpenSearch
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'es:DescribeDomain'
+                  - 'es:ESHttp*'
+                Resource:
+                  - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}'
+                  - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}/*'
+      Tags:
+        - Key: agent-health
+          Value: observability
+        - Key: ManagedBy
+          Value: AgentHealthCFN
+
+  # ---------------------------------------------------------------------------
+  # IAM Role — Ingestion (for agents pushing telemetry via SigV4)
+  # ---------------------------------------------------------------------------
+  IngestionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DomainName}-${AWS::Region}-ingestion-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: OSISIngest
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'osis:Ingest'
+                Resource:
+                  - !Sub 'arn:aws:osis:${AWS::Region}:${AWS::AccountId}:pipeline/${DomainName}-traces'
+                  - !Sub 'arn:aws:osis:${AWS::Region}:${AWS::AccountId}:pipeline/${DomainName}-logs'
+      Tags:
+        - Key: agent-health
+          Value: observability
+        - Key: ManagedBy
+          Value: AgentHealthCFN
+
+  # ---------------------------------------------------------------------------
+  # OpenSearch Ingestion (OSIS) Pipeline — OTLP Traces → OpenSearch
+  # ---------------------------------------------------------------------------
+  OSISTracePipeline:
+    Type: AWS::OSIS::Pipeline
+    DependsOn: OpenSearchDomain
+    Properties:
+      PipelineName: !Sub '${DomainName}-traces'
+      MinUnits: !Ref PipelineMinUnits
+      MaxUnits: !Ref PipelineMaxUnits
+      PipelineConfigurationBody: !Sub |
+        version: "2"
+        otel-traces-entry:
+          source:
+            otel_trace_source:
+              path: "/${DomainName}-traces/v1/traces"
+          sink:
+            - pipeline:
+                name: "otel-traces-raw-pipeline"
+            - pipeline:
+                name: "otel-service-map-pipeline"
+        otel-traces-raw-pipeline:
+          source:
+            pipeline:
+              name: "otel-traces-entry"
+          processor:
+            - otel_traces:
+          sink:
+            - opensearch:
+                hosts:
+                  - "https://${OpenSearchDomain.DomainEndpoint}"
+                index_type: trace-analytics-plain-raw
+                aws:
+                  sts_role_arn: "${OSISPipelineRole.Arn}"
+                  region: "${AWS::Region}"
+        otel-service-map-pipeline:
+          source:
+            pipeline:
+              name: "otel-traces-entry"
+          processor:
+            - service_map:
+                window_duration: 180
+          sink:
+            - opensearch:
+                hosts:
+                  - "https://${OpenSearchDomain.DomainEndpoint}"
+                index_type: trace-analytics-service-map
+                aws:
+                  sts_role_arn: "${OSISPipelineRole.Arn}"
+                  region: "${AWS::Region}"
+      Tags:
+        - Key: agent-health
+          Value: observability
+        - Key: ManagedBy
+          Value: AgentHealthCFN
+
+  # ---------------------------------------------------------------------------
+  # OpenSearch Ingestion (OSIS) Pipeline — OTLP Logs → OpenSearch
+  # ---------------------------------------------------------------------------
+  OSISLogsPipeline:
+    Type: AWS::OSIS::Pipeline
+    DependsOn: OpenSearchDomain
+    Properties:
+      PipelineName: !Sub '${DomainName}-logs'
+      MinUnits: !Ref PipelineMinUnits
+      MaxUnits: !Ref PipelineMaxUnits
+      PipelineConfigurationBody: !Sub |
+        version: "2"
+        otel-logs-pipeline:
+          source:
+            otel_logs_source:
+              path: "/${DomainName}-logs/v1/logs"
+          sink:
+            - opensearch:
+                hosts:
+                  - "https://${OpenSearchDomain.DomainEndpoint}"
+                index: "otel-logs-%{yyyy.MM.dd}"
+                aws:
+                  sts_role_arn: "${OSISPipelineRole.Arn}"
+                  region: "${AWS::Region}"
+      Tags:
+        - Key: agent-health
+          Value: observability
+        - Key: ManagedBy
+          Value: AgentHealthCFN
+
+  # ---------------------------------------------------------------------------
+  # OTLP Ingestion — API Gateway + Lambda → OpenSearch (direct)
+  # Provides a public HTTPS endpoint so apps can send OTLP without SigV4 auth.
+  # Converts OTLP JSON to trace-analytics format and bulk-indexes into OpenSearch.
+  # Also forwards to OSIS pipelines when available for service-map generation.
+  # ---------------------------------------------------------------------------
+  OTLPIngestLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${DomainName}-${AWS::Region}-otlp-ingest-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: OpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'es:ESHttp*'
+                Resource:
+                  - !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${DomainName}/*'
+        - PolicyName: OSISIngest
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'osis:Ingest'
+                Resource:
+                  - !Sub 'arn:aws:osis:${AWS::Region}:${AWS::AccountId}:pipeline/${DomainName}-traces'
+                  - !Sub 'arn:aws:osis:${AWS::Region}:${AWS::AccountId}:pipeline/${DomainName}-logs'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      Tags:
+        - Key: agent-health
+          Value: observability
+        - Key: ManagedBy
+          Value: AgentHealthCFN
+
+  OTLPIngestFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OpenSearchDomain
+    Properties:
+      FunctionName: !Sub '${DomainName}-otlp-ingest'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt OTLPIngestLambdaRole.Arn
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !Sub 'https://${OpenSearchDomain.DomainEndpoint}'
+      Code:
+        ZipFile: |
+          """OTLP Ingestion — converts OTLP JSON to OpenSearch trace-analytics format."""
+          import json
+          import os
+          import urllib.request
+          import hashlib
+          from datetime import datetime, timezone
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+          from botocore.session import Session
+
+          OS_ENDPOINT = os.environ['OPENSEARCH_ENDPOINT']
+          REGION = os.environ.get('AWS_REGION', 'us-east-1')
+          session = Session()
+
+          STATUS_MAP = {0: 0, 1: 0, 2: 2}  # OTLP Unset/Ok->0, Error->2
+          KIND_MAP = {0: 'SPAN_KIND_UNSPECIFIED', 1: 'SPAN_KIND_INTERNAL', 2: 'SPAN_KIND_SERVER',
+                      3: 'SPAN_KIND_CLIENT', 4: 'SPAN_KIND_PRODUCER', 5: 'SPAN_KIND_CONSUMER'}
+
+          def _creds():
+              c = session.get_credentials()
+              return c.resolve_credentials() if hasattr(c, 'resolve_credentials') else c
+
+          def _attr_value(v):
+              for k in ('stringValue', 'intValue', 'boolValue', 'doubleValue'):
+                  if k in v:
+                      return v[k]
+              if 'arrayValue' in v:
+                  return [_attr_value(x) for x in v['arrayValue'].get('values', [])]
+              return str(v)
+
+          def _nano_to_iso(ns):
+              """Convert nanosecond timestamp to ISO 8601 with nanosecond precision."""
+              try:
+                  ns = int(ns)
+              except (ValueError, TypeError):
+                  return '1970-01-01T00:00:00.000000000Z'
+              secs = ns // 1_000_000_000
+              nanos = ns % 1_000_000_000
+              dt = datetime.fromtimestamp(secs, tz=timezone.utc)
+              return dt.strftime('%Y-%m-%dT%H:%M:%S') + f'.{nanos:09d}Z'
+
+          def _convert_span(span, resource_attrs, scope_name):
+              trace_id = span.get('traceId', '')
+              span_id = span.get('spanId', '')
+              parent = span.get('parentSpanId', '')
+              start_ns = span.get('startTimeUnixNano', '0')
+              end_ns = span.get('endTimeUnixNano', '0')
+              try:
+                  duration_nanos = int(end_ns) - int(start_ns)
+                  if duration_nanos < 0:
+                      duration_nanos = 0
+              except (ValueError, TypeError):
+                  duration_nanos = 0
+              status = span.get('status', {})
+              status_code = STATUS_MAP.get(status.get('code', 0), 0)
+              kind = KIND_MAP.get(span.get('kind', 0), 'SPAN_KIND_UNSPECIFIED')
+              service_name = 'unknown'
+              events = []
+              for evt in span.get('events', []):
+                  evt_attrs = {}
+                  for a in evt.get('attributes', []):
+                      evt_attrs[a['key']] = _attr_value(a['value'])
+                  events.append({
+                      'name': evt.get('name', ''),
+                      'time': _nano_to_iso(evt.get('timeUnixNano', '0')),
+                      'attributes': evt_attrs
+                  })
+              doc = {
+                  'traceId': trace_id,
+                  'spanId': span_id,
+                  'parentSpanId': parent,
+                  'traceState': span.get('traceState', ''),
+                  'name': span.get('name', ''),
+                  'kind': kind,
+                  'startTime': _nano_to_iso(start_ns),
+                  'endTime': _nano_to_iso(end_ns),
+                  'durationInNanos': duration_nanos,
+                  'serviceName': service_name,
+                  'status': {'code': status_code, 'message': status.get('message', '')},
+                  'events': events,
+                  'links': [],
+                  'instrumentationScope': {'name': scope_name},
+              }
+              if not parent:
+                  doc['traceGroup'] = span.get('name', '')
+                  doc['traceGroupFields'] = {
+                      'endTime': _nano_to_iso(end_ns),
+                      'durationInNanos': duration_nanos,
+                      'statusCode': status_code,
+                  }
+              # Resource attributes: nested resource.attributes object, literal
+              # dotted keys (Data Prepper trace-analytics-plain-raw / OTEL-faithful).
+              resource_attributes = {}
+              for a in resource_attrs:
+                  val = _attr_value(a['value'])
+                  resource_attributes[a['key']] = val
+                  if a['key'] == 'service.name':
+                      doc['serviceName'] = val
+              doc['resource'] = {'attributes': resource_attributes}
+              # Span attributes: nested attributes object, literal dotted keys.
+              span_attributes = {}
+              for a in span.get('attributes', []):
+                  span_attributes[a['key']] = _attr_value(a['value'])
+              doc['attributes'] = span_attributes
+              doc_id = hashlib.md5(f'{trace_id}{span_id}'.encode()).hexdigest()
+              return doc_id, doc
+
+          def _signed_request(method, path, body):
+              url = OS_ENDPOINT + path
+              request = AWSRequest(method=method, url=url, data=body,
+                                   headers={'Content-Type': 'application/json'})
+              SigV4Auth(_creds(), 'es', REGION).add_auth(request)
+              req = urllib.request.Request(url, data=body.encode('utf-8'), method=method,
+                                           headers={k: v for k, v in dict(request.headers).items()})
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      return resp.status, resp.read().decode('utf-8', errors='replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read().decode('utf-8', errors='replace')
+
+          def handler(event, context):
+              path = event.get('rawPath', '')
+              if '/v1/traces' not in path and '/v1/logs' not in path:
+                  return {'statusCode': 404, 'body': json.dumps({'error': f'Unknown path: {path}'})}
+              body = event.get('body', '')
+              is_base64 = event.get('isBase64Encoded', False)
+              if is_base64:
+                  import base64
+                  body = base64.b64decode(body).decode('utf-8', errors='replace')
+              try:
+                  otlp = json.loads(body) if isinstance(body, str) else body
+              except json.JSONDecodeError as e:
+                  return {'statusCode': 400, 'body': json.dumps({'error': f'Invalid JSON: {e}'})}
+              bulk_lines = []
+              for rs in otlp.get('resourceSpans', []):
+                  res_attrs = rs.get('resource', {}).get('attributes', [])
+                  for ss in rs.get('scopeSpans', []):
+                      scope_name = ss.get('scope', {}).get('name', '')
+                      for span in ss.get('spans', []):
+                          doc_id, doc = _convert_span(span, res_attrs, scope_name)
+                          bulk_lines.append(json.dumps({'index': {'_index': 'otel-v1-apm-span-000001', '_id': doc_id}}))
+                          bulk_lines.append(json.dumps(doc, default=str))
+              if not bulk_lines:
+                  return {'statusCode': 200, 'body': json.dumps({'message': 'No spans to index'})}
+              bulk_body = '\n'.join(bulk_lines) + '\n'
+              status, resp_body = _signed_request('POST', '/otel-v1-apm-span-000001/_bulk', bulk_body)
+              return {'statusCode': status, 'body': resp_body}
+      Tags:
+        - Key: agent-health
+          Value: observability
+        - Key: ManagedBy
+          Value: AgentHealthCFN
+
+  # ---------------------------------------------------------------------------
+  # Custom Resource — Map IAM Roles to OpenSearch FGAC Backend Roles
+  # Maps the OSIS pipeline role and Lambda ingest role to 'all_access' so they
+  # can write to OpenSearch indices. Runs once during stack create/update.
+  # ---------------------------------------------------------------------------
+  RoleMappingFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: OpenSearchDomain
+    Properties:
+      FunctionName: !Sub '${DomainName}-fgac-role-mapping'
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 128
+      Role: !GetAtt RoleMappingFunctionRole.Arn
+      Environment:
+        Variables:
+          OPENSEARCH_ENDPOINT: !Sub 'https://${OpenSearchDomain.DomainEndpoint}'
+          OSIS_ROLE_ARN: !GetAtt OSISPipelineRole.Arn
+          LAMBDA_ROLE_ARN: !GetAtt OTLPIngestLambdaRole.Arn
+          ADMIN_ROLE_ARN: !If
+            - HasAdminRoleARN
+            - !Ref AdminRoleARN
+            - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+      Code:
+        ZipFile: |
+          """Custom Resource — maps IAM role ARNs to OpenSearch all_access backend role."""
+          import json
+          import os
+          import urllib.request
+          from botocore.auth import SigV4Auth
+          from botocore.awsrequest import AWSRequest
+          from botocore.session import Session
+
+          OS_ENDPOINT = os.environ['OPENSEARCH_ENDPOINT']
+          REGION = os.environ.get('AWS_REGION', 'us-east-1')
+          OSIS_ROLE_ARN = os.environ['OSIS_ROLE_ARN']
+          LAMBDA_ROLE_ARN = os.environ['LAMBDA_ROLE_ARN']
+          ADMIN_ROLE_ARN = os.environ.get('ADMIN_ROLE_ARN', '')
+          session = Session()
+
+          def _creds():
+              c = session.get_credentials()
+              return c.resolve_credentials() if hasattr(c, 'resolve_credentials') else c
+
+          def _signed_request(method, path, body=None):
+              url = OS_ENDPOINT + path
+              headers = {'Content-Type': 'application/json'}
+              request = AWSRequest(method=method, url=url, data=body or '', headers=headers)
+              SigV4Auth(_creds(), 'es', REGION).add_auth(request)
+              req = urllib.request.Request(url, data=(body or '').encode('utf-8'), method=method,
+                                           headers={k: v for k, v in dict(request.headers).items()})
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      return resp.status, json.loads(resp.read().decode('utf-8', errors='replace'))
+              except urllib.error.HTTPError as e:
+                  return e.code, json.loads(e.read().decode('utf-8', errors='replace'))
+
+          def _send_cfn_response(event, context, status, reason=''):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': reason or f'See CloudWatch Log Stream: {context.log_stream_name}',
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+              })
+              req = urllib.request.Request(event['ResponseURL'], data=body.encode('utf-8'),
+                                           method='PUT', headers={'Content-Type': ''})
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+              try:
+                  if event['RequestType'] == 'Delete':
+                      _send_cfn_response(event, context, 'SUCCESS')
+                      return
+                  # Get current mapping for all_access
+                  status, current = _signed_request('GET', '/_plugins/_security/api/rolesmapping/all_access')
+                  print(f"Current mapping (status={status}): {json.dumps(current)}")
+                  if status == 200:
+                      backend_roles = current.get('all_access', {}).get('backend_roles', [])
+                  else:
+                      backend_roles = []
+                  # Add our roles if not already present
+                  roles_to_map = [r for r in [OSIS_ROLE_ARN, LAMBDA_ROLE_ARN, ADMIN_ROLE_ARN] if r]
+                  for role in roles_to_map:
+                      if role not in backend_roles:
+                          backend_roles.append(role)
+                  # PUT the updated mapping
+                  payload = json.dumps({'backend_roles': backend_roles})
+                  status, resp = _signed_request('PUT', '/_plugins/_security/api/rolesmapping/all_access', payload)
+                  print(f"PUT mapping (status={status}): {json.dumps(resp)}")
+                  if status in (200, 201):
+                      _send_cfn_response(event, context, 'SUCCESS')
+                  else:
+                      _send_cfn_response(event, context, 'FAILED', f'OpenSearch returned {status}: {json.dumps(resp)}')
+              except Exception as e:
+                  print(f"Error: {e}")
+                  _send_cfn_response(event, context, 'FAILED', str(e))
+      Tags:
+        - Key: agent-health
+          Value: observability
+        - Key: ManagedBy
+          Value: AgentHealthCFN
+
+  RoleMappingCustomResource:
+    Type: Custom::OpenSearchRoleMapping
+    DependsOn:
+      - OpenSearchDomain
+      - OSISPipelineRole
+      - OTLPIngestLambdaRole
+      - RoleMappingFunction
+    Properties:
+      ServiceToken: !GetAtt RoleMappingFunction.Arn
+      # Include role ARNs so CFN re-triggers on changes
+      OSISRoleArn: !GetAtt OSISPipelineRole.Arn
+      LambdaRoleArn: !GetAtt OTLPIngestLambdaRole.Arn
+      AdminRoleArn: !If
+        - HasAdminRoleARN
+        - !Ref AdminRoleARN
+        - !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+
+  OTLPIngestApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${DomainName}-otlp-ingest'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - '*'
+        AllowMethods:
+          - POST
+        AllowHeaders:
+          - content-type
+      Tags:
+        agent-health: observability
+        ManagedBy: AgentHealthCFN
+
+  OTLPIngestApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref OTLPIngestApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt OTLPIngestFunction.Arn
+      PayloadFormatVersion: '2.0'
+
+  OTLPIngestApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref OTLPIngestApi
+      RouteKey: 'POST /v1/{signal+}'
+      Target: !Sub 'integrations/${OTLPIngestApiIntegration}'
+
+  OTLPIngestApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref OTLPIngestApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  OTLPIngestApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref OTLPIngestFunction
+      Action: 'lambda:InvokeFunction'
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${OTLPIngestApi}/*'
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  OpenSearchEndpoint:
+    Description: OpenSearch domain endpoint URL
+    Value: !Sub 'https://${OpenSearchDomain.DomainEndpoint}'
+
+  OSISTraceIngestEndpoint:
+    Description: OSIS trace ingest endpoint (configure as OTEL_EXPORTER_OTLP_TRACES_ENDPOINT in your agent)
+    Value: !Join
+      - ''
+      - - 'https://'
+        - !Select [0, !GetAtt OSISTracePipeline.IngestEndpointUrls]
+
+  OSISLogsIngestEndpoint:
+    Description: OSIS logs ingest endpoint (configure as OTEL_EXPORTER_OTLP_LOGS_ENDPOINT in your agent)
+    Value: !Join
+      - ''
+      - - 'https://'
+        - !Select [0, !GetAtt OSISLogsPipeline.IngestEndpointUrls]
+
+  Region:
+    Description: AWS Region where the stack was deployed
+    Value: !Ref 'AWS::Region'
+
+  IngestionRoleArn:
+    Description: IAM role ARN for agents to assume when pushing telemetry via SigV4
+    Value: !GetAtt IngestionRole.Arn
+
+  OTLPIngestEndpoint:
+    Description: >-
+      HTTPS endpoint for OTLP trace/log ingestion (no SigV4 needed on client).
+      Set OTEL_EXPORTER_OTLP_ENDPOINT to this value in your agent config.
+    Value: !Sub 'https://${OTLPIngestApi}.execute-api.${AWS::Region}.amazonaws.com'
+
+  AgentHealthConfigJSON:
+    Description: >-
+      Copy this JSON block into your agent-health.config.json file,
+      or run: npx @opensearch-project/agent-health configure --from-stack AgentHealthObservability
+    Value: !Sub |
+      {
+        "observability": {
+          "endpoint": "https://${OpenSearchDomain.DomainEndpoint}",
+          "authType": "sigv4",
+          "awsRegion": "${AWS::Region}",
+          "awsService": "es",
+          "tlsSkipVerify": false
+        }
+      }

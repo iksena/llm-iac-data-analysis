@@ -1,0 +1,316 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'NUBLE ELITE - Decision Engine with Alerts'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+
+  NetworkStackName:
+    Type: String
+    Default: nuble-production-vpc
+    Description: Name of the VPC CloudFormation stack
+
+  LambdaS3Bucket:
+    Type: String
+    Description: S3 bucket containing Lambda deployment packages
+
+  DecisionEngineS3Key:
+    Type: String
+    Default: lambda/decision_engine.zip
+    Description: S3 key for Decision Engine Lambda package
+
+  PolygonApiKey:
+    Type: String
+    NoEcho: true
+    Description: Polygon.io API key
+
+  TelegramBotToken:
+    Type: String
+    NoEcho: true
+    Default: ''
+    Description: Telegram Bot Token for alerts (optional)
+
+  TelegramChatId:
+    Type: String
+    Default: ''
+    Description: Telegram Chat ID for alerts (optional)
+
+  AlertEmail:
+    Type: String
+    Default: ''
+    Description: Email for trade alerts (optional)
+
+Conditions:
+  HasTelegram: !Not [!Equals [!Ref TelegramBotToken, '']]
+  HasEmail: !Not [!Equals [!Ref AlertEmail, '']]
+
+Resources:
+  # ============ IAM Role ============
+  DecisionEngineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub nuble-${Environment}-decision-engine-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: DecisionEnginePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/nuble-${Environment}-*
+                  - !Sub arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/nuble-${Environment}-*/index/*
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource:
+                  - !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/nuble-${Environment}-*
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref AlertTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # ============ Security Group ============
+  DecisionEngineSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for Decision Engine Lambda
+      VpcId:
+        Fn::ImportValue: !Sub ${NetworkStackName}-VpcId
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub nuble-${Environment}-decision-engine-sg
+
+  # ============ Decision Engine Lambda ============
+  DecisionEngineFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub nuble-${Environment}-decision-engine
+      Runtime: python3.11
+      Handler: handler_ultimate.lambda_handler
+      Role: !GetAtt DecisionEngineRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref DecisionEngineS3Key
+      Timeout: 120
+      MemorySize: 1024
+      Architectures:
+        - arm64
+      VpcConfig:
+        SubnetIds:
+          - Fn::ImportValue: !Sub ${NetworkStackName}-PrivateSubnet1
+          - Fn::ImportValue: !Sub ${NetworkStackName}-PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref DecisionEngineSecurityGroup
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          DYNAMODB_SIGNALS_TABLE: !Sub nuble-${Environment}-signals
+          DYNAMODB_DECISIONS_TABLE: !Sub nuble-${Environment}-decisions
+          POLYGON_API_KEY: !Ref PolygonApiKey
+          ALERT_TOPIC_ARN: !Ref AlertTopic
+          TELEGRAM_BOT_TOKEN: !Ref TelegramBotToken
+          TELEGRAM_CHAT_ID: !Ref TelegramChatId
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ============ Lambda Log Group ============
+  DecisionEngineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/nuble-${Environment}-decision-engine
+      RetentionInDays: 30
+
+  # ============ EventBridge Rule - Signal Trigger ============
+  SignalTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub nuble-${Environment}-signal-trigger
+      Description: Trigger decision engine when new signal arrives
+      EventBusName: !Sub nuble-${Environment}-signals
+      EventPattern:
+        source:
+          - nuble.signals
+        detail-type:
+          - SignalReceived
+      Targets:
+        - Id: DecisionEngine
+          Arn: !GetAtt DecisionEngineFunction.Arn
+
+  SignalTriggerPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DecisionEngineFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SignalTriggerRule.Arn
+
+  # ============ EventBridge Rule - Scheduled Analysis ============
+  ScheduledAnalysisRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub nuble-${Environment}-scheduled-analysis
+      Description: Run decision engine every 5 minutes during market hours
+      ScheduleExpression: 'cron(*/5 14-21 ? * MON-FRI *)'  # 9:00 AM - 4:00 PM EST
+      Targets:
+        - Id: DecisionEngine
+          Arn: !GetAtt DecisionEngineFunction.Arn
+          Input: '{"source": "aws.events", "type": "scheduled"}'
+
+  ScheduledPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DecisionEngineFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduledAnalysisRule.Arn
+
+  # ============ SNS Alert Topic ============
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub nuble-${Environment}-trade-alerts
+      DisplayName: NUBLE Trade Alerts
+
+  AlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasEmail
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ============ Alert Lambda (Telegram/Discord) ============
+  AlertFunction:
+    Type: AWS::Lambda::Function
+    Condition: HasTelegram
+    Properties:
+      FunctionName: !Sub nuble-${Environment}-alert-sender
+      Runtime: python3.11
+      Handler: index.handler
+      Role: !GetAtt AlertFunctionRole.Arn
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          TELEGRAM_BOT_TOKEN: !Ref TelegramBotToken
+          TELEGRAM_CHAT_ID: !Ref TelegramChatId
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib.request
+
+          def handler(event, context):
+              bot_token = os.environ.get('TELEGRAM_BOT_TOKEN')
+              chat_id = os.environ.get('TELEGRAM_CHAT_ID')
+
+              if not bot_token or not chat_id:
+                  return {'statusCode': 200, 'body': 'Telegram not configured'}
+
+              # Parse SNS message
+              for record in event.get('Records', []):
+                  message = record.get('Sns', {}).get('Message', '')
+
+                  # Send to Telegram
+                  url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+                  data = json.dumps({
+                      'chat_id': chat_id,
+                      'text': message,
+                      'parse_mode': 'HTML'
+                  }).encode()
+
+                  req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+                  urllib.request.urlopen(req)
+
+              return {'statusCode': 200, 'body': 'Alerts sent'}
+
+  AlertFunctionRole:
+    Type: AWS::IAM::Role
+    Condition: HasTelegram
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  AlertTopicSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasTelegram
+    Properties:
+      TopicArn: !Ref AlertTopic
+      Protocol: lambda
+      Endpoint: !GetAtt AlertFunction.Arn
+
+  AlertLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Condition: HasTelegram
+    Properties:
+      FunctionName: !Ref AlertFunction
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref AlertTopic
+
+  # ============ API Gateway Integration ============
+  DecisionApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DecisionEngineFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+
+Outputs:
+  DecisionEngineFunctionArn:
+    Description: ARN of the Decision Engine Lambda
+    Value: !GetAtt DecisionEngineFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-DecisionEngineArn
+
+  DecisionEngineFunctionName:
+    Description: Name of the Decision Engine Lambda
+    Value: !Ref DecisionEngineFunction
+    Export:
+      Name: !Sub ${AWS::StackName}-DecisionEngineName
+
+  AlertTopicArn:
+    Description: SNS Topic for trade alerts
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub ${AWS::StackName}-AlertTopicArn
+
+  ScheduledRuleArn:
+    Description: Scheduled analysis rule ARN
+    Value: !GetAtt ScheduledAnalysisRule.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-ScheduledRuleArn

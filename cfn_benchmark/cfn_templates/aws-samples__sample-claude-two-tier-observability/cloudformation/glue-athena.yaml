@@ -1,0 +1,717 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Glue catalog (with Athena partition projection) and Athena workgroup for
+  Claude Code metrics. New date partitions become queryable as soon as S3
+  writes them — no crawlers, no schedule, no partition registration.
+
+Parameters:
+  OrgName:
+    Type: String
+    Description: Organization name (used in resource naming)
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+  InvocationLogBucket:
+    Type: String
+    Description: S3 bucket containing processed invocation logs
+  ProcessedPrefix:
+    Type: String
+    Default: processed/
+    Description: S3 prefix for processed records
+  AthenaResultsPrefix:
+    Type: String
+    Default: athena-results/
+    Description: S3 prefix for Athena query results
+  PartitionProjectionStart:
+    Type: String
+    Default: '2024-01-01'
+    Description: Earliest date partition projection should consider (yyyy-MM-dd)
+  KMSKeyArn:
+    Type: String
+    Default: ''
+    Description: KMS key ARN for Athena query result encryption (from bedrock-logging outputs)
+  PermissionsBoundaryArn:
+    Type: String
+    Default: ''
+    Description: IAM Permissions Boundary ARN (required for accounts with restrictive SCPs)
+
+Conditions:
+  HasKMSKey: !Not [!Equals [!Ref KMSKeyArn, '']]
+  HasPermissionsBoundary: !Not [!Equals [!Ref PermissionsBoundaryArn, '']]
+
+Resources:
+
+  # =========================================================================
+  # Glue Catalog Database
+  # =========================================================================
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub
+          - 'claude_code_metrics_${SafeOrg}'
+          - SafeOrg: !Join ['_', !Split ['-', !Ref OrgName]]
+        Description: !Sub 'Claude Code usage metrics for org ${OrgName}'
+
+  # =========================================================================
+  # Glue Tables (Athena partition projection — no crawlers required)
+  #
+  # `date` is a projected partition key. Athena computes the partition path
+  # from `storage.location.template` at query time; new S3 date folders are
+  # queryable immediately. Columns are declared explicitly below to match
+  # the JSON schema produced by the invocation log processor Lambda.
+  # =========================================================================
+  # sessions_legacy: historical data (written by the pre-refactor Lambda) so
+  # the view can UNION it with fresh query-time aggregates. The pre-refactor
+  # Lambda pre-aggregated per-session but used an unreliable hourly key and
+  # overwrote records; data prior to the refactor is imperfect but kept.
+  SessionsLegacyTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: sessions_legacy
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          projection.enabled: 'true'
+          projection.date.type: date
+          projection.date.range: !Sub '${PartitionProjectionStart},NOW'
+          projection.date.format: yyyy-MM-dd
+          projection.date.interval: '1'
+          projection.date.interval.unit: DAYS
+          storage.location.template: !Sub 's3://${InvocationLogBucket}/${ProcessedPrefix}sessions/date=${!date}/'
+        PartitionKeys:
+          - Name: date
+            Type: string
+        StorageDescriptor:
+          Location: !Sub 's3://${InvocationLogBucket}/${ProcessedPrefix}sessions/'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              ignore.malformed.json: 'true'
+          Columns:
+            - {Name: user_id,                   Type: string}
+            - {Name: org_name,                  Type: string}
+            - {Name: session_id,                Type: string}
+            - {Name: project_name,              Type: string}
+            - {Name: cwd,                       Type: string}
+            - {Name: git_branch,                Type: string}
+            - {Name: git_commit,                Type: string}
+            - {Name: repo_name,                 Type: string}
+            - {Name: session_start,             Type: string}
+            - {Name: session_end,               Type: string}
+            - {Name: duration_seconds,          Type: double}
+            - {Name: user_turn_count,           Type: int}
+            - {Name: assistant_turn_count,      Type: int}
+            - {Name: invocation_count,          Type: int}
+            - {Name: primary_model,             Type: string}
+            - {Name: model_family,              Type: string}
+            - {Name: total_input_tokens,        Type: bigint}
+            - {Name: total_output_tokens,       Type: bigint}
+            - {Name: total_cache_read_tokens,   Type: bigint}
+            - {Name: total_cache_write_tokens,  Type: bigint}
+            - {Name: grand_total_tokens,        Type: bigint}
+            - {Name: total_thinking_chars,     Type: bigint}
+            - {Name: avg_input_per_turn,        Type: double}
+            - {Name: avg_output_per_turn,       Type: double}
+            - {Name: cache_hit_rate_pct,        Type: double}
+            - {Name: estimated_cost_usd,        Type: double}
+            - {Name: code_edit_count,           Type: int}
+            - {Name: code_acceptance_rate_pct,  Type: double}
+            - {Name: lines_generated,           Type: bigint}
+            - {Name: lines_accepted,            Type: double}
+            - {Name: files_modified_count,      Type: int}
+            - {Name: total_tool_calls,          Type: int}
+            - {Name: tool_denial_count,         Type: int}
+            - {Name: tool_denial_rate_pct,      Type: double}
+            - {Name: error_count,               Type: int}
+            - {Name: git_commit_count,          Type: int}
+            - {Name: aws_region,                Type: string}
+            - {Name: email,                     Type: string}
+            - {Name: department,                Type: string}
+            - {Name: team_id,                   Type: string}
+            - {Name: cost_center,               Type: string}
+            - {Name: cognito_group,             Type: string}
+            - {Name: client_type,               Type: string}
+
+  # invocations: per-Bedrock-call records (one row per Lambda invocation).
+  # Fed by the refactored processor Lambda; `sessions` view aggregates these.
+  InvocationsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: invocations
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          projection.enabled: 'true'
+          projection.date.type: date
+          projection.date.range: !Sub '${PartitionProjectionStart},NOW'
+          projection.date.format: yyyy-MM-dd
+          projection.date.interval: '1'
+          projection.date.interval.unit: DAYS
+          storage.location.template: !Sub 's3://${InvocationLogBucket}/${ProcessedPrefix}invocations/date=${!date}/'
+        PartitionKeys:
+          - Name: date
+            Type: string
+        StorageDescriptor:
+          Location: !Sub 's3://${InvocationLogBucket}/${ProcessedPrefix}invocations/'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              ignore.malformed.json: 'true'
+          Columns:
+            - {Name: request_id,                Type: string}
+            - {Name: timestamp,                 Type: string}
+            - {Name: user_id,                   Type: string}
+            - {Name: org_name,                  Type: string}
+            - {Name: session_id,                Type: string}
+            - {Name: model_id,                  Type: string}
+            - {Name: model_family,              Type: string}
+            - {Name: operation,                 Type: string}
+            - {Name: stop_reason,               Type: string}
+            - {Name: tool_count,                Type: int}
+            - {Name: code_edit_count,           Type: int}
+            - {Name: total_input_tokens,        Type: bigint}
+            - {Name: total_output_tokens,       Type: bigint}
+            - {Name: total_cache_read_tokens,   Type: bigint}
+            - {Name: total_cache_write_tokens,  Type: bigint}
+            - {Name: grand_total_tokens,        Type: bigint}
+            - {Name: aws_region,                Type: string}
+            - {Name: git_branch,                Type: string}
+            - {Name: git_commit,                Type: string}
+            - {Name: repo_name,                 Type: string}
+            - {Name: project_name,              Type: string}
+            - {Name: cwd,                       Type: string}
+            - {Name: email,                     Type: string}
+            - {Name: department,                Type: string}
+            - {Name: team_id,                   Type: string}
+            - {Name: cost_center,               Type: string}
+            - {Name: cognito_group,             Type: string}
+            - {Name: client_type,               Type: string}
+
+  PromptsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: prompts
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          projection.enabled: 'true'
+          projection.date.type: date
+          projection.date.range: !Sub '${PartitionProjectionStart},NOW'
+          projection.date.format: yyyy-MM-dd
+          projection.date.interval: '1'
+          projection.date.interval.unit: DAYS
+          storage.location.template: !Sub 's3://${InvocationLogBucket}/${ProcessedPrefix}prompts/date=${!date}/'
+        PartitionKeys:
+          - Name: date
+            Type: string
+        StorageDescriptor:
+          Location: !Sub 's3://${InvocationLogBucket}/${ProcessedPrefix}prompts/'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              ignore.malformed.json: 'true'
+          Columns:
+            - {Name: user_id,           Type: string}
+            - {Name: org_name,          Type: string}
+            - {Name: session_id,        Type: string}
+            - {Name: turn_number,       Type: int}
+            - {Name: prompt,            Type: string}
+            - {Name: prompt_char_count, Type: int}
+            - {Name: prompt_word_count, Type: int}
+            - {Name: project_name,      Type: string}
+            - {Name: cwd,               Type: string}
+            - {Name: git_branch,        Type: string}
+            - {Name: repo_name,         Type: string}
+            - {Name: aws_region,        Type: string}
+            - {Name: email,             Type: string}
+            - {Name: department,        Type: string}
+            - {Name: team_id,           Type: string}
+            - {Name: cost_center,       Type: string}
+            - {Name: cognito_group,     Type: string}
+
+  ToolsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: tools
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: json
+          projection.enabled: 'true'
+          projection.date.type: date
+          projection.date.range: !Sub '${PartitionProjectionStart},NOW'
+          projection.date.format: yyyy-MM-dd
+          projection.date.interval: '1'
+          projection.date.interval.unit: DAYS
+          storage.location.template: !Sub 's3://${InvocationLogBucket}/${ProcessedPrefix}tools/date=${!date}/'
+        PartitionKeys:
+          - Name: date
+            Type: string
+        StorageDescriptor:
+          Location: !Sub 's3://${InvocationLogBucket}/${ProcessedPrefix}tools/'
+          InputFormat: org.apache.hadoop.mapred.TextInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.openx.data.jsonserde.JsonSerDe
+            Parameters:
+              ignore.malformed.json: 'true'
+          Columns:
+            - {Name: user_id,           Type: string}
+            - {Name: org_name,          Type: string}
+            - {Name: session_id,        Type: string}
+            - {Name: turn_number,       Type: int}
+            - {Name: tool_name,         Type: string}
+            - {Name: is_code_modifying, Type: boolean}
+            - {Name: is_git_commit,     Type: boolean}
+            - {Name: commit_hash,       Type: string}
+            - {Name: commit_message,    Type: string}
+            - {Name: success,           Type: boolean}
+            - {Name: tool_response_len, Type: int}
+            - {Name: file_path,         Type: string}
+            - {Name: command,           Type: string}
+            - {Name: lines_added,       Type: int}
+            - {Name: lines_removed,     Type: int}
+            - {Name: project_name,      Type: string}
+            - {Name: cwd,               Type: string}
+            - {Name: aws_region,        Type: string}
+            - {Name: email,             Type: string}
+            - {Name: department,        Type: string}
+            - {Name: team_id,           Type: string}
+            - {Name: cost_center,       Type: string}
+            - {Name: cognito_group,     Type: string}
+
+  # =========================================================================
+  # Athena Workgroup
+  # =========================================================================
+  AthenaWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Sub 'claude-code-metrics-${OrgName}'
+      Description: Athena workgroup for Claude Code metrics queries and QuickSight
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${InvocationLogBucket}/${AthenaResultsPrefix}'
+          EncryptionConfiguration: !If
+            - HasKMSKey
+            - EncryptionOption: SSE_KMS
+              KmsKey: !Ref KMSKeyArn
+            - EncryptionOption: SSE_S3
+
+  # =========================================================================
+  # Athena Named Queries
+  # =========================================================================
+  SessionsPerDayQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: claude-code-sessions-per-day
+      WorkGroup: !Ref AthenaWorkgroup
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        SELECT
+          "date",
+          COUNT(session_id)                     AS session_count,
+          COUNT(DISTINCT user_id)               AS unique_users,
+          SUM(grand_total_tokens)               AS total_tokens,
+          ROUND(SUM(estimated_cost_usd), 4)     AS total_cost_usd,
+          ROUND(AVG(duration_seconds), 1)       AS avg_session_duration_s
+        FROM sessions
+        GROUP BY "date"
+        ORDER BY "date" DESC
+
+  TokensPerUserPerDayQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: claude-code-tokens-per-user-per-day
+      WorkGroup: !Ref AthenaWorkgroup
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        SELECT
+          "date",
+          user_id,
+          aws_region,
+          SUM(grand_total_tokens)               AS total_tokens,
+          SUM(total_input_tokens)               AS input_tokens,
+          SUM(total_output_tokens)              AS output_tokens,
+          SUM(total_cache_read_tokens)          AS cache_read_tokens,
+          ROUND(SUM(estimated_cost_usd), 6)     AS total_cost_usd,
+          COUNT(session_id)                     AS session_count
+        FROM sessions
+        GROUP BY "date", user_id, aws_region
+        ORDER BY "date" DESC, total_tokens DESC
+
+  CodeGenerationQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: claude-code-generation-vs-accepted
+      WorkGroup: !Ref AthenaWorkgroup
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        SELECT
+          "date",
+          user_id,
+          SUM(lines_generated)                          AS lines_generated,
+          ROUND(SUM(lines_accepted), 0)                 AS lines_accepted,
+          ROUND(AVG(code_acceptance_rate_pct), 1)       AS avg_acceptance_rate_pct,
+          SUM(code_edit_count)                          AS total_code_edits,
+          SUM(files_modified_count)                     AS files_modified
+        FROM sessions
+        WHERE code_edit_count > 0
+        GROUP BY "date", user_id
+        ORDER BY "date" DESC, lines_generated DESC
+
+  ToolUsageQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: claude-code-tool-usage-breakdown
+      WorkGroup: !Ref AthenaWorkgroup
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        SELECT
+          tool_name,
+          user_id,
+          COUNT(*)                                          AS total_calls,
+          SUM(CASE WHEN success THEN 1 ELSE 0 END)         AS successful_calls,
+          SUM(CASE WHEN NOT success THEN 1 ELSE 0 END)     AS failed_calls,
+          SUM(COALESCE(lines_added, 0))                     AS total_lines_added,
+          SUM(COALESCE(lines_removed, 0))                   AS total_lines_removed
+        FROM tools
+        GROUP BY tool_name, user_id
+        ORDER BY total_calls DESC
+
+  ProjectsWorkedOnQuery:
+    Type: AWS::Athena::NamedQuery
+    Properties:
+      Name: claude-code-projects-worked-on
+      WorkGroup: !Ref AthenaWorkgroup
+      Database: !Ref GlueDatabase
+      QueryString: !Sub |
+        SELECT
+          "date",
+          project_name,
+          repo_name,
+          git_branch,
+          COUNT(DISTINCT session_id)            AS session_count,
+          COUNT(DISTINCT user_id)               AS user_count,
+          COUNT(*)                              AS prompt_count,
+          SUM(prompt_word_count)                AS total_words_prompted
+        FROM prompts
+        WHERE project_name <> ''
+        GROUP BY "date", project_name, repo_name, git_branch
+        ORDER BY "date" DESC, session_count DESC
+
+  # =========================================================================
+  # Sessions view — aggregates per-invocation data at query time.
+  #
+  # Direct `AWS::Glue::Table` with `TableType: VIRTUAL_VIEW` requires the SQL
+  # to be stored as base64-encoded Presto-serialized JSON in `ViewOriginalText`
+  # and is brittle to maintain in CFN. Instead we use a Lambda-backed custom
+  # resource that runs `CREATE OR REPLACE VIEW` through Athena; Athena handles
+  # the encoding and the SQL stays human-readable in the template.
+  # =========================================================================
+  SessionsViewCreatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      PermissionsBoundary: !If [HasPermissionsBoundary, !Ref PermissionsBoundaryArn, !Ref 'AWS::NoValue']
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: athena-create-view
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetWorkGroup
+                Resource:
+                  - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/${AthenaWorkgroup}'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetDatabases
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:GetTable
+                  - glue:GetTables
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                Resource:
+                  - !Sub 'arn:aws:s3:::${InvocationLogBucket}'
+                  - !Sub 'arn:aws:s3:::${InvocationLogBucket}/*'
+              - !If
+                - HasKMSKey
+                - Effect: Allow
+                  Action: [kms:Decrypt, kms:Encrypt, kms:GenerateDataKey, kms:DescribeKey]
+                  Resource: !Ref KMSKeyArn
+                - !Ref 'AWS::NoValue'
+
+  SessionsViewCreatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt SessionsViewCreatorRole.Arn
+      Timeout: 120
+      Code:
+        ZipFile: |
+          import json, time, urllib.request, boto3
+          from botocore.exceptions import ClientError
+
+          athena = boto3.client('athena')
+          glue = boto3.client('glue')
+
+          def send_response(event, context, status, reason=""):
+              body = {
+                  "Status": status, "Reason": reason or "see CloudWatch",
+                  "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                  "StackId": event["StackId"], "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"], "Data": {},
+              }
+              data = json.dumps(body).encode()
+              req = urllib.request.Request(event["ResponseURL"], data=data,
+                    headers={"Content-Type": ""}, method="PUT")
+              urllib.request.urlopen(req)
+
+          def run_sql(sql, workgroup, output_location):
+              qid = athena.start_query_execution(
+                  QueryString=sql,
+                  WorkGroup=workgroup,
+                  ResultConfiguration={"OutputLocation": output_location},
+              )["QueryExecutionId"]
+              for _ in range(60):
+                  s = athena.get_query_execution(QueryExecutionId=qid)["QueryExecution"]["Status"]
+                  if s["State"] in ("SUCCEEDED", "FAILED", "CANCELLED"):
+                      return s
+                  time.sleep(2)
+              return {"State": "TIMEOUT"}
+
+          def view_exists(database, name):
+              try:
+                  t = glue.get_table(DatabaseName=database, Name=name)["Table"]
+                  return t.get("TableType") == "VIRTUAL_VIEW"
+              except ClientError as e:
+                  if e.response["Error"]["Code"] == "EntityNotFoundException":
+                      return False
+                  raise
+
+          def create_with_retry(sql, workgroup, output, database, view_name, attempts=3):
+              for i in range(attempts):
+                  status = run_sql(sql, workgroup, output)
+                  if status["State"] != "SUCCEEDED":
+                      return status  # hard failure, don't retry
+                  # Glue catalog can be eventually consistent after a CREATE VIEW;
+                  # poll up to 20s for the view to appear before reporting success.
+                  for _ in range(10):
+                      if view_exists(database, view_name):
+                          return status
+                      time.sleep(2)
+                  # View didn't materialize — retry the CREATE (idempotent via CREATE OR REPLACE)
+              return {"State": "FAILED", "StateChangeReason":
+                      f"view {database}.{view_name} did not materialize after {attempts} attempts"}
+
+          def handler(event, context):
+              try:
+                  props = event["ResourceProperties"]
+                  db = props["Database"]
+                  workgroup = props["WorkGroup"]
+                  output = props["OutputLocation"]
+                  sql = props["ViewSql"]
+                  req = event["RequestType"]
+                  if req in ("Create", "Update"):
+                      status = create_with_retry(sql, workgroup, output, db, "sessions")
+                      if status["State"] != "SUCCEEDED":
+                          return send_response(event, context, "FAILED",
+                              f"view create failed: {status}")
+                  elif req == "Delete":
+                      drop = f"DROP VIEW IF EXISTS {db}.sessions"
+                      run_sql(drop, workgroup, output)  # best-effort
+                  send_response(event, context, "SUCCESS")
+              except Exception as e:
+                  send_response(event, context, "FAILED", str(e)[:500])
+
+  SessionsView:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn: [InvocationsTable, ToolsTable, SessionsLegacyTable]
+    Properties:
+      ServiceToken: !GetAtt SessionsViewCreatorFunction.Arn
+      Database: !Ref GlueDatabase
+      WorkGroup: !Ref AthenaWorkgroup
+      OutputLocation: !Sub 's3://${InvocationLogBucket}/${AthenaResultsPrefix}'
+      # SQL is versioned here; any edit triggers an Update on the custom resource.
+      # The view exposes the 43 columns QuickSight binds to, computed at query time.
+      ViewSql: !Sub |
+        CREATE OR REPLACE VIEW ${GlueDatabase}.sessions AS
+        WITH tool_agg AS (
+          SELECT
+            session_id,
+            date,
+            COUNT(*)                                                 AS total_tool_calls,
+            SUM(CAST(COALESCE(lines_added,   0) AS BIGINT))          AS sum_lines_added,
+            SUM(CAST(COALESCE(lines_removed, 0) AS BIGINT))          AS sum_lines_removed,
+            COUNT_IF(is_code_modifying)                              AS tool_edit_count,
+            COUNT(DISTINCT CASE WHEN is_code_modifying AND file_path <> ''
+                                THEN file_path END)                  AS files_modified_count,
+            COUNT_IF(NOT COALESCE(success, true))                    AS tool_denial_count,
+            COUNT_IF(is_git_commit)                                  AS git_commit_count,
+            MAX_BY(commit_hash, CASE WHEN is_git_commit THEN 1 ELSE 0 END) AS last_commit
+          FROM ${GlueDatabase}.tools
+          GROUP BY session_id, date
+        ),
+        inv_agg AS (
+          SELECT
+            i.session_id,
+            i.date,
+            ARBITRARY(i.user_id)                                     AS user_id,
+            ARBITRARY(i.org_name)                                    AS org_name,
+            ARBITRARY(i.project_name)                                AS project_name,
+            ARBITRARY(i.cwd)                                         AS cwd,
+            ARBITRARY(i.git_branch)                                  AS git_branch,
+            ARBITRARY(i.git_commit)                                  AS git_commit,
+            ARBITRARY(i.repo_name)                                   AS repo_name,
+            MIN(i.timestamp)                                         AS session_start,
+            MAX(i.timestamp)                                         AS session_end,
+            COUNT(*)                                                 AS invocation_count,
+            ARBITRARY(i.model_id)                                    AS primary_model,
+            ARBITRARY(i.model_family)                                AS model_family,
+            SUM(CAST(i.total_input_tokens       AS BIGINT))          AS total_input_tokens,
+            SUM(CAST(i.total_output_tokens      AS BIGINT))          AS total_output_tokens,
+            SUM(CAST(i.total_cache_read_tokens  AS BIGINT))          AS total_cache_read_tokens,
+            SUM(CAST(i.total_cache_write_tokens AS BIGINT))          AS total_cache_write_tokens,
+            SUM(CAST(i.grand_total_tokens       AS BIGINT))          AS grand_total_tokens,
+            SUM(CAST(i.code_edit_count          AS BIGINT))          AS inv_code_edit_count,
+            COUNT_IF(i.stop_reason = 'error')                        AS error_count,
+            ARBITRARY(i.aws_region)                                  AS aws_region,
+            ARBITRARY(i.email)                                       AS email,
+            ARBITRARY(i.department)                                  AS department,
+            ARBITRARY(i.team_id)                                     AS team_id,
+            ARBITRARY(i.cost_center)                                 AS cost_center,
+            ARBITRARY(i.cognito_group)                               AS cognito_group,
+            ARBITRARY(i.client_type)                                 AS client_type
+          FROM ${GlueDatabase}.invocations i
+          GROUP BY i.session_id, i.date
+        )
+        SELECT
+          ia.user_id, ia.org_name, ia.session_id, ia.project_name, ia.cwd,
+          ia.git_branch, ia.git_commit, ia.repo_name, ia.session_start, ia.session_end,
+          CAST(date_diff('second', from_iso8601_timestamp(ia.session_start),
+                                    from_iso8601_timestamp(ia.session_end)) AS DOUBLE)
+                                                                     AS duration_seconds,
+          CAST(0 AS INTEGER)                                         AS user_turn_count,
+          CAST(0 AS INTEGER)                                         AS assistant_turn_count,
+          CAST(ia.invocation_count AS INTEGER)                       AS invocation_count,
+          ia.primary_model, ia.model_family,
+          ia.total_input_tokens, ia.total_output_tokens,
+          ia.total_cache_read_tokens, ia.total_cache_write_tokens,
+          ia.grand_total_tokens,
+          CAST(0 AS BIGINT)                                          AS total_thinking_chars,
+          CAST(NULL AS DOUBLE)                                       AS avg_input_per_turn,
+          CAST(NULL AS DOUBLE)                                       AS avg_output_per_turn,
+          CASE WHEN (ia.total_cache_read_tokens + ia.total_cache_write_tokens) > 0
+               THEN ROUND(100.0 * ia.total_cache_read_tokens /
+                          (ia.total_cache_read_tokens + ia.total_cache_write_tokens), 1)
+               ELSE 0.0 END                                          AS cache_hit_rate_pct,
+          CAST(0.0 AS DOUBLE)                                        AS estimated_cost_usd,
+          CAST(COALESCE(ta.tool_edit_count, ia.inv_code_edit_count, 0) AS INTEGER)
+                                                                     AS code_edit_count,
+          CASE WHEN COALESCE(ta.tool_edit_count, 0) = 0 THEN 0.0
+               ELSE ROUND(100.0 * (1.0 - LEAST(ta.tool_denial_count, ta.tool_edit_count)
+                          / CAST(ta.tool_edit_count AS DOUBLE)), 1) END
+                                                                     AS code_acceptance_rate_pct,
+          CAST(COALESCE(ta.sum_lines_added + ta.sum_lines_removed, 0) AS BIGINT)
+                                                                     AS lines_generated,
+          CAST(COALESCE(ta.sum_lines_added + ta.sum_lines_removed, 0) AS DOUBLE)
+                                                                     AS lines_accepted,
+          CAST(COALESCE(ta.files_modified_count, 0) AS INTEGER)      AS files_modified_count,
+          CAST(COALESCE(ta.total_tool_calls, 0) AS INTEGER)          AS total_tool_calls,
+          CAST(COALESCE(ta.tool_denial_count, 0) AS INTEGER)         AS tool_denial_count,
+          CASE WHEN COALESCE(ta.total_tool_calls, 0) = 0 THEN 0.0
+               ELSE ROUND(100.0 * ta.tool_denial_count /
+                          CAST(ta.total_tool_calls AS DOUBLE), 1) END
+                                                                     AS tool_denial_rate_pct,
+          CAST(ia.error_count AS INTEGER)                            AS error_count,
+          CAST(COALESCE(ta.git_commit_count, 0) AS INTEGER)          AS git_commit_count,
+          ia.aws_region, ia.email, ia.department, ia.team_id,
+          ia.cost_center, ia.cognito_group, ia.client_type, ia.date
+        FROM inv_agg ia
+        LEFT JOIN tool_agg ta
+               ON ia.session_id = ta.session_id AND ia.date = ta.date
+        UNION ALL
+        SELECT
+          user_id, org_name, session_id, project_name, cwd,
+          git_branch, git_commit, repo_name, session_start, session_end,
+          duration_seconds, user_turn_count, assistant_turn_count, invocation_count,
+          primary_model, model_family,
+          total_input_tokens, total_output_tokens,
+          total_cache_read_tokens, total_cache_write_tokens, grand_total_tokens,
+          total_thinking_chars, avg_input_per_turn, avg_output_per_turn,
+          cache_hit_rate_pct, estimated_cost_usd,
+          code_edit_count,
+          CAST(code_acceptance_rate_pct AS DOUBLE)                   AS code_acceptance_rate_pct,
+          lines_generated, lines_accepted, files_modified_count,
+          total_tool_calls, tool_denial_count, tool_denial_rate_pct,
+          error_count, git_commit_count,
+          aws_region, email, department, team_id,
+          cost_center, cognito_group, client_type, date
+        FROM ${GlueDatabase}.sessions_legacy
+
+Outputs:
+  GlueDatabaseName:
+    Value: !Ref GlueDatabase
+    Description: Glue catalog database name
+  AthenaWorkgroupName:
+    Value: !Ref AthenaWorkgroup
+    Description: Athena workgroup name
+  InvocationsTableName:
+    Value: !Ref InvocationsTable
+    Description: Per-invocation Glue table name (projection-enabled); feeds the `sessions` view
+  SessionsLegacyTableName:
+    Value: !Ref SessionsLegacyTable
+    Description: Legacy pre-refactor session records — union'd into the `sessions` view
+  SessionsViewName:
+    Value: sessions
+    Description: Athena view that aggregates invocations+tools (with legacy union) into the classic sessions column set
+  ToolsTableName:
+    Value: !Ref ToolsTable
+    Description: Tools Glue table name (projection-enabled)
+  PromptsTableName:
+    Value: !Ref PromptsTable
+    Description: Prompts Glue table name (projection-enabled)

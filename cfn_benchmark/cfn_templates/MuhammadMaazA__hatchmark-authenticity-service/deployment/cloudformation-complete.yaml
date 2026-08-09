@@ -1,0 +1,606 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Hatchmark Authenticity Service - Complete Infrastructure'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: 'hatchmark'
+    Description: Name of the project for resource naming
+
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: Environment name
+
+Resources:
+  # S3 Buckets
+  IngestionBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-ingestion-bucket-${Environment}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  ProcessedBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-processed-bucket-${Environment}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # DynamoDB Table
+  AssetRegistryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-assets-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: assetId
+          AttributeType: S
+        - AttributeName: perceptualHash
+          AttributeType: S
+      KeySchema:
+        - AttributeName: assetId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: PerceptualHashIndex
+          KeySchema:
+            - AttributeName: perceptualHash
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # SQS Queue
+  WatermarkingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-watermarking-${Environment}'
+      VisibilityTimeout: 900
+      MessageRetentionPeriod: 1209600
+      ReceiveMessageWaitTimeSeconds: 20
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-lambda-execution-role-${Environment}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: !GetAtt IngestionBucket.Arn
+                  - !Sub
+                    - '${BucketArn}/*'
+                    - BucketArn: !GetAtt ProcessedBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt IngestionBucket.Arn
+                  - !GetAtt ProcessedBucket.Arn
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt AssetRegistryTable.Arn
+                  - !Sub '${AssetRegistryTable.Arn}/index/*'
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                Resource: !GetAtt WatermarkingQueue.Arn
+
+  # Lambda Function: Generate Presigned URL
+  GeneratePresignedUrlFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-generate-url-${Environment}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from botocore.exceptions import ClientError
+
+          s3_client = boto3.client('s3')
+
+          def lambda_handler(event, context):
+              try:
+                  # Handle both API Gateway and direct invocation
+                  if 'body' in event and event['body']:
+                      body = json.loads(event['body'])
+                  else:
+                      body = event
+
+                  bucket_name = os.environ['INGESTION_BUCKET']
+                  file_name = body.get('file_name', f'upload-{context.aws_request_id}.jpg')
+                  content_type = body.get('content_type', 'image/jpeg')
+
+                  # Generate presigned URL for upload
+                  url = s3_client.generate_presigned_url(
+                      'put_object',
+                      Params={
+                          'Bucket': bucket_name,
+                          'Key': file_name,
+                          'ContentType': content_type
+                      },
+                      ExpiresIn=3600
+                  )
+
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type'
+                      },
+                      'body': json.dumps({
+                          'upload_url': url,
+                          'file_name': file_name,
+                          'bucket': bucket_name
+                      })
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type'
+                      },
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Environment:
+        Variables:
+          INGESTION_BUCKET: !Ref IngestionBucket
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          DYNAMODB_TABLE: !Ref AssetRegistryTable
+          SQS_QUEUE_URL: !Ref WatermarkingQueue
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+
+  # Lambda Function: Register Asset
+  RegisterAssetFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-register-asset-${Environment}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import uuid
+          import hashlib
+          from datetime import datetime
+          import os
+
+          s3_client = boto3.client('s3')
+          dynamodb = boto3.resource('dynamodb')
+
+          def lambda_handler(event, context):
+              try:
+                  table_name = os.environ['DYNAMODB_TABLE']
+                  table = dynamodb.Table(table_name)
+
+                  # Handle both API Gateway and direct invocation
+                  if 'body' in event and event['body']:
+                      body = json.loads(event['body'])
+                  else:
+                      body = event
+
+                  # Extract file information
+                  bucket = body.get('bucket')
+                  key = body.get('key')
+
+                  if not bucket or not key:
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                              'Access-Control-Allow-Headers': 'Content-Type'
+                          },
+                          'body': json.dumps({
+                              'error': 'bucket and key required'
+                          })
+                      }
+
+                  # Get file from S3 and compute basic hash
+                  try:
+                      response = s3_client.get_object(Bucket=bucket, Key=key)
+                      file_data = response['Body'].read()
+
+                      # Compute simple file hash (not perceptual hash)
+                      file_hash = hashlib.sha256(file_data).hexdigest()
+
+                      # Generate asset ID
+                      asset_id = str(uuid.uuid4())
+                      timestamp = datetime.utcnow().isoformat()
+
+                      # Store in DynamoDB
+                      table.put_item(
+                          Item={
+                              'assetId': asset_id,
+                              'perceptualHash': file_hash[:16],  # Use first 16 chars as placeholder
+                              'fileHash': file_hash,
+                              'timestamp': timestamp,
+                              'originalFile': key,
+                              'bucket': bucket,
+                              'size': len(file_data),
+                              'status': 'registered'
+                          }
+                      )
+
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                              'Access-Control-Allow-Headers': 'Content-Type'
+                          },
+                          'body': json.dumps({
+                              'asset_id': asset_id,
+                              'timestamp': timestamp,
+                              'file_hash': file_hash,
+                              'status': 'registered'
+                          })
+                      }
+                  except Exception as e:
+                      return {
+                          'statusCode': 500,
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                              'Access-Control-Allow-Headers': 'Content-Type'
+                          },
+                          'body': json.dumps({'error': f'Error processing file: {str(e)}'})
+                      }
+
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type'
+                      },
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Environment:
+        Variables:
+          INGESTION_BUCKET: !Ref IngestionBucket
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          DYNAMODB_TABLE: !Ref AssetRegistryTable
+          SQS_QUEUE_URL: !Ref WatermarkingQueue
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+
+  # Lambda Function: Verify Artwork
+  VerifyArtworkFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-verify-artwork-${Environment}'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import hashlib
+
+          dynamodb = boto3.resource('dynamodb')
+
+          def lambda_handler(event, context):
+              try:
+                  table_name = os.environ['DYNAMODB_TABLE']
+                  table = dynamodb.Table(table_name)
+
+                  # Handle both API Gateway and direct invocation
+                  if 'body' in event and event['body']:
+                      body = event['body']
+                      if isinstance(body, str):
+                          body = json.loads(body)
+                  else:
+                      body = event
+
+                  # For now, just search by a simple hash or ID
+                  search_term = body.get('asset_id') or body.get('search_term', '')
+
+                  if not search_term:
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                              'Access-Control-Allow-Headers': 'Content-Type'
+                          },
+                          'body': json.dumps({
+                              'error': 'asset_id or search_term required'
+                          })
+                      }
+
+                  # Try to find the asset
+                  try:
+                      response = table.get_item(Key={'assetId': search_term})
+                      if 'Item' in response:
+                          item = response['Item']
+                          return {
+                              'statusCode': 200,
+                              'headers': {
+                                  'Access-Control-Allow-Origin': '*',
+                                  'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                                  'Access-Control-Allow-Headers': 'Content-Type'
+                              },
+                              'body': json.dumps({
+                                  'verified': True,
+                                  'asset_id': item['assetId'],
+                                  'timestamp': item.get('timestamp'),
+                                  'status': item.get('status'),
+                                  'confidence': 100
+                              })
+                          }
+                  except Exception as e:
+                      print(f"Error querying DynamoDB: {e}")
+
+                  # No match found
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type'
+                      },
+                      'body': json.dumps({
+                          'verified': False,
+                          'message': 'No matching artwork found in registry'
+                      })
+                  }
+              except Exception as e:
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+                          'Access-Control-Allow-Headers': 'Content-Type'
+                      },
+                      'body': json.dumps({'error': str(e)})
+                  }
+      Environment:
+        Variables:
+          INGESTION_BUCKET: !Ref IngestionBucket
+          PROCESSED_BUCKET: !Ref ProcessedBucket
+          DYNAMODB_TABLE: !Ref AssetRegistryTable
+          SQS_QUEUE_URL: !Ref WatermarkingQueue
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+
+  # API Gateway
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api-${Environment}'
+      Description: 'Hatchmark Authenticity Service API'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # CORS OPTIONS method for /register
+  RegisterOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref RegisterResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+
+  # API Gateway Resource: /register
+  RegisterResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'register'
+
+  # API Gateway Method: POST /register
+  RegisterMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref RegisterResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations'
+          - LambdaArn: !GetAtt RegisterAssetFunction.Arn
+
+  # API Gateway Resource: /generate-url
+  GenerateUrlResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'generate-url'
+
+  # API Gateway Method: POST /generate-url
+  GenerateUrlMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref GenerateUrlResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations'
+          - LambdaArn: !GetAtt GeneratePresignedUrlFunction.Arn
+
+  # API Gateway Resource: /verify
+  VerifyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: 'verify'
+
+  # API Gateway Method: POST /verify
+  VerifyMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref VerifyResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${LambdaArn}/invocations'
+          - LambdaArn: !GetAtt VerifyArtworkFunction.Arn
+
+  # Lambda Permissions for API Gateway
+  RegisterLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RegisterAssetFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${ApiGateway}/*/*/*'
+
+  GenerateUrlLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GeneratePresignedUrlFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${ApiGateway}/*/*/*'
+
+  VerifyLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref VerifyArtworkFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub '${ApiGateway}/*/*/*'
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - RegisterMethod
+      - GenerateUrlMethod
+      - VerifyMethod
+      - RegisterOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+      StageName: !Ref Environment
+
+Outputs:
+  IngestionBucketName:
+    Description: 'S3 Bucket for ingestion'
+    Value: !Ref IngestionBucket
+
+  ProcessedBucketName:
+    Description: 'S3 Bucket for processed images'
+    Value: !Ref ProcessedBucket
+
+  DynamoDBTableName:
+    Description: 'DynamoDB Asset Registry Table'
+    Value: !Ref AssetRegistryTable
+
+  SQSQueueURL:
+    Description: 'SQS Queue URL for watermarking'
+    Value: !Ref WatermarkingQueue
+
+  ApiGatewayURL:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+
+  RegisterEndpoint:
+    Description: 'Register asset endpoint'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/register'
+
+  GenerateUrlEndpoint:
+    Description: 'Generate URL endpoint'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/generate-url'
+
+  VerifyEndpoint:
+    Description: 'Verify artwork endpoint'
+    Value: !Sub 'https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/verify'
