@@ -51,9 +51,12 @@ The generated requirement prompt MUST be a single cohesive paragraph following t
 4. Scale Detail by Complexity:
    - Simple/Single-Resource (Easy): Keep the prompt to 1-2 short sentences covering the main goal and any required key names/aliases.
    - Multi-Resource/VPCs (Complex): Detail the primary structural components (e.g., subnets, CIDRs) but generalize secondary security/ACL rules.
+5. Faithfulness:
+   - Every stated behavior, action, or threshold (e.g., "block" vs "count", "allow" vs "deny") MUST match the ground-truth template's actual effect exactly. Never soften, generalize, or substitute an action word for a different one that changes the template's real behavior.
+   - Never truncate. The paragraph must always end on a complete sentence with terminal punctuation, even for templates with many parameters -- if space is limited, drop secondary detail rather than cutting a sentence short.
 
 Output Rules:
-- Write exactly ONE well-structured paragraph.
+- Write exactly ONE well-structured, GRAMMATICALLY COMPLETE paragraph that ends with a period.
 - DO NOT use bullet points, numbered lists, markdown formatting, or raw YAML/JSON syntax.
 - Use plain standard ASCII quotes (") only—avoid smart/curly quotes to prevent encoding issues.
 """
@@ -81,22 +84,35 @@ def call_openrouter(cfn_code: str, difficulty: str, retries: int = 3) -> str:
     
     user_content = f"Scenario Difficulty Level: {difficulty}\n\nHere is the reference CloudFormation template:\n\n```yaml\n{cfn_code}\n```\n\nGenerate the complete, detailed user requirement prompt."
     
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_content}
-        ],
-        "temperature": 0.2, 
-        "max_tokens": 1000
-    }
-    
+    # Token budget escalates on retry: some templates (many parameters, long
+    # enumerated rules) need more than 1000 tokens and were silently truncated
+    # mid-sentence at that cap (see cfn_prompt_review.csv rows 2, 96, 120, 136).
+    token_budgets = [1000, 2000, 4000]
+
     for attempt in range(retries):
+        max_tokens = token_budgets[min(attempt, len(token_budgets) - 1)]
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": user_content}
+            ],
+            "temperature": 0.2,
+            "max_tokens": max_tokens
+        }
         try:
             response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
             if response.status_code == 200:
                 data = response.json()
-                return data["choices"][0]["message"]["content"].strip()
+                choice = data["choices"][0]
+                text = choice["message"]["content"].strip()
+                finish_reason = choice.get("finish_reason")
+                # Reject truncated output outright: retry with a bigger budget
+                # rather than silently keeping a prompt that ends mid-sentence.
+                if finish_reason == "length" or (text and text[-1] not in ".!?\"'"):
+                    print(f"\n Truncated output (finish_reason={finish_reason}, max_tokens={max_tokens}); retrying with more headroom.")
+                    continue
+                return text
             elif response.status_code == 429:
                 time.sleep(5 * (attempt + 1))
             else:
@@ -105,7 +121,7 @@ def call_openrouter(cfn_code: str, difficulty: str, retries: int = 3) -> str:
         except Exception as e:
             print(f"\n Request exception: {e}")
             time.sleep(2)
-            
+
     return ""
 
 # ── 4. Main Processing Loop ───────────────────────────────────────────────────
@@ -126,6 +142,16 @@ def main():
     if 'user_prompt' not in df.columns:
         df['user_prompt'] = None
 
+    # Rows manually identified by cfn_prompt_review.csv as truncated
+    # mid-sentence or factually mismatched vs. the ground-truth template are
+    # force-regenerated even though they don't look like the old ERROR:/empty
+    # sentinel values. See rows_to_regenerate.csv.
+    force_regen_files = set()
+    force_regen_path = DATASET_DIR / 'rows_to_regenerate.csv'
+    if force_regen_path.exists():
+        force_regen_files = set(pd.read_csv(force_regen_path)['dest_file'])
+        print(f"⚠️  {len(force_regen_files)} rows flagged for forced regeneration from {force_regen_path}")
+
     records = df.to_dict('records')
     new_count = 0
     
@@ -141,7 +167,8 @@ def main():
             current_prompt == '' or 
             current_prompt == 'nan' or 
             current_prompt == 'None' or 
-            current_prompt.startswith('ERROR:')
+            current_prompt.startswith('ERROR:') or
+            rec.get('dest_file') in force_regen_files
         )
         
         if needs_prompt:
