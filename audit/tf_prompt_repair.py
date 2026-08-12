@@ -3,18 +3,7 @@
 tf_prompt_repair.py
 =====================
 Rewrites `user_prompt` for every row flagged by tf_prompt_rubric_review.py,
-using the flagged reasons as targeted repair feedback. Mirrors the CFN
-prompt-repair pass documented in CLAUDE.md: rows are never dropped for
-cross-stack/external-dependency or hardcoded-literal issues, the prompt
-wording is adjusted instead.
-
-Writes repaired prompts back into final_benchmark_with_prompts.csv (same
-resume-by-existing-prompt contract generate_llm_prompts.py relies on).
-
-Usage
------
-    python audit/tf_prompt_repair.py
-    python audit/tf_prompt_repair.py --scenario-ids scenario_id_1,scenario_id_2
+using the flagged reasons as targeted repair feedback. 
 """
 
 import argparse
@@ -47,12 +36,12 @@ Your task is to rewrite a natural-language user requirement prompt that was reve
 
 The rewritten prompt MUST be a single cohesive paragraph following these guidelines:
 1. Style & Tone: Write as a DevOps engineer creating a task ticket. Start the paragraph exactly with: "We need a Terraform template that creates..."
-2. High-Level Intent & Inference Space: emphasize the core objective; do not over-specify standard supporting resources or secondary implementation details (IAM admin policies, detailed security group rules, route tables, output blocks) unless load-bearing.
-3. Essential Parameters & Hardcoded Values: only state parameters strictly necessary to prevent deployment failure or central to the template's functional objective (required variable defaults, key aliases, specific CIDRs). Only mention the AWS region if non-standard (assume us-east-1 as implicit default). Extract hardcoded values (AMIs, domain names, URLs) only if central to the template's functional objective.
+2. High-Level Intent & Inference Space: emphasize the core objective; do not over-specify standard supporting resources or secondary implementation details unless load-bearing.
+3. Essential Parameters & Hardcoded Values: only state parameters strictly necessary to prevent deployment failure. The AWS region MUST be generalized or explicitly set to `us-east-1`. If the feedback flags a non-default region (e.g., `eu-west-1`, `us-west-2`), you MUST change it to `us-east-1` or remove the region mention entirely.
 4. Scale Detail by Difficulty: Level 1-2 stay to 1-3 short sentences; higher levels detail primary structural components while generalizing secondary security/ACL rules.
 5. Faithfulness: every stated behavior/action/threshold must match the ground truth's actual effect exactly.
-6. Self-containment: never phrase the prompt as if an external AWS resource, IAM role/user, secret, or account-level dependency already exists unless it is a genuinely global/public AWS-owned resource (e.g. the latest public AMI, an AWS managed policy). If the ground truth references something that looks pre-existing/external, phrase the requirement so the agent creates that dependency itself as part of a self-contained stack. If the feedback flags the word 'existing', you MUST rewrite the requirement to explicitly say "create a new [resource]" or "provision a [resource]".
-7. Reference durability: prefer generic/floating image tags, well-known stable endpoints, or a description of "the latest X AMI" over a narrowly pinned AMI ID / image digest / dated URL. If a pinned reference is not central to the template's intent, drop it instead of stating it verbatim. If the feedback flags a literal IP address (e.g., 8.8.8.8) or a specific ephemeral URL, replace it with a generic description like "standard public DNS servers" or "a sample web endpoint".
+6. Self-containment: never phrase the prompt as if an external AWS resource, IAM role/user, secret, or account-level dependency already exists unless it is a genuinely global/public AWS-owned resource. If the feedback flags the word 'existing', you MUST rewrite the requirement to explicitly say "create a new [resource]" or "provision a [resource]".
+7. Reference durability: If the ground truth hardcodes specific Availability Zones (e.g., `eu-west-1a`) or AMIs (e.g., `ami-12345`), you MUST rewrite the prompt to describe them dynamically (e.g., 'use the first available availability zone', or 'dynamically fetch the latest Ubuntu 22.04 AMI'). DO NOT leak the Terraform solution/syntax to the user (e.g., absolutely NEVER write `data "aws_ami"` or `data.aws_availability_zones` in the prompt). If the feedback flags a literal IP address (e.g., 8.8.8.8) or a specific ephemeral URL, replace it with a generic description like "standard public DNS servers" or "a sample web endpoint".
 8. Never truncate. The paragraph must always end on a complete sentence with terminal punctuation.
 
 Output Rules:
@@ -143,14 +132,12 @@ def call_repair(current_prompt: str, tf_code: str, difficulty, feedback: str, re
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--scenario-ids", type=str, default="", help="Comma-separated scenario_ids to repair (default: all currently flagged).")
+    parser.add_argument("--scenario-ids", type=str, default="", help="Comma-separated scenario_ids to repair.")
     args = parser.parse_args()
 
     bench = pd.read_csv(DATASET_CSV)
     review = pd.read_csv(REVIEW_CSV)
 
-    # Rows that merely failed the review call (not a real rubric defect) should be
-    # re-reviewed, not "repaired" against a fabricated verdict - skip those here.
     review_failed = review["notes"].astype(str).str.contains("Review call failed", na=False)
 
     if args.scenario_ids.strip():
@@ -158,17 +145,17 @@ def main():
         target = review[review["scenario_id"].isin(ids) & ~review_failed]
     else:
         flagged = (
-            (review["critical_defect"] == True)  # noqa: E712
+            (review["critical_defect"] == True)  
             | (review["leak_severity"] != "none")
-            | (review["missing_essential_info"] == True)  # noqa: E712
+            | (review["missing_essential_info"] == True)  
             | (review["difficulty_fit"] != "appropriate")
-            | (review["assumes_external_dependency"] == True)  # noqa: E712
-            | (review["stale_reference_risk"] == True)  # noqa: E712
+            | (review["assumes_external_dependency"] == True)  
+            | (review["stale_reference_risk"] == True)  
         )
         target = review[flagged & ~review_failed]
 
     if review_failed.any() and args.scenario_ids.strip() == "":
-        print(f"Skipping {review_failed.sum()} rows that failed the review call itself (re-run the reviewer for those, don't repair).")
+        print(f"Skipping {review_failed.sum()} rows that failed the review call itself (re-run the reviewer for those).")
 
     print(f"Repairing {len(target)} flagged rows...")
 
@@ -189,7 +176,6 @@ def main():
 
     bench.reset_index().to_csv(DATASET_CSV, index=False)
     print(f"\nRepaired {updated} / {len(target)} rows. Saved to {DATASET_CSV}")
-    print("Re-run audit/tf_prompt_rubric_review.py --rerun <ids> (or --rerun-flagged after clearing stale verdicts) to re-verify.")
 
 
 if __name__ == "__main__":

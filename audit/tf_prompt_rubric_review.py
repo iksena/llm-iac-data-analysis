@@ -3,20 +3,7 @@
 tf_prompt_rubric_review.py
 ===========================
 LLM-judged rubric review of the Terraform benchmark's `user_prompt` column
-against the paired ground-truth `tf_code`, mirroring the CFN prompt-review
-process documented in CLAUDE.md (rubric rules 1-7) and extended with three
-Terraform-track-specific rules (8-10) covering self-containment of dependent
-resources and long-term validity of literal region/image/URL references.
-
-Resumes from OUTPUT_CSV: rows already reviewed (by scenario_id) are skipped
-unless --rerun is passed with a comma-separated list of scenario_ids, or
---rerun-flagged to re-review every row currently flagged as a defect.
-
-Usage
------
-    python audit/tf_prompt_rubric_review.py
-    python audit/tf_prompt_rubric_review.py --rerun-flagged
-    python audit/tf_prompt_rubric_review.py --rerun scenario_id_1,scenario_id_2
+against the paired ground-truth `tf_code`.
 """
 
 import argparse
@@ -48,16 +35,16 @@ if not OPENROUTER_API_KEY:
 
 RUBRIC_SYSTEM = """You are auditing a natural-language "user requirement" prompt that was reverse-engineered from a ground-truth Terraform template. The prompt will be handed to an independent AI coding agent, which must write its own Terraform template satisfying it, with no access to the ground truth. Judge the prompt against the ground-truth Terraform code using these rules:
 
-1. Solution leakage (bad): the prompt must not contain verbatim Terraform resource/data/variable/output identifiers or addresses (e.g. "aws_instance.web", "module.vpc.id"), raw HCL syntax or blocks, Terraform interpolation syntax (${...}, var.x, local.x, data.x.y), or Terraform-specific argument/block jargon copied straight from the template (e.g. "ingress cidr_blocks", "lifecycle_rule", "count = var.enable_x ? 1 : 0"). A business-facing name a human would naturally pick (bucket name, key alias, domain, tag value) is fine even if it happens to equal a resource's local name.
+1. Solution leakage (bad): the prompt must not contain verbatim Terraform resource/data/variable/output identifiers or addresses (e.g. "aws_instance.web", "module.vpc.id"), raw HCL syntax or blocks, Terraform interpolation syntax (${...}, var.x, local.x, data.x.y), or Terraform-specific argument/block jargon copied straight from the template. A business-facing name a human would naturally pick is fine even if it happens to equal a resource's local name.
 2. Necessary detail (must keep): any variable default, hardcoded value (CIDR, alias, name, non-default region), or configuration choice that is load-bearing for deployability or central to the template's functional objective MUST be stated. Omitting it is a real defect (under-specification), not a virtue.
 3. Inference space (should generalize): secondary/supporting details a competent engineer could infer (detailed IAM policy statements, security-group/NACL specifics, route-table wiring, output blocks, tagging schemes) should be omitted UNLESS load-bearing or the explicit point of the exercise.
-4. Difficulty scaling: Level 1 prompts should read as 1-2 short sentences. Higher levels track more structural detail (primary resources/subnets/CIDRs/module composition) while still generalizing secondary security/ACL specifics.
+4. Difficulty scaling: Level 1 prompts should read as 1-2 short sentences. Higher levels track more structural detail while still generalizing secondary security/ACL specifics.
 5. Hygiene: no mojibake, no markdown/bullet lists, no raw code, plain ASCII quotes only, must end on a complete sentence.
 6. Failure rows: a literal "ERROR: ..." user_prompt is always a critical defect.
-7. Faithfulness: any stated action/behavior/threshold (block vs count, allow vs deny, encrypted vs not, versioned vs not, public vs private, sync vs async, etc.) must match the ground truth's actual effect; a mismatch is a critical defect since it would unfairly penalize a faithful benchmarked agent.
-8. Self-containment (bad if violated): the prompt must not assume any pre-existing AWS account resource, IAM role/user/policy, secret, environment variable, or other out-of-band dependency that the agent has no way to create itself. If the ground truth references an existing/external resource (a `data` source looking up a pre-existing VPC/subnet/AMI/IAM role/secret by name or ARN, a hardcoded external ARN, cross-stack/remote-state references, an assumed default VPC), the prompt must instruct the agent to create that dependency itself as part of a self-contained stack, not phrase it as already existing. This does NOT apply to genuinely global/public AWS-owned lookups that no user stack would ever create itself (public AMI lookup via SSM parameter for the latest Amazon Linux AMI, AWS managed IAM policies/service-linked roles, AWS's own account-level defaults, public AWS partition/region data sources) - those are fine to reference as-is and are not a defect.
-9. Region/image genericity: region and AMI/image references should be stated only as specifically as needed to preserve the template's real complexity/intent. State a non-default region only if it is load-bearing (rule 2). Prefer describing an image generically (e.g. "the latest Amazon Linux 2 AMI") over an opaque pinned AMI ID, unless the specific ID is itself central to the exercise.
-10. Future durability of literal URLs/image references: any literal URL, container image reference, or AMI ID stated in the prompt should either be a value that will remain valid/resolvable for the foreseeable future (a generic/floating tag like "docker:lts", "amazon/aws-cli:latest", a stable well-known service endpoint), or, if it is a narrowly-pinned/ephemeral value (a specific dated AMI ID, a pinned image digest, a short-lived URL) that is not central to the template's intent, it should be omitted from the prompt rather than stated verbatim.
+7. Faithfulness: any stated action/behavior/threshold (block vs count, allow vs deny, encrypted vs not, versioned vs not, public vs private, sync vs async, etc.) must match the ground truth's actual effect.
+8. Self-containment (bad if violated): the prompt must not assume any pre-existing AWS account resource, IAM role/user/policy, secret, environment variable, or other out-of-band dependency that the agent has no way to create itself. 
+9. Region/AZ/image genericity: The prompt must default to the `us-east-1` region or leave the AWS region completely generic. Non-default regions MUST be flagged. Hardcoded Availability Zones (e.g., `eu-west-1a`) must NOT be present in the prompt; they must be generalized. Prefer describing an image generically (e.g. 'the latest Amazon Linux 2 AMI') over an opaque pinned AMI ID. Under NO circumstances should the prompt leak the HCL syntax to achieve this (e.g., never write `data "aws_ami"`).
+10. Future durability of literal URLs/image references: any literal URL, container image reference, or AMI ID stated in the prompt should either be a value that will remain valid/resolvable for the foreseeable future, or, if it is a narrowly-pinned/ephemeral value, it should be omitted from the prompt rather than stated verbatim.
 
 Return exactly one JSON object, no markdown fences, no extra text, with these keys:
 {
@@ -84,25 +71,35 @@ def call_reviewer(user_prompt: str, tf_code: str, difficulty, retries: int = 6) 
         "X-Title": "TF Benchmark Prompt Rubric Review",
     }
     code = tf_code if len(tf_code) <= MAX_CODE_CHARS else tf_code[:MAX_CODE_CHARS] + "\n...[TRUNCATED]..."
+    
+    # Deterministic Pre-Screening for literals that violate the rules
     import re
     re_existing = re.compile(r'\b(existing|pre-existing|already exists)\b', re.IGNORECASE)
     re_ip = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
+    re_az = re.compile(r'\b[a-z]{2}-(?:east|west|central|north|south|northeast|southeast|southwest)-\d[a-z]\b', re.IGNORECASE)
+    re_non_default_region = re.compile(r'\b(?!(?:us-east-1)\b)[a-z]{2}-(?:east|west|central|north|south|northeast|southeast|southwest)-\d\b', re.IGNORECASE)
+    re_ami = re.compile(r'\bami-[a-f0-9]{8,17}\b', re.IGNORECASE)
     
     hard_flags = []
     if re_existing.search(user_prompt):
         hard_flags.append("The prompt explicitly uses the word 'existing' or 'pre-existing'.")
     if re_ip.search(user_prompt):
         hard_flags.append("The prompt contains a literal IP address.")
+    if re_az.search(user_prompt):
+        hard_flags.append("The prompt contains a hardcoded Availability Zone (e.g., us-east-1a).")
+    if re_non_default_region.search(user_prompt):
+        hard_flags.append("The prompt specifies a non-default AWS region (must be us-east-1 or completely generic).")
+    if re_ami.search(user_prompt):
+        hard_flags.append("The prompt contains a hardcoded AMI ID (ami-...).")
         
     system_instruction_addendum = ""
     if hard_flags:
         system_instruction_addendum = (
             f"\n\nWARNING: The following deterministic violations were found in the prompt: "
             f"{' '.join(hard_flags)}. You MUST flag `assumes_external_dependency` or "
-            f"`stale_reference_risk` as TRUE unless they refer to standard AWS global properties."
+            f"`stale_reference_risk` as TRUE depending on the violation, unless they refer to strictly standard AWS global endpoints."
         )
 
-    # 2. Append to user_content
     user_content = (
         f"Difficulty level: {difficulty}\n\n"
         f"Prompt to review:\n\"\"\"\n{user_prompt}\n\"\"\"\n\n"
@@ -135,7 +132,6 @@ def call_reviewer(user_prompt: str, tf_code: str, difficulty, retries: int = 6) 
                 content = choice.get("message", {}).get("content")
                 finish_reason = choice.get("finish_reason")
                 if not content:
-                    print(f"\nEmpty content (finish_reason={finish_reason}); retrying.")
                     time.sleep(2 * (attempt + 1))
                     continue
                 text = content.strip()
@@ -189,6 +185,8 @@ def main():
 
     if OUTPUT_CSV.exists():
         review = pd.read_csv(OUTPUT_CSV)
+        # BUG FIX: Ensure the index is strictly unique before building the dictionary
+        review = review.drop_duplicates(subset=["scenario_id"], keep="last")
         print(f"Loaded existing review ({len(review)} rows) from {OUTPUT_CSV}")
     else:
         review = pd.DataFrame(columns=[
@@ -204,21 +202,29 @@ def main():
     force_ids = set(x.strip() for x in args.rerun.split(",") if x.strip())
     if args.rerun_flagged and not review.empty:
         flagged = review[
-            (review["critical_defect"] == True)  # noqa: E712
+            (review["critical_defect"] == True) 
             | (review["leak_severity"] != "none")
-            | (review["missing_essential_info"] == True)  # noqa: E712
+            | (review["missing_essential_info"] == True) 
             | (review["difficulty_fit"] != "appropriate")
-            | (review["assumes_external_dependency"] == True)  # noqa: E712
-            | (review["stale_reference_risk"] == True)  # noqa: E712
+            | (review["assumes_external_dependency"] == True) 
+            | (review["stale_reference_risk"] == True) 
         ]
         force_ids |= set(flagged["scenario_id"])
 
     records = review.set_index("scenario_id").to_dict("index") if not review.empty else {}
 
-    todo = [
-        row for _, row in bench.iterrows()
-        if row["scenario_id"] not in reviewed_ids or row["scenario_id"] in force_ids
-    ]
+    # If the user explicitly passes specific IDs, ONLY run those IDs.
+    if args.rerun:
+        todo = [
+            row for _, row in bench.iterrows()
+            if row["scenario_id"] in force_ids
+        ]
+    else:
+        # Otherwise, run standard resume logic (unreviewed rows + flagged rows)
+        todo = [
+            row for _, row in bench.iterrows()
+            if row["scenario_id"] not in reviewed_ids or row["scenario_id"] in force_ids
+        ]
     print(f"Reviewing {len(todo)} / {len(bench)} rows ({len(force_ids)} forced reruns)...")
 
     processed = 0
@@ -252,12 +258,12 @@ def main():
     out_df.to_csv(OUTPUT_CSV, index=False)
 
     flagged = out_df[
-        (out_df["critical_defect"] == True)  # noqa: E712
+        (out_df["critical_defect"] == True) 
         | (out_df["leak_severity"] != "none")
-        | (out_df["missing_essential_info"] == True)  # noqa: E712
+        | (out_df["missing_essential_info"] == True) 
         | (out_df["difficulty_fit"] != "appropriate")
-        | (out_df["assumes_external_dependency"] == True)  # noqa: E712
-        | (out_df["stale_reference_risk"] == True)  # noqa: E712
+        | (out_df["assumes_external_dependency"] == True) 
+        | (out_df["stale_reference_risk"] == True) 
     ]
     print(f"\nReview complete. {len(flagged)} / {len(out_df)} rows flagged.")
     print(f"Saved to {OUTPUT_CSV}")
