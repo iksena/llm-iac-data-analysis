@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
+generate_cfn_prompts.py
+========================
 Generate detailed LLM synthesis prompts from pristine benchmark CloudFormation scenarios using OpenRouter.
-Resumes from output CSV if available, saving the template code and skipping already-processed rows.
+Operates directly on `final_benchmark_with_prompts.csv`, backfilling only rows where
+the prompt is missing, empty, or flagged with an ERROR string.
+Prioritizes `final_cfn_code` and `final_user_prompt` columns if they exist.
 """
 
 import os
@@ -20,8 +24,7 @@ load_dotenv()  # Load environment variables from .env file if present
 BASE_DIR = Path('./cfn_benchmark')
 DATASET_DIR = BASE_DIR / 'dataset'
 
-INPUT_CSV = DATASET_DIR / 'final_benchmark_custom.csv'  
-OUTPUT_CSV = DATASET_DIR / 'final_benchmark_with_prompts.csv'
+PROMPTS_CSV = DATASET_DIR / 'final_benchmark_with_prompts.csv'
 
 # OpenRouter Configuration
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
@@ -34,7 +37,7 @@ SAVE_EVERY = 5
 if not OPENROUTER_API_KEY:
     raise ValueError("⚠️ OPENROUTER_API_KEY environment variable is not set. Please run: export OPENROUTER_API_KEY='your-key'")
 
-# ── 2. System Instructions for Prompt Generation ─────────────────────────────
+# ── 2. System Instructions for Prompt Generation (Unified Rubric) ─────────────
 SYSTEM_PROMPT = """You are an expert Cloud Architect and DevOps Lead. 
 Your task is to analyze a complete, valid AWS CloudFormation template and reverse-engineer it into a natural, realistic user requirement prompt that tests an AI assistant's ability to infer IaC requirements.
 
@@ -44,21 +47,28 @@ The generated requirement prompt MUST be a single cohesive paragraph following t
 2. High-Level Intent & Inference Space:
    - Emphasize the core objective and high-level purpose (e.g., "for testing purposes", "to host a static website").
    - DO NOT over-specify standard supporting resources or secondary implementation details (e.g., IAM admin policies, detailed security group rules, CloudFront origin settings, route tables, or output blocks). Allow the AI assistant space to infer these best practices on its own.
-3. Essential Parameters & Hardcoded Values:
+3. Essential Parameters & Region/AZ/Image Genericity:
    - Only explicitly state parameters strictly necessary to prevent deployment failure (e.g., required default variable values, key aliases, specific VPC CIDRs/subnet allocations).
-   - Only mention the AWS region if it is a non-standard region (assume 'us-east-1' as the implicit default).
-   - Extract specific hardcoded values (e.g., AMIs, domain names, URLs) only if they are central to the template's functional objective.
-4. Scale Detail by Complexity:
-   - Simple/Single-Resource (Easy): Keep the prompt to 1-2 short sentences covering the main goal and any required key names/aliases.
-   - Multi-Resource/VPCs (Complex): Detail the primary structural components (e.g., subnets, CIDRs) but generalize secondary security/ACL rules.
-5. Faithfulness:
-   - Every stated behavior, action, or threshold (e.g., "block" vs "count", "allow" vs "deny") MUST match the ground-truth template's actual effect exactly. Never soften, generalize, or substitute an action word for a different one that changes the template's real behavior.
-   - Never truncate. The paragraph must always end on a complete sentence with terminal punctuation, even for templates with many parameters -- if space is limited, drop secondary detail rather than cutting a sentence short.
+   - The AWS region MUST default to `us-east-1` or remain completely generic. Omit or generalize non-standard regions (e.g., `eu-west-1`, `ap-southeast-2`).
+   - Describe Availability Zones generically (e.g., "the first available availability zone in the region") rather than hardcoding specific AZ strings (e.g., `us-east-1a`).
+   - Describe Machine Images generically (e.g., "the latest Amazon Linux 2 AMI", "the latest Ubuntu 22.04 AMI") rather than stating pinned AMI IDs (e.g., `ami-0123456789abcdef0`).
+   - DO NOT leak CloudFormation solution syntax in the prompt (e.g., NEVER write raw YAML/JSON, and never leak intrinsic functions like `!Ref`, `!GetAtt`, or `Fn::ImportValue`).
+4. Self-Containment & External Dependencies:
+   - Never phrase the prompt as if an external AWS account resource, IAM role/user, secret, or VPC already exists. Always instruct the agent to create all required dependencies as part of a self-contained stack.
+5. Reference Durability & Literal Values:
+   - Replace literal IP addresses (e.g., `8.8.8.8`) or ephemeral URLs with generic descriptions (e.g., "standard public DNS servers", "a sample web endpoint").
+6. Scale Detail by Complexity:
+   - Simple/Single-Resource (Easy, Level 1-2): Keep the prompt to 1-2 short sentences covering the main goal and any required key names/aliases.
+   - Multi-Resource/VPCs (Complex, Level 3-5): Detail primary structural components (subnets, CIDRs) while generalizing secondary security/ACL rules.
+7. Faithfulness & Truncation:
+   - Every stated behavior, action, or threshold (e.g., "block" vs "count", "allow" vs "deny") MUST match the ground-truth template's actual effect exactly.
+   - Never truncate. The paragraph must always end on a complete sentence with terminal punctuation.
 
 Output Rules:
 - Write exactly ONE well-structured, GRAMMATICALLY COMPLETE paragraph that ends with a period.
 - DO NOT use bullet points, numbered lists, markdown formatting, or raw YAML/JSON syntax.
 - Use plain standard ASCII quotes (") only—avoid smart/curly quotes to prevent encoding issues.
+- Output ONLY the requirement paragraph, nothing else.
 """
 
 # ── 3. Helper Functions ───────────────────────────────────────────────────────
@@ -83,10 +93,6 @@ def call_openrouter(cfn_code: str, difficulty: str, retries: int = 3) -> str:
     }
     
     user_content = f"Scenario Difficulty Level: {difficulty}\n\nHere is the reference CloudFormation template:\n\n```yaml\n{cfn_code}\n```\n\nGenerate the complete, detailed user requirement prompt."
-    
-    # Token budget escalates on retry: some templates (many parameters, long
-    # enumerated rules) need more than 1000 tokens and were silently truncated
-    # mid-sentence at that cap (see cfn_prompt_review.csv rows 2, 96, 120, 136).
     token_budgets = [1000, 2000, 4000]
 
     for attempt in range(retries):
@@ -107,8 +113,8 @@ def call_openrouter(cfn_code: str, difficulty: str, retries: int = 3) -> str:
                 choice = data["choices"][0]
                 text = choice["message"]["content"].strip()
                 finish_reason = choice.get("finish_reason")
-                # Reject truncated output outright: retry with a bigger budget
-                # rather than silently keeping a prompt that ends mid-sentence.
+                
+                # Reject truncated output outright
                 if finish_reason == "length" or (text and text[-1] not in ".!?\"'"):
                     print(f"\n Truncated output (finish_reason={finish_reason}, max_tokens={max_tokens}); retrying with more headroom.")
                     continue
@@ -126,26 +132,25 @@ def call_openrouter(cfn_code: str, difficulty: str, retries: int = 3) -> str:
 
 # ── 4. Main Processing Loop ───────────────────────────────────────────────────
 def main():
-    # Load from output CSV if it exists to resume, otherwise load the clean benchmark
-    if OUTPUT_CSV.exists():
-        df = pd.read_csv(OUTPUT_CSV)
-        print(f"✅ Loaded existing progress from {OUTPUT_CSV} ({len(df)} scenarios).")
-    elif INPUT_CSV.exists():
-        df = pd.read_csv(INPUT_CSV)
-        print(f"✅ Starting fresh from {INPUT_CSV} ({len(df)} scenarios).")
-    else:
-        raise FileNotFoundError(f"⚠️ Neither {OUTPUT_CSV} nor {INPUT_CSV} were found.")
+    if not PROMPTS_CSV.exists():
+        raise FileNotFoundError(f"⚠️ Benchmark dataset not found at {PROMPTS_CSV}. Please ensure it exists.")
 
-    # Ensure required columns exist
+    df = pd.read_csv(PROMPTS_CSV)
+    print(f"✅ Loaded benchmark dataset directly from {PROMPTS_CSV} ({len(df)} scenarios).")
+
+    # Ensure required base columns exist
     if 'cfn_code' not in df.columns:
         df['cfn_code'] = None
     if 'user_prompt' not in df.columns:
         df['user_prompt'] = None
+        
+    # Ensure enhanced columns exist (create if missing to avoid KeyError)
+    if 'final_cfn_code' not in df.columns:
+        df['final_cfn_code'] = np.nan
+    if 'final_user_prompt' not in df.columns:
+        df['final_user_prompt'] = np.nan
 
-    # Rows manually identified by cfn_prompt_review.csv as truncated
-    # mid-sentence or factually mismatched vs. the ground-truth template are
-    # force-regenerated even though they don't look like the old ERROR:/empty
-    # sentinel values. See rows_to_regenerate.csv.
+    # Check for scenarios flagged for forced regeneration
     force_regen_files = set()
     force_regen_path = DATASET_DIR / 'rows_to_regenerate.csv'
     if force_regen_path.exists():
@@ -156,13 +161,26 @@ def main():
     new_count = 0
     
     for rec in tqdm(records, desc="Processing Scenarios"):
-        # 1. Read full CloudFormation code if it hasn't been saved yet
-        if pd.isna(rec.get('cfn_code')) or not str(rec.get('cfn_code')).strip():
-            # Use 'dest_file' created in cell 5c of the CFN pipeline
-            rec['cfn_code'] = read_cfn_template(rec.get('dest_file'))
+        # 1. Determine which CFN code to use (prioritize final_cfn_code)
+        has_final_code = not pd.isna(rec.get('final_cfn_code')) and str(rec.get('final_cfn_code')).strip()
+        
+        if has_final_code:
+            target_code = str(rec.get('final_cfn_code')).strip()
+        else:
+            # Fallback to standard cfn_code (read from disk if missing)
+            if pd.isna(rec.get('cfn_code')) or not str(rec.get('cfn_code')).strip():
+                rec['cfn_code'] = read_cfn_template(rec.get('dest_file'))
+            target_code = str(rec.get('cfn_code')).strip()
             
-        # 2. Check if we need to generate a prompt
-        current_prompt = str(rec.get('user_prompt', '')).strip()
+        # 2. Check if we need to generate a prompt (prioritize final_user_prompt)
+        current_prompt = str(rec.get('final_user_prompt', '')).strip()
+        target_prompt_col = 'final_user_prompt'
+        
+        # If final_user_prompt is completely empty/missing, fall back to checking user_prompt
+        if current_prompt == '' or current_prompt == 'nan' or current_prompt == 'None':
+            current_prompt = str(rec.get('user_prompt', '')).strip()
+            target_prompt_col = 'user_prompt'
+            
         needs_prompt = (
             current_prompt == '' or 
             current_prompt == 'nan' or 
@@ -172,26 +190,26 @@ def main():
         )
         
         if needs_prompt:
-            if not rec['cfn_code']:
-                rec['user_prompt'] = "ERROR: Missing or empty CloudFormation template file."
+            if not target_code:
+                rec[target_prompt_col] = "ERROR: Missing or empty CloudFormation template file."
             else:
                 diff_level = str(rec.get('difficulty', 'Unspecified'))
-                prompt_result = call_openrouter(rec['cfn_code'], diff_level)
-                rec['user_prompt'] = prompt_result if prompt_result else "ERROR: LLM generation failed."
+                prompt_result = call_openrouter(target_code, diff_level)
+                rec[target_prompt_col] = prompt_result if prompt_result else "ERROR: LLM generation failed."
 
             new_count += 1
             
-            # Periodically flush to disk
+            # Periodically flush to disk in-place
             if new_count % SAVE_EVERY == 0:
-                pd.DataFrame(records).to_csv(OUTPUT_CSV, index=False)
+                pd.DataFrame(records).to_csv(PROMPTS_CSV, index=False)
 
-    # Final save
-    pd.DataFrame(records).to_csv(OUTPUT_CSV, index=False)
+    # Final save in-place
+    pd.DataFrame(records).to_csv(PROMPTS_CSV, index=False)
     
     if new_count > 0:
-        print(f"\n🎉 Processed {new_count} scenarios! Output saved to: {OUTPUT_CSV}")
+        print(f"\n🎉 Generated/repaired {new_count} scenario prompts! Output saved to: {PROMPTS_CSV}")
     else:
-        print(f"\n✅ All scenarios already have generated prompts. Output is up to date at: {OUTPUT_CSV}")
+        print(f"\n✅ All scenarios already have generated prompts. Output is up to date at: {PROMPTS_CSV}")
 
 if __name__ == "__main__":
     main()
