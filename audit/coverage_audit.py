@@ -14,25 +14,15 @@ Each row in the input CSV is matched by `row_number` to the benchmark file
   - needed_resources    : resources explicitly required by user intent
   - difficulty_level    : 1-5 complexity scale
 
-For every matched row the script computes (reproducing `analyze_resource_coverage`):
-  - total_required_resources  — how many resources the ground truth has
-  - total_generated_resources — how many the LLM generated
-  - correct_resources         — matched (min of req vs gen per type)
-  - missing_resources         — present in ground truth, absent in generated
-  - extra_resources           — present in generated, absent in ground truth
-  - coverage_pct              — correct / required × 100  (recall)
-  - accuracy_pct              — correct / generated × 100 (precision)
-  - intent_coverage_pct       — correct-intent / needed_resources × 100
-                                (only rows that have needed_resources set)
-
 Usage
 -----
-    python intent_coverage_audit.py \\
-        --input   Result/iacgod/DeepseekV4Flash_security.csv \\
-        --benchmark Data/iac_with_user_intent.csv \\
-        [--output  results.json] \\
-        [--output-csv results_coverage.csv] \\
-        [--limit 20] \\
+    python intent_coverage_audit.py \
+        --input   Result/iacgod/DeepseekV4Flash_security.csv \
+        --benchmark Data/iac_with_user_intent.csv \
+        --base-dir dataset/cfn_benchmark \
+        [--output  results.json] \
+        [--output-csv results_coverage.csv] \
+        [--limit 20] \
         [--skip-unmatched]
 
 Requirements
@@ -44,9 +34,8 @@ import argparse
 import csv
 import json
 import re
+import os
 import sys
-import tempfile
-import io
 from collections import Counter
 from pathlib import Path
 
@@ -92,74 +81,129 @@ def _make_cfn_loader():
 
 CFN_LOADER = _make_cfn_loader()
 
-
-def _make_tf_loader():
-    """Minimal loader for Terraform HCL — just tries yaml.safe_load as a no-op fallback."""
-    return yaml.SafeLoader  # Terraform is HCL, not YAML; see extract_tf_resources below
-
-
 # ---------------------------------------------------------------------------
-# Resource extraction from templates
+# AST & Regex Resource / Parameter Extraction
 # ---------------------------------------------------------------------------
 
-def extract_cfn_resource_types(template_str: str) -> list[str]:
+def _extract_from_dict(doc: dict) -> dict:
+    """Extract Resources and Parameters from a parsed AST dictionary."""
+    result = {"resources": [], "parameters": []}
+    
+    # CloudFormation style
+    if "Resources" in doc and isinstance(doc["Resources"], dict):
+        for k, v in doc["Resources"].items():
+            if isinstance(v, dict) and "Type" in v:
+                result["resources"].append(v["Type"])
+    
+    if "Parameters" in doc and isinstance(doc["Parameters"], dict):
+        result["parameters"].extend(list(doc["Parameters"].keys()))
+
+    return result
+
+
+def extract_template_data(template_str: str, file_ext: str = "") -> dict:
     """
-    Parse a CloudFormation YAML/JSON template string and return
-    the list of resource types (preserving duplicates, as IaCGen does).
-    Returns [] on parse failure.
+    Attempt AST parsing (JSON/YAML) to extract Resources and Parameters.
+    Fallback to Regex if AST parsing fails.
+    Returns a dict: {"resources": [...], "parameters": [...]}
     """
+    result = {"resources": [], "parameters": []}
     template_str = template_str.strip()
     if not template_str:
-        return []
+        return result
+
+    # 1. Try JSON AST
     try:
-        if template_str.startswith("{"):
-            doc = json.loads(template_str)
-        else:
-            doc = yaml.load(template_str, Loader=CFN_LOADER)
-        resources = doc.get("Resources", {}) if isinstance(doc, dict) else {}
-        return [v["Type"] for v in resources.values() if isinstance(v, dict) and "Type" in v]
+        doc = json.loads(template_str)
+        return _extract_from_dict(doc)
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Try YAML AST (handles CFN intrinsics)
+    try:
+        doc = yaml.load(template_str, Loader=CFN_LOADER)
+        if isinstance(doc, dict):
+            return _extract_from_dict(doc)
     except Exception:
-        return []
+        pass
+
+    # 3. Fallback: Regex extraction (For malformed templates or raw HCL/TF)
+    
+    # Regex for Terraform/HCL resources: resource "type" "name" {
+    tf_res_pattern = re.compile(r'^\s*resource\s+"([^"]+)"\s+"[^"]*"\s*\{', re.MULTILINE)
+    tf_resources = tf_res_pattern.findall(template_str)
+    
+    # Regex for Terraform variables: variable "name" {
+    tf_var_pattern = re.compile(r'^\s*variable\s+"([^"]+)"\s*\{', re.MULTILINE)
+    tf_params = tf_var_pattern.findall(template_str)
+
+    # Regex for CFN Resources fallback (Type: AWS::...::...)
+    cfn_res_pattern = re.compile(r'Type:\s*([A-Za-z0-9]+::[A-Za-z0-9:]+)', re.IGNORECASE)
+    cfn_resources = cfn_res_pattern.findall(template_str)
+
+    # Determine if it's mostly TF or CFN by heuristics
+    if tf_resources or tf_params or file_ext in ['.tf']:
+        result["resources"].extend(tf_resources)
+        result["parameters"].extend(tf_params)
+    else:
+        # CFN Regex fallback
+        result["resources"].extend(cfn_resources)
+        # Parameters regex for CFN (rough heuristic without AST)
+        param_block_match = re.search(r'Parameters:\s*\n((?:[ \t]+[A-Za-z0-9_]+:\s*\n(?:[ \t]+[A-Za-z0-9_]+:.*\n)*)*)', template_str)
+        if param_block_match:
+            param_block = param_block_match.group(1)
+            param_keys = re.findall(r'^[ \t]+([A-Za-z0-9_]+):\s*$', param_block, re.MULTILINE)
+            result["parameters"].extend(param_keys)
+    
+    return result
 
 
-def extract_tf_resource_types(template_str: str) -> list[str]:
-    """
-    Parse a Terraform HCL template string and return a list of resource type
-    identifiers in the form `aws_<type>` (or the raw provider type string).
-    Uses regex since HCL is not YAML/JSON.
-    Returns [] if nothing found.
-    """
-    template_str = template_str.strip()
-    if not template_str:
-        return []
-    # Match: resource "aws_something" "name" {
-    pattern = re.compile(r'^\s*resource\s+"([^"]+)"\s+"[^"]*"\s*\{', re.MULTILINE)
-    return pattern.findall(template_str)
+def extract_resource_types(template_str: str, iac_type: str = "") -> list[str]:
+    """Wrapper to maintain compatibility with existing logic."""
+    file_ext = ".tf" if iac_type == "terraform" else ".yaml"
+    return extract_template_data(template_str, file_ext)["resources"]
 
 
-def extract_resource_types(template_str: str, iac_type: str) -> list[str]:
-    if iac_type == "terraform":
-        return extract_tf_resource_types(template_str)
-    return extract_cfn_resource_types(template_str)
-
-
-def load_ground_truth_resource_types(ground_truth_path: str) -> list[str]:
+def load_ground_truth_resource_types(ground_truth_path: str, base_dir: Path = None) -> list[str]:
     """
     Load resource types from an on-disk ground truth template file.
+    Supports resolving complex paths against a base_dir or recursive filename search.
     Returns [] if the file cannot be read or parsed.
     """
+    if not ground_truth_path:
+        return []
+
     p = Path(ground_truth_path)
-    # Try both the path as-is and normalised (Windows → POSIX separators)
+    filename = p.name
+    target_path = None
+
+    # 1. Try absolute / relative to CWD
     for candidate in [p, Path(ground_truth_path.replace("\\", "/"))]:
-        if candidate.exists():
-            try:
-                content = candidate.read_text(encoding="utf-8")
-                # Ground truth is always CloudFormation YAML in this benchmark
-                types = extract_cfn_resource_types(content)
-                if types:
-                    return types
-            except Exception:
-                pass
+        if candidate.exists() and candidate.is_file():
+            target_path = candidate
+            break
+            
+    # 2. Try relative to base_dir
+    if not target_path and base_dir and base_dir.exists():
+        direct_base = base_dir / p
+        if direct_base.exists() and direct_base.is_file():
+            target_path = direct_base
+        else:
+            # 3. Recursive search inside base_dir to bypass folder drift
+            for root, dirs, files in os.walk(base_dir):
+                if filename in files:
+                    target_path = Path(root) / filename
+                    break
+
+    if target_path:
+        try:
+            content = target_path.read_text(encoding="utf-8")
+            ext = target_path.suffix.lower()
+            data = extract_template_data(content, file_ext=ext)
+            return data["resources"]
+        except Exception:
+            pass
+            
     return []
 
 
@@ -171,16 +215,6 @@ def analyze_resource_coverage(
     required_resources: list[str],
     generated_resources: list[str],
 ) -> dict:
-    """
-    Reproduce `analyze_resource_coverage` from IaCGen/Code/evaluation/cloud_evaluation.py.
-
-    Handles duplicate resource types by counting occurrences:
-      - correct   = min(required_count, generated_count) per type
-      - missing   = required_count - generated_count  (when req > gen)
-      - extra     = generated_count - required_count  (when gen > req)
-      - coverage  = correct / required  × 100   (recall)
-      - accuracy  = correct / generated × 100   (precision)
-    """
     required_counts  = Counter(required_resources)
     generated_counts = Counter(generated_resources)
 
@@ -223,11 +257,6 @@ def analyze_resource_coverage(
 # ---------------------------------------------------------------------------
 
 def parse_resource_list(cell: str) -> list[str]:
-    """
-    Parse a comma-separated resource type list from a CSV cell.
-    e.g. 'AWS::S3::Bucket, AWS::KMS::Key' -> ['AWS::S3::Bucket', 'AWS::KMS::Key']
-    Handles empty / NaN gracefully.
-    """
     if not cell or (isinstance(cell, float)):
         return []
     return [r.strip() for r in str(cell).split(",") if r.strip()]
@@ -237,11 +266,6 @@ def intent_coverage(
     needed_resources: list[str],
     generated_resources: list[str],
 ) -> dict:
-    """
-    Measure how many of the *user-intent-specific* resources were generated.
-    Uses the same counting logic as analyze_resource_coverage but scoped to
-    the `needed_resources` subset defined in the benchmark.
-    """
     if not needed_resources:
         return {"intent_coverage_pct": None, "intent_correct": 0, "intent_needed": 0}
 
@@ -280,22 +304,18 @@ def aggregate_metrics(rows: list[dict]) -> dict:
         "rows_with_empty_template":      sum(1 for r in rows if r.get("template_empty")),
         "rows_with_parse_error":         sum(1 for r in rows if r.get("parse_error")),
         "rows_with_missing_gt_file":     sum(1 for r in rows if r.get("gt_missing")),
-        # Coverage / accuracy (all matched rows)
         "mean_coverage_pct":             avg("coverage_pct"),
         "mean_accuracy_pct":             avg("accuracy_pct"),
-        # Intent coverage (rows with needed_resources set)
         "rows_with_intent_data":         len(intent_rows),
         "mean_intent_coverage_pct":      (
             round(sum(r["intent_coverage_pct"] for r in intent_rows) / len(intent_rows), 4)
             if intent_rows else None
         ),
-        # Resource totals
         "grand_total_required":          sum(r.get("total_required_resources", 0) for r in matched),
         "grand_total_generated":         sum(r.get("total_generated_resources", 0) for r in matched),
         "grand_total_correct":           sum(r.get("correct_resources", 0) for r in matched),
         "grand_total_missing":           sum(r.get("missing_resources", 0) for r in matched),
         "grand_total_extra":             sum(r.get("extra_resources", 0) for r in matched),
-        # Micro-averaged (global pool)
         "micro_coverage_pct": (
             round(
                 sum(r.get("correct_resources", 0) for r in matched)
@@ -335,6 +355,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Input CSV with `final_template` and `row_number` columns.")
     p.add_argument("--benchmark",  "-b", required=True,  metavar="CSV",
                    help="Benchmark CSV (iac_with_user_intent.csv from Tianyi2/IaCGen).")
+    p.add_argument("--base-dir",   "-d", type=str, default=None,
+                   help="Base directory to search for ground truth files (e.g. cfn_benchmark).")
     p.add_argument("--type",       "-t", dest="iac_type",
                    choices=["cloudformation", "terraform"], default="cloudformation",
                    help="IaC type of the generated templates (default: cloudformation).")
@@ -352,7 +374,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
 
-    # --- Load benchmark index keyed by row_number ---
     bench_path = Path(args.benchmark)
     if not bench_path.exists():
         sys.exit(f"[ERROR] Benchmark file not found: {bench_path}")
@@ -360,7 +381,6 @@ def main() -> None:
     bench_df = pd.read_csv(bench_path, dtype=str)
     bench_df["row_number"] = bench_df["row_number"].astype(str).str.strip()
 
-    # Build lookup dict: row_number_str -> benchmark row dict
     benchmark: dict[str, dict] = {
         str(row["row_number"]): row.to_dict()
         for _, row in bench_df.iterrows()
@@ -368,7 +388,6 @@ def main() -> None:
 
     print(f"[INFO] Benchmark loaded : {bench_path}  ({len(benchmark)} entries)")
 
-    # --- Load input CSV ---
     input_path = Path(args.input)
     if not input_path.exists():
         sys.exit(f"[ERROR] Input file not found: {input_path}")
@@ -377,23 +396,20 @@ def main() -> None:
         reader = csv.DictReader(fh)
         fieldnames = reader.fieldnames or []
         if "final_template" not in fieldnames:
-            sys.exit(
-                f"[ERROR] CSV missing `final_template` column.\n"
-                f"        Found: {fieldnames}"
-            )
+            sys.exit(f"[ERROR] CSV missing `final_template` column.\n        Found: {fieldnames}")
         if "row_number" not in fieldnames:
-            sys.exit(
-                f"[ERROR] CSV missing `row_number` column.\n"
-                f"        Found: {fieldnames}"
-            )
+            sys.exit(f"[ERROR] CSV missing `row_number` column.\n        Found: {fieldnames}")
         input_rows = list(reader)
 
     print(f"[INFO] Input CSV loaded : {input_path}  ({len(input_rows)} rows)")
     print(f"[INFO] IaC type         : {args.iac_type}")
+    if args.base_dir:
+        print(f"[INFO] Base GT Dir      : {args.base_dir}")
     if args.limit:
         print(f"[INFO] Row limit        : {args.limit}")
     print()
 
+    base_dir_path = Path(args.base_dir) if args.base_dir else None
     SEP = "─" * 72
     row_results: list[dict] = []
 
@@ -411,12 +427,10 @@ def main() -> None:
             "template_empty": not bool(template),
             "parse_error":  False,
             "gt_missing":   False,
-            # Benchmark metadata (filled when matched)
             "prompt":               None,
             "difficulty_level":     None,
             "ground_truth_path":    None,
             "expected_resource_count": None,
-            # Metric fields
             "total_required_resources":  0,
             "total_generated_resources": 0,
             "correct_resources":         0,
@@ -434,7 +448,6 @@ def main() -> None:
             "required_resource_types":   [],
         }
 
-        # --- Match to benchmark ---
         bench_row = benchmark.get(row_num)
         if bench_row is None:
             msg = f"NO BENCHMARK MATCH for row_number={row_num!r}"
@@ -447,11 +460,10 @@ def main() -> None:
 
         result["matched"]           = True
         result["prompt"]            = bench_row.get("prompt", "")
-        result["difficulty_level"]  = bench_row.get("difficulty_level", "")
+        result["difficulty_level"]  = bench_row.get("difficulty_level", bench_row.get("difficulty", ""))
         result["ground_truth_path"] = bench_row.get("ground_truth_path", "")
         result["expected_resource_count"] = bench_row.get("resource_count", "")
 
-        # --- Handle empty template ---
         if not template:
             print(f"  [{i:>4}] row={row_num:<6} FAIL  (empty template)")
             result["coverage_pct"] = 0.0
@@ -459,19 +471,16 @@ def main() -> None:
             row_results.append(result)
             continue
 
-        # --- Extract generated resource types ---
         generated_types = extract_resource_types(template, args.iac_type)
         if not generated_types:
             result["parse_error"] = True
 
         result["generated_resource_types"] = generated_types
 
-        # --- Load ground truth resource types ---
         gt_path = bench_row.get("ground_truth_path", "")
-        gt_types = load_ground_truth_resource_types(gt_path)
+        gt_types = load_ground_truth_resource_types(gt_path, base_dir_path)
 
         if not gt_types:
-            # Fall back to the `resources` column in the benchmark CSV
             gt_types = parse_resource_list(bench_row.get("resources", ""))
 
         if not gt_types:
@@ -485,7 +494,6 @@ def main() -> None:
 
         result["required_resource_types"] = gt_types
 
-        # --- Resource coverage (analyze_resource_coverage) ---
         cov = analyze_resource_coverage(gt_types, generated_types)
         result.update({
             "total_required_resources":  cov["total_required_resources"],
@@ -500,12 +508,10 @@ def main() -> None:
             "extra_resource_types":      cov["resource_details"]["extra"],
         })
 
-        # --- User-intent coverage ---
         needed = parse_resource_list(bench_row.get("needed_resources", ""))
         intent = intent_coverage(needed, generated_types)
         result.update(intent)
 
-        # --- Console output ---
         intent_str = (
             f"  intent={intent['intent_coverage_pct']:>6.1f}%"
             if intent["intent_coverage_pct"] is not None
@@ -523,9 +529,6 @@ def main() -> None:
         )
         row_results.append(result)
 
-    # -------------------------------------------------------------------
-    # Aggregate
-    # -------------------------------------------------------------------
     agg = aggregate_metrics(row_results)
 
     print()
@@ -556,9 +559,6 @@ def main() -> None:
           f"missing={agg['grand_total_missing']}  "
           f"extra={agg['grand_total_extra']}")
 
-    # -------------------------------------------------------------------
-    # Optional output files
-    # -------------------------------------------------------------------
     if args.output:
         Path(args.output).write_text(
             json.dumps({"aggregate": agg, "rows": row_results}, indent=2),
@@ -584,7 +584,6 @@ def main() -> None:
             writer.writeheader()
             for r in row_results:
                 flat = dict(r)
-                # Serialise list columns to semicolon-separated strings
                 for col in [
                     "correct_resource_types", "missing_resource_types",
                     "extra_resource_types", "generated_resource_types",

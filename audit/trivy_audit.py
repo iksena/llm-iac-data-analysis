@@ -5,12 +5,10 @@ trivy_csv_audit.py
 Reads a CSV file (like DeepseekV4Flash_security.csv) and runs a fresh Trivy
 misconfiguration scan on each row's `final_template` column.
 
-For each row, the script collects:
-  - All check IDs encountered (PASS + FAIL)
-  - Counts per severity (CRITICAL, HIGH, MEDIUM, LOW, UNKNOWN)
-  - Lists of passed check IDs
-  - Lists of failed check IDs
-  - Grand totals across all rows
+Filters scan results exclusively for AWS-related checks and records:
+  - Total evaluated, passed, and failed checks per severity (CRITICAL, HIGH, MEDIUM, LOW)
+  - Lists of passed check IDs and failed check IDs
+  - Grand totals and severity pass rates across all rows
 
 Usage
 -----
@@ -23,11 +21,6 @@ Usage
         [--skip-empty]
 
 Supported --type values: cloudformation | terraform
-
-Requirements
-------------
-    trivy >= 0.50  (https://aquasecurity.github.io/trivy/latest/getting-started/installation/)
-    (No extra Python packages required — stdlib only)
 """
 
 import argparse
@@ -40,6 +33,17 @@ from pathlib import Path
 SEVERITIES = ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]
 
 
+def is_aws_check(check_id: str, misconf: dict) -> bool:
+    """Check if the Trivy misconfiguration check pertains to AWS."""
+    cid = check_id.upper()
+    provider = (misconf.get("Provider") or "").lower()
+    return (
+        cid.startswith("AWS-")
+        or cid.startswith("AVD-AWS-")
+        or provider == "aws"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Core: run trivy on one template string
 # ---------------------------------------------------------------------------
@@ -48,22 +52,9 @@ def run_trivy(template: str, iac_type: str) -> dict:
     """
     Write *template* to a temp file/dir and run:
 
-        trivy config --format json --exit-code 0 <tmpdir>
+        trivy config --format json --exit-code 0 --include-non-failures <tmpdir>
 
-    File naming follows the IaC type:
-        terraform      -> main.tf
-        cloudformation -> template.yaml
-
-    Trivy emits individual Misconfigurations with a Status field:
-        "PASS" -> check passed on this template
-        "FAIL" / "WARN" -> check failed; Severity is recorded
-
-    When trivy does not emit individual PASS objects it still reports them
-    as MisconfSummary.Successes; we fall back to that count.
-
-    Returns a dict:
-        trivy_passed, all_check_ids, passed_check_ids, failed_check_ids,
-        severity_counts, total_checks, total_passed, total_failed, error
+    Returns a dict with per-severity evaluated, passed, and failed counts for AWS checks.
     """
     filename = "main.tf" if iac_type == "terraform" else "template.yaml"
 
@@ -72,7 +63,9 @@ def run_trivy(template: str, iac_type: str) -> dict:
         "all_check_ids":    [],
         "passed_check_ids": [],
         "failed_check_ids": [],
-        "severity_counts":  {s: 0 for s in SEVERITIES},
+        "sev_eval":         {s: 0 for s in SEVERITIES},
+        "sev_passed":       {s: 0 for s in SEVERITIES},
+        "sev_failed":       {s: 0 for s in SEVERITIES},
         "total_checks":     0,
         "total_passed":     0,
         "total_failed":     0,
@@ -112,7 +105,9 @@ def run_trivy(template: str, iac_type: str) -> dict:
 
         passed_ids: list[str] = []
         failed_ids: list[str] = []
-        sev_counts = {s: 0 for s in SEVERITIES}
+        sev_eval = {s: 0 for s in SEVERITIES}
+        sev_passed = {s: 0 for s in SEVERITIES}
+        sev_failed = {s: 0 for s in SEVERITIES}
         summary_successes = 0
 
         for res in data.get("Results", []):
@@ -120,19 +115,27 @@ def run_trivy(template: str, iac_type: str) -> dict:
             summary_successes += int(summary.get("Successes", 0) or 0)
 
             for m in res.get("Misconfigurations", []):
-                cid      = m.get("ID") or "UNKNOWN"
-                status   = (m.get("Status") or "FAIL").upper()
+                cid = m.get("ID") or "UNKNOWN"
+
+                # Restrict focus strictly to AWS checks
+                if not is_aws_check(cid, m):
+                    continue
+
+                status = (m.get("Status") or "FAIL").upper()
                 severity = (m.get("Severity") or "UNKNOWN").upper()
                 if severity not in SEVERITIES:
                     severity = "UNKNOWN"
 
+                sev_eval[severity] += 1
+
                 if status == "PASS":
                     passed_ids.append(cid)
+                    sev_passed[severity] += 1
                 else:
                     failed_ids.append(cid)
-                    sev_counts[severity] += 1
+                    sev_failed[severity] += 1
 
-        # Fallback: use summary count when no individual PASS items are emitted
+        # Fallback: use summary count when individual PASS items are omitted by Trivy
         if not passed_ids and summary_successes:
             passed_ids = [f"PASS_SUMMARY#{i}" for i in range(summary_successes)]
 
@@ -145,7 +148,9 @@ def run_trivy(template: str, iac_type: str) -> dict:
             "all_check_ids":    all_ids,
             "passed_check_ids": list(dict.fromkeys(passed_ids)),
             "failed_check_ids": list(dict.fromkeys(failed_ids)),
-            "severity_counts":  sev_counts,
+            "sev_eval":         sev_eval,
+            "sev_passed":       sev_passed,
+            "sev_failed":       sev_failed,
             "total_checks":     total_p + total_f,
             "total_passed":     total_p,
             "total_failed":     total_f,
@@ -159,15 +164,21 @@ def run_trivy(template: str, iac_type: str) -> dict:
 
 def aggregate(rows: list[dict]) -> dict:
     all_ids = set(); all_passed = set(); all_failed = set()
-    sev_totals = {s: 0 for s in SEVERITIES}
+    sev_eval_totals = {s: 0 for s in SEVERITIES}
+    sev_passed_totals = {s: 0 for s in SEVERITIES}
+    sev_failed_totals = {s: 0 for s in SEVERITIES}
     g_checks = g_passed = g_failed = 0
 
     for r in rows:
         all_ids    |= set(r["all_check_ids"])
         all_passed |= set(r["passed_check_ids"])
         all_failed |= set(r["failed_check_ids"])
-        for s, c in r["severity_counts"].items():
-            sev_totals[s] += c
+        
+        for s in SEVERITIES:
+            sev_eval_totals[s] += r["sev_eval"][s]
+            sev_passed_totals[s] += r["sev_passed"][s]
+            sev_failed_totals[s] += r["sev_failed"][s]
+
         g_checks += r["total_checks"]
         g_passed += r["total_passed"]
         g_failed += r["total_failed"]
@@ -180,7 +191,9 @@ def aggregate(rows: list[dict]) -> dict:
         "all_unique_check_ids":  sorted(all_ids),
         "all_passed_check_ids":  sorted(all_passed),
         "all_failed_check_ids":  sorted(all_failed),
-        "total_severity_counts": sev_totals,
+        "total_severity_eval":   sev_eval_totals,
+        "total_severity_passed": sev_passed_totals,
+        "total_severity_failed": sev_failed_totals,
         "grand_total_checks":    g_checks,
         "grand_total_passed":    g_passed,
         "grand_total_failed":    g_failed,
@@ -194,7 +207,7 @@ def aggregate(rows: list[dict]) -> dict:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="trivy_csv_audit.py",
-        description="Run Trivy misconfiguration scans on every row of a CSV file.",
+        description="Run Trivy misconfiguration scans on AWS checks for every row of a CSV file.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -223,6 +236,7 @@ def main() -> None:
 
     print(f"[INFO] Input   : {csv_path}")
     print(f"[INFO] IaC type: {args.iac_type}")
+    print(f"[INFO] Focus   : AWS Checks Only")
     if args.limit:
         print(f"[INFO] Row limit: {args.limit}")
     print()
@@ -252,7 +266,9 @@ def main() -> None:
                     "row_index": i, "run_id": run_id,
                     "trivy_passed": False, "all_check_ids": [],
                     "passed_check_ids": [], "failed_check_ids": [],
-                    "severity_counts": {s: 0 for s in SEVERITIES},
+                    "sev_eval": {s: 0 for s in SEVERITIES},
+                    "sev_passed": {s: 0 for s in SEVERITIES},
+                    "sev_failed": {s: 0 for s in SEVERITIES},
                     "total_checks": 0, "total_passed": 0, "total_failed": 0,
                     "error": "empty template",
                 }
@@ -272,8 +288,9 @@ def main() -> None:
                 label = "PASS" if r["trivy_passed"] else "FAIL"
 
             sev_parts = [
-                f"{s}={r['severity_counts'][s]}"
-                for s in SEVERITIES if r["severity_counts"][s]
+                f"{s}:{r['sev_passed'][s]}/{r['sev_eval'][s]}"
+                for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW"]
+                if r["sev_eval"][s] > 0
             ]
             print(
                 f"{label:<8} total={r['total_checks']:>3} "
@@ -290,7 +307,7 @@ def main() -> None:
 
     print()
     print(SEP)
-    print("AGGREGATE SUMMARY")
+    print("AGGREGATE SUMMARY (AWS Checks Only)")
     print(SEP)
     print(f"  Rows scanned          : {agg['rows_scanned']}")
     print(f"  Rows PASSED (trivy)   : {agg['rows_trivy_passed']}")
@@ -301,10 +318,15 @@ def main() -> None:
     print(f"  Grand total passed    : {agg['grand_total_passed']}")
     print(f"  Grand total failed    : {agg['grand_total_failed']}")
     print()
-    print("  Severity breakdown (failed checks):")
-    for s in SEVERITIES:
-        c = agg["total_severity_counts"][s]
-        print(f"    {s:<10} {c:>6}  {'#' * min(c, 50)}")
+    print("  Severity breakdown (AWS Checks):")
+    print(f"    {'Severity':<10} {'Evaluated':>10} {'Passed':>10} {'Failed':>10} {'Pass Rate (%)':>15}")
+    print(f"    {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*15}")
+    for s in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "UNKNOWN"]:
+        ev = agg["total_severity_eval"][s]
+        pa = agg["total_severity_passed"][s]
+        fa = agg["total_severity_failed"][s]
+        rate = (pa / ev * 100) if ev > 0 else 0.0
+        print(f"    {s:<10} {ev:>10} {pa:>10} {fa:>10} {rate:>14.1f}%")
 
     passed_set = set(agg["all_passed_check_ids"])
     failed_set = set(agg["all_failed_check_ids"])
@@ -324,12 +346,6 @@ def main() -> None:
         freq = sum(1 for r in row_results if cid in r["failed_check_ids"])
         print(f"    {cid:<42} {freq} rows")
 
-    print()
-    passed_only = sorted(passed_set - failed_set)
-    print(f"  Passed-only check IDs ({len(passed_only)}) — never failed:")
-    for cid in passed_only:
-        print(f"    {cid}")
-
     # --- JSON output ---
     if args.output:
         Path(args.output).write_text(
@@ -340,29 +356,40 @@ def main() -> None:
 
     # --- CSV output ---
     if args.output_csv:
-        cols = (
-            ["row_index", "run_id", "trivy_passed",
-             "total_checks", "total_passed", "total_failed"]
-            + [f"severity_{s.lower()}" for s in SEVERITIES]
-            + ["passed_check_ids", "failed_check_ids", "all_check_ids", "error"]
-        )
+        cols = [
+            "row_index", "run_id", "trivy_passed",
+            "total_checks", "total_passed", "total_failed"
+        ]
+        for s in SEVERITIES:
+            sl = s.lower()
+            cols.extend([f"severity_{sl}_eval", f"severity_{sl}_passed", f"severity_{sl}_failed"])
+        cols.extend(["passed_check_ids", "failed_check_ids", "all_check_ids", "error"])
+
         with open(args.output_csv, "w", newline="", encoding="utf-8") as fh:
             w = csv.DictWriter(fh, fieldnames=cols)
             w.writeheader()
             for r in row_results:
-                w.writerow({
-                    "row_index":        r["row_index"],
-                    "run_id":           r["run_id"],
-                    "trivy_passed":     r["trivy_passed"],
-                    "total_checks":     r["total_checks"],
-                    "total_passed":     r["total_passed"],
-                    "total_failed":     r["total_failed"],
-                    **{f"severity_{s.lower()}": r["severity_counts"][s] for s in SEVERITIES},
+                row_dict = {
+                    "row_index":    r["row_index"],
+                    "run_id":       r["run_id"],
+                    "trivy_passed": r["trivy_passed"],
+                    "total_checks": r["total_checks"],
+                    "total_passed": r["total_passed"],
+                    "total_failed": r["total_failed"],
+                }
+                for s in SEVERITIES:
+                    sl = s.lower()
+                    row_dict[f"severity_{sl}_eval"]   = r["sev_eval"][s]
+                    row_dict[f"severity_{sl}_passed"] = r["sev_passed"][s]
+                    row_dict[f"severity_{sl}_failed"] = r["sev_failed"][s]
+
+                row_dict.update({
                     "passed_check_ids": ";".join(r["passed_check_ids"]),
                     "failed_check_ids": ";".join(r["failed_check_ids"]),
                     "all_check_ids":    ";".join(r["all_check_ids"]),
                     "error":            r.get("error") or "",
                 })
+                w.writerow(row_dict)
         print(f"[INFO] CSV written   : {args.output_csv}")
 
 
