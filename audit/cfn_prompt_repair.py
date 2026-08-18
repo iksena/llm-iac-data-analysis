@@ -134,6 +134,7 @@ def call_repair(current_prompt: str, cfn_code: str, difficulty, feedback: str, r
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dest-files", type=str, default="", help="Comma-separated dest_files to repair.")
+    parser.add_argument("--rows", type=str, default="", help="Comma-separated row_numbers to repair (alternative to --dest-files).")
     args = parser.parse_args()
 
     bench = pd.read_csv(DATASET_CSV)
@@ -141,8 +142,12 @@ def main():
 
     review_failed = review["notes"].astype(str).str.contains("Review call failed", na=False)
 
-    if args.dest_files.strip():
-        ids = set(x.strip() for x in args.dest_files.split(",") if x.strip())
+    ids = set(x.strip() for x in args.dest_files.split(",") if x.strip())
+    if args.rows.strip():
+        row_nums = {int(x.strip()) for x in args.rows.split(",") if x.strip()}
+        ids |= set(bench.loc[bench["row_number"].isin(row_nums), "dest_file"])
+
+    if ids:
         target = review[review["dest_file"].isin(ids) & ~review_failed]
     else:
         flagged = (
@@ -155,7 +160,7 @@ def main():
         )
         target = review[flagged & ~review_failed]
 
-    if review_failed.any() and args.dest_files.strip() == "":
+    if review_failed.any() and not ids:
         print(f"Skipping {review_failed.sum()} rows that failed the review call itself.")
 
     print(f"Repairing {len(target)} flagged rows...")

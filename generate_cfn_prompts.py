@@ -159,7 +159,8 @@ def main():
 
     records = df.to_dict('records')
     new_count = 0
-    
+    generated = []  # (row_number, dest_file) for rows actually generated this run
+
     for rec in tqdm(records, desc="Processing Scenarios"):
         # 1. Determine which CFN code to use (prioritize final_cfn_code)
         has_final_code = not pd.isna(rec.get('final_cfn_code')) and str(rec.get('final_cfn_code')).strip()
@@ -198,16 +199,29 @@ def main():
                 rec[target_prompt_col] = prompt_result if prompt_result else "ERROR: LLM generation failed."
 
             new_count += 1
-            
+            generated.append({'row_number': rec.get('row_number'), 'dest_file': rec.get('dest_file')})
+
             # Periodically flush to disk in-place
             if new_count % SAVE_EVERY == 0:
                 pd.DataFrame(records).to_csv(PROMPTS_CSV, index=False)
 
     # Final save in-place
     pd.DataFrame(records).to_csv(PROMPTS_CSV, index=False)
-    
+
     if new_count > 0:
         print(f"\n🎉 Generated/repaired {new_count} scenario prompts! Output saved to: {PROMPTS_CSV}")
+
+        row_numbers = sorted(r['row_number'] for r in generated)
+        print(f"\nRow numbers generated this run: {row_numbers}")
+
+        generated_csv = DATASET_DIR / 'cfn_prompts_generated_latest.csv'
+        pd.DataFrame(generated).to_csv(generated_csv, index=False)
+        print(f"Saved generated-row list to: {generated_csv}")
+
+        print("\nTo audit just these rows:")
+        print(f'  python audit/cfn_prompt_rubric_review.py --rerun-rows "{",".join(str(n) for n in row_numbers)}"')
+        print("To repair just these rows after review:")
+        print(f'  python audit/cfn_prompt_repair.py --rows "{",".join(str(n) for n in row_numbers)}"')
     else:
         print(f"\n✅ All scenarios already have generated prompts. Output is up to date at: {PROMPTS_CSV}")
 

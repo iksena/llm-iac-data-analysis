@@ -175,6 +175,7 @@ def join_list(v):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--rerun", type=str, default="", help="Comma-separated dest_files to force re-review.")
+    parser.add_argument("--rerun-rows", type=str, default="", help="Comma-separated row_numbers to force re-review (alternative to --rerun).")
     parser.add_argument("--rerun-flagged", action="store_true", help="Re-review every currently-flagged row.")
     args = parser.parse_args()
 
@@ -197,6 +198,9 @@ def main():
     reviewed_ids = set(review["dest_file"]) if not review.empty else set()
 
     force_ids = set(x.strip() for x in args.rerun.split(",") if x.strip())
+    if args.rerun_rows.strip():
+        row_nums = {int(x.strip()) for x in args.rerun_rows.split(",") if x.strip()}
+        force_ids |= set(bench.loc[bench["row_number"].isin(row_nums), "dest_file"])
     if args.rerun_flagged and not review.empty:
         flagged = review[
             (review["critical_defect"] == True) 
@@ -211,7 +215,7 @@ def main():
     records = review.set_index("dest_file").to_dict("index") if not review.empty else {}
 
     # Strict vs Standard mode queuing
-    if args.rerun:
+    if args.rerun or args.rerun_rows:
         todo = [row for _, row in bench.iterrows() if row["dest_file"] in force_ids]
     else:
         todo = [row for _, row in bench.iterrows() if row["dest_file"] not in reviewed_ids or row["dest_file"] in force_ids]

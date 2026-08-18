@@ -76,6 +76,9 @@ a comparable conference; paper sources live in `../Papers/` — `introduction.te
       this exact file" — extend it, don't build a second exclusion mechanism.
   6. Size filter & **difficulty assignment** (`calculate_difficulty_cfn`) — the single
      authoritative difficulty computation; not recomputed anywhere downstream (see below).
+     Also applies the **compliance rule-list filter** (`mask_rule_list`) — drops scenarios
+     whose resources are dominated by a repeated AWS Config rule/pack type (see "Key
+     concepts" item 6 below).
   7. AWS-targeting filter
   8. cfn-lint validation
   9. Security scan (Trivy + Checkov) — only for lint-passed templates
@@ -378,3 +381,27 @@ change, change it only in the one function and rerun from that cell forward.
    notebook should be preceded by a timestamped `.bakN_<timestamp>` copy and followed by a
    JSON-roundtrip + per-cell `ast.parse` syntax check across the *whole* notebook (not just
    the edited cell) before considering the edit complete.
+6. **Compliance rule-list filter (CFN, cell 6) — separate from the diverse-resource
+   sampler.** `parse_cfn_metrics` (cell 5b) computes `dominant_resource_type`,
+   `dominant_resource_count`, and `dominant_resource_frac` (the most-repeated resource
+   `Type` in a template and its share of `n_resources`). Cell 6 uses these to drop
+   scenarios where an AWS Config rule/pack type (`AWS::Config::ConfigRule`,
+   `ConformancePack`, `OrganizationConfigRule`, `OrganizationConformancePack`) accounts for
+   `>=70%` of resources with `>=8` instances — e.g. an
+   `aws-config-conformance-packs/Operational-Best-Practices-for-*.yaml` template with
+   44-86 near-identical `AWS::Config::ConfigRule` resources. These inflate `n_resources`/
+   `loc` enough to land in L4/L5 under the joint difficulty metric, but they're a flat
+   enumeration of specific AWS-managed rule identifiers, not an architecture — no
+   reasonable natural-language prompt can name all of them, so every benchmarked model
+   (IaCGOD included) scores near-0% resource coverage regardless of skill (diagnosed from
+   IaCGOD eval rows 305-317, `cfn_eval_benchmark_diff_345.csv`, 2026-08-17). The existing
+   diverse-resource sampler (`sample_diverse` in cell 14, grouped by `aws_services`)
+   doesn't catch this: it diversifies across service *domains*, and a rule-list template
+   groups under service domain "Config" indistinguishably from a legitimate Config
+   scenario, so the fix belongs at the source (cell 6), not in the sampler. A handful of
+   Config rules attached to real surrounding infra (below the `dominant_resource_frac`
+   threshold), and a single `AWS::Config::ConformancePack` resource that just references an
+   AWS-managed pack by name (`dominant_resource_count == 1`), are deliberately spared — only
+   the checklist-dump pattern is excluded. If a new repeated-boilerplate pattern surfaces
+   (a different service's list-of-many-near-identical-rules resource type), extend
+   `RULE_LIST_TYPES` in cell 6 rather than adding a second homogeneity filter elsewhere.
