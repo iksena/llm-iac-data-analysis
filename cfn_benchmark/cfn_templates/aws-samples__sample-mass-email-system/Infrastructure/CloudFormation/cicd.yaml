@@ -1,0 +1,354 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: CI/CD Pipeline with CodePipeline, CodeCommit, and CodeBuild using EventBridge
+
+Parameters:
+  AccessLogsBucket:
+    Type: String
+    Description: S3 bucket for access logs
+  EmailDistributionApiGatewayUrl:
+    Type: String
+    Description: URL of the API Gateway endpoint
+  CognitoUserPoolId:
+    Type: String
+  CognitoUserPoolClientId:
+    Type: String
+  CodeS3BucketName:
+    Type: String
+    Description: Name of the S3 bucket containing source code
+  SourceObjectKey:
+    Type: String
+    Description: S3 key for the source code zip file
+    Default: reactapplication.zip
+  InsightsRuntimeArn:
+    Type: String
+    Description: ARN of the SES Insights AgentCore Runtime (empty to disable)
+    Default: ""
+  UniqueSuffix:
+    Type: String
+    Description: 'Deterministic hash suffix for S3 bucket names (avoids exposing AWS account ID)'
+    AllowedPattern: '[a-f0-9]{8}'
+    ConstraintDescription: 'Must be an 8-character lowercase hex string'
+
+Resources:
+  UICodeS3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-ui-code-${UniqueSuffix}'
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: GOVERNANCE
+            Days: 1
+      LoggingConfiguration:
+        DestinationBucketName: !Ref AccessLogsBucket
+        LogFilePrefix: code-logs/
+
+  UICodeS3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UICodeS3Bucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonSSLRequests
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub 'arn:${AWS::Partition}:s3:::${UICodeS3Bucket}'
+              - !Sub 'arn:${AWS::Partition}:s3:::${UICodeS3Bucket}/*'
+            Condition:
+              Bool:
+                aws:SecureTransport: false
+
+  CodeBuildKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for CodeBuild project encryption
+      EnableKeyRotation: true
+      # Note on the wildcards below, which security scanners commonly flag:
+      #
+      # A key policy is attached to exactly one key, so 'Resource: *' means THIS key,
+      # not every key in the account. Referencing the key's own ARN from inside its
+      # KeyPolicy is a CloudFormation circular dependency, so there is no narrower value.
+      #
+      # 'arn:...:root' is the account principal, not the root user. It grants no
+      # principal access by itself; it is what allows IAM policies in this account to
+      # govern the key. Narrowing 'kms:*' here would break IAM-delegated administration
+      # of the key, including CloudFormation's ability to update or delete it. If you
+      # need tighter control in production, restrict which IAM principals may use the
+      # key through their identity policies rather than by editing this statement.
+      # See https://docs.aws.amazon.com/kms/latest/developerguide/key-policy-default.html
+      KeyPolicy:
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          # Minimum set CodeBuild needs to encrypt build artifacts with this key.
+          - Sid: Allow CodeBuild Service
+            Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Name: !Sub ${AWS::StackName}-CodeBuildProject
+      EncryptionKey: !GetAtt CodeBuildKMSKey.Arn
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+
+          phases:
+            install:
+              runtime-versions:
+                nodejs: 22
+              commands:
+                - npm install --legacy-peer-deps
+
+            build:
+              commands:
+                - npm run build
+
+            post_build:
+              commands:
+                # no-cache so a redeploy is picked up immediately. The build is a single
+                # inlined index.html, so a stale cached copy means stale application code.
+                - aws s3 sync build/ s3://${S3_BUCKET}/ --cache-control no-cache
+
+      Environment:
+        EnvironmentVariables:
+          - Name: S3_BUCKET
+            Type: PLAINTEXT
+            Value: !Ref UICodeS3Bucket
+          - Name: VITE_AWS_REGION
+            Type: PLAINTEXT
+            Value: !Ref AWS::Region
+          - Name: VITE_AMAZON_COGNITO_USER_POOL_ID
+            Type: PLAINTEXT
+            Value: !Ref CognitoUserPoolId
+          - Name: VITE_AMAZON_COGNITO_USER_POOL_WEB_CLIENT_ID
+            Type: PLAINTEXT
+            Value: !Ref CognitoUserPoolClientId
+          - Name: VITE_API_GATEWAY_URL
+            Type: PLAINTEXT
+            Value: !Ref EmailDistributionApiGatewayUrl
+          - Name: VITE_INSIGHTS_RUNTIME_ARN
+            Type: PLAINTEXT
+            Value: !Ref InsightsRuntimeArn
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+        Type: LINUX_CONTAINER
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+
+  CodePipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref UICodeS3Bucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: SourceAction
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: S3
+                Version: '1'
+              Configuration:
+                S3Bucket: !Ref CodeS3BucketName
+                S3ObjectKey: !Ref SourceObjectKey
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+              RunOrder: 1
+        - Name: Build
+          Actions:
+            - Name: BuildAction
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref CodeBuildProject
+              InputArtifacts:
+                - Name: SourceOutput
+              OutputArtifacts:
+                - Name: BuildOutput
+              RunOrder: 1
+
+  CodeBuildS3Policy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${UICodeS3Bucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${UICodeS3Bucket}/*"
+              - !Sub "arn:${AWS::Partition}:s3:::${CodeS3BucketName}"
+              - !Sub "arn:${AWS::Partition}:s3:::${CodeS3BucketName}/*"
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource:
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-CodeBuildProject"
+              - !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-CodeBuildProject:*"
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt CodeBuildKMSKey.Arn
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref CodeBuildS3Policy
+
+  CodePipelineS3Policy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - codebuild:BatchGetBuilds
+              - codebuild:StartBuild
+            Resource: !GetAtt CodeBuildProject.Arn
+          - Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:GetObjectVersion
+              - s3:PutObject
+              - s3:ListBucket
+              - s3:GetBucketVersioning
+              - s3:GetBucketLocation
+            Resource:
+              - !Sub "arn:${AWS::Partition}:s3:::${UICodeS3Bucket}"
+              - !Sub "arn:${AWS::Partition}:s3:::${UICodeS3Bucket}/*"
+              - !Sub "arn:${AWS::Partition}:s3:::${CodeS3BucketName}"
+              - !Sub "arn:${AWS::Partition}:s3:::${CodeS3BucketName}/*"
+
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref CodePipelineS3Policy
+
+  EventBridgePipelinePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - codepipeline:StartPipelineExecution
+            Resource: !Sub arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${CodePipeline}
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref EventBridgePipelinePolicy
+
+  S3CommitTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - Object Created
+        detail:
+          bucket:
+            name:
+              - !Ref CodeS3BucketName
+          object:
+            key:
+              - !Ref SourceObjectKey
+      Targets:
+        - Arn: !Sub arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${CodePipeline}
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          Id: TriggerPipeline
+
+Outputs:
+  PipelineName:
+    Description: Name of the created CodePipeline
+    Value: !Ref CodePipeline
+  UICodeS3Bucket:
+    Description: S3 bucket hosting React application
+    Value: !Ref UICodeS3Bucket
+  UICodeS3BucketDomainName:
+    Description: S3 bucket regional domain name used by CloudFront
+    Value: !GetAtt UICodeS3Bucket.RegionalDomainName
+  UICodeS3BucketArn:
+    Description: S3 bucket ARN
+    Value: !GetAtt UICodeS3Bucket.Arn

@@ -1,0 +1,430 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Deploy a fully configured WireGuard VPN server on AWS, ready for client connections, with support for seamless dynamic updates to client configurations."
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: "The VPC where the WireGuard VPN will operate and have connectivity."
+    Default: ''
+
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: "Public subnet within the selected VPC where the WireGuard EC2 instance will be deployed."
+    Default: ''
+
+  InstanceType:
+    Type: String
+    Default: t2.micro
+    Description: "Amazon EC2 instance type used to provision the WireGuard server."
+
+  Prefix:
+    Type: String
+    Default: ''
+    Description: "(Optional) Prefix for all AWS resource names created by this stack; if not empty, it must end with '-'."
+    AllowedPattern: '^$|.*-$'
+    ConstraintDescription: "Prefix must be empty or end with a '-'."
+
+  AttachElasticIp:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: "Whether to attach an Elastic IP to the WireGuard EC2 instance."
+
+  VpnCidr:
+    Type: String
+    Default: 100.64.0.0/24
+    Description: "CIDR block for the VPN network. Must use a /24 mask."
+    AllowedPattern: '^((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}0/24$'
+    ConstraintDescription: "CIDR must be a valid IPv4 CIDR with a /24 prefix length and end in .0/24."
+
+  ClientConfig:
+    Type: String
+    Description: "Comma-separated list of client number, alias, and public key triples (number:alias:PublicKey,number:alias:PublicKey)."
+    Default: ""
+    AllowedPattern: '^((([1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-3]):[A-Za-z@]+:[A-Za-z0-9+/=]{43,44})(,([1-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-3]):[A-Za-z@]+:[A-Za-z0-9+/=]{43,44})*)?$'
+    ConstraintDescription: "Each entry must follow the format number:alias:PublicKey, where number is 1-253, alias contains letters or '@', and PublicKey is a valid WireGuard base64 key."
+
+  Port:
+    Type: Number
+    Default: 51820
+    Description: "UDP port on which WireGuard server will listen."
+    MinValue: 1024
+    MaxValue: 65535
+    ConstraintDescription: "Port must be a valid port number between 1024 and 65535."
+
+  AdditionalCidrs:
+    Type: String
+    Description: "(Optional) Additional CIDR blocks to route through the VPN, separated by commas."
+    Default: ""
+    AllowedPattern: '^$|^((25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])/(3[0-2]|[12]?[0-9])(,((25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1?[0-9]?[0-9])/(3[0-2]|[12]?[0-9]))*$'
+    ConstraintDescription: "Each entry must be a valid IPv4 CIDR block, separated by commas."
+
+Conditions:
+  UseElasticIp: !Equals [!Ref AttachElasticIp, 'true']
+
+Resources:
+  # IAM role assumed by the WireGuard EC2 instance
+  WireGuardIamRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Prefix}wireguard-iam-role"
+      Description: "IAM role for WireGuard EC2 instance"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Path: /
+
+  # Instance profile for associating the WireGuard IAM role with the EC2 instance
+  WireGuardInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${Prefix}wireguard-instance-profile"
+      Roles:
+        - !Ref WireGuardIamRole
+      Path: /
+
+  # Security Group for the WireGuard EC2 instance, allowing WireGuard UDP traffic
+  WireGuardInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${Prefix}wireguard-security-group"
+      GroupDescription: "Security Group for WireGuard EC2 instance"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: udp
+          FromPort: !Ref Port
+          ToPort: !Ref Port
+      Tags:
+        - Key: Name
+          Value: !Sub "${Prefix}wireguard-security-group"
+
+  # Elastic IP for the WireGuard EC2 instance (conditionally attached)
+  WireGuardElasticIp:
+    Type: AWS::EC2::EIP
+    Condition: UseElasticIp
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${Prefix}wireguard-elastic-ip"
+
+  # Association of the Elastic IP to the WireGuard EC2 instance (conditional)
+  ElasticIpAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Condition: UseElasticIp
+    Properties:
+      AllocationId: !GetAtt WireGuardElasticIp.AllocationId
+      InstanceId: !Ref WireGuardEc2Instance
+
+  # WaitConditionHandle used by CloudFormation to wait for EC2 setup completion
+  WaitHandle:
+    Type: AWS::CloudFormation::WaitConditionHandle
+
+  # WaitCondition to pause stack creation until the WireGuard EC2 instance signals success
+  WaitCondition:
+    Type: AWS::CloudFormation::WaitCondition
+    Properties:
+      Handle: !Ref WaitHandle
+      Timeout: 600
+      Count: 1
+
+  # EC2 instance running WireGuard VPN with user data and cfn-init helper scripts to configure the server
+  WireGuardEc2Instance:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            apt:
+              wireguard: []
+              awscli: []
+              jq: []
+          files:
+            "/opt/wireguard-setup.sh":
+              content: |
+                #!/bin/bash
+                set -xe
+
+                # Generate server keys
+                [ ! -f /etc/wireguard/private.key ] && wg genkey | tee /etc/wireguard/private.key
+                chmod 600 /etc/wireguard/private.key
+                [ ! -f /etc/wireguard/public.key ] && cat /etc/wireguard/private.key | wg pubkey | tee /etc/wireguard/public.key
+
+                # Determine primary network interface for NAT
+                PRIMARY_IF=$(ip r | grep '^default' | awk '{print $5}')
+
+                # Create base wg0.conf configuration with inline comments
+                echo "[Interface]" > /etc/wireguard/wg0.conf
+                echo "# Private key generated on the EC2 instance" >> /etc/wireguard/wg0.conf
+                echo "PrivateKey = $(cat /etc/wireguard/private.key)" >> /etc/wireguard/wg0.conf
+                echo "# IP address assigned to the EC2 instance within the VPN" >> /etc/wireguard/wg0.conf
+                echo "Address = ${VPN_CIDR%.*}.254/32" >> /etc/wireguard/wg0.conf
+                echo "# Port WireGuard will listen on" >> /etc/wireguard/wg0.conf
+                echo "ListenPort = ${PORT}" >> /etc/wireguard/wg0.conf
+                echo "# Traffic masquerading rules for PostUp and PostDown" >> /etc/wireguard/wg0.conf
+                echo "PostUp = iptables -A FORWARD -i %i -j ACCEPT; iptables -t nat -A POSTROUTING -o $PRIMARY_IF -j MASQUERADE" >> /etc/wireguard/wg0.conf
+                echo "PostDown = iptables -D FORWARD -i %i -j ACCEPT; iptables -t nat -D POSTROUTING -o $PRIMARY_IF -j MASQUERADE" >> /etc/wireguard/wg0.conf
+
+                # Process client configurations
+                IFS=',' read -ra CLIENTS <<< "$CLIENT_CONFIG"
+
+                for entry in "${CLIENTS[@]}"; do
+                  number=$(echo "$entry" | cut -d':' -f1)
+                  alias=$(echo "$entry" | cut -d':' -f2)
+                  pubkey=$(echo "$entry" | cut -d':' -f3)
+
+                  # Assign IP address to client
+                  client_ip="${VPN_CIDR%.*}.${number}/32"
+
+                  # Append client peer configuration to wg0.conf
+                  echo "" >> /etc/wireguard/wg0.conf
+                  echo "[Peer]" >> /etc/wireguard/wg0.conf
+                  echo "# Public key generated for Client ${number} ${alias}" >> /etc/wireguard/wg0.conf
+                  echo "PublicKey = ${pubkey}" >> /etc/wireguard/wg0.conf
+                  echo "# IP address assigned to Client ${number} ${alias} within VPN" >> /etc/wireguard/wg0.conf
+                  echo "AllowedIPs = ${client_ip}" >> /etc/wireguard/wg0.conf
+
+                done
+
+                # Secure wg0.conf file
+                sudo chmod 600 /etc/wireguard/wg0.conf
+
+                # Enable IPv4 forwarding
+                sudo sed -i 's/^#\(net.ipv4.ip_forward=1\)/\1/' /etc/sysctl.conf
+                sudo sysctl -p
+
+                # Restart WireGuard service
+                sudo systemctl restart wg-quick@wg0
+
+                # Extract public key for signaling
+                PUBKEY=$(cat /etc/wireguard/public.key)
+
+                # Send success signal to WaitConditionHandle
+                curl -X PUT -H 'Content-Type:' \
+                  --data-binary "{\"Status\":\"SUCCESS\",\"Reason\":\"WireGuard ready\",\"UniqueId\":\"WireGuardConfig\",\"Data\":\"$PUBKEY\"}" \
+                  "${WAIT_HANDLE}"
+
+              mode: "000755"
+              owner: "root"
+              group: "root"
+
+            "/etc/cfn/cfn-hup.conf":
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+                interval=1
+              mode: "000400"
+              owner: "root"
+              group: "root"
+
+            "/etc/cfn/hooks.d/cfn-auto-reloader.conf":
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.WireGuardEc2Instance.Metadata.AWS::CloudFormation::Init
+                action=cfn-init -v --stack ${AWS::StackName} --resource WireGuardEc2Instance --region ${AWS::Region}
+              mode: "000400"
+              owner: "root"
+              group: "root"
+          commands:
+            run_wireguard_setup:
+              command: "bash /opt/wireguard-setup.sh"
+              env:
+                VPN_CIDR: !Ref VpnCidr
+                PORT: !Ref Port
+                CLIENT_CONFIG: !Ref ClientConfig
+                WAIT_HANDLE: !Ref WaitHandle
+          services:
+            systemd:
+              wg-quick@wg0:
+                enabled: true
+                ensureRunning: true
+
+    Properties:
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnetId
+      ImageId: !Sub "{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}"
+      IamInstanceProfile: !Ref WireGuardInstanceProfile
+      SecurityGroupIds:
+        - !Ref WireGuardInstanceSecurityGroup
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -xe
+
+          # Update package lists and install required packages
+          apt update
+          apt install -y python3-pip
+
+          # Install AWS CloudFormation bootstrap scripts
+          pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+
+          # Run cfn-init to apply metadata configurations
+          cfn-init -v --stack ${AWS::StackName} --resource WireGuardEc2Instance --region ${AWS::Region}
+
+          # Start cfn-hup daemon to check for updates
+          cfn-hup -v
+      Tags:
+        - Key: Name
+          Value: !Sub "${Prefix}wireguard-vpn-instance"
+
+  # IAM role for executing the WireGuard CloudFormation custom resource Lambda
+  CustomResourceLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Prefix}wireguard-custom-resource-lambda-role"
+      Description: "IAM role for executing the WireGuard CloudFormation custom resource Lambda"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/AmazonEC2ReadOnlyAccess
+
+  # Lambda function that generates WireGuard tunnel configuration for clients
+  CustomResourceLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Prefix}wireguard-custom-resource-lambda"
+      Description: "CloudFormation custom resource Lambda function to generate WireGuard tunnel configuration"
+      Handler: index.handler
+      Runtime: python3.12
+      Timeout: 60
+      Role: !GetAtt CustomResourceLambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import boto3
+          import cfnresponse
+
+          # Initialize EC2 client
+          ec2 = boto3.client("ec2")
+
+          def handler(event, context):
+              try:
+                  # Log the received CloudFormation event for debugging
+                  print("Received event:", json.dumps(event))
+
+                  # Extract resource properties from the CloudFormation custom resource
+                  props = event["ResourceProperties"]
+                  server_pubkey_wrapper = props["ServerPublicKey"]
+
+                  # Decode the wrapper JSON containing WireGuard server public key
+                  wrapper = json.loads(server_pubkey_wrapper)
+                  server_pubkey = wrapper["WireGuardConfig"]
+
+                  # Extract additional properties
+                  public_ip = props["PublicIp"]
+                  vpn_cidr = props["VpnCidr"]
+                  port = int(props["Port"])
+                  vpc_id = props["VpcId"]
+                  additional_cidrs = props["AdditionalCidrs"]
+
+                  # Retrieve VPC CIDR block from AWS
+                  vpc_resp = ec2.describe_vpcs(VpcIds=[vpc_id])
+                  vpc_cidr = vpc_resp["Vpcs"][0]["CidrBlock"]
+
+                  # Build client tunnel configuration
+                  lines = [
+                      f"Address = {vpn_cidr.rsplit('.', 1)[0] + './' + vpn_cidr.split('/')[-1]}",  # Client's VPN address
+                      "[Peer]",  # Begin peer section
+                      f"PublicKey = {server_pubkey}",  # WireGuard server public key
+                      f"AllowedIPs = {vpn_cidr}, {vpc_cidr} {',' + additional_cidrs if additional_cidrs else ''}",  # Routes allowed for the client
+                      f"Endpoint = {public_ip}:{port}"  # Server endpoint for this peer
+                  ]
+                  tunnel_config = "\n".join(lines)
+
+                  # Encode tunnel configuration in base64 to safely transport via JSON
+                  encoded_tunnel_config = base64.b64encode(tunnel_config.encode()).decode()
+
+                  # Prepare response data for CloudFormation
+                  response_data = {"TunnelConfig": encoded_tunnel_config}
+
+                  # Send SUCCESS response to CloudFormation
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  # On any error, send FAILED response with error message
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+
+  # Custom resource that triggers the Lambda to generate tunnel configuration
+  CustomResource:
+    Type: Custom::WireGuardTunnelConfig
+    Properties:
+      ServiceToken: !GetAtt CustomResourceLambdaFunction.Arn
+      ServerPublicKey: !GetAtt WaitCondition.Data
+      PublicIp: !If [UseElasticIp, !Ref WireGuardElasticIp, !GetAtt WireGuardEc2Instance.PublicIp]
+      VpnCidr: !Ref VpnCidr
+      Port: !Ref Port
+      VpcId: !Ref VpcId
+      AdditionalCidrs: !Ref AdditionalCidrs
+
+Outputs:
+  WireGuardSecurityGroupId:
+    Description: "Security Group ID attached to the WireGuard EC2 instance."
+    Value: !Ref WireGuardInstanceSecurityGroup
+
+  WireGuardInstanceId:
+    Description: "EC2 instance ID running the WireGuard server."
+    Value: !Ref WireGuardEc2Instance
+
+  WireGuardPublicIp:
+    Description: "Public IP address of the WireGuard EC2 instance (Elastic IP if configured)."
+    Value: !If [UseElasticIp, !Ref WireGuardElasticIp, !GetAtt WireGuardEc2Instance.PublicIp]
+
+  WireGuardPrivateIp:
+    Description: "Private IP address of the WireGuard EC2 instance."
+    Value: !GetAtt WireGuardEc2Instance.PrivateIp
+
+  TestPing:
+    Description: "Command to ping the WireGuard instance's private IP for connectivity testing."
+    Value: !Sub "ping ${WireGuardEc2Instance.PrivateIp}"
+
+  WireGuardTunnelConfig:
+    Description: "WireGuard client tunnel configuration encoded in Base64."
+    Value: !GetAtt CustomResource.TunnelConfig
+
+  WireGuardPort:
+    Description: "UDP port on which the WireGuard server listens."
+    Value: !Ref Port
+
+  WireGuardVpcId:
+    Description: "VPC where the WireGuard VPN operates and has network connectivity."
+    Value: !Ref VpcId
+
+  WireGuardVpnCidr:
+    Description: "CIDR block allocated for the WireGuard VPN network."
+    Value: !Ref VpnCidr
+
+  WireGuardConfigFile:
+    Description: "Path to the WireGuard configuration file on the EC2 instance."
+    Value: "/etc/wireguard/wg0.conf"
+
+  WireGuardRestartCommand:
+    Description: "Command to restart the WireGuard service."
+    Value: "sudo systemctl restart wg-quick@wg0"
+
+  WireGuardStatusCommand:
+    Description: "Command to check the status of the WireGuard service."
+    Value: "sudo systemctl status wg-quick@wg0"
+
+  WireGuardInstallationUrl:
+    Description: "Official WireGuard installation page for reference."
+    Value: "https://www.wireguard.com/install/"
+
+  ClientTunnelConfigDecodeUrl:
+    Description: "Online tool to decode the Base64 client tunnel configuration."
+    Value: "https://www.base64decode.org/"

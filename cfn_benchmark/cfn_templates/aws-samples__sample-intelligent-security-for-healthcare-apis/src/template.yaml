@@ -1,0 +1,878 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  FHIR API Security Monitoring with Amazon Bedrock.
+  Deploys a secure healthcare API with anomaly detection,
+  data sensitivity classification, and automated compliance reporting.
+
+# ---------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment name for resource tagging and naming.
+
+  AlertEmail:
+    Type: String
+    Description: Email address for security alert notifications.
+    AllowedPattern: "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"
+    ConstraintDescription: Must be a valid email address.
+
+  BedrockAnomalyModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-5-20250929-v1:0
+    Description: >
+      Bedrock inference profile for anomaly analysis.
+      Must support Structured Outputs (Sonnet 4.5+, Haiku 4.5).
+
+  BedrockClassifierModelId:
+    Type: String
+    Default: us.anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: >
+      Bedrock inference profile for sensitivity classification.
+      Must support Structured Outputs (Sonnet 4.5+, Haiku 4.5).
+
+  BedrockReportModelId:
+    Type: String
+    Default: us.anthropic.claude-sonnet-4-5-20250929-v1:0
+    Description: >
+      Bedrock inference profile for compliance report generation.
+      Must support Structured Outputs (Sonnet 4.5+, Haiku 4.5).
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing the Lambda deployment packages (created by deploy.sh).
+
+  LambdaCodeVersion:
+    Type: String
+    Default: "latest"
+    Description: >
+      Version identifier for Lambda code packages. Change this value
+      to force CloudFormation to update the Lambda function code.
+
+# ---------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------
+Resources:
+
+  # ===================== Bedrock Guardrail (HIPAA PHI Protection) =====================
+  FhirGuardrail:
+    Type: AWS::Bedrock::Guardrail
+    Properties:
+      Name: !Sub "fhir-hipaa-guardrail-${EnvironmentName}"
+      Description: >
+        HIPAA PHI protection guardrail. Anonymizes protected health information
+        in both prompts and model responses to prevent PHI leakage through
+        Bedrock interactions.
+      BlockedInputMessaging: "Request blocked: potential PHI detected in input."
+      BlockedOutputsMessaging: "Response blocked: potential PHI detected in output."
+      SensitiveInformationPolicyConfig:
+        PiiEntitiesConfig:
+          - Type: NAME
+            Action: ANONYMIZE
+          - Type: AGE
+            Action: ANONYMIZE
+          - Type: EMAIL
+            Action: ANONYMIZE
+          - Type: PHONE
+            Action: ANONYMIZE
+          - Type: ADDRESS
+            Action: ANONYMIZE
+          - Type: US_SOCIAL_SECURITY_NUMBER
+            Action: BLOCK
+          - Type: IP_ADDRESS
+            Action: ANONYMIZE
+          - Type: US_PASSPORT_NUMBER
+            Action: BLOCK
+          - Type: DRIVER_ID
+            Action: ANONYMIZE
+          - Type: USERNAME
+            Action: ANONYMIZE
+          - Type: CA_HEALTH_NUMBER
+            Action: ANONYMIZE
+          - Type: UK_NATIONAL_HEALTH_SERVICE_NUMBER
+            Action: ANONYMIZE
+        RegexesConfig:
+          - Name: MedicalRecordNumber
+            Description: Matches common MRN patterns
+            Pattern: "\\bMRN[:\\s]*\\d{4,10}\\b"
+            Action: ANONYMIZE
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Compliance
+          Value: HIPAA
+
+  FhirGuardrailVersion:
+    Type: AWS::Bedrock::GuardrailVersion
+    Properties:
+      GuardrailIdentifier: !GetAtt FhirGuardrail.GuardrailArn
+      Description: !Sub "HIPAA PHI guardrail v1 - ${EnvironmentName}"
+
+  # ===================== Cognito User Pool =====================
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "fhir-users-${EnvironmentName}"
+      AutoVerifiedAttributes:
+        - email
+      MfaConfiguration: "ON"
+      EnabledMfas:
+        - SOFTWARE_TOKEN_MFA
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireUppercase: true
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: role
+          AttributeDataType: String
+          Mutable: true
+      UserPoolTags:
+        Environment: !Ref EnvironmentName
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "fhir-api-client-${EnvironmentName}"
+      UserPoolId: !Ref CognitoUserPool
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+
+  # ===================== DynamoDB Tables =====================
+  PermissionsTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      checkov:
+        skip:
+          - id: "CKV_AWS_119"
+            comment: >-
+              PoC accepts AWS-owned SSE (SSEEnabled: true) instead of a
+              customer-managed KMS CMK. Data is still encrypted at rest;
+              a CMK adds cost and key-management overhead not needed for
+              this demo. Revisit for production (see README Limitations).
+    Properties:
+      TableName: !Sub "fhir-permissions-${EnvironmentName}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  AccessHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Metadata:
+      checkov:
+        skip:
+          - id: "CKV_AWS_119"
+            comment: >-
+              PoC accepts AWS-owned SSE (SSEEnabled: true) instead of a
+              customer-managed KMS CMK. Data is still encrypted at rest;
+              a CMK adds cost and key-management overhead not needed for
+              this demo. Revisit for production (see README Limitations).
+    Properties:
+      TableName: !Sub "fhir-access-history-${EnvironmentName}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ===================== SNS Topic =====================
+  SecurityAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "fhir-security-alerts-${EnvironmentName}"
+      KmsMasterKeyId: alias/aws/sns
+
+  SecurityAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref SecurityAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ===================== S3 Bucket for Reports =====================
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    # cfn-guard: S3_BUCKET_LOGGING_ENABLED - accepted for this PoC. Enabling
+    # server access logging requires a second bucket (with its own encryption,
+    # public-access-block, and lifecycle config) just to hold logs for a demo
+    # bucket. This bucket already has SSE-KMS encryption, versioning, and full
+    # public access blocking. Revisit for production (see README Limitations).
+    Metadata:
+      checkov:
+        skip:
+          - id: "CKV_AWS_18"
+            comment: >-
+              PoC accepts no S3 access logging bucket. See comment above
+              and README Limitations for the tradeoff.
+    Properties:
+      BucketName: !Sub "fhir-compliance-reports-${AWS::AccountId}-${EnvironmentName}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ArchiveOldReports
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 365
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ===================== CloudWatch Log Groups =====================
+  AuditLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/fhir/security-audit-${EnvironmentName}"
+      RetentionInDays: 365
+
+  AuthorizerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/fhir-authorizer-${EnvironmentName}"
+      RetentionInDays: 90
+
+  FhirProcessorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/fhir-processor-${EnvironmentName}"
+      RetentionInDays: 90
+
+  AnomalyAnalyzerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/fhir-anomaly-analyzer-${EnvironmentName}"
+      RetentionInDays: 90
+
+  SensitivityClassifierLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/fhir-sensitivity-classifier-${EnvironmentName}"
+      RetentionInDays: 90
+
+  ComplianceReporterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/fhir-compliance-reporter-${EnvironmentName}"
+      RetentionInDays: 365
+
+  # ===================== EventBridge =====================
+  FhirEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "fhir-events-${EnvironmentName}"
+
+  AccessEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "fhir-access-analysis-${EnvironmentName}"
+      EventBusName: !Ref FhirEventBus
+      EventPattern:
+        source:
+          - "fhir.api.access"
+        detail-type:
+          - "FHIR API Access Event"
+      Targets:
+        - Arn: !GetAtt AnomalyAnalyzerFunction.Arn
+          Id: AnomalyAnalyzerTarget
+
+  ClassificationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "fhir-classification-${EnvironmentName}"
+      EventBusName: !Ref FhirEventBus
+      EventPattern:
+        source:
+          - "fhir.api.classification"
+        detail-type:
+          - "FHIR Resource Classification Request"
+      Targets:
+        - Arn: !GetAtt SensitivityClassifierFunction.Arn
+          Id: SensitivityClassifierTarget
+
+  ComplianceScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "fhir-compliance-report-schedule-${EnvironmentName}"
+      ScheduleExpression: "cron(0 6 1 * ? *)"
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ComplianceReporterFunction.Arn
+          Id: ComplianceReporterTarget
+          Input: '{"reporting_days": 30}'
+
+  # ===================== IAM Roles =====================
+  AuthorizerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "fhir-authorizer-role-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AuthorizerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt AuthorizerLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:Query
+                Resource: !GetAtt PermissionsTable.Arn
+
+  FhirProcessorFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "fhir-processor-role-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FhirProcessorPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt FhirProcessorLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - healthlake:ReadResource
+                  - healthlake:SearchWithGet
+                  - healthlake:SearchWithPost
+                  - healthlake:CreateResource
+                  - healthlake:UpdateResource
+                Resource: !Sub "arn:aws:healthlake:${AWS::Region}:${AWS::AccountId}:datastore/fhir/*"
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt FhirEventBus.Arn
+
+  AnomalyAnalyzerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "fhir-anomaly-analyzer-role-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AnomalyAnalyzerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt AnomalyAnalyzerLogGroup.Arn
+                  - !Sub "${AuditLogGroup.Arn}:*"
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockAnomalyModelId}"
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+                  - "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+                  - "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+                Condition:
+                  StringEquals:
+                    bedrock:InferenceProfileArn: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockAnomalyModelId}"
+              - Effect: Allow
+                Action:
+                  - bedrock:ApplyGuardrail
+                Resource: !GetAtt FhirGuardrail.GuardrailArn
+              - Effect: Allow
+                Action:
+                  - comprehendmedical:DetectPHI
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:Query
+                  - dynamodb:PutItem
+                Resource: !GetAtt AccessHistoryTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityAlertsTopic
+
+  SensitivityClassifierFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "fhir-sensitivity-classifier-role-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SensitivityClassifierPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt SensitivityClassifierLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockClassifierModelId}"
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
+                  - "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
+                  - "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-haiku-4-5-20251001-v1:0"
+                Condition:
+                  StringEquals:
+                    bedrock:InferenceProfileArn: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockClassifierModelId}"
+              - Effect: Allow
+                Action:
+                  - bedrock:ApplyGuardrail
+                Resource: !GetAtt FhirGuardrail.GuardrailArn
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt PermissionsTable.Arn
+
+  ComplianceReporterFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "fhir-compliance-reporter-role-${EnvironmentName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ComplianceReporterPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:FilterLogEvents
+                Resource:
+                  - !GetAtt ComplianceReporterLogGroup.Arn
+                  - !Sub "${AuditLogGroup.Arn}:*"
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockReportModelId}"
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource:
+                  - "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+                  - "arn:aws:bedrock:us-east-2::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+                  - "arn:aws:bedrock:us-west-2::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0"
+                Condition:
+                  StringEquals:
+                    bedrock:InferenceProfileArn: !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockReportModelId}"
+              - Effect: Allow
+                Action:
+                  - bedrock:ApplyGuardrail
+                Resource: !GetAtt FhirGuardrail.GuardrailArn
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource: !GetAtt AccessHistoryTable.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub "${ReportBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - kms:GenerateDataKey
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    kms:ViaService: !Sub "s3.${AWS::Region}.amazonaws.com"
+
+  # ===================== Lambda Functions =====================
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "fhir-authorizer-${EnvironmentName}"
+      Runtime: python3.12
+      Handler: handler.handler
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub "fhir-bedrock-security/${LambdaCodeVersion}/authorizer.zip"
+      Role: !GetAtt AuthorizerFunctionRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          PERMISSIONS_TABLE_NAME: !Ref PermissionsTable
+          COGNITO_USER_POOL_ID: !Ref CognitoUserPool
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FhirProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "fhir-processor-${EnvironmentName}"
+      Runtime: python3.12
+      Handler: handler.handler
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub "fhir-bedrock-security/${LambdaCodeVersion}/fhir_processor.zip"
+      Role: !GetAtt FhirProcessorFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 512
+      Environment:
+        Variables:
+          HEALTHLAKE_DATASTORE_ID: ""
+          EVENT_BUS_NAME: !Ref FhirEventBus
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  AnomalyAnalyzerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "fhir-anomaly-analyzer-${EnvironmentName}"
+      Runtime: python3.12
+      Handler: handler.handler
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub "fhir-bedrock-security/${LambdaCodeVersion}/anomaly_analyzer.zip"
+      Role: !GetAtt AnomalyAnalyzerFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SecurityAlertsTopic
+          ACCESS_HISTORY_TABLE_NAME: !Ref AccessHistoryTable
+          AUDIT_LOG_GROUP_NAME: !Sub "/fhir/security-audit-${EnvironmentName}"
+          BEDROCK_ANOMALY_MODEL_ID: !Ref BedrockAnomalyModelId
+          GUARDRAIL_ID: !GetAtt FhirGuardrail.GuardrailId
+          GUARDRAIL_VERSION: !GetAtt FhirGuardrailVersion.Version
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  SensitivityClassifierFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "fhir-sensitivity-classifier-${EnvironmentName}"
+      Runtime: python3.12
+      Handler: handler.handler
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub "fhir-bedrock-security/${LambdaCodeVersion}/sensitivity_classifier.zip"
+      Role: !GetAtt SensitivityClassifierFunctionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          PERMISSIONS_TABLE_NAME: !Ref PermissionsTable
+          BEDROCK_CLASSIFIER_MODEL_ID: !Ref BedrockClassifierModelId
+          GUARDRAIL_ID: !GetAtt FhirGuardrail.GuardrailId
+          GUARDRAIL_VERSION: !GetAtt FhirGuardrailVersion.Version
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ComplianceReporterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "fhir-compliance-reporter-${EnvironmentName}"
+      Runtime: python3.12
+      Handler: handler.handler
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub "fhir-bedrock-security/${LambdaCodeVersion}/compliance_reporter.zip"
+      Role: !GetAtt ComplianceReporterFunctionRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      Environment:
+        Variables:
+          ACCESS_HISTORY_TABLE_NAME: !Ref AccessHistoryTable
+          REPORT_BUCKET_NAME: !Ref ReportBucket
+          AUDIT_LOG_GROUP_NAME: !Sub "/fhir/security-audit-${EnvironmentName}"
+          BEDROCK_REPORT_MODEL_ID: !Ref BedrockReportModelId
+          GUARDRAIL_ID: !GetAtt FhirGuardrail.GuardrailId
+          GUARDRAIL_VERSION: !GetAtt FhirGuardrailVersion.Version
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # ===================== Lambda Permissions for EventBridge =====================
+  AnomalyAnalyzerEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AnomalyAnalyzerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt AccessEventRule.Arn
+
+  SensitivityClassifierEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SensitivityClassifierFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ClassificationEventRule.Arn
+
+  ComplianceReporterSchedulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ComplianceReporterFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ComplianceScheduleRule.Arn
+
+  # ===================== API Gateway =====================
+  FhirApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "fhir-api-${EnvironmentName}"
+      Description: FHIR R4 API with Bedrock-powered security monitoring
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  FhirApiAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoJWTAuthorizer
+      RestApiId: !Ref FhirApi
+      Type: TOKEN
+      AuthorizerUri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations"
+      AuthorizerResultTtlInSeconds: 300
+      IdentitySource: method.request.header.Authorization
+
+  AuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${FhirApi}/*"
+
+  FhirResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref FhirApi
+      ParentId: !GetAtt FhirApi.RootResourceId
+      PathPart: "{resourceType}"
+
+  FhirResourceWithId:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref FhirApi
+      ParentId: !Ref FhirResource
+      PathPart: "{resourceId}"
+
+  FhirGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref FhirApi
+      ResourceId: !Ref FhirResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref FhirApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FhirProcessorFunction.Arn}/invocations"
+
+  FhirGetByIdMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref FhirApi
+      ResourceId: !Ref FhirResourceWithId
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref FhirApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FhirProcessorFunction.Arn}/invocations"
+
+  FhirPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref FhirApi
+      ResourceId: !Ref FhirResource
+      HttpMethod: POST
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref FhirApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FhirProcessorFunction.Arn}/invocations"
+
+  FhirProcessorInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FhirProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${FhirApi}/*"
+
+  FhirApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - FhirGetMethod
+      - FhirGetByIdMethod
+      - FhirPostMethod
+    Properties:
+      RestApiId: !Ref FhirApi
+
+  FhirApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/fhir-api-access-${EnvironmentName}"
+      RetentionInDays: 90
+
+  FhirApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref FhirApi
+      DeploymentId: !Ref FhirApiDeployment
+      StageName: !Ref EnvironmentName
+      TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt FhirApiAccessLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "requestTime":"$context.requestTime","httpMethod":"$context.httpMethod",
+          "resourcePath":"$context.resourcePath","status":"$context.status",
+          "responseLength":"$context.responseLength","integrationErrorMessage":"$context.integrationErrorMessage"}
+      MethodSettings:
+        - ResourcePath: "/*"
+          HttpMethod: "*"
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 100
+          LoggingLevel: INFO
+
+# ---------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------
+Outputs:
+  ApiEndpoint:
+    Description: FHIR API Gateway endpoint URL
+    Value: !Sub "https://${FhirApi}.execute-api.${AWS::Region}.amazonaws.com/${EnvironmentName}"
+
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID for authentication
+    Value: !Ref CognitoUserPool
+
+  CognitoClientId:
+    Description: Cognito App Client ID
+    Value: !Ref CognitoUserPoolClient
+
+  EventBusName:
+    Description: EventBridge bus name for FHIR access events
+    Value: !Ref FhirEventBus
+
+  ReportBucketName:
+    Description: S3 bucket for compliance reports
+    Value: !Ref ReportBucket
+
+  SecurityAlertsTopicArn:
+    Description: SNS topic ARN for security alerts
+    Value: !Ref SecurityAlertsTopic
+
+  PermissionsTableName:
+    Description: DynamoDB table for permissions and classifications
+    Value: !Ref PermissionsTable
+
+  AccessHistoryTableName:
+    Description: DynamoDB table for access history
+    Value: !Ref AccessHistoryTable

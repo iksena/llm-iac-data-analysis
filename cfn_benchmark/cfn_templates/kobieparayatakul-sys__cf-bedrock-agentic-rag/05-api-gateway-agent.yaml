@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: CloudFormation template for Amazon Bedrock Agent with chat capabilities
+
+Parameters:
+  EnvName:
+    Type: String
+    Description: Environment based resource name prefix
+    Default: dev
+
+  ModelId:
+    Type: String
+    Description: Bedrock model ID to use for text generation
+    Default: anthropic.claude-3-5-sonnet-20241022-v2:0
+    AllowedValues:
+      - anthropic.claude-3-5-sonnet-20241022-v2:0
+
+Resources:
+
+  #============================================================
+  # Bedrock Agent
+  #============================================================
+
+  BedrockAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: bedrock.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockAgentExecutionPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${ModelId}'
+              - Effect: Allow
+                Action:
+                  - bedrock:Retrieve
+                  - bedrock:RetrieveAndGenerate
+                Resource:
+                  - !ImportValue
+                      Fn::Sub: '${EnvName}-rag-KnowledgeBaseArn'
+
+  BedrockAgent:
+    Type: AWS::Bedrock::Agent
+    Properties:
+      AgentName: !Sub '${EnvName}-rag-agent'
+      Description: "RAG Agent"
+      AgentResourceRoleArn: !GetAtt BedrockAgentRole.Arn
+      AutoPrepare: true
+      FoundationModel: !Ref ModelId
+      Instruction: |
+        You are a helpful assistant that answers questions based on knowledge base documents.
+        Always respond in a friendly, conversational tone.
+        If you don't know the answer, say you don't know - don't make up answers.
+      IdleSessionTTLInSeconds: 600
+      KnowledgeBases:
+        - KnowledgeBaseId: !ImportValue
+            Fn::Sub: '${EnvName}-rag-KnowledgeBaseId'
+          Description: "RAG Knowledge Base"
+          KnowledgeBaseState: ENABLED
+
+  BedrockAgentAliasProd:
+    Type: AWS::Bedrock::AgentAlias
+    Properties:
+      AgentAliasName: prod
+      AgentId: !Ref BedrockAgent
+      Description: "Production alias for RAG Agent"
+
+  #============================================================
+  # Api Gateway + Invocation Endpoint
+  #============================================================
+
+  AgentInvokeLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvName}-agent-invoke-role'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaInvokeBedrockAgent
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeAgent
+                Resource: !GetAtt BedrockAgentAliasProd.AgentAliasArn
+
+  AgentInvokeLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${EnvName}-rag-agent-lambda'
+      Handler: index.lambda_handler
+      Role: !GetAtt AgentInvokeLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      Environment:
+        Variables:
+          AGENT_ID: !Ref BedrockAgent
+          AGENT_ALIAS_ID: !GetAtt BedrockAgentAliasProd.AgentAliasId
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+
+          bedrock_agent_client = boto3.client("bedrock-agent-runtime")
+
+          def lambda_handler(event, context):
+              print("Event:", json.dumps(event))
+
+              try:
+                  body = json.loads(event.get("body", "{}"))
+                  user_input = body.get("input", "")
+                  session_id = body.get("sessionId", "default-session")
+
+                  if not user_input:
+                      return {
+                          "statusCode": 400,
+                          "body": json.dumps({"error": "Missing 'input' in request body"})
+                      }
+
+                  response = bedrock_agent_client.invoke_agent(
+                      agentId=os.environ["AGENT_ID"],
+                      agentAliasId=os.environ["AGENT_ALIAS_ID"],
+                      sessionId=session_id,
+                      inputText=user_input,
+                  )
+
+                  completion = ""
+
+                  for event in response.get("completion"):
+                          chunk = event["chunk"]
+                          completion = completion + chunk["bytes"].decode()
+
+                  return {
+                      "statusCode": 200,
+                      "headers": {"Content-Type": "application/json"},
+                      "body": json.dumps({"response": completion})
+                  }
+
+              except Exception as e:
+                  print(f"Error: {json.dumps({"error": str(e)})}")
+                  return {
+                      "statusCode": 500,
+                      "body": json.dumps({"error": str(e)})
+                  }
+
+  RestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${EnvName}-rag-agent-api'
+      Description: API for invoking Bedrock Agent
+
+  ApiResourceChat:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt RestApi.RootResourceId
+      RestApiId: !Ref RestApi
+      PathPart: chat
+
+  ApiMethodPostChat:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RestApi
+      ResourceId: !Ref ApiResourceChat
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        IntegrationHttpMethod: POST
+        Type: AWS_PROXY
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AgentInvokeLambda.Arn}/invocations'
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ApiMethodPostChat
+    Properties:
+      RestApiId: !Ref RestApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      StageName: prod
+      RestApiId: !Ref RestApi
+      DeploymentId: !Ref ApiDeployment
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt AgentInvokeLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RestApi}/*'
+
+Outputs:
+
+  AgentApiEndpoint:
+    Description: Endpoint for Bedrock Agent invocation
+    Value: !Sub 'https://${RestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/chat'
+    Export:
+      Name: !Sub '${EnvName}-rag-AgentApiUrl'

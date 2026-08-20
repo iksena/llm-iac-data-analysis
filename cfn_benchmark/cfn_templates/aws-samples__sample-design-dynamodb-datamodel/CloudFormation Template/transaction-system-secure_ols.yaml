@@ -1,0 +1,288 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Secure Transaction Processing System with DynamoDB and Lambda'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, prod]
+    Description: Environment name
+
+Resources:
+  # KMS Key for encryption
+  TransactionKMSKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS Key for Transaction System encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: 'kms:*'
+            Resource: '*'
+
+  TransactionKMSKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${Environment}-transaction-key
+      TargetKeyId: !Ref TransactionKMSKey
+
+  # DynamoDB Table with security enhancements
+  TransactionTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref TransactionKMSKey
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # Dead Letter Queue for Lambda
+  LambdaDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Environment}-transaction-dlq
+      KmsMasterKeyId: !Ref TransactionKMSKey
+
+  # CloudWatch Log Group for API Gateway
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${Environment}-transaction-api
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt TransactionKMSKey.Arn
+
+  # Lambda Execution Role with managed policies
+  TransactionLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Separate managed policy for DynamoDB access
+  DynamoDBAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - dynamodb:PutItem
+              - dynamodb:BatchWriteItem
+              - dynamodb:GetItem
+              - dynamodb:Query
+              - dynamodb:UpdateItem
+              - dynamodb:DeleteItem
+              - dynamodb:TransactWriteItems
+            Resource:
+              - !GetAtt TransactionTable.Arn
+              - !Sub "${TransactionTable.Arn}/index/*"
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt LambdaDLQ.Arn
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: !GetAtt TransactionKMSKey.Arn
+      Roles:
+        - !Ref TransactionLambdaRole
+
+  # Transaction Processing Lambda with security enhancements
+  TransactionProcessingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${Environment}-transaction-processor
+      Handler: index.lambda_handler
+      Role: !GetAtt TransactionLambdaRole.Arn
+      ReservedConcurrentExecutions: 10
+      DeadLetterConfig:
+        TargetArn: !GetAtt LambdaDLQ.Arn
+      KmsKeyArn: !GetAtt TransactionKMSKey.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          import uuid
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+
+          # Initialize DynamoDB client
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DYNAMODB_TABLE_NAME'])
+
+          def create_transaction(transaction_data):
+              """Create a new transaction record"""
+              transaction_id = str(uuid.uuid4())
+              timestamp = datetime.utcnow().isoformat()
+
+              try:
+                  item = {
+                      'PK': f"TRANS#{transaction_id}",
+                      'SK': 'METADATA',
+                      'customerId': f"CUST#{transaction_data['customer_id']}",
+                      'status': transaction_data.get('status', 'PENDING'),
+                      'creationTime': timestamp,
+                      'transactionType': transaction_data.get('transaction_type'),
+                      'deliveryId': f"DEL#{str(uuid.uuid4())}" if 'delivery_id' not in transaction_data else f"DEL#{transaction_data['delivery_id']}",
+                      'entityType': 'TRANSACTION',
+                      'GSI1PK': f"CUST#{transaction_data['customer_id']}",
+                      'GSI1SK': f"TRANS#{timestamp}"
+                  }
+
+                  table.put_item(Item=item)
+                  return item
+
+              except ClientError as e:
+                  print(f"Error creating transaction: {e.response['Error']['Message']}")
+                  raise
+
+          def lambda_handler(event, context):
+              """Main Lambda handler"""
+              try:
+                  # Parse the incoming event
+                  body = json.loads(event['body']) if isinstance(event.get('body'), str) else event.get('body', {})
+
+                  operation = body.get('operation')
+                  data = body.get('data', {})
+
+                  if operation == 'create_transaction':
+                      result = create_transaction(data)
+                      response = {
+                          'transaction_id': result['PK'].split('#')[1],
+                          'delivery_id': result['deliveryId'].split('#')[1]
+                      }
+                  else:
+                      return {
+                          'statusCode': 400,
+                          'body': json.dumps({'error': 'Invalid operation'})
+                      }
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(response)
+                  }
+
+              except Exception as e:
+                  print(f"Error processing request: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          DYNAMODB_TABLE_NAME: !Ref TransactionTable
+
+  # API Gateway with security enhancements
+  TransactionApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub ${Environment}-transaction-api
+      TracingConfig:
+        TracingEnabled: true
+
+  # API Gateway Authorizer (using AWS_IAM for security)
+  TransactionApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TransactionApi
+      ParentId: !GetAtt TransactionApi.RootResourceId
+      PathPart: transaction
+
+  TransactionApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TransactionApi
+      ResourceId: !Ref TransactionApiResource
+      HttpMethod: POST
+      AuthorizationType: AWS_IAM
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${TransactionProcessingFunction.Arn}/invocations
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: TransactionApiMethod
+    Properties:
+      RestApiId: !Ref TransactionApi
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ApiDeployment
+      RestApiId: !Ref TransactionApi
+      StageName: !Ref Environment
+      TracingConfig:
+        TracingEnabled: true
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength"}'
+      CacheClusterEnabled: true
+      CacheClusterSize: '0.5'
+
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt TransactionProcessingFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TransactionApi}/*/*/*
+
+Outputs:
+  ApiEndpoint:
+    Description: API Endpoint URL
+    Value: !Sub https://${TransactionApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/transaction
+
+  TableName:
+    Description: DynamoDB Table Name
+    Value: !Ref TransactionTable
+
+  LambdaFunction:
+    Description: Lambda Function ARN
+    Value: !GetAtt TransactionProcessingFunction.Arn
+
+  KMSKeyId:
+    Description: KMS Key ID for encryption
+    Value: !Ref TransactionKMSKey

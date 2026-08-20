@@ -1,0 +1,1075 @@
+# Companion code for "The Backend of Luck" - Chapter 24, Security and Compliance.
+# https://thebackendofluck.com | https://github.com/thebackendofluck/book
+# SPDX-License-Identifier: Apache-2.0
+#
+# FOR TESTING AND EVALUATION ONLY. NOT FOR PRODUCTION USE.
+# Published to demonstrate the patterns explained in the book. This code is
+# not certified for real-money gaming: operating a gambling platform requires
+# your own licence, independent test-lab certification (GLI, eCOGRA or
+# equivalent) and regulator approval.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  iGaming IP Detection Pipeline — 8-gate security filter.
+  Resources: Lambda, API Gateway, DynamoDB (4 tables), S3, WAF, IAM, CloudWatch, SNS, ElastiCache.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: Deployment environment
+
+  LambdaMemorySize:
+    Type: Number
+    Default: 512
+    MinValue: 256
+    MaxValue: 3008
+    Description: Lambda memory in MB (higher = more CPU, faster GeoIP lookups)
+
+  LambdaTimeout:
+    Type: Number
+    Default: 10
+    MinValue: 3
+    MaxValue: 29
+    Description: Lambda timeout in seconds (must be < API GW 29s limit)
+
+  FraudScoreThreshold:
+    Type: Number
+    Default: 75
+    Description: Fraud score above which requests are blocked (0-100)
+
+  FraudReviewThreshold:
+    Type: Number
+    Default: 50
+    Description: Fraud score above which requests are flagged for review (0-100)
+
+  IPReputationApiKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: IPQualityScore API key (leave blank to use ip-api.com fallback)
+
+  ElastiCacheEnabled:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Deploy ElastiCache Redis for velocity tracking
+
+  ElastiCacheNodeType:
+    Type: String
+    Default: cache.t4g.micro
+    Description: ElastiCache node type (only used when ElastiCacheEnabled=true)
+
+  KmsKeyArn:
+    Type: String
+    Default: ""
+    Description: Optional KMS key ARN for DynamoDB + S3 encryption. Leave blank for AWS-managed keys.
+
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email address for SNS security alert notifications (optional)
+
+  MaxMindLicenseKey:
+    Type: String
+    NoEcho: true
+    Default: ""
+    Description: MaxMind license key for GeoLite2 database downloads
+
+# ---------------------------------------------------------------------------
+# Conditions
+# ---------------------------------------------------------------------------
+Conditions:
+  IsProd: !Equals [!Ref Environment, production]
+  UseCustomKMS: !Not [!Equals [!Ref KmsKeyArn, ""]]
+  EnableElastiCache: !Equals [!Ref ElastiCacheEnabled, "true"]
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # =========================================================================
+  # S3 Bucket — GeoIP databases + OFAC SDN list
+  # =========================================================================
+  GeoIPBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "igaming-geoip-${AWS::AccountId}-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseCustomKMS, aws:kms, AES256]
+              KMSMasterKeyID: !If [UseCustomKMS, !Ref KmsKeyArn, !Ref AWS::NoValue]
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+        - Key: Environment
+          Value: !Ref Environment
+
+  SanctionsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "igaming-sanctions-${AWS::AccountId}-${Environment}"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: !If [UseCustomKMS, aws:kms, AES256]
+              KMSMasterKeyID: !If [UseCustomKMS, !Ref KmsKeyArn, !Ref AWS::NoValue]
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldSdnVersions
+            Status: Enabled
+            NoncurrentVersionExpiration:
+              NoncurrentDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+        - Key: DataClassification
+          Value: Restricted
+
+  # =========================================================================
+  # DynamoDB Tables
+  # =========================================================================
+
+  # Table 1: IP Blacklist
+  IPBlacklistTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "ip-blacklist-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ip_address
+          AttributeType: S
+        - AttributeName: reason
+          AttributeType: S
+        - AttributeName: added_at
+          AttributeType: "N"
+      KeySchema:
+        - AttributeName: ip_address
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: reason-code-index
+          KeySchema:
+            - AttributeName: reason
+              KeyType: HASH
+            - AttributeName: added_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: !If [UseCustomKMS, KMS, AWS_OWNED_KMS]
+        KMSMasterKeyId: !If [UseCustomKMS, !Ref KmsKeyArn, !Ref AWS::NoValue]
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+        - Key: Component
+          Value: ip-blacklist
+
+  # Table 2: Device Fingerprints
+  DeviceFingerprintTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "device-fingerprints-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: fingerprint_id
+          AttributeType: S
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: ip_address
+          AttributeType: S
+        - AttributeName: seen_at
+          AttributeType: "N"
+      KeySchema:
+        - AttributeName: fingerprint_id
+          KeyType: HASH
+        - AttributeName: seen_at
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: user-fp-index
+          KeySchema:
+            - AttributeName: user_id
+              KeyType: HASH
+            - AttributeName: seen_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: ip-fp-index
+          KeySchema:
+            - AttributeName: ip_address
+              KeyType: HASH
+            - AttributeName: seen_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - fingerprint_id
+              - user_id
+              - anomaly_type
+        - IndexName: fp-users-index
+          KeySchema:
+            - AttributeName: fingerprint_id
+              KeyType: HASH
+            - AttributeName: seen_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - user_id
+        - IndexName: fp-ip-index
+          KeySchema:
+            - AttributeName: fingerprint_id
+              KeyType: HASH
+            - AttributeName: seen_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - ip_address
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: !If [UseCustomKMS, KMS, AWS_OWNED_KMS]
+        KMSMasterKeyId: !If [UseCustomKMS, !Ref KmsKeyArn, !Ref AWS::NoValue]
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+        - Key: Component
+          Value: device-fingerprints
+
+  # Table 3: KYC Status
+  KYCStatusTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "kyc-status-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: kyc_status
+          AttributeType: S
+        - AttributeName: verified_at
+          AttributeType: "N"
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: kyc_status
+              KeyType: HASH
+            - AttributeName: verified_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes:
+              - user_id
+              - kyc_level
+              - expires_at
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: !If [UseCustomKMS, KMS, AWS_OWNED_KMS]
+        KMSMasterKeyId: !If [UseCustomKMS, !Ref KmsKeyArn, !Ref AWS::NoValue]
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+        - Key: Component
+          Value: kyc-status
+        - Key: DataClassification
+          Value: PII
+
+  # Table 4: Tor Exit Nodes
+  TorExitNodesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "tor-exit-nodes-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ip_address
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ip_address
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+        - Key: Component
+          Value: tor-exits
+
+  # Table 5: Known Proxies
+  KnownProxiesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "known-proxies-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ip_address
+          AttributeType: S
+        - AttributeName: proxy_type
+          AttributeType: S
+        - AttributeName: added_at
+          AttributeType: "N"
+      KeySchema:
+        - AttributeName: ip_address
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: proxy-type-index
+          KeySchema:
+            - AttributeName: proxy_type
+              KeyType: HASH
+            - AttributeName: added_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+        - Key: Component
+          Value: known-proxies
+
+  # =========================================================================
+  # SNS Topic for security alerts
+  # =========================================================================
+  SecurityAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "igaming-security-alerts-${Environment}"
+      KmsMasterKeyId: !If [UseCustomKMS, !Ref KmsKeyArn, "alias/aws/sns"]
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+
+  SecurityAlertEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref SecurityAlertTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # =========================================================================
+  # IAM Role for Lambda
+  # =========================================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "igaming-ip-gate-lambda-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: IPGateLambdaPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CloudWatch Logs
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/igaming-ip-gate-*:*"
+
+              # DynamoDB — all 5 tables
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:BatchWriteItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:DescribeTable
+                Resource:
+                  - !GetAtt IPBlacklistTable.Arn
+                  - !Sub "${IPBlacklistTable.Arn}/index/*"
+                  - !GetAtt DeviceFingerprintTable.Arn
+                  - !Sub "${DeviceFingerprintTable.Arn}/index/*"
+                  - !GetAtt KYCStatusTable.Arn
+                  - !Sub "${KYCStatusTable.Arn}/index/*"
+                  - !GetAtt TorExitNodesTable.Arn
+                  - !GetAtt KnownProxiesTable.Arn
+                  - !Sub "${KnownProxiesTable.Arn}/index/*"
+
+              # S3 — GeoIP + Sanctions buckets
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:HeadObject
+                Resource:
+                  - !Sub "${GeoIPBucket.Arn}/*"
+                  - !Sub "${SanctionsBucket.Arn}/*"
+
+              # S3 list (for bucket enumeration)
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt GeoIPBucket.Arn
+                  - !GetAtt SanctionsBucket.Arn
+
+              # SNS publish
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SecurityAlertTopic
+
+              # WAF IP set management
+              - Effect: Allow
+                Action:
+                  - wafv2:GetIPSet
+                  - wafv2:UpdateIPSet
+                  - wafv2:ListIPSets
+                Resource: "*"
+
+              # CloudWatch custom metrics
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                Resource: "*"
+
+              # SSM Parameter Store — for secrets (API keys)
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/igaming/*"
+
+              # KMS decrypt (for SSM SecureString + DynamoDB + S3)
+              - !If
+                - UseCustomKMS
+                - Effect: Allow
+                  Action:
+                    - kms:Decrypt
+                    - kms:GenerateDataKey
+                  Resource: !Ref KmsKeyArn
+                - !Ref AWS::NoValue
+
+  # =========================================================================
+  # Lambda Functions
+  # =========================================================================
+
+  # Main IP gate Lambda
+  IPGateLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "igaming-ip-gate-${Environment}"
+      Runtime: python3.12
+      Handler: lambda_ip_gate.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: !Ref LambdaMemorySize
+      Timeout: !Ref LambdaTimeout
+      ReservedConcurrentExecutions: !If [IsProd, 200, 20]
+      Code:
+        S3Bucket: !Sub "igaming-lambda-artifacts-${AWS::AccountId}"
+        S3Key: !Sub "ip-gate/${Environment}/lambda.zip"
+      Environment:
+        Variables:
+          AWS_REGION_NAME: !Ref AWS::Region
+          MAXMIND_DB_BUCKET: !Ref GeoIPBucket
+          MAXMIND_ASN_KEY: GeoLite2-ASN.mmdb
+          MAXMIND_CITY_KEY: GeoLite2-City.mmdb
+          BLACKLIST_TABLE: !Ref IPBlacklistTable
+          DEVICE_FP_TABLE: !Ref DeviceFingerprintTable
+          KYC_TABLE: !Ref KYCStatusTable
+          SDN_BUCKET: !Ref SanctionsBucket
+          SDN_KEY: ofac/sdn_advanced.xml
+          SNS_ALERT_TOPIC: !Ref SecurityAlertTopic
+          FRAUD_SCORE_THRESHOLD: !Ref FraudScoreThreshold
+          FRAUD_REVIEW_THRESHOLD: !Ref FraudReviewThreshold
+          ELASTICACHE_ENDPOINT: !If
+            - EnableElastiCache
+            - !Sub "${ElastiCacheCluster.RedisEndpoint.Address}:${ElastiCacheCluster.RedisEndpoint.Port}"
+            - ""
+          LOG_LEVEL: !If [IsProd, INFO, DEBUG]
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:layer:igaming-deps:1"
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+        - Key: Environment
+          Value: !Ref Environment
+
+  # SDN refresh Lambda (scheduled)
+  SDNRefreshLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "igaming-sdn-refresh-${Environment}"
+      Runtime: python3.12
+      Handler: s3_sanctions_checker.refresh_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      MemorySize: 512
+      Timeout: 300
+      Code:
+        S3Bucket: !Sub "igaming-lambda-artifacts-${AWS::AccountId}"
+        S3Key: !Sub "ip-gate/${Environment}/lambda.zip"
+      Environment:
+        Variables:
+          SDN_BUCKET: !Ref SanctionsBucket
+          SDN_KEY: ofac/sdn_advanced.xml
+          AWS_REGION_NAME: !Ref AWS::Region
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+
+  # EventBridge rule: refresh SDN daily at 02:00 UTC
+  SDNRefreshSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "igaming-sdn-refresh-${Environment}"
+      Description: "Daily OFAC SDN list refresh"
+      ScheduleExpression: "cron(0 2 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Id: SDNRefreshLambda
+          Arn: !GetAtt SDNRefreshLambda.Arn
+
+  SDNRefreshPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SDNRefreshLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt SDNRefreshSchedule.Arn
+
+  # Lambda log groups with retention
+  IPGateLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/igaming-ip-gate-${Environment}"
+      RetentionInDays: !If [IsProd, 365, 30]
+
+  SDNRefreshLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/igaming-sdn-refresh-${Environment}"
+      RetentionInDays: 90
+
+  # =========================================================================
+  # API Gateway (HTTP API v2)
+  # =========================================================================
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "igaming-ip-gate-${Environment}"
+      ProtocolType: HTTP
+      Description: "iGaming IP detection pipeline — 8-gate security filter"
+      CorsConfiguration:
+        AllowMethods:
+          - POST
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - X-User-ID
+          - X-Session-ID
+          - Authorization
+        AllowOrigins:
+          - "*"
+        MaxAge: 300
+      Tags:
+        Service: igaming-ip-gate
+        Environment: !Ref Environment
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt IPGateLambda.Arn
+      PayloadFormatVersion: "2.0"
+      TimeoutInMillis: 29000
+
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "POST /check"
+      Target: !Sub "integrations/${HttpApiIntegration}"
+
+  HttpApiHealthRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: "GET /health"
+      Target: !Sub "integrations/${HttpApiIntegration}"
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: !Ref Environment
+      AutoDeploy: true
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 1000
+        ThrottlingRateLimit: 500
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiGatewayLogGroup.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp",
+          "requestTime":"$context.requestTime","httpMethod":"$context.httpMethod",
+          "routeKey":"$context.routeKey","status":"$context.status",
+          "protocol":"$context.protocol","responseLength":"$context.responseLength",
+          "integrationLatency":"$context.integrationLatency",
+          "responseLatency":"$context.responseLatency"}
+
+  HttpApiLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref IPGateLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*"
+
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/igaming-ip-gate-${Environment}"
+      RetentionInDays: !If [IsProd, 90, 14]
+
+  # =========================================================================
+  # AWS WAF Web ACL + IP Set
+  # =========================================================================
+  WAFBlockedIPSet:
+    Type: AWS::WAFv2::IPSet
+    Properties:
+      Name: !Sub "igaming-blocked-ips-${Environment}"
+      Scope: REGIONAL
+      IPAddressVersion: IPV4
+      Addresses: []
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+
+  WAFWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "igaming-ip-gate-acl-${Environment}"
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      Description: "iGaming IP gate WAF: blocks known bad IPs at edge"
+      Rules:
+        - Name: BlockListedIPs
+          Priority: 0
+          Statement:
+            IPSetReferenceStatement:
+              Arn: !GetAtt WAFBlockedIPSet.Arn
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: BlockListedIPs
+
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+              ExcludedRules:
+                - Name: SizeRestrictions_BODY
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesKnownBadInputsRuleSet
+
+        - Name: RateLimitPerIP
+          Priority: 3
+          Statement:
+            RateBasedStatement:
+              Limit: 1000
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitPerIP
+
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "igaming-ip-gate-${Environment}"
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Associate WAF WebACL with API Gateway
+  WAFWebACLAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Properties:
+      WebACLArn: !GetAtt WAFWebACL.Arn
+      ResourceArn: !Sub "arn:aws:apigateway:${AWS::Region}::/restapis/${HttpApi}/stages/${Environment}"
+
+  # =========================================================================
+  # ElastiCache Redis (optional, for velocity tracking)
+  # =========================================================================
+  ElastiCacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Condition: EnableElastiCache
+    Properties:
+      Description: "iGaming IP gate Redis subnet group"
+      SubnetIds: !Split [",", !Sub "{{resolve:ssm:/igaming/${Environment}/private-subnet-ids}}"]
+
+  ElastiCacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: EnableElastiCache
+    Properties:
+      GroupDescription: "ElastiCache Redis for iGaming IP gate"
+      VpcId: !Sub "{{resolve:ssm:/igaming/${Environment}/vpc-id}}"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: EnableElastiCache
+    Properties:
+      GroupDescription: "Lambda for iGaming IP gate"
+      VpcId: !Sub "{{resolve:ssm:/igaming/${Environment}/vpc-id}}"
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+
+  ElastiCacheCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Condition: EnableElastiCache
+    Properties:
+      ReplicationGroupDescription: "iGaming IP gate velocity tracker"
+      Engine: redis
+      EngineVersion: "7.1"
+      CacheNodeType: !Ref ElastiCacheNodeType
+      NumCacheClusters: !If [IsProd, 2, 1]
+      AutomaticFailoverEnabled: !If [IsProd, true, false]
+      MultiAZEnabled: !If [IsProd, true, false]
+      CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
+      SecurityGroupIds:
+        - !Ref ElastiCacheSecurityGroup
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      SnapshotRetentionLimit: 7
+      SnapshotWindow: "03:00-04:00"
+      Tags:
+        - Key: Service
+          Value: igaming-ip-gate
+
+  # =========================================================================
+  # CloudWatch Alarms
+  # =========================================================================
+
+  # Alert: Lambda error rate too high
+  LambdaErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "igaming-ip-gate-error-rate-${Environment}"
+      AlarmDescription: "Lambda error rate > 1% over 5 minutes"
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IPGateLambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+
+  # Alert: Lambda P99 latency too high
+  LambdaLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "igaming-ip-gate-latency-${Environment}"
+      AlarmDescription: "Lambda P99 duration > 8000ms"
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IPGateLambda
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 8000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+
+  # Alert: high block rate (possible DDoS or misconfiguration)
+  HighBlockRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "igaming-ip-gate-high-block-rate-${Environment}"
+      AlarmDescription: "WAF block rate > 500 per minute"
+      MetricName: BlockedRequests
+      Namespace: AWS/WAFV2
+      Dimensions:
+        - Name: WebACL
+          Value: !Ref WAFWebACL
+        - Name: Region
+          Value: !Ref AWS::Region
+        - Name: Rule
+          Value: ALL
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 500
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+
+  # Alert: Lambda throttling
+  LambdaThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "igaming-ip-gate-throttles-${Environment}"
+      AlarmDescription: "Lambda throttle count > 0"
+      MetricName: Throttles
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IPGateLambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+
+  # Alert: DynamoDB blacklist write failures
+  BlacklistWriteErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "igaming-blacklist-write-errors-${Environment}"
+      AlarmDescription: "DynamoDB write errors on ip-blacklist table"
+      MetricName: WriteThrottleEvents
+      Namespace: AWS/DynamoDB
+      Dimensions:
+        - Name: TableName
+          Value: !Ref IPBlacklistTable
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref SecurityAlertTopic
+
+  # =========================================================================
+  # CloudWatch Dashboard
+  # =========================================================================
+  IPGateDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "igaming-ip-gate-${Environment}"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Lambda Invocations & Errors",
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", "FunctionName", "${IPGateLambda}"],
+                  ["AWS/Lambda", "Errors", "FunctionName", "${IPGateLambda}"],
+                  ["AWS/Lambda", "Throttles", "FunctionName", "${IPGateLambda}"]
+                ],
+                "period": 60,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "Lambda Latency (P50 / P95 / P99)",
+                "metrics": [
+                  ["AWS/Lambda", "Duration", "FunctionName", "${IPGateLambda}", {"stat": "p50"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${IPGateLambda}", {"stat": "p95"}],
+                  ["AWS/Lambda", "Duration", "FunctionName", "${IPGateLambda}", {"stat": "p99"}]
+                ],
+                "period": 60,
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "WAF Blocked Requests",
+                "metrics": [
+                  ["AWS/WAFV2", "BlockedRequests", "WebACL", "${WAFWebACL}", "Region", "${AWS::Region}", "Rule", "ALL"]
+                ],
+                "period": 60,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "title": "DynamoDB Consumed Capacity",
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${IPBlacklistTable}"],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${IPBlacklistTable}"],
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", "TableName", "${DeviceFingerprintTable}"],
+                  ["AWS/DynamoDB", "ConsumedWriteCapacityUnits", "TableName", "${DeviceFingerprintTable}"]
+                ],
+                "period": 60,
+                "stat": "Sum",
+                "view": "timeSeries"
+              }
+            }
+          ]
+        }
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL"
+    Value: !Sub "https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/check"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiEndpoint"
+
+  IPGateLambdaArn:
+    Description: "IP Gate Lambda function ARN"
+    Value: !GetAtt IPGateLambda.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaArn"
+
+  IPBlacklistTableName:
+    Description: "DynamoDB IP Blacklist table name"
+    Value: !Ref IPBlacklistTable
+    Export:
+      Name: !Sub "${AWS::StackName}-BlacklistTable"
+
+  DeviceFingerprintTableName:
+    Description: "DynamoDB Device Fingerprint table name"
+    Value: !Ref DeviceFingerprintTable
+    Export:
+      Name: !Sub "${AWS::StackName}-FingerprintTable"
+
+  KYCTableName:
+    Description: "DynamoDB KYC Status table name"
+    Value: !Ref KYCStatusTable
+    Export:
+      Name: !Sub "${AWS::StackName}-KYCTable"
+
+  GeoIPBucketName:
+    Description: "S3 bucket for MaxMind GeoIP databases"
+    Value: !Ref GeoIPBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-GeoIPBucket"
+
+  SanctionsBucketName:
+    Description: "S3 bucket for OFAC SDN list"
+    Value: !Ref SanctionsBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-SanctionsBucket"
+
+  WAFBlockedIPSetId:
+    Description: "WAF IP Set ID for blocked IPs"
+    Value: !GetAtt WAFBlockedIPSet.Id
+    Export:
+      Name: !Sub "${AWS::StackName}-WAFIPSetId"
+
+  WAFWebACLArn:
+    Description: "WAF WebACL ARN"
+    Value: !GetAtt WAFWebACL.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-WAFWebACLArn"
+
+  SecurityAlertTopicArn:
+    Description: "SNS topic ARN for security alerts"
+    Value: !Ref SecurityAlertTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-AlertTopic"

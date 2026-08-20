@@ -1,0 +1,203 @@
+Description: Lambda function for SSM command execution waiter
+
+Parameters:
+  StackPrefix:
+    Type: String
+
+Resources:
+  SSMWaiterRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W11
+            reason: "Wildcard resource required for SSM GetCommandInvocation and ListCommandInvocations - these actions do not support resource-level permissions per AWS SSM API documentation"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SSMAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                Resource:
+                  - !Sub 'arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/*'
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:document/*'
+                  - 'arn:aws:ssm:*:*:document/AWS-*'
+              - Effect: Allow
+                Action:
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                Resource: '*'
+
+  SSMWaiterFunction:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "CloudFormation custom resource function only calls AWS SSM API, does not require VPC access"
+          - id: W92
+            reason: "CloudFormation custom resource with low invocation frequency, reserved concurrency not required"
+      checkov:
+        skip:
+          - id: CKV_AWS_116
+            comment: "DLQ not required for CloudFormation custom resource"
+          - id: CKV_AWS_117
+            comment: "Lambda only calls AWS APIs, no VPC access required"
+          - id: W92
+            reason: "CloudFormation custom resource with low invocation frequency, reserved concurrency not required"
+          - id: W92
+            reason: "CloudFormation custom resource with low invocation frequency, reserved concurrency not required"
+      checkov:
+        skip:
+          - id: CKV_AWS_116
+            comment: "DLQ not required for CloudFormation custom resource"
+          - id: CKV_AWS_117
+            comment: "Lambda only calls AWS APIs, no VPC access required"
+    Properties:
+      FunctionName: !Sub '${StackPrefix}-ssm-waiter'
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt SSMWaiterRole.Arn
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import time
+          from datetime import datetime
+          from botocore.exceptions import ClientError
+
+          ssm = boto3.client('ssm')
+
+          def handler(event, context):
+              start_time = datetime.utcnow()
+              try:
+                  request_type = event['RequestType']
+
+                  if request_type == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  if request_type in ['Create', 'Update']:
+                      props = event['ResourceProperties']
+                      document_name = props['DocumentName']
+                      instance_id = props['InstanceId']
+                      parameters = props.get('Parameters', {})
+                      timeout = int(props.get('Timeout', 600))
+
+                      print(f"=== Lambda Invocation Start ===")
+                      print(f"Timestamp: {start_time.isoformat()}Z")
+                      print(f"Document: {document_name}")
+                      print(f"InstanceId: {instance_id}")
+                      print(f"Timeout: {timeout}s")
+                      print(f"Parameters: {list(parameters.keys())}")
+
+                      # Send command with retry for InvalidInstanceId
+                      command_id = None
+                      cmd_start = datetime.utcnow()
+                      for attempt in range(5):
+                          try:
+                              response = ssm.send_command(
+                                  InstanceIds=[instance_id],
+                                  DocumentName=document_name,
+                                  Parameters=parameters,
+                                  TimeoutSeconds=timeout
+                              )
+                              command_id = response['Command']['CommandId']
+                              print(f"SSM command sent: {command_id}")
+                              break
+                          except ClientError as e:
+                              if e.response['Error']['Code'] == 'InvalidInstanceId' and attempt < 4:
+                                  print(f"InvalidInstanceId error on attempt {attempt + 1}, sleeping 60s before retry")
+                                  time.sleep(60)
+                              else:
+                                  raise
+
+                      # Wait for completion
+                      poll_start = time.time()
+                      while time.time() - poll_start < timeout:
+                          try:
+                              invocation = ssm.get_command_invocation(
+                                  CommandId=command_id,
+                                  InstanceId=instance_id
+                              )
+
+                              status = invocation['Status']
+
+                              if status == 'Success':
+                                  end_time = datetime.utcnow()
+                                  duration = (end_time - start_time).total_seconds()
+                                  print(f"=== Lambda Invocation Complete ===")
+                                  print(f"Document: {document_name}")
+                                  print(f"InstanceId: {instance_id}")
+                                  print(f"End Time: {end_time.isoformat()}Z")
+                                  print(f"Duration: {duration:.2f}s")
+                                  print(f"Status: SUCCESS")
+                                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                                      'CommandId': command_id,
+                                      'Status': status
+                                  })
+                                  return
+                              elif status in ['Failed', 'Cancelled', 'TimedOut']:
+                                  end_time = datetime.utcnow()
+                                  duration = (end_time - start_time).total_seconds()
+                                  error_msg = invocation.get('StandardErrorContent', 'Command failed')
+                                  print(f"=== Lambda Invocation Failed ===")
+                                  print(f"Document: {document_name}")
+                                  print(f"InstanceId: {instance_id}")
+                                  print(f"End Time: {end_time.isoformat()}Z")
+                                  print(f"Duration: {duration:.2f}s")
+                                  print(f"Status: {status}")
+                                  print(f"Error: {error_msg}")
+                                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                                      'CommandId': command_id,
+                                      'Status': status,
+                                      'Error': error_msg
+                                  })
+                                  return
+
+                              time.sleep(10)
+                          except ssm.exceptions.InvocationDoesNotExist:
+                              time.sleep(5)
+
+                      # Timeout
+                      end_time = datetime.utcnow()
+                      duration = (end_time - start_time).total_seconds()
+                      print(f"=== Lambda Invocation Timeout ===")
+                      print(f"Document: {document_name}")
+                      print(f"InstanceId: {instance_id}")
+                      print(f"End Time: {end_time.isoformat()}Z")
+                      print(f"Duration: {duration:.2f}s")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {
+                          'CommandId': command_id,
+                          'Error': 'Timeout waiting for command completion'
+                      })
+
+              except Exception as e:
+                  end_time = datetime.utcnow()
+                  duration = (end_time - start_time).total_seconds()
+                  print(f"=== Lambda Invocation Error ===")
+                  print(f"End Time: {end_time.isoformat()}Z")
+                  print(f"Duration: {duration:.2f}s")
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+
+Outputs:
+  SSMWaiterFunctionArn:
+    Value: !GetAtt SSMWaiterFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-SSMWaiterFunctionArn'

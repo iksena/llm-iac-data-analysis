@@ -1,0 +1,588 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Mainnet Reth + Lighthouse single-node deployment.
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: m7i.xlarge
+    Description: EC2 instance type for the mainnet node.
+    AllowedValues:
+      - m7i.large
+      - m7i.xlarge
+      - m7i.2xlarge
+      - m7a.xlarge
+      - m7a.2xlarge
+      - c7a.xlarge
+      - c7a.2xlarge
+  VolumeSizeGb:
+    Type: Number
+    Default: 2000
+    MinValue: 1200
+    Description: Size of the gp3 EBS data volume mounted at /opt/ethereum.
+  VolumeIops:
+    Type: Number
+    Default: 12000
+    MinValue: 3000
+    MaxValue: 16000
+    Description: Provisioned gp3 IOPS for the data volume.
+  VolumeThroughput:
+    Type: Number
+    Default: 500
+    MinValue: 125
+    MaxValue: 1000
+    Description: Provisioned gp3 throughput in MiB/s for the data volume.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: Existing VPC where the node instance will run.
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: Existing subnet where the node instance will run.
+  AvailabilityZone:
+    Type: AWS::EC2::AvailabilityZone::Name
+    Description: Availability Zone for the node instance and data volume. Must match the selected subnet.
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI from SSM Parameter Store.
+  LogRetentionDays:
+    Type: Number
+    Default: 14
+    Description: Number of days to keep boot and bootstrap logs in CloudWatch Logs.
+    AllowedValues:
+      - 1
+      - 3
+      - 7
+      - 14
+      - 30
+      - 60
+      - 90
+Resources:
+  NodeLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /${AWS::StackName}/ethereum-node
+      RetentionInDays: !Ref LogRetentionDays
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for the Reth/Lighthouse mainnet node.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 30303
+          ToPort: 30303
+          CidrIp: 0.0.0.0/0
+          Description: Reth execution p2p TCP.
+        - IpProtocol: udp
+          FromPort: 30303
+          ToPort: 30303
+          CidrIp: 0.0.0.0/0
+          Description: Reth execution p2p UDP.
+        - IpProtocol: tcp
+          FromPort: 9000
+          ToPort: 9000
+          CidrIp: 0.0.0.0/0
+          Description: Lighthouse consensus p2p TCP.
+        - IpProtocol: udp
+          FromPort: 9000
+          ToPort: 9000
+          CidrIp: 0.0.0.0/0
+          Description: Lighthouse consensus p2p UDP.
+        - IpProtocol: udp
+          FromPort: 9001
+          ToPort: 9001
+          CidrIp: 0.0.0.0/0
+          Description: Lighthouse consensus QUIC p2p UDP.
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow outbound traffic for packages, SSM, and peer discovery.
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-node-sg
+
+  NodeInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-instance-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-instance-role
+
+  NodeInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${AWS::StackName}-instance-profile
+      Roles:
+        - !Ref NodeInstanceRole
+
+  NodeInstance:
+    Type: AWS::EC2::Instance
+    DependsOn:
+      - NodeDataVolume
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref NodeInstanceProfile
+      SubnetId: !Ref SubnetId
+      AvailabilityZone: !Ref AvailabilityZone
+      SecurityGroupIds:
+        - !Ref NodeSecurityGroup
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+        InstanceMetadataTags: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-mainnet-node
+        - Key: CloudWatchLogGroup
+          Value: !Ref NodeLogGroup
+      UserData:
+        Fn::Base64: |
+          #!/usr/bin/env bash
+          set -euxo pipefail
+
+          dnf install -y amazon-cloudwatch-agent || true
+
+          metadata_token="$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600" || true)"
+          if [[ -n "$metadata_token" ]]; then
+            cloudwatch_log_group="$(curl -fsS -H "X-aws-ec2-metadata-token: $metadata_token" "http://169.254.169.254/latest/meta-data/tags/instance/CloudWatchLogGroup" || true)"
+          else
+            cloudwatch_log_group=""
+          fi
+
+          if [[ -n "$cloudwatch_log_group" && -x /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl ]]; then
+            install -d -m 0755 /opt/aws/amazon-cloudwatch-agent/etc
+            touch /var/log/ethereum-bootstrap.log /var/log/ethereum-status.log
+            cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<CWAGENT
+          {
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/cloud-init.log",
+                      "log_group_name": "$cloudwatch_log_group",
+                      "log_stream_name": "{instance_id}/cloud-init"
+                    },
+                    {
+                      "file_path": "/var/log/cloud-init-output.log",
+                      "log_group_name": "$cloudwatch_log_group",
+                      "log_stream_name": "{instance_id}/cloud-init-output"
+                    },
+                    {
+                      "file_path": "/var/log/ethereum-bootstrap.log",
+                      "log_group_name": "$cloudwatch_log_group",
+                      "log_stream_name": "{instance_id}/ethereum-bootstrap"
+                    },
+                    {
+                      "file_path": "/var/log/ethereum-status.log",
+                      "log_group_name": "$cloudwatch_log_group",
+                      "log_stream_name": "{instance_id}/ethereum-status"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+          CWAGENT
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config \
+              -m ec2 \
+              -s \
+              -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json || true
+          fi
+
+          dnf update -y
+          dnf install -y docker jq tar gzip openssl xfsprogs
+          dnf install -y docker-compose-plugin || true
+
+          if ! docker compose version >/dev/null 2>&1; then
+            mkdir -p /usr/local/libexec/docker/cli-plugins
+            arch="$(uname -m)"
+            case "$arch" in
+              x86_64) compose_arch="x86_64" ;;
+              aarch64) compose_arch="aarch64" ;;
+              *) echo "Unsupported architecture for Docker Compose: $arch" >&2; exit 1 ;;
+            esac
+            curl -fsSL "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${compose_arch}" \
+              -o /usr/local/libexec/docker/cli-plugins/docker-compose
+            chmod +x /usr/local/libexec/docker/cli-plugins/docker-compose
+          fi
+
+          systemctl enable --now docker
+
+          cat > /usr/local/sbin/ethereum-bootstrap.sh <<'BOOTSTRAP'
+          #!/usr/bin/env bash
+          set -euxo pipefail
+
+          data_label="${ETHEREUM_DATA_LABEL:-ETHDATA}"
+          mount_point="${ETHEREUM_MOUNT_POINT:-/opt/ethereum}"
+          compose_source="${ETHEREUM_COMPOSE_SOURCE:-/etc/ethereum/docker-compose.yml}"
+          node_service_source="${ETHEREUM_NODE_SERVICE_SOURCE:-/etc/ethereum/ethereum-node.service}"
+          reth_image="ghcr.io/paradigmxyz/reth:latest"
+          reth_snapshot_mode="full"
+
+          log_event() {
+            printf 'timestamp=%s component=ethereum-bootstrap event=%s message="%s"\n' \
+              "$(date -u +"%Y-%m-%dT%H:%M:%SZ")" \
+              "$1" \
+              "$2"
+          }
+
+          log_event "started" "bootstrap started"
+
+          root_source="$(findmnt -n -o SOURCE /)"
+          root_parent="$(lsblk -no PKNAME "$root_source" 2>/dev/null || true)"
+          if [[ -n "$root_parent" ]]; then
+            root_device="/dev/${root_parent}"
+          else
+            root_device="$root_source"
+          fi
+          root_device="$(readlink -f "$root_device")"
+
+          data_device=""
+          labeled_device="$(blkid -L "$data_label" 2>/dev/null || true)"
+          if [[ -n "$labeled_device" ]]; then
+            data_device="$labeled_device"
+          else
+            for _ in {1..120}; do
+              data_device="$(lsblk -ndo PATH,TYPE | awk -v root="$root_device" '$2 == "disk" && $1 != root {print $1; exit}')"
+              if [[ -n "$data_device" ]]; then
+                break
+              fi
+              echo "Waiting for Ethereum data volume to become visible..."
+              sleep 5
+            done
+          fi
+
+          if [[ -z "$data_device" ]]; then
+            echo "No attached data volume found after waiting" >&2
+            exit 1
+          fi
+
+          data_device="$(readlink -f "$data_device")"
+          log_event "data_volume_found" "data volume found at $data_device"
+          if [[ "$data_device" == "$root_device" ]]; then
+            echo "Refusing to format or mount root device: $data_device" >&2
+            exit 1
+          fi
+
+          if ! blkid "$data_device" >/dev/null 2>&1; then
+            log_event "format_started" "formatting data volume with xfs label $data_label"
+            mkfs.xfs -f -L "$data_label" "$data_device"
+            log_event "format_complete" "data volume formatted"
+          else
+            fs_type="$(blkid -s TYPE -o value "$data_device")"
+            fs_label="$(blkid -s LABEL -o value "$data_device" 2>/dev/null || true)"
+            if [[ "$fs_type" != "xfs" ]]; then
+              echo "Data device $data_device has unsupported filesystem type: $fs_type" >&2
+              exit 1
+            fi
+            if [[ -z "$fs_label" ]]; then
+              xfs_admin -L "$data_label" "$data_device"
+            elif [[ "$fs_label" != "$data_label" ]]; then
+              echo "Data device $data_device has unexpected filesystem label: $fs_label" >&2
+              exit 1
+            fi
+          fi
+
+          mkdir -p "$mount_point"
+          data_uuid="$(blkid -s UUID -o value "$data_device")"
+          if ! grep -q "UUID=${data_uuid}[[:space:]]" /etc/fstab; then
+            sed -i "\# ${mount_point} #d" /etc/fstab
+            echo "UUID=${data_uuid} ${mount_point} xfs defaults,nofail 0 2" >> /etc/fstab
+          fi
+          mountpoint -q "$mount_point" || mount "$mount_point"
+          log_event "mounted" "data volume mounted at $mount_point"
+
+          mkdir -p \
+            "$mount_point/reth" \
+            "$mount_point/lighthouse" \
+            "$mount_point/jwt"
+
+          if [[ ! -f "$mount_point/jwt/jwt.hex" ]]; then
+            log_event "jwt_started" "creating shared JWT secret"
+            openssl rand -hex 32 | tr -d "\n" > "$mount_point/jwt/jwt.hex"
+            chmod 600 "$mount_point/jwt/jwt.hex"
+            log_event "jwt_complete" "shared JWT secret created"
+          fi
+
+          snapshot_marker="$mount_point/.reth-snapshot-download-complete"
+          snapshot_started_marker="$mount_point/.reth-snapshot-download-started"
+          if [[ "$reth_snapshot_mode" != "none" && ! -f "$snapshot_marker" ]]; then
+            if find "$mount_point/reth" -mindepth 1 -maxdepth 1 | grep -q . && [[ ! -f "$snapshot_started_marker" ]]; then
+              log_event "snapshot_skipped" "Reth data directory is not empty; skipping snapshot download"
+            else
+              log_event "snapshot_started" "starting Reth $reth_snapshot_mode snapshot download"
+              touch "$snapshot_started_marker"
+              docker run --rm --network host \
+                -v "$mount_point/reth:/root/.local/share/reth" \
+                "$reth_image" \
+                download \
+                --chain mainnet \
+                --datadir /root/.local/share/reth \
+                --"$reth_snapshot_mode" \
+                -y \
+                --resumable
+              touch "$snapshot_marker"
+              rm -f "$snapshot_started_marker"
+              log_event "snapshot_complete" "Reth snapshot download complete"
+            fi
+          else
+            log_event "snapshot_already_complete" "Reth snapshot marker already exists or snapshot mode is disabled"
+          fi
+
+          log_event "config_started" "installing Docker Compose and systemd service config"
+          install -m 0644 "$compose_source" "$mount_point/docker-compose.yml"
+          install -m 0644 "$node_service_source" /etc/systemd/system/ethereum-node.service
+
+          systemctl daemon-reload
+          systemctl enable ethereum-node.service
+          systemctl restart ethereum-node.service
+          log_event "node_started" "ethereum-node service started"
+          systemctl enable --now ethereum-status.timer
+          log_event "status_timer_started" "ethereum-status timer started"
+          touch "$mount_point/.bootstrap-complete"
+          log_event "complete" "bootstrap complete"
+          BOOTSTRAP
+
+          chmod 0755 /usr/local/sbin/ethereum-bootstrap.sh
+          install -d -m 0755 /etc/ethereum
+
+          cat > /usr/local/sbin/ethereum-status.sh <<'STATUS'
+          #!/usr/bin/env bash
+          set -uo pipefail
+
+          log_file="/var/log/ethereum-status.log"
+          timestamp="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+
+          container_running() {
+            docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null || echo "false"
+          }
+
+          reth_running="$(container_running reth)"
+          lighthouse_running="$(container_running lighthouse)"
+          bootstrap_complete="false"
+          [[ -f /opt/ethereum/.bootstrap-complete ]] && bootstrap_complete="true"
+
+          disk_used_percent="unknown"
+          disk_avail="unknown"
+          if df_output="$(df -hP /opt/ethereum 2>/dev/null | awk 'NR == 2 {print $5, $4}')"; then
+            disk_used_percent="$(awk '{gsub("%", "", $1); print $1}' <<< "$df_output")"
+            disk_avail="$(awk '{print $2}' <<< "$df_output")"
+          fi
+
+          latest_reth_status="$(docker logs --since 30m reth 2>&1 | grep -E 'Status connected_peers=|Committed stage progress|stage_progress=' | tail -n 1 || true)"
+
+          connected_peers="$(sed -n 's/.*connected_peers=\([0-9][0-9]*\).*/\1/p' <<< "$latest_reth_status")"
+          stage="$(sed -n 's/.*stage=\([^ ]*\).*/\1/p' <<< "$latest_reth_status")"
+          stage_progress="$(sed -n 's/.*stage_progress=\([0-9.][0-9.]*\)%.*/\1/p' <<< "$latest_reth_status")"
+          checkpoint="$(sed -n 's/.*checkpoint=\([0-9][0-9]*\).*/\1/p' <<< "$latest_reth_status")"
+          target="$(sed -n 's/.*target=\([0-9][0-9]*\).*/\1/p' <<< "$latest_reth_status")"
+
+          [[ -n "$connected_peers" ]] || connected_peers="unknown"
+          [[ -n "$stage" ]] || stage="unknown"
+          [[ -n "$stage_progress" ]] || stage_progress="unknown"
+          [[ -n "$checkpoint" ]] || checkpoint="unknown"
+          [[ -n "$target" ]] || target="unknown"
+
+          rpc_syncing="unknown"
+          rpc_block_number="unknown"
+          rpc_response="$(curl -s --max-time 2 localhost:8545 -H 'content-type: application/json' --data '{"jsonrpc":"2.0","method":"eth_syncing","params":[],"id":1}' 2>/dev/null || true)"
+          if [[ -n "$rpc_response" ]]; then
+            rpc_syncing="$(jq -r 'if .result == false then "false" elif .result == null then "unknown" else "true" end' <<< "$rpc_response" 2>/dev/null || echo "unknown")"
+          fi
+          block_response="$(curl -s --max-time 2 localhost:8545 -H 'content-type: application/json' --data '{"jsonrpc":"2.0","method":"eth_blockNumber","params":[],"id":1}' 2>/dev/null || true)"
+          if [[ -n "$block_response" ]]; then
+            rpc_block_number="$(jq -r '.result // "unknown"' <<< "$block_response" 2>/dev/null || echo "unknown")"
+          fi
+
+          printf 'timestamp=%s bootstrap_complete=%s reth_running=%s lighthouse_running=%s stage=%s stage_progress=%s checkpoint=%s target=%s connected_peers=%s disk_used_percent=%s disk_avail=%s rpc_syncing=%s rpc_block_number=%s\n' \
+            "$timestamp" \
+            "$bootstrap_complete" \
+            "$reth_running" \
+            "$lighthouse_running" \
+            "$stage" \
+            "$stage_progress" \
+            "$checkpoint" \
+            "$target" \
+            "$connected_peers" \
+            "$disk_used_percent" \
+            "$disk_avail" \
+            "$rpc_syncing" \
+            "$rpc_block_number" >> "$log_file"
+          STATUS
+
+          chmod 0755 /usr/local/sbin/ethereum-status.sh
+
+          cat > /etc/ethereum/docker-compose.yml <<'COMPOSE'
+          services:
+            reth:
+              image: ghcr.io/paradigmxyz/reth:latest
+              container_name: reth
+              restart: unless-stopped
+              network_mode: host
+              volumes:
+                - /opt/ethereum/reth:/root/.local/share/reth
+                - /opt/ethereum/jwt:/jwt:ro
+              command:
+                - node
+                - --full
+                - --chain=mainnet
+                - --datadir=/root/.local/share/reth
+                - --authrpc.addr=127.0.0.1
+                - --authrpc.port=8551
+                - --authrpc.jwtsecret=/jwt/jwt.hex
+                - --http
+                - --http.addr=127.0.0.1
+                - --http.port=8545
+                - --http.api=eth,net,web3,txpool
+                - --ws
+                - --ws.addr=127.0.0.1
+                - --ws.port=8546
+                - --ws.api=eth,net,web3,txpool
+
+            lighthouse:
+              image: sigp/lighthouse:latest
+              container_name: lighthouse
+              restart: unless-stopped
+              network_mode: host
+              volumes:
+                - /opt/ethereum/lighthouse:/root/.lighthouse
+                - /opt/ethereum/jwt:/jwt:ro
+              command:
+                - lighthouse
+                - beacon
+                - --network=mainnet
+                - --execution-endpoint=http://127.0.0.1:8551
+                - --execution-jwt=/jwt/jwt.hex
+                - --checkpoint-sync-url=https://mainnet.checkpoint.sigp.io
+                - --http
+                - --http-address=127.0.0.1
+          COMPOSE
+
+          cat > /etc/ethereum/ethereum-node.service <<'NODE_SERVICE'
+          [Unit]
+          Description=Ethereum Reth + Lighthouse Node
+          Requires=docker.service
+          Wants=network-online.target
+          After=docker.service network-online.target
+          RequiresMountsFor=/opt/ethereum
+          ConditionPathIsMountPoint=/opt/ethereum
+
+          [Service]
+          WorkingDirectory=/opt/ethereum
+          ExecStart=/usr/bin/docker compose up
+          ExecStop=/usr/bin/docker compose down
+          Restart=always
+          RestartSec=10
+
+          [Install]
+          WantedBy=multi-user.target
+          NODE_SERVICE
+
+          cat > /etc/systemd/system/ethereum-status.service <<'STATUS_SERVICE'
+          [Unit]
+          Description=Ethereum node status summary
+          Wants=docker.service
+          After=docker.service
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/ethereum-status.sh
+          STATUS_SERVICE
+
+          cat > /etc/systemd/system/ethereum-status.timer <<'STATUS_TIMER'
+          [Unit]
+          Description=Write Ethereum node status summary every 5 minutes
+
+          [Timer]
+          OnBootSec=2min
+          OnUnitActiveSec=5min
+          Unit=ethereum-status.service
+
+          [Install]
+          WantedBy=timers.target
+          STATUS_TIMER
+
+          cat > /etc/systemd/system/ethereum-bootstrap.service <<'BOOTSTRAP_SERVICE'
+          [Unit]
+          Description=Ethereum data volume bootstrap
+          Requires=docker.service
+          Wants=network-online.target
+          After=docker.service network-online.target
+          StartLimitIntervalSec=0
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/sbin/ethereum-bootstrap.sh
+          StandardOutput=append:/var/log/ethereum-bootstrap.log
+          StandardError=append:/var/log/ethereum-bootstrap.log
+          RemainAfterExit=yes
+          Restart=on-failure
+          RestartSec=30
+
+          [Install]
+          WantedBy=multi-user.target
+          BOOTSTRAP_SERVICE
+
+          systemctl daemon-reload
+          systemctl enable ethereum-bootstrap.service
+          systemctl start --no-block ethereum-bootstrap.service
+          mkdir -p /etc/motd.d
+          echo "reth-aws-cloudformation mainnet bootstrap service installed" > /etc/motd.d/reth-aws-cloudformation
+
+  NodeDataVolume:
+    Type: AWS::EC2::Volume
+    Properties:
+      AvailabilityZone: !Ref AvailabilityZone
+      Size: !Ref VolumeSizeGb
+      VolumeType: gp3
+      Iops: !Ref VolumeIops
+      Throughput: !Ref VolumeThroughput
+      Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}-ethereum-data
+
+  NodeDataVolumeAttachment:
+    Type: AWS::EC2::VolumeAttachment
+    Properties:
+      Device: /dev/sdf
+      InstanceId: !Ref NodeInstance
+      VolumeId: !Ref NodeDataVolume
+
+Outputs:
+  InstanceId:
+    Description: EC2 instance ID.
+    Value: !Ref NodeInstance
+  SecurityGroupId:
+    Description: Node security group ID.
+    Value: !Ref NodeSecurityGroup
+  DataVolumeId:
+    Description: EBS data volume ID.
+    Value: !Ref NodeDataVolume
+  SsmSessionCommand:
+    Description: Command shape for connecting through SSM Session Manager.
+    Value: !Sub aws ssm start-session --target ${NodeInstance}
+  RethLocalRpcUrl:
+    Description: Reth JSON-RPC URL, available only on the instance.
+    Value: http://127.0.0.1:8545
+  LighthouseLocalApiUrl:
+    Description: Lighthouse beacon API URL, available only on the instance.
+    Value: http://127.0.0.1:5052
+  CloudWatchLogGroupName:
+    Description: CloudWatch Logs group for cloud-init and bootstrap logs.
+    Value: !Ref NodeLogGroup

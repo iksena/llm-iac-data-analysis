@@ -1,0 +1,226 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Metadata:
+  AWS::ServerlessRepo::Application:
+    Name: gazette-publisher
+    Description: Publish CloudFormation templates to AWS Service Catalog via S3
+    Author: Matt Tyler
+    SpdxLicenseId: Apache-2.0
+    LicenseUrl: LICENSE.txt
+    ReadmeUrl: README.md
+    HomePageUrl: https://github.com/MechanicalRock/gazette-publisher
+    SourceCodeUrl: https://github.com/MechanicalRock/gazette-publisher
+Parameters:
+  EventBus:
+    Type: String
+    Default: "default"
+  Bucket:
+    Type: String
+    Description: The name of the bucket that will contain the templates
+  Owner:
+    Type: String
+    Description: The name of the product creator/owner/team
+Globals:
+  Function:
+    Runtime: nodejs10.x
+    Timeout: 20
+Resources:
+  CreateProduct:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/CreateProduct
+      Handler: index.handler
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          OWNER: !Ref Owner
+      Tracing: Active
+      Policies:
+        - arn:aws:iam::aws:policy/AWSServiceCatalogAdminFullAccess
+        - S3ReadPolicy:
+            BucketName: !Ref Bucket
+
+  CreateVersion:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/CreateVersion
+      Handler: index.handler
+      ReservedConcurrentExecutions: 1
+      Tracing: Active
+      Policies:
+        - arn:aws:iam::aws:policy/AWSServiceCatalogAdminFullAccess
+        - S3ReadPolicy:
+            BucketName: !Ref Bucket
+
+  EventAdaptor:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/EventAdaptor
+      Handler: index.handler
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          BUCKET_ARN: !Sub "arn:aws:s3:::${Bucket}"
+          EVENT_BUS: !Ref EventBus
+      Tracing: Active
+      Policies:
+        - Statement:
+          - Action:
+              - events:PutEvents
+            Effect: Allow
+            Resource: '*'
+      Events:
+        Cloudwatch:
+          Type: CloudWatchEvent
+          Properties:
+            InputPath: "$.detail.output"
+            Pattern:
+              source:
+                - aws.states
+              detail-type:
+                - "Step Functions Execution Status Change"
+              detail:
+                stateMachineArn:
+                  - !Ref Publisher
+                status:
+                  - "SUCCEEDED"
+
+  FindProduct:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/FindProduct
+      Handler: index.handler
+      ReservedConcurrentExecutions: 1
+      Tracing: Active
+      Policies:
+        - arn:aws:iam::aws:policy/AWSServiceCatalogAdminFullAccess
+
+  Publisher:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      DefinitionString: !Sub |
+        {
+          "StartAt": "FindProduct",
+          "States": {
+            "FindProduct": {
+              "Type": "Task",
+              "Resource": "${FindProduct.Arn}",
+              "Next": "Fork",
+              "Retry": [{
+                "ErrorEquals": [ "States.ALL"]
+              }]
+            },
+            "Fork": {
+              "Type": "Choice",
+              "Default": "AmbiguousProductName",
+              "Choices": [
+                {
+                  "Variable": "$.products.count",
+                  "NumericEquals": 0,
+                  "Next": "CreateProduct"
+                },
+                {
+                  "Variable": "$.products.count",
+                  "NumericEquals": 1,
+                  "Next": "CreateVersion"
+                }
+              ],
+              "OutputPath": "$.candidate"
+            },
+            "AmbiguousProductName": {
+                "Type": "Fail",
+                "Cause": "Product name belongs to multiple products",
+                "Error": "ErrorAmbiguousProductName"
+            },
+            "CreateProduct": {
+              "Type": "Task",
+              "Resource": "${CreateProduct.Arn}",
+              "End": true,
+              "Retry": [{
+                "ErrorEquals": [ "States.Timeout" ]
+              }]
+            },
+            "CreateVersion": {
+              "Type": "Task",
+              "Resource": "${CreateVersion.Arn}",
+              "End": true,
+              "Retry": [{
+                "ErrorEquals": [ "States.Timeout" ]
+              }]
+            }
+          }
+        }
+      RoleArn: !GetAtt StatesExecutionRole.Arn
+
+  StatesExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: states.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt FindProduct.Arn
+                  - !GetAtt CreateProduct.Arn
+                  - !GetAtt CreateVersion.Arn
+
+  TriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepMachineExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref Publisher
+
+  PublisherTrigger:
+    Type: AWS::Events::Rule
+    Properties:
+      State: ENABLED
+      RoleArn: !GetAtt TriggerRole.Arn
+      Targets:
+        - Arn: !Ref Publisher
+          Id: Publisher
+          RoleArn: !GetAtt TriggerRole.Arn
+          InputTransformer:
+            InputPathsMap:
+              Bucket: "$.detail.requestParameters.bucketName"
+              Key: "$.detail.requestParameters.key"
+              Region: "$.detail.awsRegion"
+            InputTemplate: >-
+              "{ \"bucket\": \"<Bucket>\", \"key\": \"<Key>\", \"region\": \"<Region>\" }"
+      EventPattern:
+        source:
+          - aws.s3
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - s3.amazonaws.com
+          awsRegion:
+            - !Sub "${AWS::Region}"
+          eventName:
+            - PutObject
+          requestParameters:
+            bucketName:
+              - !Ref Bucket

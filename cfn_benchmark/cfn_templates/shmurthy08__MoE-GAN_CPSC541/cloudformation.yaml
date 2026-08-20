@@ -1,0 +1,1605 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Infrastructure for Text-to-Image GAN Model with SageMaker and API Gateway'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: gan-text-to-image
+    Description: Name of the project for resource naming
+
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, test, prod]
+    Description: Environment name
+
+  ModelArtifactUrl:
+    Type: String
+    Default: ''
+    Description: S3 URL of the model artifact (optional for initial setup)
+
+  ContainerImage:
+    Type: String
+    Default: ''
+    Description: ECR image URL for the model container (optional for initial setup)
+
+  InstanceType:
+    Type: String
+    Default: ml.t2.medium
+    AllowedValues:
+      - ml.m5.xlarge
+      - ml.t2.medium
+      - ml.g5.xlarge
+      - ml.g5.2xlarge
+      - ml.g6.xlarge
+      - ml.g6.2xlarge
+    Description: SageMaker instance type for the endpoint (free tier eligible)
+
+Resources:
+  # ===== IAM Roles =====
+  SageMakerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sagemaker.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-sagemaker-role'
+
+  LambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+      RoleName: !Sub '${ProjectName}-${EnvironmentName}-lambda-role'
+
+  # ===== Storage Resources =====
+  ModelArtifactBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${ProjectName}-${EnvironmentName}-artifacts-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+
+  # ===== DynamoDB Table for Job Status =====
+  GenerationJobsTable:
+    Type: 'AWS::DynamoDB::Table'
+    Properties:
+      TableName: !Sub '${ProjectName}-${EnvironmentName}-generation-jobs'
+      AttributeDefinitions:
+        - AttributeName: request_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: request_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST  # Free tier eligible
+      TimeToLiveSpecification:
+        AttributeName: expiration_time
+        Enabled: true
+
+  # ===== SageMaker Resources =====
+  SageMakerModel:
+    Type: 'AWS::SageMaker::Model'
+    Condition: HasModelArtifact
+    Properties:
+      ExecutionRoleArn: !GetAtt SageMakerRole.Arn
+      ModelName: !Sub '${ProjectName}-${EnvironmentName}-model'
+      PrimaryContainer:
+        Image: !Ref ContainerImage
+        ModelDataUrl: !Ref ModelArtifactUrl
+
+  SageMakerEndpointConfig:
+    Type: 'AWS::SageMaker::EndpointConfig'
+    Condition: HasModelArtifact
+    Properties:
+      EndpointConfigName: !Sub '${ProjectName}-${EnvironmentName}-endpoint-config'
+      ProductionVariants:
+        - InitialInstanceCount: 1
+          InstanceType: !Ref InstanceType
+          ModelName: !GetAtt SageMakerModel.ModelName
+          VariantName: 'AllTraffic'
+          InitialVariantWeight: 1.0
+
+  SageMakerEndpoint:
+    Type: 'AWS::SageMaker::Endpoint'
+    Condition: HasModelArtifact
+    Properties:
+      EndpointName: !Sub '${ProjectName}-${EnvironmentName}-endpoint'
+      EndpointConfigName: !GetAtt SageMakerEndpointConfig.EndpointConfigName
+
+  # ===== Lambda Functions =====
+  InferenceLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-inference'
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.8
+      Handler: index.handler
+      Timeout: 500
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import uuid
+          import time
+          import logging
+          from datetime import datetime, timedelta
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Updated InferenceLambda with consistent ID handling and verified S3 upload
+          def handler(event, context):
+              # Log the incoming request
+              logger.info(f"InferenceLambda received request: {json.dumps(event, default=str)}")
+
+              # Hardcode endpoint name and DynamoDB table name as requested
+              endpoint_name = 'gan-ep-dev'
+              dynamodb_table = 'gan-text-to-image-dev-generation-jobs'
+              s3_bucket_name = 'gan-text-to-image-dev-artifacts-207567761455'
+
+              # Handle OPTIONS request for CORS
+              if event.get('httpMethod') == 'OPTIONS':
+                  logger.info("Handling OPTIONS request for CORS")
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+                      },
+                      'body': json.dumps({})
+                  }
+
+              # Get the text prompt from the request
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  text_prompt = body.get('text', '')
+                  logger.info(f"Received text prompt: {text_prompt}")
+
+                  if not text_prompt:
+                      logger.warning("No text prompt provided in request")
+                      return {
+                          'statusCode': 400,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type',
+                              'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+                          },
+                          'body': json.dumps({
+                              'error': 'Text prompt is required in the request body.'
+                          })
+                      }
+
+                  # Generate a unique request ID - IMPORTANT: Use a short, simple format for easier debugging
+                  # Use time-based component to make it easier to track in logs
+                  timestamp = int(time.time())
+                  request_id = f"req-{timestamp}-{uuid.uuid4().hex[:8]}"
+                  logger.info(f"Generated request_id: {request_id}")
+
+                  # Prepare the request payload
+                  request_payload = json.dumps({
+                      'text': text_prompt,
+                      'request_id': request_id  # Include the request_id in the payload for traceability
+                  })
+
+                  # Save the request to DynamoDB first with an INITIALIZING status
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(dynamodb_table)
+
+                  # Calculate expiration time (24 hours from now)
+                  expiration_time = int((datetime.now() + timedelta(hours=24)).timestamp())
+
+                  # Store initial job information
+                  logger.info(f"Storing initial job information in DynamoDB: {dynamodb_table}")
+                  table.put_item(
+                      Item={
+                          'request_id': request_id,
+                          'status': 'INITIALIZING',
+                          'prompt': text_prompt,
+                          'created_at': timestamp,
+                          'expiration_time': expiration_time
+                      }
+                  )
+
+                  # Create S3 path - use a consistent format
+                  input_key = f"async-inputs/{request_id}.json"
+                  s3_input_path = f"s3://{s3_bucket_name}/{input_key}"
+                  logger.info(f"S3 input path: {s3_input_path}")
+
+                  # Upload to S3 with explicit verification
+                  s3_client = boto3.client('s3')
+                  logger.info(f"Uploading request payload to S3: {s3_input_path}")
+
+                  # Try to upload to S3
+                  try:
+                      s3_client.put_object(
+                          Bucket=s3_bucket_name,
+                          Key=input_key,
+                          Body=request_payload,
+                          ContentType='application/json'
+                      )
+
+                      # Verify the file is actually there (important for debugging)
+                      try:
+                          s3_client.head_object(
+                              Bucket=s3_bucket_name,
+                              Key=input_key
+                          )
+                          logger.info(f"Successfully verified S3 upload at: {s3_input_path}")
+
+                          # Update DynamoDB with S3 path now that we've confirmed upload
+                          table.update_item(
+                              Key={'request_id': request_id},
+                              UpdateExpression='SET #status = :status, #s3_path = :s3_path',
+                              ExpressionAttributeNames={
+                                  '#status': 'status',
+                                  '#s3_path': 's3_input_path'
+                              },
+                              ExpressionAttributeValues={
+                                  ':status': 'UPLOADED',
+                                  ':s3_path': s3_input_path
+                              }
+                          )
+                      except Exception as verify_error:
+                          logger.error(f"Failed to verify S3 upload: {str(verify_error)}")
+                          raise Exception(f"Upload verification failed: {str(verify_error)}")
+
+                  except Exception as s3_error:
+                      logger.error(f"Failed to upload to S3: {str(s3_error)}")
+
+                      # Update DynamoDB with error
+                      table.update_item(
+                          Key={'request_id': request_id},
+                          UpdateExpression='SET #status = :status, #error = :error',
+                          ExpressionAttributeNames={
+                              '#status': 'status',
+                              '#error': 'error'
+                          },
+                          ExpressionAttributeValues={
+                              ':status': 'FAILED',
+                              ':error': f"S3 upload failed: {str(s3_error)}"
+                          }
+                      )
+
+                      return {
+                          'statusCode': 500,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type',
+                              'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+                          },
+                          'body': json.dumps({
+                              'request_id': request_id,
+                              'status': 'FAILED',
+                              'error': f"Failed to upload input to S3: {str(s3_error)}"
+                          })
+                      }
+
+                  # Check if endpoint exists before invoking
+                  sagemaker = boto3.client('sagemaker')
+                  endpoint_exists = True
+
+                  try:
+                      sagemaker.describe_endpoint(EndpointName=endpoint_name)
+                      logger.info(f"Endpoint {endpoint_name} exists")
+                  except Exception as endpoint_error:
+                      logger.warning(f"Endpoint doesn't exist or other error: {str(endpoint_error)}")
+                      endpoint_exists = False
+
+                      # Update DynamoDB to indicate no endpoint
+                      table.update_item(
+                          Key={'request_id': request_id},
+                          UpdateExpression='SET #status = :status, #message = :message',
+                          ExpressionAttributeNames={
+                              '#status': 'status',
+                              '#message': 'message'
+                          },
+                          ExpressionAttributeValues={
+                              ':status': 'NO_ENDPOINT',
+                              ':message': f"Endpoint {endpoint_name} not available"
+                          }
+                      )
+
+                      # Return success response with explanation
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type',
+                              'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+                          },
+                          'body': json.dumps({
+                              'request_id': request_id,
+                              'status': 'READY_FOR_PROCESSING',
+                              'message': 'Input saved but endpoint not available. Will process when endpoint is ready.'
+                          })
+                      }
+
+                  # Only try to invoke endpoint if it exists
+                  if endpoint_exists:
+                      try:
+                          # Create the SageMaker async request
+                          logger.info(f"Submitting async request to SageMaker endpoint: {endpoint_name}")
+                          sagemaker_runtime = boto3.client('sagemaker-runtime')
+
+                          async_response = sagemaker_runtime.invoke_endpoint_async(
+                              EndpointName=endpoint_name,
+                              ContentType='application/json',
+                              Accept='application/json',
+                              InputLocation=s3_input_path
+                          )
+
+                          # Get the SageMaker inference ID
+                          inference_id = async_response.get('InferenceId')
+                          logger.info(f"Received SageMaker InferenceId: {inference_id}")
+
+                          # Update DynamoDB with the SageMaker inference ID
+                          table.update_item(
+                              Key={'request_id': request_id},
+                              UpdateExpression='SET #status = :status, #inference_id = :inference_id',
+                              ExpressionAttributeNames={
+                                  '#status': 'status',
+                                  '#inference_id': 'sagemaker_inference_id'
+                              },
+                              ExpressionAttributeValues={
+                                  ':status': 'IN_PROGRESS',
+                                  ':inference_id': inference_id
+                              }
+                          )
+
+                          # Start a separate Lambda to check status
+                          processor_lambda = os.environ.get('PROCESSOR_LAMBDA', '')
+                          logger.info(f"Invoking ProcessorLambda ({processor_lambda}) asynchronously")
+                          lambda_client = boto3.client('lambda')
+                          lambda_client.invoke(
+                              FunctionName=processor_lambda,
+                              InvocationType='Event',  # Asynchronous invocation
+                              Payload=json.dumps({
+                                  'request_id': request_id,
+                                  'inference_id': inference_id,
+                                  'endpoint_name': endpoint_name,
+                                  's3_input_path': s3_input_path
+                              })
+                          )
+                      except Exception as invoke_error:
+                          logger.error(f"Error invoking SageMaker endpoint: {str(invoke_error)}")
+
+                          # Update DynamoDB with error
+                          table.update_item(
+                              Key={'request_id': request_id},
+                              UpdateExpression='SET #status = :status, #error = :error',
+                              ExpressionAttributeNames={
+                                  '#status': 'status',
+                                  '#error': 'error'
+                              },
+                              ExpressionAttributeValues={
+                                  ':status': 'INVOCATION_FAILED',
+                                  ':error': f"SageMaker invocation failed: {str(invoke_error)}"
+                              }
+                          )
+
+                          return {
+                              'statusCode': 500,
+                              'headers': {
+                                  'Content-Type': 'application/json',
+                                  'Access-Control-Allow-Origin': '*',
+                                  'Access-Control-Allow-Headers': 'Content-Type',
+                                  'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+                              },
+                              'body': json.dumps({
+                                  'request_id': request_id,
+                                  'status': 'FAILED',
+                                  'error': f"Failed to invoke SageMaker endpoint: {str(invoke_error)}"
+                              })
+                          }
+
+                  # Return success response to client
+                  return {
+                      'statusCode': 200,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+                      },
+                      'body': json.dumps({
+                          'request_id': request_id,
+                          'status': 'ACCEPTED',
+                          'message': 'Request accepted. Poll for results using the request_id.'
+                      })
+                  }
+              except Exception as e:
+                  logger.error(f"Unhandled exception in handler: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+                      },
+                      'body': json.dumps({
+                          'error': f"Internal server error: {str(e)}"
+                      })
+                  }
+      Environment:
+        Variables:
+          SAGEMAKER_ENDPOINT_NAME: 'gan-ep-dev'
+          DYNAMODB_TABLE: 'gan-text-to-image-dev-generation-jobs'
+          PROCESSOR_LAMBDA: !GetAtt ProcessorLambda.Arn
+          S3_BUCKET_NAME: !Ref ModelArtifactBucket
+
+  ProcessorLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-processor'
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.8
+      Handler: index.handler
+      Timeout: 900  # Increased timeout for long-running tasks
+      MemorySize: 512
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import time
+          import logging
+          from decimal import Decimal  # Add this import
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Helper class to convert floats to Decimal for DynamoDB
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, float):
+                      return Decimal(str(obj))
+                  return super(DecimalEncoder, self).default(obj)
+
+          def float_to_decimal(obj):
+              """Recursively convert floats to Decimal for DynamoDB compatibility"""
+              if isinstance(obj, float):
+                  return Decimal(str(obj))
+              elif isinstance(obj, dict):
+                  return {k: float_to_decimal(v) for k, v in obj.items()}
+              elif isinstance(obj, list):
+                  return [float_to_decimal(item) for item in obj]
+              else:
+                  return obj
+
+          def handler(event, context):
+              # Log the incoming event
+              logger.info(f"ProcessorLambda started with request_id: {event.get('request_id')}")
+
+              # Get parameters from the event
+              request_id = event.get('request_id')
+
+              # Hardcoded values for reliability
+              dynamodb_table = 'gan-text-to-image-dev-generation-jobs'
+              s3_bucket_name = 'gan-text-to-image-dev-artifacts-207567761455'
+
+              # Initialize clients
+              dynamodb = boto3.resource('dynamodb')
+              table = dynamodb.Table(dynamodb_table)
+              s3_client = boto3.client('s3')
+
+              try:
+                  # First check if job is already completed
+                  response = table.get_item(Key={'request_id': request_id})
+                  if 'Item' in response and response['Item'].get('status') == 'COMPLETED':
+                      logger.info(f"Request {request_id} already completed. Skipping.")
+                      return {
+                          'statusCode': 200,
+                          'body': json.dumps({
+                              'message': 'Processing already completed'
+                          })
+                      }
+
+                  # Look at all files in the async-outputs directory
+                  output_prefix = "async-outputs/"
+                  logger.info(f"Checking S3 for output files at: {s3_bucket_name}/{output_prefix}")
+
+                  try:
+                      # List objects in the output prefix
+                      s3_response = s3_client.list_objects_v2(
+                          Bucket=s3_bucket_name,
+                          Prefix=output_prefix,
+                          MaxKeys=100  # Get a reasonable number of recent files
+                      )
+
+                      # Check if any output files exist
+                      if 'Contents' in s3_response and len(s3_response['Contents']) > 0:
+                          # Sort by last modified (newest first)
+                          output_files = sorted(
+                              s3_response['Contents'],
+                              key=lambda x: x['LastModified'],
+                              reverse=True
+                          )
+
+                          # Find the most recent .out file
+                          output_key = None
+                          for file in output_files:
+                              if file['Key'].endswith('.out'):
+                                  output_key = file['Key']
+                                  break
+
+                          if output_key:
+                              logger.info(f"Processing most recent output file: {output_key}")
+
+                              # Get the output file
+                              object_response = s3_client.get_object(
+                                  Bucket=s3_bucket_name,
+                                  Key=output_key
+                              )
+
+                              result_data = object_response['Body'].read().decode('utf-8')
+                              logger.info(f"Result data preview: {result_data[:100]}...")
+
+                              try:
+                                  # Parse JSON data
+                                  result = json.loads(result_data)
+
+                                  # Check if this output contains FID score (has multiple images AND a fid_score field)
+                                  is_fid_output = False
+                                  if 'fid_score' in result and 'images' in result and len(result['images']) > 1:
+                                      is_fid_output = True
+                                      logger.info(f"Detected FID calculation output with score: {result['fid_score']}")
+
+                                  # Check if the job was a FID calculation request based on DynamoDB
+                                  job_is_fid_request = False
+                                  if 'Item' in response and response['Item'].get('calculate_fid', False):
+                                      job_is_fid_request = True
+
+                                  # If we're processing a FID job, make sure this output is a FID result
+                                  if job_is_fid_request and not is_fid_output:
+                                      logger.warning(f"Job is FID calculation but output doesn't have FID score. Checking again later.")
+
+                                      # Wait before re-checking
+                                      time.sleep(5)
+
+                                      # Re-invoke this Lambda to check status again
+                                      lambda_client = boto3.client('lambda')
+                                      lambda_client.invoke(
+                                          FunctionName=context.function_name,
+                                          InvocationType='Event',
+                                          Payload=json.dumps(event)
+                                      )
+
+                                      return {
+                                          'statusCode': 200,
+                                          'body': json.dumps({
+                                              'message': 'Output file found, but not FID result yet. Checking again later.'
+                                          })
+                                      }
+
+                                  # Ensure we have the right data structure for the frontend
+                                  if 'images' not in result:
+                                      # Try to extract images from nested structures
+                                      if 'body' in result and isinstance(result['body'], str):
+                                          try:
+                                              body_json = json.loads(result['body'])
+                                              if 'images' in body_json:
+                                                  result['images'] = body_json['images']
+                                          except:
+                                              pass
+                                      # If still no images, create a placeholder
+                                      if 'images' not in result:
+                                          logger.warning("No images found in result, creating empty array")
+                                          result['images'] = []
+
+                                  # Make sure we have a prompt
+                                  if 'prompt' not in result:
+                                      # Try to get prompt from DynamoDB record
+                                      if 'Item' in response and 'prompt' in response['Item']:
+                                          result['prompt'] = response['Item']['prompt']
+                                      else:
+                                          result['prompt'] = "Unknown prompt"
+
+                                  # Update DynamoDB with completed status
+                                  logger.info(f"Updating DynamoDB with completed status for request_id: {request_id}")
+
+                                  # Convert all float values to Decimal for DynamoDB
+                                  result_for_dynamodb = float_to_decimal(result)
+
+                                  # Verify image count for FID output
+                                  if is_fid_output:
+                                      expected_image_count = response['Item'].get('num_samples', 4) if 'Item' in response else 4
+                                      actual_image_count = len(result['images'])
+                                      logger.info(f"FID output has {actual_image_count} images (expected approximately {expected_image_count})")
+
+                                      # Continue processing even if counts don't match exactly
+                                      # FID processing might return a different number in some cases
+
+                                  table.update_item(
+                                      Key={'request_id': request_id},
+                                      UpdateExpression='SET #status = :status, #data = :data, #updated_at = :updated_at, #output_path = :output_path',
+                                      ExpressionAttributeNames={
+                                          '#status': 'status',
+                                          '#data': 'data',
+                                          '#updated_at': 'updated_at',
+                                          '#output_path': 's3_output_path'
+                                      },
+                                      ExpressionAttributeValues={
+                                          ':status': 'COMPLETED',
+                                          ':data': result_for_dynamodb,
+                                          ':updated_at': int(time.time()),
+                                          ':output_path': f"s3://{s3_bucket_name}/{output_key}"
+                                      }
+                                  )
+
+                                  logger.info(f"ProcessorLambda completed successfully for request_id: {request_id}")
+                                  return {
+                                      'statusCode': 200,
+                                      'body': json.dumps({
+                                          'message': 'Processing completed successfully',
+                                          'output_path': f"s3://{s3_bucket_name}/{output_key}",
+                                          'is_fid_output': is_fid_output
+                                      })
+                                  }
+                              except json.JSONDecodeError as json_err:
+                                  logger.error(f"Error parsing JSON from output file: {str(json_err)}")
+                                  # Handle raw data or update with error
+                                  table.update_item(
+                                      Key={'request_id': request_id},
+                                      UpdateExpression='SET #status = :status, #error = :error, #updated_at = :updated_at',
+                                      ExpressionAttributeNames={
+                                          '#status': 'status',
+                                          '#error': 'error',
+                                          '#updated_at': 'updated_at'
+                                      },
+                                      ExpressionAttributeValues={
+                                          ':status': 'FAILED',
+                                          ':error': f"Failed to parse output JSON: {str(json_err)}",
+                                          ':updated_at': int(time.time())
+                                      }
+                                  )
+                          else:
+                              # No .out files found yet, check for error file or wait
+                              logger.info("No .out files found yet. Checking again later.")
+
+                              # Update the last checked timestamp in DynamoDB
+                              table.update_item(
+                                  Key={'request_id': request_id},
+                                  UpdateExpression='SET last_checked = :last_checked',
+                                  ExpressionAttributeValues={
+                                      ':last_checked': int(time.time())
+                                  }
+                              )
+
+                              # Wait before re-checking
+                              time.sleep(5)
+
+                              # Re-invoke this Lambda to check status again
+                              lambda_client = boto3.client('lambda')
+                              lambda_client.invoke(
+                                  FunctionName=context.function_name,
+                                  InvocationType='Event',
+                                  Payload=json.dumps(event)
+                              )
+
+                              return {
+                                  'statusCode': 200,
+                                  'body': json.dumps({
+                                      'message': 'No output files found yet. Checking again later.'
+                                  })
+                              }
+                      else:
+                          # No output files found yet
+                          logger.info("No output files found yet. Checking again later.")
+
+                          # Wait and re-invoke
+                          time.sleep(5)
+                          lambda_client = boto3.client('lambda')
+                          lambda_client.invoke(
+                              FunctionName=context.function_name,
+                              InvocationType='Event',
+                              Payload=json.dumps(event)
+                          )
+
+                          return {
+                              'statusCode': 200,
+                              'body': json.dumps({
+                                  'message': 'No output files found yet. Checking again later.'
+                              })
+                          }
+
+                  except Exception as s3_error:
+                      logger.error(f"Error checking S3: {str(s3_error)}")
+                      table.update_item(
+                          Key={'request_id': request_id},
+                          UpdateExpression='SET #status = :status, #error = :error, #updated_at = :updated_at',
+                          ExpressionAttributeNames={
+                              '#status': 'status',
+                              '#error': 'error',
+                              '#updated_at': 'updated_at'
+                          },
+                          ExpressionAttributeValues={
+                              ':status': 'FAILED',
+                              ':error': f"Error checking S3: {str(s3_error)}",
+                              ':updated_at': int(time.time())
+                          }
+                      )
+
+              except Exception as e:
+                  logger.error(f"Error processing request {request_id}: {str(e)}")
+                  # Update with error
+                  table.update_item(
+                      Key={'request_id': request_id},
+                      UpdateExpression='SET #status = :status, #error = :error, #updated_at = :updated_at',
+                      ExpressionAttributeNames={
+                          '#status': 'status',
+                          '#error': 'error',
+                          '#updated_at': 'updated_at'
+                      },
+                      ExpressionAttributeValues={
+                          ':status': 'FAILED',
+                          ':error': str(e),
+                          ':updated_at': int(time.time())
+                      }
+                  )
+
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      })
+                  }
+
+              # Final fallback
+              lambda_client = boto3.client('lambda')
+              lambda_client.invoke(
+                  FunctionName=context.function_name,
+                  InvocationType='Event',
+                  Payload=json.dumps(event)
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'message': 'Status check in progress'
+                  })
+              }
+      Environment:
+        Variables:
+          DYNAMODB_TABLE: 'gan-text-to-image-dev-generation-jobs'
+          SAGEMAKER_ENDPOINT_NAME: 'gan-ep-dev'
+
+  ImageMetricsLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-image-metrics'
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.8
+      Handler: index.handler
+      Timeout: 600
+      MemorySize: 512  # Reduced from 1024 to save costs
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import uuid
+          import boto3
+          import logging
+          import time
+          from datetime import datetime, timedelta
+
+          # Setup logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Clients
+          dynamodb = boto3.resource('dynamodb')
+          s3 = boto3.client('s3')
+          sagemaker_runtime = boto3.client('sagemaker-runtime')
+
+          # Environment variables
+          TABLE_NAME = os.environ['DYNAMODB_TABLE']
+          ENDPOINT_NAME = os.environ['SAGEMAKER_ENDPOINT_NAME']
+          BUCKET_NAME = os.environ['S3_BUCKET_NAME']
+
+          def handler(event, context):
+              # Setup logging
+              logger.info(f"[ImageMetricsLambda] Event: {json.dumps(event, default=str)}")
+
+              # Handle OPTIONS request for CORS
+              if event.get('httpMethod') == 'OPTIONS':
+                  logger.info("[ImageMetricsLambda] Handling OPTIONS request for CORS")
+                  return {
+                      'statusCode': 200,
+                      'headers': cors_headers(),
+                      'body': json.dumps({})
+                  }
+
+              # Environment variables
+              table_name = os.environ.get('DYNAMODB_TABLE', 'gan-text-to-image-dev-generation-jobs')
+              endpoint_name = os.environ.get('SAGEMAKER_ENDPOINT_NAME', 'gan-ep-dev')
+              bucket_name = os.environ.get('S3_BUCKET_NAME', 'gan-text-to-image-dev-artifacts-207567761455')
+
+              try:
+                  # Parse the request body
+                  body = json.loads(event.get('body', '{}'))
+                  text_prompt = body.get('text', '')
+
+                  # Validate text prompt
+                  if not text_prompt:
+                      logger.warning("[ImageMetricsLambda] No text prompt provided")
+                      return {
+                          'statusCode': 400,
+                          'headers': cors_headers(),
+                          'body': json.dumps({'error': 'Text prompt is required'})
+                      }
+
+                  # Generate a unique request ID
+                  timestamp = int(time.time())
+                  request_id = f"fid-{timestamp}-{uuid.uuid4().hex[:8]}"
+                  logger.info(f"[ImageMetricsLambda] Generated request_id: {request_id}")
+
+                  # Number of samples (2-4 is good for FID calculation)
+                  # SageMaker can handle 2 concurrent, so limit to 2 if needed
+                  num_samples = min(body.get('num_samples', 2), 4)  # Limit to max 4
+
+                  # Create initial DynamoDB entry
+                  dynamodb = boto3.resource('dynamodb')
+                  table = dynamodb.Table(table_name)
+
+                  # Calculate expiration time (24 hours from now)
+                  expiration_time = int((datetime.now() + timedelta(hours=24)).timestamp())
+
+                  # Store initial job information
+                  logger.info(f"[ImageMetricsLambda] Storing initial job in DynamoDB: {table_name}")
+                  table.put_item(
+                      Item={
+                          'request_id': request_id,
+                          'status': 'INITIALIZING',
+                          'prompt': text_prompt,
+                          'num_samples': num_samples,
+                          'calculate_fid': True,
+                          'created_at': timestamp,
+                          'expiration_time': expiration_time
+                      }
+                  )
+
+                  # Create S3 input payload
+                  input_key = f"async-inputs/{request_id}.json"
+                  s3_input_path = f"s3://{bucket_name}/{input_key}"
+
+                  # Prepare payload for SageMaker
+                  payload = {
+                      "text": text_prompt,
+                      "num_samples": num_samples,
+                      "calculate_fid": True,
+                      "request_id": request_id
+                  }
+
+                  # Upload to S3
+                  s3_client = boto3.client('s3')
+                  logger.info(f"[ImageMetricsLambda] Uploading payload to S3: {s3_input_path}")
+                  s3_client.put_object(
+                      Bucket=bucket_name,
+                      Key=input_key,
+                      Body=json.dumps(payload),
+                      ContentType='application/json'
+                  )
+
+                  # Verify S3 upload
+                  try:
+                      s3_client.head_object(
+                          Bucket=bucket_name,
+                          Key=input_key
+                      )
+                      logger.info(f"[ImageMetricsLambda] Successfully verified S3 upload")
+
+                      # Update DynamoDB with S3 path
+                      table.update_item(
+                          Key={'request_id': request_id},
+                          UpdateExpression='SET #status = :status, #s3_path = :s3_path',
+                          ExpressionAttributeNames={
+                              '#status': 'status',
+                              '#s3_path': 's3_input_path'
+                          },
+                          ExpressionAttributeValues={
+                              ':status': 'UPLOADED',
+                              ':s3_path': s3_input_path
+                          }
+                      )
+                  except Exception as verify_error:
+                      logger.error(f"[ImageMetricsLambda] Failed to verify S3 upload: {str(verify_error)}")
+                      raise Exception(f"Upload verification failed: {str(verify_error)}")
+
+                  # Check if endpoint exists
+                  sagemaker = boto3.client('sagemaker')
+                  endpoint_exists = True
+
+                  try:
+                      sagemaker.describe_endpoint(EndpointName=endpoint_name)
+                      logger.info(f"[ImageMetricsLambda] Endpoint {endpoint_name} exists")
+                  except Exception as endpoint_error:
+                      logger.warning(f"[ImageMetricsLambda] Endpoint doesn't exist: {str(endpoint_error)}")
+                      endpoint_exists = False
+
+                      # Update DynamoDB to indicate no endpoint
+                      table.update_item(
+                          Key={'request_id': request_id},
+                          UpdateExpression='SET #status = :status, #message = :message',
+                          ExpressionAttributeNames={
+                              '#status': 'status',
+                              '#message': 'message'
+                          },
+                          ExpressionAttributeValues={
+                              ':status': 'NO_ENDPOINT',
+                              ':message': f"Endpoint {endpoint_name} not available"
+                          }
+                      )
+
+                      return {
+                          'statusCode': 200,
+                          'headers': cors_headers(),
+                          'body': json.dumps({
+                              'request_id': request_id,
+                              'status': 'READY_FOR_PROCESSING',
+                              'message': 'Input saved but endpoint not available. Will process when endpoint is ready.'
+                          })
+                      }
+
+                  # Invoke SageMaker endpoint asynchronously
+                  if endpoint_exists:
+                      try:
+                          logger.info(f"[ImageMetricsLambda] Submitting async request to SageMaker: {endpoint_name}")
+                          sagemaker_runtime = boto3.client('sagemaker-runtime')
+
+                          async_response = sagemaker_runtime.invoke_endpoint_async(
+                              EndpointName=endpoint_name,
+                              ContentType='application/json',
+                              Accept='application/json',
+                              InputLocation=s3_input_path
+                          )
+
+                          # Get the SageMaker inference ID
+                          inference_id = async_response.get('InferenceId')
+                          logger.info(f"[ImageMetricsLambda] Received InferenceId: {inference_id}")
+
+                          # Update DynamoDB with the inference ID
+                          table.update_item(
+                              Key={'request_id': request_id},
+                              UpdateExpression='SET #status = :status, #inference_id = :inference_id',
+                              ExpressionAttributeNames={
+                                  '#status': 'status',
+                                  '#inference_id': 'sagemaker_inference_id'
+                              },
+                              ExpressionAttributeValues={
+                                  ':status': 'IN_PROGRESS',
+                                  ':inference_id': inference_id
+                              }
+                          )
+
+                          # Start processor Lambda to check status
+                          processor_lambda = os.environ.get('PROCESSOR_LAMBDA', '')
+                          if processor_lambda:
+                              logger.info(f"[ImageMetricsLambda] Invoking ProcessorLambda asynchronously")
+                              lambda_client = boto3.client('lambda')
+                              lambda_client.invoke(
+                                  FunctionName=processor_lambda,
+                                  InvocationType='Event',  # Asynchronous invocation
+                                  Payload=json.dumps({
+                                      'request_id': request_id,
+                                      'inference_id': inference_id,
+                                      'endpoint_name': endpoint_name,
+                                      's3_input_path': s3_input_path
+                                  })
+                              )
+
+                      except Exception as invoke_error:
+                          logger.error(f"[ImageMetricsLambda] Error invoking SageMaker: {str(invoke_error)}")
+
+                          # Update DynamoDB with error
+                          table.update_item(
+                              Key={'request_id': request_id},
+                              UpdateExpression='SET #status = :status, #error = :error',
+                              ExpressionAttributeNames={
+                                  '#status': 'status',
+                                  '#error': 'error'
+                              },
+                              ExpressionAttributeValues={
+                                  ':status': 'INVOCATION_FAILED',
+                                  ':error': f"SageMaker invocation failed: {str(invoke_error)}"
+                              }
+                          )
+
+                          return {
+                              'statusCode': 500,
+                              'headers': cors_headers(),
+                              'body': json.dumps({
+                                  'request_id': request_id,
+                                  'status': 'FAILED',
+                                  'error': f"Failed to invoke SageMaker endpoint: {str(invoke_error)}"
+                              })
+                          }
+
+                  # Return success response
+                  return {
+                      'statusCode': 200,
+                      'headers': cors_headers(),
+                      'body': json.dumps({
+                          'request_id': request_id,
+                          'status': 'ACCEPTED',
+                          'message': 'FID calculation request accepted. Poll for results using the request_id.'
+                      })
+                  }
+
+              except Exception as e:
+                  logger.error(f"[ImageMetricsLambda] Unhandled exception: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': cors_headers(),
+                      'body': json.dumps({
+                          'error': f"Internal server error: {str(e)}"
+                      })
+                  }
+
+          def cors_headers():
+              """Return standard CORS headers"""
+              return {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Methods': 'OPTIONS,POST,GET'
+              }
+
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+          PROCESSOR_LAMBDA: !GetAtt ProcessorLambda.Arn
+          DYNAMODB_TABLE: 'gan-text-to-image-dev-generation-jobs'
+          SAGEMAKER_ENDPOINT_NAME: 'gan-ep-dev'
+          S3_BUCKET_NAME: !Ref ModelArtifactBucket
+  MetricsLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-metrics'
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.8
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          import logging
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Constants for the specific training job
+          TRAINING_JOB_NAME = "gan-train-2504270134"
+          MODEL_ARTIFACTS_PATH = "s3://gan-text-to-image-dev-artifacts-207567761455/training/gan-train-2504270134/gan-train-2504270134/output/"
+
+          def handler(event, context):
+              # Log the incoming request
+              logger.info(f"MetricsLambda received request: {json.dumps(event, default=str)}")
+
+              # Initialize S3 client
+              s3 = boto3.client('s3')
+
+              try:
+                  # Log that we're using the specific training job
+                  logger.info(f"Using specific training job: {TRAINING_JOB_NAME}")
+                  logger.info(f"Model artifacts path: {MODEL_ARTIFACTS_PATH}")
+
+                  # Extract bucket and path from the model artifacts path
+                  bucket = MODEL_ARTIFACTS_PATH.split('/')[2]
+                  model_dir = '/'.join(MODEL_ARTIFACTS_PATH.split('/')[3:])
+
+                  # Get metrics file - construct the full path
+                  metrics_key = f"{model_dir}model_metrics.json"
+                  logger.info(f"Looking for metrics file at s3://{bucket}/{metrics_key}")
+
+                  try:
+                      response = s3.get_object(
+                          Bucket=bucket,
+                          Key=metrics_key
+                      )
+
+                      metrics = json.loads(response['Body'].read().decode('utf-8'))
+                      logger.info(f"Successfully retrieved metrics: {json.dumps(metrics, default=str)[:200]}...")
+
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type',
+                              'Access-Control-Allow-Methods': 'OPTIONS,GET,POST'
+                          },
+                          'body': json.dumps(metrics)
+                      }
+                  except s3.exceptions.NoSuchKey:
+                      # Try with a different path pattern
+                      metrics_key = f"{model_dir}/model_metrics.json"
+                      logger.info(f"First path not found. Trying alternate path: s3://{bucket}/{metrics_key}")
+
+                      response = s3.get_object(
+                          Bucket=bucket,
+                          Key=metrics_key
+                      )
+
+                      metrics = json.loads(response['Body'].read().decode('utf-8'))
+                      logger.info(f"Successfully retrieved metrics from alternate path: {json.dumps(metrics, default=str)[:200]}...")
+
+                      return {
+                          'statusCode': 200,
+                          'headers': {
+                              'Content-Type': 'application/json',
+                              'Access-Control-Allow-Origin': '*',
+                              'Access-Control-Allow-Headers': 'Content-Type',
+                              'Access-Control-Allow-Methods': 'OPTIONS,GET,POST'
+                          },
+                          'body': json.dumps(metrics)
+                      }
+
+              except Exception as e:
+                  logger.error(f"Error retrieving metrics: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*',
+                          'Access-Control-Allow-Headers': 'Content-Type',
+                          'Access-Control-Allow-Methods': 'OPTIONS,GET,POST'
+                      },
+                      'body': json.dumps({
+                          'error': str(e),
+                          'message': 'Failed to retrieve model metrics'
+                      })
+                  }
+      Environment:
+        Variables:
+          PROJECT_NAME: !Ref ProjectName
+          ENVIRONMENT: !Ref EnvironmentName
+
+  PollLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${EnvironmentName}-poll'
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: python3.8
+      Handler: index.handler
+      Timeout: 750
+      MemorySize: 256  # Reduced to 128MB to save costs
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import logging
+          import boto3
+          from decimal import Decimal
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          dynamodb = boto3.resource('dynamodb')
+
+          # Custom JSON encoder to handle Decimal values
+          class DecimalEncoder(json.JSONEncoder):
+              def default(self, obj):
+                  if isinstance(obj, Decimal):
+                      return float(obj)
+                  return super(DecimalEncoder, self).default(obj)
+
+          def handler(event, context):
+              table_name = os.environ.get('DYNAMODB_TABLE', '')
+              logger.info(f"[PollLambda] Received event: {json.dumps(event)}")
+
+              try:
+                  request_id = event.get('queryStringParameters', {}).get('request_id', '')
+                  if not request_id:
+                      logger.warning("[PollLambda] Missing request_id in query parameters")
+                      return {
+                          'statusCode': 400,
+                          'headers': cors_headers(),
+                          'body': json.dumps({'error': 'request_id is required'})
+                      }
+
+                  table = dynamodb.Table(table_name)
+                  response = table.get_item(Key={'request_id': request_id})
+
+                  if 'Item' not in response:
+                      logger.info(f"[PollLambda] No job found for request_id={request_id}")
+                      return {
+                          'statusCode': 404,
+                          'headers': cors_headers(),
+                          'body': json.dumps({'error': 'Job not found'})
+                      }
+
+                  job = response['Item']
+                  logger.info(f"[PollLambda] Job status for request_id={request_id}: {job.get('status', 'UNKNOWN')}")
+
+                  return {
+                      'statusCode': 200,
+                      'headers': cors_headers(),
+                      'body': json.dumps({
+                          'status': job.get('status', 'UNKNOWN'),
+                          'data': job.get('data', {}),
+                          'fid_inference_id': job.get('fid_inference_id', None)
+                      }, cls=DecimalEncoder)  # Use the custom encoder here
+                  }
+
+              except Exception as e:
+                  logger.error(f"[PollLambda] ERROR: {str(e)}", exc_info=True)
+                  return {
+                      'statusCode': 500,
+                      'headers': cors_headers(),
+                      'body': json.dumps({'error': str(e)})
+                  }
+
+          def cors_headers():
+              return {
+                  'Content-Type': 'application/json',
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type',
+                  'Access-Control-Allow-Methods': 'OPTIONS,GET,POST'
+              }
+
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref EnvironmentName
+          PROJECT_NAME: !Ref ProjectName
+          DYNAMODB_TABLE: 'gan-text-to-image-dev-generation-jobs'
+          SAGEMAKER_ENDPOINT_NAME: 'gan-ep-dev'
+          S3_BUCKET_NAME: !Ref ModelArtifactBucket
+
+  # ===== API Gateway =====
+  APIGatewayRestAPI:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: !Sub '${ProjectName}-${EnvironmentName}-api'
+      Description: 'API for the Text-to-Image GAN project'
+
+  InferenceResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt APIGatewayRestAPI.RootResourceId
+      PathPart: 'generate'
+
+  ImageMetricsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt APIGatewayRestAPI.RootResourceId
+      PathPart: 'image-metrics'
+
+  MetricsResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt APIGatewayRestAPI.RootResourceId
+      PathPart: 'metrics'
+
+  PollResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ParentId: !GetAtt APIGatewayRestAPI.RootResourceId
+      PathPart: 'poll'
+
+  InferenceMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref InferenceResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${InferenceLambda.Arn}/invocations'
+
+  ImageMetricsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref ImageMetricsResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ImageMetricsLambda.Arn}/invocations'
+
+  MetricsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref MetricsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${MetricsLambda.Arn}/invocations'
+
+  PollMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref PollResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PollLambda.Arn}/invocations'
+
+  # ===== CORS Configuration =====
+  # OPTIONS Method for the /generate endpoint
+  InferenceOptionsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref InferenceResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type'"
+              'method.response.header.Access-Control-Allow-Methods': "'OPTIONS,POST'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': true
+            'method.response.header.Access-Control-Allow-Methods': true
+            'method.response.header.Access-Control-Allow-Origin': true
+
+  # OPTIONS Method for the /poll endpoint
+  PollOptionsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref PollResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type'"
+              'method.response.header.Access-Control-Allow-Methods': "'OPTIONS,GET'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': true
+            'method.response.header.Access-Control-Allow-Methods': true
+            'method.response.header.Access-Control-Allow-Origin': true
+
+  # OPTIONS Method for the /metrics endpoint
+  MetricsOptionsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref MetricsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type'"
+              'method.response.header.Access-Control-Allow-Methods': "'OPTIONS,GET'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': true
+            'method.response.header.Access-Control-Allow-Methods': true
+            'method.response.header.Access-Control-Allow-Origin': true
+
+  # OPTIONS Method for the /image-metrics endpoint
+  ImageMetricsOptionsMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      ResourceId: !Ref ImageMetricsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              'method.response.header.Access-Control-Allow-Headers': "'Content-Type'"
+              'method.response.header.Access-Control-Allow-Methods': "'OPTIONS,POST'"
+              'method.response.header.Access-Control-Allow-Origin': "'*'"
+        RequestTemplates:
+          'application/json': '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            'method.response.header.Access-Control-Allow-Headers': true
+            'method.response.header.Access-Control-Allow-Methods': true
+            'method.response.header.Access-Control-Allow-Origin': true
+
+  # ===== Lambda Permissions =====
+  InferenceLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref InferenceLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGatewayRestAPI}/*/POST/generate'
+
+  ImageMetricsLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ImageMetricsLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGatewayRestAPI}/*/POST/image-metrics'
+
+  MetricsLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref MetricsLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGatewayRestAPI}/*/GET/metrics'
+
+  PollLambdaPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PollLambda
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${APIGatewayRestAPI}/*/GET/poll'
+
+  APIGatewayDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn:
+      - InferenceMethod
+      - MetricsMethod
+      - ImageMetricsMethod
+      - PollMethod
+      - InferenceOptionsMethod
+      - MetricsOptionsMethod
+      - ImageMetricsOptionsMethod
+      - PollOptionsMethod
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      Description: 'Initial deployment with async support and CORS'
+
+  APIGatewayStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      RestApiId: !Ref APIGatewayRestAPI
+      StageName: v1
+      DeploymentId: !Ref APIGatewayDeployment
+
+  # ===== CloudWatch Dashboard =====
+  MonitoringDashboard:
+    Type: 'AWS::CloudWatch::Dashboard'
+    Properties:
+      DashboardName: !Sub '${ProjectName}-${EnvironmentName}-dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/ApiGateway", "Count", "ApiName", "${ProjectName}-${EnvironmentName}-api" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "API Gateway Request Count"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-${EnvironmentName}-inference" ],
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-${EnvironmentName}-metrics" ],
+                  [ "AWS/Lambda", "Invocations", "FunctionName", "${ProjectName}-${EnvironmentName}-poll" ]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Lambda Invocations"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 6,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-${EnvironmentName}-inference" ],
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-${EnvironmentName}-metrics" ],
+                  [ "AWS/Lambda", "Duration", "FunctionName", "${ProjectName}-${EnvironmentName}-poll" ]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Duration"
+              }
+            }
+          ]
+        }
+
+Conditions:
+  HasModelArtifact: !And [!Not [!Equals [!Ref ModelArtifactUrl, '']], !Not [!Equals [!Ref ContainerImage, '']]]
+
+Outputs:
+  SageMakerRoleArn:
+    Description: "ARN of the SageMaker execution role"
+    Value: !GetAtt SageMakerRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${EnvironmentName}-sagemaker-role-arn"
+
+  LambdaRoleArn:
+    Description: "ARN of the Lambda execution role"
+    Value: !GetAtt LambdaRole.Arn
+    Export:
+      Name: !Sub "${ProjectName}-${EnvironmentName}-lambda-role-arn"
+
+  ModelArtifactBucketName:
+    Description: "Name of the S3 bucket for model artifacts"
+    Value: !Ref ModelArtifactBucket
+    Export:
+      Name: !Sub "${ProjectName}-${EnvironmentName}-model-artifact-bucket"
+
+  APIEndpoint:
+    Description: "URL of the API Gateway endpoint"
+    Value: !Sub "https://${APIGatewayRestAPI}.execute-api.${AWS::Region}.amazonaws.com/v1"
+    Export:
+      Name: !Sub "${ProjectName}-${EnvironmentName}-api-endpoint"

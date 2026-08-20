@@ -1,0 +1,283 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: One-click deployment of Shadowsocks server using the latest Ubuntu version with Session Manager and VPC
+
+Parameters:
+  ServerPort:
+    Default: 45785
+    Type: Number
+  Method:
+    Default: 2022-blake3-chacha20-poly1305
+    Type: String
+    AllowedValues:
+      - plain
+      - none
+      - aes-128-gcm
+      - aes-256-gcm
+      - chacha20-ietf-poly1305
+      - 2022-blake3-aes-128-gcm
+      - 2022-blake3-aes-256-gcm
+      - 2022-blake3-chacha20-poly1305
+  Password:
+    Default: /shadowsocks/password
+    Type: String
+    Description: The parameter/key for the Shadowsocks
+  VpcCidrBlock:
+    Description: CIDR block for the VPC
+    Type: String
+    Default: 10.0.0.0/16
+  UbuntuLatestAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: /aws/service/canonical/ubuntu/server/22.04/stable/current/arm64/hvm/ebs-gp2/ami-id
+  InstanceTypeParam:
+    Description: EC2 Instance Type
+    Type: String
+    Default: t4g.small
+    AllowedValues:
+      - t4g.nano
+      - t4g.micro
+      - t4g.small
+    ConstraintDescription: must be a valid EC2 instance type.
+
+Resources:
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidrBlock
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: ShadowSocksVPC
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Select [ 0, !Cidr [ !GetAtt VPC.CidrBlock, 16, 8 ]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: PublicSubnet
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: ShadowSocksInternetGateway
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: PublicRouteTable
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  ShadowSocksSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable Shadowsocks access
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref ServerPort
+          ToPort: !Ref ServerPort
+          CidrIp: 0.0.0.0/0
+
+  ShadowSocksInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref ShadowSocksInstanceRole
+
+  ShadowSocksInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: ShadowSocksEC2Policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeAddresses
+                  - ec2:AssociateAddress
+                Resource: "*"
+        - PolicyName: SSMParameterAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:PutParameter
+                Resource:
+                  - !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter${Password}'
+
+  ShadowSocksLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    DependsOn:
+      - ServerIP
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref UbuntuLatestAmiId
+        InstanceType: !Ref InstanceTypeParam
+        SecurityGroupIds:
+          - !Ref ShadowSocksSecurityGroup
+        IamInstanceProfile:
+          Arn: !GetAtt ShadowSocksInstanceProfile.Arn
+        MetadataOptions:
+          HttpTokens: optional
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+
+            # Catch exit code and signal CloudFormation
+            trap 'exit_status=${!?}; /usr/local/bin/cfn-signal -e ${!exit_status} --stack ${AWS::StackName} --resource ShadowSocksAutoScalingGroup --region ${AWS::Region}' HUP INT TERM EXIT
+
+            # Install packages
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get update
+            apt-get install -y awscli curl python3-pip
+            pip3 install https://s3.amazonaws.com/cloudformation-examples/aws-cfn-bootstrap-py3-latest.tar.gz
+
+            # Install from snapstore
+            snap install shadowsocks-rust
+
+            # Set default region
+            export TOKEN=`curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60"`
+            export AWS_DEFAULT_REGION=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone | sed 's/\([0-9][0-9]*\)[a-z]*$/\1/')
+
+            # Collect parameters
+            ALLOCATION_ID=$(aws ec2 describe-addresses --filters="Name=tag:Name,Values=${AWS::StackName}-vpn-pool" --output text --query "Addresses[0].AllocationId")
+            EXTERNAL_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+            INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+
+            # Assign static IP from pool
+            if [ ! -z ${!ALLOCATION_ID} ]; then
+              aws ec2 associate-address --instance-id ${!INSTANCE_ID} --allocation-id ${!ALLOCATION_ID} --allow-reassociation
+            fi
+
+            # Configure server password and configuration folder (mush be within allowed scope)
+            SS_PASSWORD=$(aws ssm get-parameter --name ${Password} --with-decryption --query "Parameter.Value" --output text 2>/dev/null || /snap/shadowsocks-rust/current/bin/ssservice genkey -m "${Method}")
+            SS_CONFIG_FOLDER=/home/shadowsocks
+
+            # Upload password to SSM
+            aws ssm put-parameter --name ${Password} --value ${!SS_PASSWORD} --type SecureString --overwrite
+
+            # Setup firewall
+            ufw allow ${ServerPort}/tcp
+            ufw enable
+
+            # Configure shadowsocks-rust.ssserver-daemon service and configuration
+            mkdir -m 700 -p ${!SS_CONFIG_FOLDER}
+            cat > ${!SS_CONFIG_FOLDER}/ss.json <<EOF
+            {
+                "server": "0.0.0.0",
+                "server_port": ${ServerPort},
+                "password": "${!SS_PASSWORD}",
+                "timeout": 300,
+                "method": "${Method}",
+                "mode": "tcp_only",
+                "fast_open": true,
+                "nameserver": "1.1.1.1"
+            }
+            EOF
+
+            cat > /etc/systemd/system/shadowsocks-rust.ssserver-daemon.service <<EOF
+            [Service]
+            ExecStart=/usr/bin/snap run shadowsocks-rust.ssserver-daemon -c ${!SS_CONFIG_FOLDER}/ss.json
+            Restart=on-failure
+            TimeoutStopSec=30
+            Type=simple
+            EOF
+
+            # Reload daemons
+            systemctl daemon-reload
+
+            # Enable and start shadowsocks-rust.ssserver-daemon snap service
+            snap start --enable shadowsocks-rust.ssserver-daemon
+            systemctl restart shadowsocks-rust.ssserver-daemon
+
+  ShadowSocksAutoScalingGroup:
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT5M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MinInstancesInService: 1
+        MaxBatchSize: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: True
+        SuspendProcesses:
+          - AZRebalance
+          - AlarmNotification
+          - HealthCheck
+          - ReplaceUnhealthy
+          - ScheduledActions
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref ShadowSocksLaunchTemplate
+        Version: !GetAtt ShadowSocksLaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 2
+      DesiredCapacity: 1
+      VPCZoneIdentifier:
+        - !Ref PublicSubnet
+
+  ServerIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-vpn-pool"
+
+Outputs:
+  Server:
+    Value: !GetAtt ServerIP.PublicIp
+    Description: The Elastic IP address of the Shadowsocks server
+
+  ServerPort:
+    Value: !Ref ServerPort
+    Description: The port of the Shadowsocks server
+
+  Method:
+    Value: !Ref Method
+    Description: The method of the Shadowsocks server

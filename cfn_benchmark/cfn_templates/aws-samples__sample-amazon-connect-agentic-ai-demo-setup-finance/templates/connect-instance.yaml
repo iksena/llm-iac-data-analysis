@@ -1,0 +1,380 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Amazon Connect Instance with S3 Storage Configuration'
+
+Resources:
+  ConnectInstance:
+    Type: AWS::Connect::Instance
+    Properties:
+      InstanceAlias: !Sub # - amazon-connect-${UUID}
+        - amazon-connect-${AWS::AccountId}-${UUID}
+        - UUID:
+            !Select [
+              4,
+              !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]],
+            ]
+      IdentityManagementType: CONNECT_MANAGED
+      Attributes:
+        InboundCalls: true
+        OutboundCalls: true
+        ContactflowLogs: true
+        ContactLens: true
+        EarlyMedia: true
+        UseCustomTTSVoices: true
+
+  # checkov:skip=CKV_AWS_18:This is a logging bucket that receives access logs from other buckets
+  # cfn-lint:disable=W35:This is a logging bucket that receives access logs from other buckets
+  StorageLoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub # - connect-logs-${UUID}
+        - connect-logs-${AWS::AccountId}-${UUID}
+        - UUID:
+            !Select [
+              4,
+              !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]],
+            ]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    DeletionPolicy: Retain
+
+  # S3 Bucket Policy for Logging Bucket to allow S3 logging service
+  StorageLoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StorageLoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3LoggingService
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action:
+              - s3:PutObject
+            Resource: !Sub '${StorageLoggingBucket.Arn}/*'
+
+  StorageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub # - connect-${UUID}
+        - connect-${AWS::AccountId}-${UUID}
+        - UUID:
+            !Select [
+              4,
+              !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]],
+            ]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref StorageLoggingBucket
+        LogFilePrefix: 'connect-access-logs/'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    DeletionPolicy: Retain
+
+  # S3 Bucket Policy for Storage Bucket
+  StorageBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StorageBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowConnectAccess
+            Effect: Allow
+            Principal:
+              Service: connect.amazonaws.com
+            Action:
+              - s3:PutObject
+              - s3:GetObject
+            Resource: !Sub '${StorageBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  CallRecordingsStorage:
+    Type: AWS::Connect::InstanceStorageConfig
+    Properties:
+      InstanceArn: !GetAtt ConnectInstance.Arn
+      ResourceType: CALL_RECORDINGS
+      StorageType: S3
+      S3Config:
+        BucketName: !Ref StorageBucket
+        BucketPrefix: call-recordings
+
+  ChatTranscriptsStorage:
+    Type: AWS::Connect::InstanceStorageConfig
+    Properties:
+      InstanceArn: !GetAtt ConnectInstance.Arn
+      ResourceType: CHAT_TRANSCRIPTS
+      StorageType: S3
+      S3Config:
+        BucketName: !Ref StorageBucket
+        BucketPrefix: chat-transcripts
+
+  ScheduledReportsStorage:
+    Type: AWS::Connect::InstanceStorageConfig
+    Properties:
+      InstanceArn: !GetAtt ConnectInstance.Arn
+      ResourceType: SCHEDULED_REPORTS
+      StorageType: S3
+      S3Config:
+        BucketName: !Ref StorageBucket
+        BucketPrefix: scheduled-reports
+
+  # Lambda Role for Admin User Creation
+  AdminUserCreationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ConnectAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - connect:ListRoutingProfiles
+                  - connect:ListSecurityProfiles
+                  - connect:CreateUser
+                  - connect:DeleteUser
+                  - connect:DescribeUser
+                  - connect:ListUsers
+                Resource:
+                  - !GetAtt ConnectInstance.Arn
+                  - !Sub '${ConnectInstance.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt AdminUserFnDLQ.Arn
+
+  # SQS Dead Letter Queue for Admin User Lambda
+  AdminUserFnDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-AdminUserFn-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    DeletionPolicy: Delete
+
+  # Lambda Function to Create Admin User
+  # checkov:skip=CKV_AWS_117:Lambda functions call public APIs in demo environment
+  # checkov:skip=CKV_SECRET_6:Lambda function handles demo environment default password, not a production secret
+  AdminUserFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt AdminUserCreationRole.Arn
+      Timeout: 60
+      DeadLetterConfig:
+        TargetArn: !GetAtt AdminUserFnDLQ.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              response_data = {}
+              user_id = None
+
+              try:
+                  print(f"Received event: {json.dumps(event, default=str)}")
+
+                  instance_id = event['ResourceProperties']['InstanceId']
+                  username = event['ResourceProperties']['Username']
+                  password = event['ResourceProperties']['Password']
+
+                  connect = boto3.client('connect')
+
+                  if event['RequestType'] == 'Delete':
+                      print("Delete request - attempting to delete user")
+
+                      # Try to find and delete the user
+                      try:
+                          paginator = connect.get_paginator('list_users')
+                          for page in paginator.paginate(InstanceId=instance_id):
+                              for user in page.get('UserSummaryList', []):
+                                  if user['Username'] == username:
+                                      user_id = user['Id']
+                                      print(f"Found user to delete: {user_id}")
+                                      connect.delete_user(InstanceId=instance_id, UserId=user_id)
+                                      print(f"Deleted user: {username}")
+                                      break
+                              if user_id:
+                                  break
+                      except Exception as delete_error:
+                          print(f"Error deleting user (may not exist): {str(delete_error)}")
+
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  print(f"Creating admin user for instance: {instance_id}")
+
+                  # Look up Basic routing profile
+                  routing_profile_id = None
+                  paginator = connect.get_paginator('list_routing_profiles')
+                  for page in paginator.paginate(InstanceId=instance_id):
+                      for profile in page.get('RoutingProfileSummaryList', []):
+                          if profile['Name'].lower() == 'basic routing profile':
+                              routing_profile_id = profile['Id']
+                              print(f"Found Basic routing profile ID: {routing_profile_id}")
+                              break
+                      if routing_profile_id:
+                          break
+
+                  # Look up Admin security profile
+                  security_profile_id = None
+                  paginator = connect.get_paginator('list_security_profiles')
+                  for page in paginator.paginate(InstanceId=instance_id):
+                      for profile in page.get('SecurityProfileSummaryList', []):
+                          if profile['Name'].lower() == 'admin':
+                              security_profile_id = profile['Id']
+                              print(f"Found Admin security profile ID: {security_profile_id}")
+                              break
+                      if security_profile_id:
+                          break
+
+                  if not routing_profile_id or not security_profile_id:
+                      error_message = "Required default profiles not found"
+                      print(error_message)
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {
+                          'Error': error_message
+                      })
+                      return
+
+                  # Create the user
+                  response = connect.create_user(
+                      Username=username,
+                      Password=password,
+                      IdentityInfo={
+                          'FirstName': 'Workshop',
+                          'LastName': 'Admin',
+                          'Email': f'admin-{instance_id}@example.com'
+                      },
+                      PhoneConfig={
+                          'PhoneType': 'SOFT_PHONE',
+                          'AutoAccept': False,
+                          'AfterContactWorkTimeLimit': 60
+                      },
+                      SecurityProfileIds=[security_profile_id],
+                      RoutingProfileId=routing_profile_id,
+                      InstanceId=instance_id
+                  )
+
+                  user_id = response['UserId']
+                  user_arn = response['UserArn']
+
+                  response_data = {
+                      'UserId': user_id,
+                      'UserArn': user_arn,
+                      'Username': username
+                  }
+
+                  print(f"Successfully created user: {username} ({user_id})")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  error_message = f"Error creating admin user: {str(e)}"
+                  print(error_message)
+
+                  # Always send a response to prevent CloudFormation from hanging
+                  try:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {
+                          'Error': error_message
+                      })
+                  except Exception as send_error:
+                      print(f"Failed to send error response: {str(send_error)}")
+                      # Last resort - try to send minimal response
+                      try:
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {})
+                      except:
+                          print("Complete failure to send any response to CloudFormation")
+
+  # Custom Resource to Create Admin User
+  # checkov:skip=CKV_SECRET_6:This is a demo environment default password, not a production secret
+  AdminUser:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt AdminUserFn.Arn
+      InstanceId: !Ref ConnectInstance
+      Username: admin
+      Password: A!Ag3nts
+    DependsOn: ConnectInstance
+
+Outputs:
+  ConnectInstanceArn:
+    Description: ARN of the Connect instance
+    Value: !GetAtt ConnectInstance.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ConnectInstanceArn'
+
+  ConnectInstanceId:
+    Description: UUID of the Connect instance (e.g., 12345678-1234-1234-1234-123456789012)
+    Value: !GetAtt ConnectInstance.Id
+    Export:
+      Name: !Sub '${AWS::StackName}-ConnectInstanceId'
+
+  ConnectInstanceAlias:
+    Description: Alias of the Connect instance
+    Value: !Sub
+      - 'amazon-connect-${AWS::AccountId}-${UUID}'
+      - UUID:
+          !Select [
+            4,
+            !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]],
+          ]
+    Export:
+      Name: !Sub '${AWS::StackName}-ConnectInstanceAlias'
+
+  AdminUsername:
+    Description: Username of the admin user
+    Value: !GetAtt AdminUser.Username
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminUsername'
+
+  AdminPassword:
+    Description: Password for the admin user
+    # checkov:skip=CKV_SECRET_6:This is a demo environment default password, not a production secret
+    Value: A!Ag3nts
+    Export:
+      Name: !Sub '${AWS::StackName}-AdminPassword'
+
+  AgentCoreGatewayDiscoveryUrl:
+    Description: Connect instance URL for agent configuration
+    Value: !Sub
+      - 'https://amazon-connect-${AWS::AccountId}-${UUID}.my.connect.aws/.well-known/openid-configuration'
+      - UUID:
+          !Select [
+            4,
+            !Split ['-', !Select [2, !Split ['/', !Ref AWS::StackId]]],
+          ]
+    Export:
+      Name: !Sub '${AWS::StackName}-AgentCoreGatewayDiscoveryUrl'

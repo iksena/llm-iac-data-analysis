@@ -1,0 +1,557 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'NAT Gateway Security Monitor'
+
+Parameters:
+  NatGwId:
+    Type: String
+    Description: NAT Gateway ID
+    Default: nat-xxxxxx
+
+  RefreshInterval:
+    Type: Number
+    Description: 汇总计算间隔(分钟)
+    Default: 10
+    MinValue: 2
+    MaxValue: 60
+
+  OutDataAlertThreshold:
+    Type: Number
+    Description: 出流量报警阈值(Bytes/min)
+    Default: 30000000
+
+  NotifyEmail:
+    Type: String
+    Description: 报警通知邮箱
+    Default: abc@mail.com
+
+  LogsRetainDays:
+    Type: Number
+    Description: 原始日志保存天数
+    Default: 7
+    MinValue: 1
+    MaxValue: 365
+
+Resources:
+  # SNS主题和邮件订阅
+  NotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-notify'
+      DisplayName: NAT Gateway Security Monitor Notifications
+
+  EmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      TopicArn: !Ref NotificationTopic
+      Endpoint: !Ref NotifyEmail
+
+  # S3存储桶
+  FlowLogBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-flowlogs-${AWS::AccountId}'
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: !Ref LogsRetainDays
+            Prefix: /
+
+  # DynamoDB表
+  IpTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-table'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: ip
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ip
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  # IAM角色
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: NatGwMonitorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:BatchGetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource: !GetAtt IpTable.Arn
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref NotificationTopic
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:ListMultipartUploadParts
+                  - s3:AbortMultipartUpload
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${FlowLogBucket}/*'
+                  - !Sub 'arn:aws:s3:::${FlowLogBucket}'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeNatGateways
+                  - ec2:CreateFlowLogs
+                  - ec2:DescribeFlowLogs
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:GetNamedQuery
+                  - athena:ListNamedQueries
+                  - athena:StopQueryExecution
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabases
+                  - glue:GetDatabase
+                  - glue:GetTables
+                  - glue:GetTable
+                  - glue:GetPartitions
+                  - glue:GetPartition
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:UpdatePartition
+                  - glue:BatchUpdatePartition
+                  - glue:DeletePartition
+                  - glue:BatchDeletePartition
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Lambda 函数用于获取 NAT Gateway 的 ENI ID
+  GetNatGatewayEniFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.13
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+            if event['RequestType'] == 'Delete':
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              return
+            nat_gateway_id = event['ResourceProperties']['NatGatewayId']
+            try:
+              ec2 = boto3.client('ec2')
+              response = ec2.describe_nat_gateways(NatGatewayIds=[nat_gateway_id])
+              if response['NatGateways'] and len(response['NatGateways']) > 0:
+                nat_gateway = response['NatGateways'][0]
+                if 'NatGatewayAddresses' in nat_gateway and len(nat_gateway['NatGatewayAddresses']) > 0:
+                  network_interface_id = nat_gateway['NatGatewayAddresses'][0]['NetworkInterfaceId']
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'NetworkInterfaceId': network_interface_id})
+                  return
+              cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': 'Could not find ENI for NAT Gateway'})
+            except Exception as e:
+              cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  # 自定义资源调用 Lambda 函数
+  GetNatGatewayEni:
+    Type: Custom::GetNatGatewayEni
+    Properties:
+      ServiceToken: !GetAtt GetNatGatewayEniFunction.Arn
+      NatGatewayId: !Ref NatGwId
+
+  # 为 NAT Gateway 创建 VPC Flow Log
+  NatGatewayFlowLog:
+    Type: AWS::EC2::FlowLog
+    DependsOn: [GetNatGatewayEni, FlowLogBucket]
+    Properties:
+      ResourceId: !GetAtt GetNatGatewayEni.NetworkInterfaceId
+      ResourceType: NetworkInterface
+      TrafficType: ALL
+      LogDestinationType: s3
+      LogDestination: !GetAtt FlowLogBucket.Arn
+      DestinationOptions:
+        FileFormat: parquet
+        HiveCompatiblePartitions: true
+        PerHourPartition: true
+      MaxAggregationInterval: 600
+      LogFormat: '${version} ${account-id} ${interface-id} ${srcaddr} ${dstaddr} ${srcport} ${dstport} ${protocol} ${packets} ${bytes} ${start} ${end} ${action} ${log-status}'
+
+  # Lambda函数
+  TrafficAnalysisFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-traffic-analysis'
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 300
+      Environment:
+        Variables:
+          STACK_NAME: !Sub '${AWS::StackName}'
+          SNS_TOPIC_ARN: !Ref NotificationTopic
+          REFRESH_INTERVAL: !Ref RefreshInterval
+      Code:
+        ZipFile: |
+          import json
+          def lambda_handler(event, context):
+              return {'statusCode': 200, 'body': json.dumps('Function created, code will be updated separately')}
+
+  # EventBridge规则
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: 定期触发流量分析Lambda
+      ScheduleExpression: !Sub 'rate(${RefreshInterval} minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt TrafficAnalysisFunction.Arn
+          Id: TrafficAnalysisTarget
+
+  # Lambda权限
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TrafficAnalysisFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+  # CloudWatch报警
+  NatGwOutboundTrafficAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub 'NatGw-${NatGwId}-OutboundTraffic'
+      AlarmDescription: NAT Gateway出站流量报警
+      MetricName: BytesOutToDestination
+      Namespace: AWS/NatGateway
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: !Ref OutDataAlertThreshold
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: NatGatewayId
+          Value: !Ref NatGwId
+      AlarmActions:
+        - !Ref NotificationTopic
+
+  # Athena 工作组
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${AWS::StackName}-workgroup'
+      Description: 'WorkGroup for NAT Gateway Flow Logs analysis'
+      State: ENABLED
+      WorkGroupConfiguration:
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://${FlowLogBucket}/athena_query_result/'
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: true
+        BytesScannedCutoffPerQuery: 1073741824  # 1GB
+
+  # Athena 数据库
+  AthenaDatabase:
+    Type: AWS::Glue::Database
+    DeletionPolicy: Delete
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub '${AWS::StackName}-db'
+        Description: 'Database for NAT Gateway Flow Logs analysis'
+
+  AthenaTable:
+    Type: AWS::Glue::Table
+    DeletionPolicy: Delete
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref AthenaDatabase
+      TableInput:
+        Name: "vpc_flow_logs"
+        TableType: "EXTERNAL_TABLE"
+        Parameters:
+          EXTERNAL: "true"
+          "skip.header.line.count": "1"
+          classification: "parquet"
+          compressionType: "none"
+          typeOfData: "file"
+        StorageDescriptor:
+          Columns:
+            - Name: "version"
+              Type: "int"
+            - Name: "account_id"
+              Type: "string"
+            - Name: "interface_id"
+              Type: "string"
+            - Name: "srcaddr"
+              Type: "string"
+            - Name: "dstaddr"
+              Type: "string"
+            - Name: "srcport"
+              Type: "int"
+            - Name: "dstport"
+              Type: "int"
+            - Name: "protocol"
+              Type: "bigint"
+            - Name: "packets"
+              Type: "bigint"
+            - Name: "bytes"
+              Type: "bigint"
+            - Name: "start"
+              Type: "bigint"
+            - Name: "end"
+              Type: "bigint"
+            - Name: "action"
+              Type: "string"
+            - Name: "log_status"
+              Type: "string"
+          Location: !Sub "s3://${FlowLogBucket}/AWSLogs/aws-account-id=${AWS::AccountId}/aws-service=vpcflowlogs/aws-region=${AWS::Region}/"
+          InputFormat: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat"
+          OutputFormat: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat"
+          Compressed: false
+          SerdeInfo:
+            SerializationLibrary: "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+            Parameters:
+              serialization.format: "1"
+        PartitionKeys:
+          - Name: "year"
+            Type: "string"
+          - Name: "month"
+            Type: "string"
+          - Name: "day"
+            Type: "string"
+          - Name: "hour"
+            Type: "string"
+
+  # Athena 表创建查询
+  # s3://xxx/AWSLogs/aws-account-id=xxx/aws-service=vpcflowlogs/aws-region=ap-northeast-1/year=2025/month=10/day=11/hour=06/xxx_vpcflowlogs_ap-northeast-1_fl-006d753xxx_20251011T0650Z_1338b62c.log.parquet
+  AthenaTableCreationQuery:
+    Type: AWS::Athena::NamedQuery
+    DeletionPolicy: Delete
+    Properties:
+      Database: !Sub '${AWS::StackName}-db'
+      Name: !Sub '${AWS::StackName}-create-flow-logs-table-projection'
+      Description: 'Create table for VPC Flow Logs with projection'
+      QueryString: !Sub |
+        CREATE EXTERNAL TABLE IF NOT EXISTS vpc_flow_logs (
+          `version` int,
+          account_id string,
+          interface_id string,
+          srcaddr string,
+          dstaddr string,
+          srcport int,
+          dstport int,
+          protocol int,
+          packets int,
+          bytes bigint,
+          `start` bigint,
+          `end` bigint,
+          action string,
+          log_status string
+        )
+        PARTITIONED BY (
+          `year` string,
+          `month` string,
+          `day` string,
+          `hour` string
+        )
+        STORED AS PARQUET
+        LOCATION 's3://${FlowLogBucket}/AWSLogs/aws-account-id=${AWS::AccountId}/aws-service=vpcflowlogs/aws-region=${AWS::Region}/'
+        TBLPROPERTIES (
+          'has_encrypted_data'='false',
+          'projection.enabled'='true',
+          'projection.year.type'='integer',
+          'projection.year.range'='2025,2099',
+          'projection.year.digits'='4',
+          'projection.month.type'='integer',
+          'projection.month.range'='1,12',
+          'projection.month.digits'='2',
+          'projection.day.type'='integer',
+          'projection.day.range'='1,31',
+          'projection.day.digits'='2',
+          'projection.hour.type'='integer',
+          'projection.hour.range'='0,23',
+          'projection.hour.digits'='2',
+          'storage.location.template'='s3://${FlowLogBucket}/AWSLogs/aws-account-id=${AWS::AccountId}/aws-service=vpcflowlogs/aws-region=${AWS::Region}/year=${!year}/month=${!month}/day=${!day}/hour=${!hour}/'
+        );
+      WorkGroup: !Ref AthenaWorkGroup
+
+  # 常用分析查询示例
+  AthenaTopSourcesQuery:
+    Type: AWS::Athena::NamedQuery
+    DeletionPolicy: Delete
+    Properties:
+      Database: !Sub '${AWS::StackName}-db'
+      Name: !Sub '${AWS::StackName}-top-sources'
+      Description: 'Top 10 source IPs by traffic volume'
+      QueryString: !Sub |
+        SELECT
+          srcaddr,
+          SUM(bytes) as total_bytes,
+          COUNT(*) as connection_count
+        FROM
+          vpc_flow_logs
+        WHERE
+          interface_id = '${GetNatGatewayEni.NetworkInterfaceId}'
+          AND action = 'ACCEPT'
+        GROUP BY
+          srcaddr
+        ORDER BY
+          total_bytes DESC
+        LIMIT 10;
+      WorkGroup: !Ref AthenaWorkGroup
+
+  AthenaTopDestinationsQuery:
+    Type: AWS::Athena::NamedQuery
+    DeletionPolicy: Delete
+    Properties:
+      Database: !Sub '${AWS::StackName}-db'
+      Name: !Sub '${AWS::StackName}-top-destinations'
+      Description: 'Top 10 destination IPs by traffic volume'
+      QueryString: !Sub |
+        SELECT
+          dstaddr,
+          SUM(bytes) as total_bytes,
+          COUNT(*) as connection_count
+        FROM
+          vpc_flow_logs
+        WHERE
+          interface_id = '${GetNatGatewayEni.NetworkInterfaceId}'
+          AND action = 'ACCEPT'
+        GROUP BY
+          dstaddr
+        ORDER BY
+          total_bytes DESC
+        LIMIT 10;
+      WorkGroup: !Ref AthenaWorkGroup
+
+  AthenaTopDestCClassQuery:
+    Type: AWS::Athena::NamedQuery
+    DeletionPolicy: Delete
+    Properties:
+      Database: !Sub '${AWS::StackName}-db'
+      Name: !Sub '${AWS::StackName}-top-dest-c-class'
+      Description: 'Top 10 dest C-Class IPs by traffic volume'
+      QueryString: !Sub |
+        SELECT
+          concat(regexp_extract(dstaddr, '(\d+\.\d+\.\d+)\.\d+', 1), '.0/24') AS dstaddr_c_class,
+          SUM(bytes) as total_bytes,
+          COUNT(*) as connection_count
+        FROM
+          vpc_flow_logs
+        WHERE
+          interface_id = '${GetNatGatewayEni.NetworkInterfaceId}'
+          AND action = 'ACCEPT'
+          AND NOT regexp_like(dstaddr, '^(10\.|172\.(1[6-9]|2[0-9]|3[01])\.|192\.168\.|127\.|169\.254\.)')
+        GROUP BY
+          concat(regexp_extract(dstaddr, '(\d+\.\d+\.\d+)\.\d+', 1), '.0/24')
+        ORDER BY
+          total_bytes DESC
+        LIMIT 10;
+      WorkGroup: !Ref AthenaWorkGroup
+
+  AthenaTopPortsQuery:
+    Type: AWS::Athena::NamedQuery
+    DeletionPolicy: Delete
+    Properties:
+      Database: !Sub '${AWS::StackName}-db'
+      Name: !Sub '${AWS::StackName}-top-ports'
+      Description: 'Top 10 destination ports by traffic volume'
+      QueryString: !Sub |
+        SELECT
+          dstport,
+          CASE
+            WHEN dstport = 80 THEN 'HTTP'
+            WHEN dstport = 443 THEN 'HTTPS'
+            WHEN dstport = 22 THEN 'SSH'
+            WHEN dstport = 3389 THEN 'RDP'
+            WHEN dstport = 53 THEN 'DNS'
+            ELSE CAST(dstport AS VARCHAR)
+          END as service,
+          SUM(bytes) as total_bytes,
+          COUNT(*) as connection_count
+        FROM
+          vpc_flow_logs
+        WHERE
+          interface_id = '${GetNatGatewayEni.NetworkInterfaceId}'
+          AND action = 'ACCEPT'
+        GROUP BY
+          dstport
+        ORDER BY
+          total_bytes DESC
+        LIMIT 10;
+      WorkGroup: !Ref AthenaWorkGroup
+
+Outputs:
+  SNSTopicArn:
+    Description: SNS主题ARN
+    Value: !Ref NotificationTopic
+
+  DynamoDBTableName:
+    Description: DynamoDB表名
+    Value: !Ref IpTable
+
+  LambdaFunctionName:
+    Description: Lambda函数名
+    Value: !Ref TrafficAnalysisFunction
+
+  S3BucketName:
+    Description: S3存储桶名
+    Value: !Ref FlowLogBucket
+
+  NatGatewayEniId:
+    Description: The ENI ID of the NAT Gateway
+    Value: !GetAtt GetNatGatewayEni.NetworkInterfaceId
+
+  FlowLogId:
+    Description: The ID of the Flow Log
+    Value: !Ref NatGatewayFlowLog
+
+  AthenaWorkGroupName:
+    Description: Athena WorkGroup Name
+    Value: !Ref AthenaWorkGroup
+
+  AthenaConsoleLink:
+    Description: Link to Athena Console with predefined queries
+    Value: !Sub 'https://console.aws.amazon.com/athena/home?region=${AWS::Region}'
+
+  AthenaDatabase:
+    Description: Athena Database for Search
+    Value: !Sub '${AWS::StackName}-db'

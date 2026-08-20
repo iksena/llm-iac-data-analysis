@@ -1,0 +1,203 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Post-deployment stack: updates S3 CORS with the actual frontend origin
+  and forces an API Gateway redeployment to pick up AllowedOrigin changes.
+
+Parameters:
+  RecipientsBucketName:
+    Type: String
+    Description: Name of the Recipients S3 bucket to update CORS on
+  AllowedOrigin:
+    Type: String
+    Description: The frontend origin URL (CloudFront domain or API Gateway endpoint)
+  LambdaKMSKeyArn:
+    Type: String
+    Description: ARN of the KMS key for Lambda environment variable encryption
+  CloudWatchLogsKMSKeyArn:
+    Type: String
+    Description: ARN of the KMS key for CloudWatch Logs encryption
+  EmailApiRestApiId:
+    Type: String
+    Description: REST API ID for the Email Distribution API Gateway
+  EmailApiStageName:
+    Type: String
+    Description: Stage name for the Email Distribution API Gateway
+
+Resources:
+
+  # ============================================================================
+  # Dead Letter Queue
+  # ============================================================================
+  PostDeployDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-DLQ
+      KmsMasterKeyId: !Ref LambdaKMSKeyArn
+      MessageRetentionPeriod: 1209600
+
+  # ============================================================================
+  # IAM Policies
+  # ============================================================================
+  PostDeployS3Policy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:PutBucketCors
+              - s3:GetBucketCors
+            Resource: !Sub arn:${AWS::Partition}:s3:::${RecipientsBucketName}
+
+  PostDeployApiGwPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - apigateway:POST
+            Resource: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${EmailApiRestApiId}/deployments"
+          - Effect: Allow
+            Action:
+              - apigateway:PATCH
+            Resource: !Sub "arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${EmailApiRestApiId}/stages/${EmailApiStageName}"
+
+  PostDeployKMSAndDLQPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - kms:Decrypt
+              - kms:DescribeKey
+            Resource: !Ref LambdaKMSKeyArn
+          - Effect: Allow
+            Action:
+              - sqs:SendMessage
+            Resource: !GetAtt PostDeployDLQ.Arn
+
+  # ============================================================================
+  # IAM Role
+  # ============================================================================
+  PostDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref PostDeployS3Policy
+        - !Ref PostDeployApiGwPolicy
+        - !Ref PostDeployKMSAndDLQPolicy
+
+  # ============================================================================
+  # Log Group
+  # ============================================================================
+  PostDeployLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-PostDeploy
+      RetentionInDays: 14
+      KmsKeyId: !Ref CloudWatchLogsKMSKeyArn
+
+  # ============================================================================
+  # Lambda Function
+  # ============================================================================
+  PostDeployFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: PostDeployLogGroup
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-PostDeploy
+      ReservedConcurrentExecutions: 1
+      Handler: index.handler
+      Role: !GetAtt PostDeployRole.Arn
+      Runtime: python3.13
+      Timeout: 30
+      MemorySize: 128
+      KmsKeyArn: !Ref LambdaKMSKeyArn
+      DeadLetterConfig:
+        TargetArn: !GetAtt PostDeployDLQ.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  props = event['ResourceProperties']
+                  request_type = event['RequestType']
+
+                  if request_type in ('Create', 'Update'):
+                      # 1. Update S3 CORS
+                      bucket = props['RecipientsBucketName']
+                      origin = props['AllowedOrigin']
+
+                      s3 = boto3.client('s3')
+                      s3.put_bucket_cors(
+                          Bucket=bucket,
+                          CORSConfiguration={
+                              'CORSRules': [{
+                                  'AllowedHeaders': ['*'],
+                                  'AllowedMethods': ['PUT', 'POST'],
+                                  'AllowedOrigins': [origin],
+                                  'MaxAgeSeconds': 3000
+                              }]
+                          }
+                      )
+                      print(f'Updated S3 CORS on {bucket} to {origin}')
+
+                      # 2. Create new API Gateway deployment
+                      rest_api_id = props['RestApiId']
+                      stage_name = props['StageName']
+
+                      apigw = boto3.client('apigateway')
+                      deploy = apigw.create_deployment(
+                          restApiId=rest_api_id,
+                          description='Deployed by post-deploy custom resource'
+                      )
+                      apigw.update_stage(
+                          restApiId=rest_api_id,
+                          stageName=stage_name,
+                          patchOperations=[{
+                              'op': 'replace',
+                              'path': '/deploymentId',
+                              'value': deploy['id']
+                          }]
+                      )
+                      print(f'Redeployed API {rest_api_id} stage {stage_name} -> {deploy["id"]}')
+
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                          'AllowedOrigin': origin,
+                          'DeploymentId': deploy['id']
+                      })
+                  else:
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+
+              except Exception as e:
+                  print(f'Error: {e}')
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': str(e)
+                  })
+
+  # ============================================================================
+  # Custom Resource
+  # ============================================================================
+  PostDeployCustomResource:
+    Type: Custom::PostDeploy
+    Properties:
+      ServiceToken: !GetAtt PostDeployFunction.Arn
+      RecipientsBucketName: !Ref RecipientsBucketName
+      AllowedOrigin: !Ref AllowedOrigin
+      RestApiId: !Ref EmailApiRestApiId
+      StageName: !Ref EmailApiStageName

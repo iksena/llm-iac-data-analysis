@@ -1,0 +1,993 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Event-Driven Architecture for Order Processing System
+  Includes EventBridge, SQS, Lambda, SNS, DynamoDB, and Step Functions
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+    Description: Environment name
+
+  OrderTableReadCapacity:
+    Type: Number
+    Default: 5
+    Description: DynamoDB read capacity units
+
+  OrderTableWriteCapacity:
+    Type: Number
+    Default: 5
+    Description: DynamoDB write capacity units
+
+  NotificationEmail:
+    Type: String
+    Description: Email address for order notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+
+  EnableDetailedMonitoring:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Enable detailed CloudWatch monitoring
+
+Resources:
+  # ==================== EventBridge ====================
+  OrderEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${Environment}-order-event-bus'
+
+  OrderEventBusPolicy:
+    Type: AWS::Events::EventBusPolicy
+    Properties:
+      EventBusName: !Ref OrderEventBus
+      StatementId: AllowCurrentAccount
+      Statement:
+        Effect: Allow
+        Principal:
+          AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+        Action:
+          - events:PutEvents
+        Resource: !GetAtt OrderEventBus.Arn
+
+  # SECURITY FLAW #5: EventBridge rule without DLQ for failed invocations
+  OrderCreatedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Environment}-order-created-rule'
+      Description: Routes order.created events to processing queue
+      EventBusName: !Ref OrderEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - order.service
+        detail-type:
+          - order.created
+      Targets:
+        - Arn: !GetAtt OrderProcessingQueue.Arn
+          Id: OrderProcessingQueueTarget
+          RetryPolicy:
+            MaximumRetryAttempts: 3
+            MaximumEventAge: 3600
+        - Arn: !GetAtt OrderValidationFunction.Arn
+          Id: OrderValidationFunctionTarget
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAge: 1800
+
+  OrderShippedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Environment}-order-shipped-rule'
+      Description: Routes order.shipped events to notification topic
+      EventBusName: !Ref OrderEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - order.service
+        detail-type:
+          - order.shipped
+      Targets:
+        - Arn: !Ref OrderNotificationTopic
+          Id: OrderNotificationTopicTarget
+
+  OrderFailedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Environment}-order-failed-rule'
+      Description: Routes order.failed events to alert queue
+      EventBusName: !Ref OrderEventBus
+      State: ENABLED
+      EventPattern:
+        source:
+          - order.service
+        detail-type:
+          - order.failed
+      Targets:
+        - Arn: !GetAtt OrderAlertQueue.Arn
+          Id: OrderAlertQueueTarget
+
+  # ==================== SQS Queues ====================
+  # SECURITY FLAW #1: SQS queue without server-side encryption
+  # SECURITY FLAW #2: SQS queue without dead-letter queue configured
+  OrderProcessingQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-order-processing-queue'
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 1209600  # 14 days
+      ReceiveMessageWaitTimeSeconds: 10
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: OrderProcessing
+
+  # Dead-letter queue (correctly configured for demonstration)
+  OrderProcessingDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-order-processing-dlq'
+      MessageRetentionPeriod: 1209600
+      KmsMasterKeyId: alias/aws/sqs
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: DeadLetterQueue
+
+  # SECURITY FLAW #1 & #2: Alert queue without encryption and DLQ
+  OrderAlertQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-order-alert-queue'
+      VisibilityTimeout: 120
+      MessageRetentionPeriod: 345600  # 4 days
+      ReceiveMessageWaitTimeSeconds: 5
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: Alerting
+
+  # Queue policy for EventBridge to send messages
+  OrderProcessingQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref OrderProcessingQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrderProcessingQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt OrderCreatedRule.Arn
+
+  OrderAlertQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref OrderAlertQueue
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt OrderAlertQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt OrderFailedRule.Arn
+
+  # ==================== SNS Topics ====================
+  # SECURITY FLAW #4: SNS topic without encryption
+  OrderNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${Environment}-order-notifications'
+      DisplayName: Order Notification Topic
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: email
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  OrderNotificationTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref OrderNotificationTopic
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref OrderNotificationTopic
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt OrderShippedRule.Arn
+
+  # ==================== DynamoDB Tables ====================
+  OrderTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}-orders'
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: !Ref OrderTableReadCapacity
+        WriteCapacityUnits: !Ref OrderTableWriteCapacity
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: N
+        - AttributeName: status
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerIndex
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref OrderTableReadCapacity
+            WriteCapacityUnits: !Ref OrderTableWriteCapacity
+        - IndexName: StatusIndex
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: !Ref OrderTableReadCapacity
+            WriteCapacityUnits: !Ref OrderTableWriteCapacity
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      SSESpecification:
+        SSEEnabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  OrderEventTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}-order-events'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: OrderIdIndex
+          KeySchema:
+            - AttributeName: orderId
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ==================== Lambda Functions ====================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-order-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: OrderProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt OrderTable.Arn
+                  - !Sub '${OrderTable.Arn}/index/*'
+                  - !GetAtt OrderEventTable.Arn
+                  - !Sub '${OrderEventTable.Arn}/index/*'
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource:
+                  - !GetAtt OrderProcessingQueue.Arn
+                  - !GetAtt OrderAlertQueue.Arn
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt OrderEventBus.Arn
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: !Ref OrderFulfillmentStateMachine
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref OrderNotificationTopic
+
+  # SECURITY FLAW #3: Lambda function without reserved concurrent executions
+  OrderValidationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-order-validation'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      CodeUri: ./functions/order-validation/
+      Description: Validates incoming orders
+      MemorySize: 512
+      Timeout: 60
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          ORDER_TABLE: !Ref OrderTable
+          EVENT_TABLE: !Ref OrderEventTable
+          EVENT_BUS_NAME: !Ref OrderEventBus
+          ENVIRONMENT: !Ref Environment
+      Events:
+        EventBridgeTrigger:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref OrderEventBus
+            Pattern:
+              source:
+                - order.service
+              detail-type:
+                - order.created
+      Tags:
+        Environment: !Ref Environment
+      InlineCode: |
+        import json
+        import os
+        import boto3
+        from datetime import datetime
+        import uuid
+
+        dynamodb = boto3.resource('dynamodb')
+        events = boto3.client('events')
+
+        order_table = dynamodb.Table(os.environ['ORDER_TABLE'])
+        event_table = dynamodb.Table(os.environ['EVENT_TABLE'])
+        event_bus_name = os.environ['EVENT_BUS_NAME']
+
+        def lambda_handler(event, context):
+            print(f"Received event: {json.dumps(event)}")
+
+            try:
+                order_data = event['detail']
+                order_id = order_data.get('orderId')
+
+                # Validate order data
+                validation_result = validate_order(order_data)
+
+                if validation_result['valid']:
+                    # Store event
+                    store_event(order_id, 'order.validated', validation_result)
+
+                    # Emit validated event
+                    emit_event('order.validated', order_data)
+
+                    return {
+                        'statusCode': 200,
+                        'body': json.dumps({'message': 'Order validated', 'orderId': order_id})
+                    }
+                else:
+                    # Emit failed event
+                    emit_event('order.failed', {
+                        'orderId': order_id,
+                        'reason': validation_result['errors']
+                    })
+
+                    return {
+                        'statusCode': 400,
+                        'body': json.dumps({'message': 'Validation failed', 'errors': validation_result['errors']})
+                    }
+
+            except Exception as e:
+                print(f"Error: {str(e)}")
+                return {
+                    'statusCode': 500,
+                    'body': json.dumps({'message': 'Internal error'})
+                }
+
+        def validate_order(order_data):
+            errors = []
+
+            required_fields = ['orderId', 'customerId', 'items', 'totalAmount']
+            for field in required_fields:
+                if field not in order_data:
+                    errors.append(f"Missing required field: {field}")
+
+            if 'totalAmount' in order_data and order_data['totalAmount'] <= 0:
+                errors.append("Total amount must be positive")
+
+            if 'items' in order_data and len(order_data['items']) == 0:
+                errors.append("Order must contain at least one item")
+
+            return {
+                'valid': len(errors) == 0,
+                'errors': errors
+            }
+
+        def store_event(order_id, event_type, data):
+            event_table.put_item(
+                Item={
+                    'eventId': str(uuid.uuid4()),
+                    'orderId': order_id,
+                    'eventType': event_type,
+                    'timestamp': int(datetime.utcnow().timestamp()),
+                    'data': data,
+                    'ttl': int(datetime.utcnow().timestamp()) + 2592000  # 30 days
+                }
+            )
+
+        def emit_event(detail_type, detail):
+            events.put_events(
+                Entries=[{
+                    'Source': 'order.service',
+                    'DetailType': detail_type,
+                    'Detail': json.dumps(detail),
+                    'EventBusName': event_bus_name
+                }]
+            )
+
+  # SECURITY FLAW #3: Lambda function without reserved concurrent executions
+  OrderProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-order-processor'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      CodeUri: ./functions/order-processor/
+      Description: Processes orders from SQS queue
+      MemorySize: 1024
+      Timeout: 300
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          ORDER_TABLE: !Ref OrderTable
+          EVENT_TABLE: !Ref OrderEventTable
+          STATE_MACHINE_ARN: !Ref OrderFulfillmentStateMachine
+          ENVIRONMENT: !Ref Environment
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderProcessingQueue.Arn
+            BatchSize: 10
+            MaximumBatchingWindowInSeconds: 5
+      Tags:
+        Environment: !Ref Environment
+      InlineCode: |
+        import json
+        import os
+        import boto3
+        from datetime import datetime
+
+        dynamodb = boto3.resource('dynamodb')
+        stepfunctions = boto3.client('stepfunctions')
+
+        order_table = dynamodb.Table(os.environ['ORDER_TABLE'])
+        event_table = dynamodb.Table(os.environ['EVENT_TABLE'])
+        state_machine_arn = os.environ['STATE_MACHINE_ARN']
+
+        def lambda_handler(event, context):
+            print(f"Processing {len(event['Records'])} messages")
+
+            results = []
+            for record in event['Records']:
+                try:
+                    message_body = json.loads(record['body'])
+                    order_data = message_body.get('detail', {})
+
+                    # Update order in DynamoDB
+                    order_id = order_data.get('orderId')
+                    update_order(order_id, 'PROCESSING')
+
+                    # Start Step Functions workflow
+                    execution_arn = stepfunctions.start_execution(
+                        stateMachineArn=state_machine_arn,
+                        name=f"{order_id}-{int(datetime.utcnow().timestamp())}",
+                        input=json.dumps(order_data)
+                    )
+
+                    results.append({
+                        'orderId': order_id,
+                        'status': 'started',
+                        'executionArn': execution_arn['executionArn']
+                    })
+
+                except Exception as e:
+                    print(f"Error processing message: {str(e)}")
+                    results.append({
+                        'status': 'error',
+                        'error': str(e)
+                    })
+
+            return {
+                'statusCode': 200,
+                'body': json.dumps({
+                    'processed': len(results),
+                    'results': results
+                })
+            }
+
+        def update_order(order_id, status):
+            order_table.update_item(
+                Key={'orderId': order_id},
+                UpdateExpression='SET #status = :status, updatedAt = :updated',
+                ExpressionAttributeNames={'#status': 'status'},
+                ExpressionAttributeValues={
+                    ':status': status,
+                    ':updated': int(datetime.utcnow().timestamp())
+                }
+            )
+
+  OrderAlertFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-order-alert'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      CodeUri: ./functions/order-alert/
+      Description: Handles order failure alerts
+      MemorySize: 256
+      Timeout: 60
+      ReservedConcurrentExecutions: 5
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          NOTIFICATION_TOPIC: !Ref OrderNotificationTopic
+          ENVIRONMENT: !Ref Environment
+      Events:
+        SQSTrigger:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt OrderAlertQueue.Arn
+            BatchSize: 5
+      Tags:
+        Environment: !Ref Environment
+      InlineCode: |
+        import json
+        import os
+        import boto3
+
+        sns = boto3.client('sns')
+        topic_arn = os.environ['NOTIFICATION_TOPIC']
+
+        def lambda_handler(event, context):
+            print(f"Processing {len(event['Records'])} alert messages")
+
+            for record in event['Records']:
+                try:
+                    message_body = json.loads(record['body'])
+                    alert_data = message_body.get('detail', {})
+
+                    # Send SNS notification
+                    sns.publish(
+                        TopicArn=topic_arn,
+                        Subject=f"Order Failed: {alert_data.get('orderId')}",
+                        Message=json.dumps(alert_data, indent=2)
+                    )
+
+                    print(f"Alert sent for order: {alert_data.get('orderId')}")
+
+                except Exception as e:
+                    print(f"Error processing alert: {str(e)}")
+
+            return {
+                'statusCode': 200,
+                'body': json.dumps({'message': 'Alerts processed'})
+            }
+
+  # ==================== Step Functions ====================
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-order-stepfunctions-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:UpdateItem
+                  - dynamodb:GetItem
+                Resource:
+                  - !GetAtt OrderTable.Arn
+              - Effect: Allow
+                Action:
+                  - events:PutEvents
+                Resource: !GetAtt OrderEventBus.Arn
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  OrderFulfillmentStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${Environment}-order-fulfillment'
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Order fulfillment workflow",
+          "StartAt": "ReserveInventory",
+          "States": {
+            "ReserveInventory": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${OrderTable}",
+                "Key": {
+                  "orderId": {
+                    "S.$": "$.orderId"
+                  }
+                },
+                "UpdateExpression": "SET #status = :status",
+                "ExpressionAttributeNames": {
+                  "#status": "status"
+                },
+                "ExpressionAttributeValues": {
+                  ":status": {
+                    "S": "INVENTORY_RESERVED"
+                  }
+                }
+              },
+              "Next": "ProcessPayment",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleFailure"
+                }
+              ]
+            },
+            "ProcessPayment": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${OrderTable}",
+                "Key": {
+                  "orderId": {
+                    "S.$": "$.orderId"
+                  }
+                },
+                "UpdateExpression": "SET #status = :status",
+                "ExpressionAttributeNames": {
+                  "#status": "status"
+                },
+                "ExpressionAttributeValues": {
+                  ":status": {
+                    "S": "PAYMENT_PROCESSED"
+                  }
+                }
+              },
+              "Next": "ShipOrder",
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "Next": "HandleFailure"
+                }
+              ]
+            },
+            "ShipOrder": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::dynamodb:updateItem",
+              "Parameters": {
+                "TableName": "${OrderTable}",
+                "Key": {
+                  "orderId": {
+                    "S.$": "$.orderId"
+                  }
+                },
+                "UpdateExpression": "SET #status = :status",
+                "ExpressionAttributeNames": {
+                  "#status": "status"
+                },
+                "ExpressionAttributeValues": {
+                  ":status": {
+                    "S": "SHIPPED"
+                  }
+                }
+              },
+              "Next": "EmitShippedEvent"
+            },
+            "EmitShippedEvent": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::events:putEvents",
+              "Parameters": {
+                "Entries": [
+                  {
+                    "Source": "order.service",
+                    "DetailType": "order.shipped",
+                    "Detail": {
+                      "orderId.$": "$.orderId",
+                      "customerId.$": "$.customerId"
+                    },
+                    "EventBusName": "${OrderEventBus}"
+                  }
+                ]
+              },
+              "End": true
+            },
+            "HandleFailure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::events:putEvents",
+              "Parameters": {
+                "Entries": [
+                  {
+                    "Source": "order.service",
+                    "DetailType": "order.failed",
+                    "Detail": {
+                      "orderId.$": "$.orderId",
+                      "error.$": "$.error"
+                    },
+                    "EventBusName": "${OrderEventBus}"
+                  }
+                ]
+              },
+              "End": true
+            }
+          }
+        }
+      LoggingConfiguration:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StepFunctionsLogGroup.Arn
+
+  # ==================== CloudWatch ====================
+  StepFunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${Environment}-order-fulfillment'
+      RetentionInDays: 30
+
+  OrderProcessingDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${Environment}-order-processing'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/SQS", "NumberOfMessagesSent", {"stat": "Sum", "label": "Messages Sent"}],
+                  [".", "NumberOfMessagesReceived", {"stat": "Sum", "label": "Messages Received"}],
+                  [".", "ApproximateNumberOfMessagesVisible", {"stat": "Average", "label": "Queue Depth"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "SQS Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", {"stat": "Sum"}],
+                  [".", "Errors", {"stat": "Sum"}],
+                  [".", "Duration", {"stat": "Average"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Lambda Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/States", "ExecutionsFailed", {"stat": "Sum"}],
+                  [".", "ExecutionsSucceeded", {"stat": "Sum"}],
+                  [".", "ExecutionsStarted", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "Step Functions Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", {"stat": "Sum"}],
+                  [".", "ConsumedWriteCapacityUnits", {"stat": "Sum"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Capacity"
+              }
+            }
+          ]
+        }
+
+  # Alarms
+  OrderProcessingQueueDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-order-queue-depth'
+      AlarmDescription: Alert when queue depth is high
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 100
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrderProcessingQueue.QueueName
+      AlarmActions:
+        - !Ref OrderNotificationTopic
+
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-lambda-errors'
+      AlarmDescription: Alert on Lambda function errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OrderProcessorFunction
+      AlarmActions:
+        - !Ref OrderNotificationTopic
+
+  StepFunctionsFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-stepfunctions-failures'
+      AlarmDescription: Alert on Step Functions failures
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref OrderFulfillmentStateMachine
+      AlarmActions:
+        - !Ref OrderNotificationTopic
+
+Outputs:
+  EventBusArn:
+    Description: Order event bus ARN
+    Value: !GetAtt OrderEventBus.Arn
+    Export:
+      Name: !Sub '${Environment}-order-event-bus-arn'
+
+  EventBusName:
+    Description: Order event bus name
+    Value: !Ref OrderEventBus
+    Export:
+      Name: !Sub '${Environment}-order-event-bus-name'
+
+  OrderProcessingQueueUrl:
+    Description: Order processing queue URL
+    Value: !Ref OrderProcessingQueue
+    Export:
+      Name: !Sub '${Environment}-order-processing-queue-url'
+
+  OrderProcessingQueueArn:
+    Description: Order processing queue ARN
+    Value: !GetAtt OrderProcessingQueue.Arn
+    Export:
+      Name: !Sub '${Environment}-order-processing-queue-arn'
+
+  OrderAlertQueueUrl:
+    Description: Order alert queue URL
+    Value: !Ref OrderAlertQueue
+    Export:
+      Name: !Sub '${Environment}-order-alert-queue-url'
+
+  OrderNotificationTopicArn:
+    Description: Order notification topic ARN
+    Value: !Ref OrderNotificationTopic
+    Export:
+      Name: !Sub '${Environment}-order-notification-topic-arn'
+
+  OrderTableName:
+    Description: Order DynamoDB table name
+    Value: !Ref OrderTable
+    Export:
+      Name: !Sub '${Environment}-order-table-name'
+
+  OrderTableArn:
+    Description: Order DynamoDB table ARN
+    Value: !GetAtt OrderTable.Arn
+    Export:
+      Name: !Sub '${Environment}-order-table-arn'
+
+  OrderEventTableName:
+    Description: Order event DynamoDB table name
+    Value: !Ref OrderEventTable
+    Export:
+      Name: !Sub '${Environment}-order-event-table-name'
+
+  StateMachineArn:
+    Description: Order fulfillment state machine ARN
+    Value: !Ref OrderFulfillmentStateMachine
+    Export:
+      Name: !Sub '${Environment}-order-fulfillment-sm-arn'
+
+  DashboardURL:
+    Description: CloudWatch dashboard URL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${OrderProcessingDashboard}'

@@ -1,0 +1,233 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: |
+  Sentasity Org Bootstrap
+  Deploys the Org Discovery Role and auto-enables required AWS service access
+  (CloudTrail and StackSets) in the customer's AWS Organization.
+  Deployed to the management (payer) account only.
+
+Resources:
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # IAM Role — name kept as SentasityOrgDiscoveryRole for backward compatibility
+  # with existing tenant deployments and role verifications.
+  # ──────────────────────────────────────────────────────────────────────────
+  SentasityOrgDiscoveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: SentasityOrgDiscoveryRole
+      Description: "Sentasity read-only access to AWS Organizations structure"
+      MaxSessionDuration: 43200
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: "arn:aws:iam::886557787053:root"
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: OrgDiscoveryReadOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowOrgDiscovery
+                Effect: Allow
+                Action:
+                  - "organizations:DescribeOrganization"
+                  - "organizations:ListRoots"
+                  - "organizations:ListOrganizationalUnitsForParent"
+                  - "organizations:ListAccountsForParent"
+                  - "organizations:ListAccounts"
+                  - "organizations:ListAWSServiceAccessForOrganization"
+                  - "organizations:EnableAWSServiceAccess"
+                  - "sts:GetCallerIdentity"
+                  - "cloudformation:DescribeStackSet"
+                  - "cloudformation:DescribeStackSetOperation"
+                  - "cloudformation:ListStackInstances"
+                  - "cloudformation:ListStackSetOperations"
+                  - "cloudformation:ListStackSetOperationResults"
+                  - "billing:GetBillingPreferences"
+                Resource: "*"
+      Tags:
+        - Key: "ManagedBy"
+          Value: "Sentasity-CloudFormation"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Lambda execution role — scoped only to the service-access operations
+  # needed by the custom resource.
+  # ──────────────────────────────────────────────────────────────────────────
+  ServiceAccessEnablerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: "Execution role for the Sentasity service-access enablement Lambda"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: "ManagedBy"
+          Value: "Sentasity-CloudFormation"
+
+  # Separate policy resource so CloudFormation creates it as a distinct step
+  # after the role. The Lambda DependsOn this policy, which gives IAM time to
+  # propagate the role before the Lambda tries to assume it (avoids the
+  # "role cannot be assumed" race condition on rapid create/delete cycles).
+  ServiceAccessEnablerPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: EnableServiceAccess
+      Roles:
+        - !Ref ServiceAccessEnablerRole
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowServiceAccessOps
+            Effect: Allow
+            Action:
+              - "organizations:ListAWSServiceAccessForOrganization"
+              - "organizations:EnableAWSServiceAccess"
+              - "organizations:DescribeOrganization"
+              - "organizations:ListDelegatedAdministrators"
+              - "organizations:ListRoots"
+              - "organizations:ListAccounts"
+              - "cloudformation:ActivateOrganizationsAccess"
+              - "cloudformation:DescribeOrganizationsAccess"
+            Resource: "*"
+          # ActivateOrganizationsAccess creates/reads the StackSets service-linked
+          # role; without these IAM perms on the specific SLR ARN the API fails
+          # with AccessDenied on iam:GetRole.
+          - Sid: AllowStackSetsServiceLinkedRole
+            Effect: Allow
+            Action:
+              - "iam:GetRole"
+              - "iam:CreateServiceLinkedRole"
+            Resource: "arn:aws:iam::*:role/aws-service-role/stacksets.cloudformation.amazonaws.com/AWSServiceRoleForCloudFormationStackSetsOrgAdmin"
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Lambda — enables CloudTrail and StackSets service access on Create/Update.
+  # On Delete it is a no-op (we never disable service access on stack teardown).
+  # ──────────────────────────────────────────────────────────────────────────
+  ServiceAccessEnablerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: ServiceAccessEnablerPolicy
+    Properties:
+      Description: "Enables required AWS Organizations service access for Sentasity"
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt ServiceAccessEnablerRole.Arn
+      Timeout: 60
+      Tags:
+        - Key: "ManagedBy"
+          Value: "Sentasity-CloudFormation"
+      Code:
+        ZipFile: |
+          import json
+          import urllib.request
+          import boto3
+
+          REQUIRED_SERVICES = [
+              "cloudtrail.amazonaws.com",
+              "member.org.stacksets.cloudformation.amazonaws.com",
+          ]
+
+          def send_response(event, context, status, reason=""):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason,
+                  "PhysicalResourceId": event.get("PhysicalResourceId", "ServiceAccessEnabler"),
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+              }).encode("utf-8")
+
+              url = event["ResponseURL"]
+              req = urllib.request.Request(
+                  url,
+                  data=body,
+                  method="PUT",
+                  headers={
+                      "Content-Type": "",
+                      "Content-Length": str(len(body)),
+                  },
+              )
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              request_type = event.get("RequestType")
+              print(f"RequestType: {request_type}")
+
+              # Delete is always a no-op — we never disable service access.
+              if request_type == "Delete":
+                  print("Delete request — no-op, sending SUCCESS")
+                  send_response(event, context, "SUCCESS")
+                  return
+
+              try:
+                  client = boto3.client("organizations")
+
+                  # Determine which services are already enabled.
+                  already_enabled = set()
+                  paginator = client.get_paginator("list_aws_service_access_for_organization")
+                  for page in paginator.paginate():
+                      for svc in page.get("EnabledServicePrincipals", []):
+                          already_enabled.add(svc["ServicePrincipal"])
+
+                  print(f"Already enabled services: {already_enabled}")
+
+                  # Enable any services that are not yet active.
+                  for svc in REQUIRED_SERVICES:
+                      if svc not in already_enabled:
+                          print(f"Enabling service access: {svc}")
+                          client.enable_aws_service_access(ServicePrincipal=svc)
+                      else:
+                          print(f"Already enabled, skipping: {svc}")
+
+                  # Organizations-side service access is necessary but not sufficient for
+                  # service-managed StackSets. CloudFormation tracks its own activation
+                  # state; without this call, StackSet deployments fail with
+                  # "You must enable organizations access to operate a service managed stack set."
+                  cfn_client = boto3.client("cloudformation")
+                  status_response = cfn_client.describe_organizations_access()
+                  current_status = status_response.get("Status")
+                  print(f"CloudFormation Organizations access status: {current_status}")
+
+                  if current_status != "ACTIVE":
+                      print("Activating CloudFormation Organizations access")
+                      cfn_client.activate_organizations_access()
+                  else:
+                      print("CloudFormation Organizations access already active")
+
+                  print("All required services enabled — sending SUCCESS")
+                  send_response(event, context, "SUCCESS")
+
+              except Exception as exc:
+                  try:
+                      send_response(
+                          event,
+                          context,
+                          "FAILED",
+                          reason=f"Error enabling service access: {exc}",
+                      )
+                  except Exception as send_exc:
+                      print(f"Failed to send CFN response: {send_exc}")
+
+  # ──────────────────────────────────────────────────────────────────────────
+  # Custom resource — triggers the Lambda on stack create/update/delete.
+  # ──────────────────────────────────────────────────────────────────────────
+  ServiceAccessEnabler:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ServiceAccessEnablerFunction.Arn
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt SentasityOrgDiscoveryRole.Arn
+    Description: "Org Discovery Role ARN"
+
+  RoleName:
+    Value: !Ref SentasityOrgDiscoveryRole
+    Description: "Org Discovery Role name"

@@ -1,0 +1,473 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Panoptik — ECS Fargate cluster, service, task def, ALB, ECR repo"
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: dev
+  VpcId:
+    Type: String
+  PublicSubnetA:
+    Type: String
+  PublicSubnetB:
+    Type: String
+  PrivateSubnetA:
+    Type: String
+  PrivateSubnetB:
+    Type: String
+  ALBSecurityGroupId:
+    Type: String
+  ECSSecurityGroupId:
+    Type: String
+  RedisEndpoint:
+    Type: String
+    Default: ""
+  CognitoUserPoolId:
+    Type: String
+    Default: ""
+  CognitoAppClientId:
+    Type: String
+    Default: ""
+  CorsOrigins:
+    Type: String
+    Default: "*"
+  ImageTag:
+    Type: String
+    Description: Docker image tag for the backend container (required — no default to prevent pulling nonexistent tags)
+
+Resources:
+  # Access Logs S3 Bucket (shared by ALB, CloudFront, S3)
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "panoptik-${EnvironmentName}-access-logs-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      Tags:
+        - Key: Name
+          Value: !Sub "panoptik-${EnvironmentName}-access-logs"
+
+  AccessLogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AccessLogsBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowELBLogs
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::127311923021:root"
+            Action: s3:PutObject
+            Resource: !Sub "${AccessLogsBucket.Arn}/alb/*"
+          - Sid: AllowELBLogDelivery
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${AccessLogsBucket.Arn}/alb/*"
+            Condition:
+              StringEquals:
+                "s3:x-amz-acl": "bucket-owner-full-control"
+          - Sid: AllowELBLogDeliveryAclCheck
+            Effect: Allow
+            Principal:
+              Service: delivery.logs.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt AccessLogsBucket.Arn
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt AccessLogsBucket.Arn
+              - !Sub "${AccessLogsBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+  # ECR Repository
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "panoptik-${EnvironmentName}-backend"
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub "panoptik-${EnvironmentName}-backend"
+
+  # ECS Cluster
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "panoptik-${EnvironmentName}"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Name
+          Value: !Sub "panoptik-${EnvironmentName}"
+
+  # CloudWatch Log Group
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/panoptik/${EnvironmentName}/ecs"
+      RetentionInDays: 30
+
+  # Task Execution Role
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "panoptik-${EnvironmentName}-ecs-execution"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ECRPull
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                  - ecr:GetAuthorizationToken
+                Resource: "*"
+
+  # Task Role (app permissions)
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "panoptik-${EnvironmentName}-ecs-task"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AppPermissions
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !GetAtt ECSLogGroup.Arn
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/panoptik/${EnvironmentName}/*"
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                Resource: !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/panoptik-${EnvironmentName}-*"
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: "*"
+                Condition:
+                  StringEquals:
+                    "aws:SourceAccount": !Ref "AWS::AccountId"
+                  StringLike:
+                    "sts:ExternalId": "panoptik-*"
+              - Sid: PanoptikReadOnlyMonitoring
+                Effect: Allow
+                Action:
+                  # AWS Config
+                  - config:SelectResourceConfig
+                  - config:BatchGetResourceConfig
+                  - config:GetResourceConfigHistory
+                  # CloudWatch
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:DescribeAlarms
+                  # CloudWatch Logs
+                  - logs:FilterLogEvents
+                  - logs:GetLogEvents
+                  # Cost Explorer
+                  - ce:GetCostAndUsage
+                  # Security Hub
+                  - securityhub:GetFindings
+                  - securityhub:GetInsightResults
+                  - securityhub:BatchGetSecurityControls
+                  # GuardDuty
+                  - guardduty:ListDetectors
+                  - guardduty:ListFindings
+                  - guardduty:GetFindings
+                  - guardduty:GetFindingsStatistics
+                  # CloudTrail
+                  - cloudtrail:LookupEvents
+                  # EC2 Describe
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRegions
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeInternetGateways
+                  - ec2:DescribeNatGateways
+                  - ec2:DescribeRouteTables
+                  # Resource Tagging
+                  - tag:GetResources
+                  # Organizations (multi-account)
+                  - organizations:ListAccounts
+                  - organizations:DescribeOrganization
+                  # Account (region discovery)
+                  - account:ListRegions
+                  # CloudFormation (Drift Detection)
+                  - cloudformation:DetectStackDrift
+                  - cloudformation:DescribeStackDriftDetectionStatus
+                  - cloudformation:DescribeStackResourceDrifts
+                  - cloudformation:ListStacks
+                  - cloudformation:DescribeStacks
+                  # Amazon Bedrock (AI analysis)
+                  - bedrock:InvokeModel
+                  # ECS (Container monitoring)
+                  - ecs:ListClusters
+                  - ecs:DescribeClusters
+                  - ecs:ListServices
+                  - ecs:DescribeServices
+                  - ecs:ListTasks
+                  - ecs:DescribeTasks
+                  - ecs:DescribeTaskDefinition
+                Resource: "*"
+              # FinOps collector: Compute Optimizer + Trusted Advisor + Cost Explorer
+              - Sid: PanoptikFinOpsReadOnly
+                Effect: Allow
+                Action:
+                  - compute-optimizer:GetEnrollmentStatus
+                  - compute-optimizer:GetEC2InstanceRecommendations
+                  - compute-optimizer:GetAutoScalingGroupRecommendations
+                  - support:DescribeTrustedAdvisorChecks
+                  - support:DescribeTrustedAdvisorCheckResult
+                  - ce:GetReservationCoverage
+                  - ce:GetSavingsPlansCoverage
+                Resource: "*"
+
+  # Task Definition
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "panoptik-${EnvironmentName}-backend"
+      Cpu: "512"
+      Memory: "1024"
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/panoptik-${EnvironmentName}-backend:${ImageTag}"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          LinuxParameters:
+            Capabilities:
+              Drop:
+                - ALL
+          ReadonlyRootFilesystem: true
+          MountPoints:
+            - ContainerPath: /tmp
+              SourceVolume: tmp
+          Environment:
+            - Name: ENVIRONMENT
+              Value: !Ref EnvironmentName
+            - Name: LOG_LEVEL
+              Value: INFO
+            - Name: REDIS_URL
+              Value: !If
+                - HasRedis
+                - !Sub "rediss://${RedisEndpoint}:6379/0"
+                - ""
+            - Name: COGNITO_USER_POOL_ID
+              Value: !Ref CognitoUserPoolId
+            - Name: COGNITO_APP_CLIENT_ID
+              Value: !Ref CognitoAppClientId
+            - Name: COGNITO_REGION
+              Value: !Ref "AWS::Region"
+            - Name: CORS_ORIGINS
+              Value: !Ref CorsOrigins
+            - Name: SCHEDULER_ENABLED
+              Value: "true"
+            - Name: DYNAMODB_TABLE_PREFIX
+              Value: !Sub "panoptik-${EnvironmentName}"
+            - Name: PYTHONDONTWRITEBYTECODE
+              Value: "1"
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')\" || exit 1"
+            Interval: 30
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: backend
+      Volumes:
+        - Name: tmp
+
+  # ALB
+  ALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: AccessLogsBucketPolicy
+    Properties:
+      Name: !Sub "panoptik-${EnvironmentName}-alb"
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - !Ref PublicSubnetA
+        - !Ref PublicSubnetB
+      SecurityGroups:
+        - !Ref ALBSecurityGroupId
+      LoadBalancerAttributes:
+        - Key: access_logs.s3.enabled
+          Value: "true"
+        - Key: access_logs.s3.bucket
+          Value: !Ref AccessLogsBucket
+        - Key: access_logs.s3.prefix
+          Value: "alb"
+      Tags:
+        - Key: Name
+          Value: !Sub "panoptik-${EnvironmentName}-alb"
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "panoptik-${EnvironmentName}-tg"
+      Port: 8000
+      Protocol: HTTP
+      VpcId: !Ref VpcId
+      TargetType: ip
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Tags:
+        - Key: Name
+          Value: !Sub "panoptik-${EnvironmentName}-tg"
+
+  ALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ECS Service
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn: ALBListener
+    Properties:
+      ServiceName: !Sub "panoptik-${EnvironmentName}-backend"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PrivateSubnetA
+            - !Ref PrivateSubnetB
+          SecurityGroups:
+            - !Ref ECSSecurityGroupId
+          AssignPublicIp: DISABLED
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: 8000
+          TargetGroupArn: !Ref TargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+
+Conditions:
+  HasRedis:
+    !Not [!Equals [!Ref RedisEndpoint, ""]]
+
+Outputs:
+  ClusterName:
+    Value: !Ref ECSCluster
+  ServiceName:
+    Value: !GetAtt ECSService.Name
+  ALBDnsName:
+    Value: !GetAtt ALB.DNSName
+    Export:
+      Name: !Sub "panoptik-${EnvironmentName}-alb-dns"
+  ALBArn:
+    Value: !Ref ALB
+  ECRRepositoryUri:
+    Value: !GetAtt ECRRepository.RepositoryUri
+    Export:
+      Name: !Sub "panoptik-${EnvironmentName}-ecr-uri"
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
+  AccessLogsBucketName:
+    Value: !Ref AccessLogsBucket
+    Export:
+      Name: !Sub "panoptik-${EnvironmentName}-access-logs-bucket"
+  AccessLogsBucketDomainName:
+    Value: !GetAtt AccessLogsBucket.DomainName
+    Export:
+      Name: !Sub "panoptik-${EnvironmentName}-access-logs-domain"

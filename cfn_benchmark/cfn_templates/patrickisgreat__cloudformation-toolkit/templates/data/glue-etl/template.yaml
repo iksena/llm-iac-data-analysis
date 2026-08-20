@@ -1,0 +1,317 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Glue Data Catalog database, a crawler over an S3 prefix, and a scheduled Spark
+  ETL job with bookmarks - the catalog and transform half of a data lake.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Naming
+        Parameters:
+          - NamePrefix
+          - Environment
+          - DatabaseSuffix
+      - Label:
+          default: Source data
+        Parameters:
+          - SourceBucketArn
+          - SourcePrefix
+      - Label:
+          default: Output
+        Parameters:
+          - TargetBucketArn
+          - TargetPrefix
+      - Label:
+          default: Crawler
+        Parameters:
+          - CrawlerSchedule
+          - EnableCrawler
+      - Label:
+          default: ETL job
+        Parameters:
+          - EnableJob
+          - JobScriptS3Uri
+          - GlueVersion
+          - WorkerType
+          - NumberOfWorkers
+          - JobTimeoutMinutes
+          - MaxConcurrentRuns
+      - Label:
+          default: Operations
+        Parameters:
+          - LogRetentionDays
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: Prefix for the database, crawler and job names.
+    AllowedPattern: "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+    ConstraintDescription: 3-32 lowercase characters, digits and hyphens.
+
+  Environment:
+    Type: String
+    Description: Environment this catalog serves.
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  DatabaseSuffix:
+    Type: String
+    Description: >-
+      Catalog database name suffix, e.g. "raw" or "curated". Glue database names
+      use underscores, so hyphens in NamePrefix are converted.
+    Default: raw
+    AllowedPattern: "^[a-z0-9_]{1,60}$"
+
+  SourceBucketArn:
+    Type: String
+    Description: ARN of the bucket the crawler reads and the job takes input from.
+
+  SourcePrefix:
+    Type: String
+    Description: >-
+      Prefix the crawler scans, e.g. "raw/clickstream". Point it at the table
+      root, above the partition directories - a crawler pointed inside the
+      partitions registers each one as a separate table.
+    Default: raw
+
+  TargetBucketArn:
+    Type: String
+    Description: ARN of the bucket the ETL job writes to. May be the same bucket.
+    Default: ""
+
+  TargetPrefix:
+    Type: String
+    Description: Prefix the job writes transformed data under.
+    Default: curated
+
+  EnableCrawler:
+    Type: String
+    Description: Create the crawler that discovers schema and partitions.
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  CrawlerSchedule:
+    Type: String
+    Description: >-
+      Cron expression for the crawler, in UTC, e.g. "cron(0 1 * * ? *)" for
+      01:00 daily. Leave empty to run it on demand only.
+    Default: "cron(0 1 * * ? *)"
+
+  EnableJob:
+    Type: String
+    Description: >-
+      Create the Spark ETL job. Off by default - a catalog and a crawler are
+      useful on their own, and a job with no script is just a failing resource.
+    Default: "false"
+    AllowedValues: ["true", "false"]
+
+  JobScriptS3Uri:
+    Type: String
+    Description: >-
+      s3:// URI of the PySpark or Scala script. Version the key: Glue reads the
+      script at run time, so overwriting it changes what runs without any
+      CloudFormation event to show for it.
+    Default: ""
+
+  GlueVersion:
+    Type: String
+    Description: Glue runtime version, which fixes the Spark and Python versions.
+    Default: "4.0"
+    AllowedValues: ["3.0", "4.0", "5.0"]
+
+  WorkerType:
+    Type: String
+    Description: >-
+      G.1X is 4 vCPU / 16 GB per worker and the sensible starting point. G.2X
+      doubles both, for wide joins or skewed data. G.025X is a quarter worker for
+      small streaming jobs.
+    Default: G.1X
+    AllowedValues: [G.1X, G.2X, G.4X, G.8X, G.025X]
+
+  NumberOfWorkers:
+    Type: Number
+    Description: >-
+      Workers per run. Glue bills per DPU-hour with a 1-minute minimum, so
+      over-provisioning a short job is a direct multiplier on cost.
+    Default: 2
+    MinValue: 2
+    MaxValue: 299
+
+  JobTimeoutMinutes:
+    Type: Number
+    Description: >-
+      Kill the run after this long. Glue's own default is 2880 minutes - two
+      days - which on a hung job is an expensive way to find out.
+    Default: 60
+    MinValue: 1
+    MaxValue: 2880
+
+  MaxConcurrentRuns:
+    Type: Number
+    Description: >-
+      Simultaneous runs allowed. Keep it at 1 unless the job is genuinely
+      partitioned by input: two concurrent runs with bookmarks enabled will
+      process overlapping data.
+    Default: 1
+    MinValue: 1
+    MaxValue: 100
+
+  LogRetentionDays:
+    Type: Number
+    Description: Retention for the job's log group.
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Conditions:
+  ShouldCreateCrawler: !Equals [!Ref EnableCrawler, "true"]
+  HasCrawlerSchedule: !And
+    - !Condition ShouldCreateCrawler
+    - !Not [!Equals [!Ref CrawlerSchedule, ""]]
+  ShouldCreateJob: !Equals [!Ref EnableJob, "true"]
+  HasTargetBucket: !Not [!Equals [!Ref TargetBucketArn, ""]]
+
+Resources:
+  Database:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        # Glue database names reject hyphens, so the prefix is joined with
+        # underscores rather than passed through.
+        Name: !Sub
+          - "${Prefix}_${Environment}_${DatabaseSuffix}"
+          - Prefix: !Join ["_", !Split ["-", !Ref NamePrefix]]
+        Description: !Sub "${NamePrefix} ${DatabaseSuffix} catalog (${Environment})"
+
+  ServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        # Grants catalog access and CloudWatch logging. It does *not* grant S3
+        # access to your buckets — that is the inline policy below, scoped to
+        # exactly the two buckets this stack was given.
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSGlueServiceRole"
+      Policies:
+        - PolicyName: lake-access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Ref SourceBucketArn
+                  - !Sub "${SourceBucketArn}/*"
+              - !If
+                - HasTargetBucket
+                - Effect: Allow
+                  Action:
+                    - s3:PutObject
+                    - s3:DeleteObject
+                    - s3:ListBucket
+                  Resource:
+                    - !Ref TargetBucketArn
+                    - !Sub "${TargetBucketArn}/*"
+                - !Ref AWS::NoValue
+
+  Crawler:
+    Type: AWS::Glue::Crawler
+    Condition: ShouldCreateCrawler
+    Properties:
+      Name: !Sub "${NamePrefix}-${Environment}-${DatabaseSuffix}"
+      Role: !GetAtt ServiceRole.Arn
+      DatabaseName: !Ref Database
+      Targets:
+        S3Targets:
+          - Path: !Sub
+              - "s3://${BucketName}/${SourcePrefix}/"
+              - BucketName: !Select [5, !Split [":", !Ref SourceBucketArn]]
+      Schedule: !If
+        - HasCrawlerSchedule
+        - ScheduleExpression: !Ref CrawlerSchedule
+        - !Ref AWS::NoValue
+      SchemaChangePolicy:
+        # LOG rather than UPDATE_IN_DATABASE: an automatic schema update on a
+        # column type change silently rewrites the table definition, and every
+        # query that relied on the old type starts failing or, worse, coercing.
+        UpdateBehavior: LOG
+        # A deleted partition is far more often a lifecycle rule doing its job
+        # than a table that should vanish.
+        DeleteBehavior: LOG
+      RecrawlPolicy:
+        # Only scan what arrived since the last run. A full recrawl of a large
+        # lake is slow and bills for every object listed.
+        RecrawlBehavior: CRAWL_NEW_FOLDERS_ONLY
+      Configuration: |
+        {"Version":1.0,"CrawlerOutput":{"Partitions":{"AddOrUpdateBehavior":"InheritFromTable"}}}
+
+  JobLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ShouldCreateJob
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/${Environment}/${NamePrefix}/glue/${DatabaseSuffix}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  Job:
+    Type: AWS::Glue::Job
+    Condition: ShouldCreateJob
+    Properties:
+      Name: !Sub "${NamePrefix}-${Environment}-${DatabaseSuffix}-etl"
+      Role: !GetAtt ServiceRole.Arn
+      GlueVersion: !Ref GlueVersion
+      WorkerType: !Ref WorkerType
+      NumberOfWorkers: !Ref NumberOfWorkers
+      Timeout: !Ref JobTimeoutMinutes
+      ExecutionProperty:
+        MaxConcurrentRuns: !Ref MaxConcurrentRuns
+      Command:
+        Name: glueetl
+        PythonVersion: "3"
+        ScriptLocation: !Ref JobScriptS3Uri
+      DefaultArguments:
+        # Bookmarks make a rerun process only new data. Without them, a job
+        # scheduled hourly reprocesses the entire lake every hour.
+        "--job-bookmark-option": job-bookmark-enable
+        "--enable-metrics": "true"
+        "--enable-continuous-cloudwatch-log": "true"
+        "--continuous-log-logGroup": !Ref JobLogGroup
+        "--enable-spark-ui": "false"
+        "--TempDir": !Sub
+          - "s3://${BucketName}/${TargetPrefix}/_glue_temp/"
+          - BucketName: !Select
+              - 5
+              - !Split [":", !If [HasTargetBucket, !Ref TargetBucketArn, !Ref SourceBucketArn]]
+
+Outputs:
+  DatabaseName:
+    Description: Glue Data Catalog database name, for Athena queries and job scripts.
+    Value: !Ref Database
+
+  ServiceRoleArn:
+    Description: Role the crawler and job assume.
+    Value: !GetAtt ServiceRole.Arn
+
+  CrawlerName:
+    Description: Crawler name, for on-demand runs via start-crawler.
+    Condition: ShouldCreateCrawler
+    Value: !Ref Crawler
+
+  JobName:
+    Description: ETL job name, for start-job-run and for Step Functions.
+    Condition: ShouldCreateJob
+    Value: !Ref Job

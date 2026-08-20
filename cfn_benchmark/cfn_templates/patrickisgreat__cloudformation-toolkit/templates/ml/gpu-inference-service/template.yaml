@@ -1,0 +1,617 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Self-hosted open-weight model serving - a GPU EC2 Auto Scaling group joined to
+  an ECS cluster as a capacity provider, running vLLM or TGI behind a load
+  balancer, with scale-to-zero and a model cache on EBS.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Naming
+        Parameters:
+          - NamePrefix
+          - Environment
+          - ServiceSuffix
+      - Label:
+          default: Cluster and network
+        Parameters:
+          - ClusterName
+          - VpcId
+          - SubnetIds
+          - AlbSecurityGroupId
+          - ListenerArn
+          - ListenerRulePriority
+          - PathPattern
+      - Label:
+          default: GPU fleet (this is the whole cost)
+        Parameters:
+          - InstanceType
+          - MinInstanceCount
+          - MaxInstanceCount
+          - UseSpotInstances
+          - RootVolumeSizeGb
+      - Label:
+          default: Model server
+        Parameters:
+          - ServingImageUri
+          - ModelId
+          - ServedModelName
+          - MaxModelLength
+          - GpuMemoryUtilization
+          - ContainerPort
+          - HuggingFaceTokenSecretArn
+      - Label:
+          default: Task sizing
+        Parameters:
+          - TaskCpu
+          - TaskMemoryMb
+          - GpuCount
+      - Label:
+          default: Health and operations
+        Parameters:
+          - HealthCheckPath
+          - HealthCheckGracePeriodSeconds
+          - LogRetentionDays
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: Prefix for every resource this stack names.
+    AllowedPattern: "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+    ConstraintDescription: 3-32 lowercase characters, digits and hyphens.
+
+  Environment:
+    Type: String
+    Description: Environment this service runs in.
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  ServiceSuffix:
+    Type: String
+    Description: Distinguishes model services, e.g. "llama" or "embeddings".
+    Default: llm
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{0,30}$"
+
+  ClusterName:
+    Type: String
+    Description: >-
+      Existing ECS cluster from containers/ecs-cluster. Read the README before
+      deploying - attaching a capacity provider replaces the cluster's entire
+      provider list, including FARGATE and FARGATE_SPOT.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC the instances and target group live in.
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >-
+      Private subnets for the GPU instances. GPU capacity is not evenly
+      distributed across AZs; spanning three materially improves the chance of
+      getting an instance at all.
+
+  AlbSecurityGroupId:
+    Type: String
+    Description: Load balancer security group. Instances admit traffic from this group only.
+
+  ListenerArn:
+    Type: String
+    Description: ALB listener to attach to, from containers/alb.
+
+  ListenerRulePriority:
+    Type: Number
+    Description: Priority of this service's listener rule; unique per listener.
+    Default: 300
+    MinValue: 1
+    MaxValue: 50000
+
+  PathPattern:
+    Type: String
+    Description: Path this service answers for. vLLM serves an OpenAI-compatible /v1 API.
+    Default: /v1/*
+
+  InstanceType:
+    Type: String
+    Description: >-
+      GPU instance type. g5.xlarge (1x A10G, 24 GB) runs a 7-8B model in 16-bit
+      or a 13B quantised. g5.12xlarge (4x A10G) or g6e are needed above that.
+      This choice dominates the bill: a single on-demand g5.12xlarge is roughly
+      $4,000/month if left running.
+    Default: g5.xlarge
+    AllowedValues:
+      - g5.xlarge
+      - g5.2xlarge
+      - g5.4xlarge
+      - g5.12xlarge
+      - g5.48xlarge
+      - g6.xlarge
+      - g6e.xlarge
+      - p4d.24xlarge
+
+  MinInstanceCount:
+    Type: Number
+    Description: >-
+      Floor for the GPU fleet. 0 means scale to zero when idle - the difference
+      between a dev environment costing $30/month and $700. The cost is a cold
+      start of several minutes: instance launch, image pull, then model load.
+    Default: 0
+    MinValue: 0
+    MaxValue: 100
+
+  MaxInstanceCount:
+    Type: Number
+    Description: Ceiling for the GPU fleet, and your hard cost cap.
+    Default: 2
+    MinValue: 1
+    MaxValue: 100
+
+  UseSpotInstances:
+    Type: String
+    Description: >-
+      Run the fleet on Spot, at roughly 60-70% off, with a two-minute
+      interruption notice. Reasonable for batch and for dev. For interactive
+      serving, understand that reclamation means a multi-minute model reload
+      before the replacement can serve.
+    Default: "false"
+    AllowedValues: ["true", "false"]
+
+  RootVolumeSizeGb:
+    Type: Number
+    Description: >-
+      Root volume size. Model weights land here, and they are large - a 7B model
+      in 16-bit is ~15 GB, a 70B is ~140 GB. Too small a volume fails the pull
+      after several minutes with a disk-space error.
+    Default: 200
+    MinValue: 100
+    MaxValue: 16384
+
+  ServingImageUri:
+    Type: String
+    Description: >-
+      Model server image, e.g. vllm/vllm-openai:latest or a Text Generation
+      Inference image. Mirror it into your own ECR rather than pulling from
+      Docker Hub on every instance launch - the rate limit will find you.
+    Default: vllm/vllm-openai:latest
+
+  ModelId:
+    Type: String
+    Description: >-
+      Hugging Face model to serve, e.g. "meta-llama/Llama-3.1-8B-Instruct" or
+      "mistralai/Mistral-7B-Instruct-v0.3". Gated models additionally need
+      HuggingFaceTokenSecretArn.
+    Default: mistralai/Mistral-7B-Instruct-v0.3
+
+  ServedModelName:
+    Type: String
+    Description: >-
+      Name clients use in the OpenAI-compatible "model" field. Keeping it stable
+      means swapping the underlying weights does not break every caller.
+    Default: default
+
+  MaxModelLength:
+    Type: Number
+    Description: >-
+      Maximum context length. vLLM pre-allocates KV cache for this, so setting
+      it to a model's full 128k context on a 24 GB card fails at startup with an
+      out-of-memory error that names KV cache rather than the parameter.
+    Default: 8192
+    MinValue: 512
+    MaxValue: 1048576
+
+  GpuMemoryUtilization:
+    Type: String
+    Description: >-
+      Fraction of GPU memory vLLM may claim. 0.90 leaves headroom for CUDA
+      context and fragmentation; 0.95+ raises throughput and the chance of an
+      out-of-memory kill mid-request.
+    Default: "0.90"
+
+  ContainerPort:
+    Type: Number
+    Description: Port the model server listens on. vLLM's OpenAI server defaults to 8000.
+    Default: 8000
+    MinValue: 1
+    MaxValue: 65535
+
+  HuggingFaceTokenSecretArn:
+    Type: String
+    Description: >-
+      Secrets Manager ARN holding a Hugging Face token, for gated models such as
+      Llama. Injected as HUGGING_FACE_HUB_TOKEN. Leave empty for open models.
+    Default: ""
+
+  TaskCpu:
+    Type: Number
+    Description: >-
+      CPU units reserved for the task. Leave headroom below the instance total -
+      a task requesting the whole instance never places, and the failure appears
+      as a service stuck at 0 running tasks with no error.
+    Default: 3584
+    MinValue: 256
+    MaxValue: 393216
+
+  TaskMemoryMb:
+    Type: Number
+    Description: >-
+      Memory reserved. Same caution: request less than the instance has, or the
+      task never places.
+    Default: 14336
+    MinValue: 512
+    MaxValue: 786432
+
+  GpuCount:
+    Type: Number
+    Description: >-
+      GPUs the task reserves. Must match the instance type - asking for 4 on a
+      g5.xlarge leaves the task permanently pending.
+    Default: 1
+    MinValue: 1
+    MaxValue: 8
+
+  HealthCheckPath:
+    Type: String
+    Description: Health endpoint. vLLM exposes /health.
+    Default: /health
+
+  HealthCheckGracePeriodSeconds:
+    Type: Number
+    Description: >-
+      Seconds before the load balancer's verdict is trusted. Model load is the
+      long pole: downloading and loading a 7B model takes minutes, and too short
+      a grace period produces an endless kill-and-restart loop that looks like a
+      crash.
+    Default: 900
+    MinValue: 0
+    MaxValue: 2147483647
+
+  LogRetentionDays:
+    Type: Number
+    Description: Retention for the model server log group.
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Conditions:
+  UsesSpot: !Equals [!Ref UseSpotInstances, "true"]
+  HasHuggingFaceToken: !Not [!Equals [!Ref HuggingFaceTokenSecretArn, ""]]
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/${Environment}/${NamePrefix}/${ServiceSuffix}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "GPU inference instances for ${NamePrefix} (${Environment})"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: Model server traffic from the load balancer only
+          IpProtocol: tcp
+          FromPort: !Ref ContainerPort
+          ToPort: !Ref ContainerPort
+          SourceSecurityGroupId: !Ref AlbSecurityGroupId
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-${ServiceSuffix}-gpu"
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+        # Session Manager access instead of SSH. There is no key pair and no
+        # port 22 rule anywhere in this template: debugging a stuck model load
+        # is common, and a bastion is not the way to do it.
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref InstanceRole]
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${NamePrefix}-${Environment}-${ServiceSuffix}"
+      LaunchTemplateData:
+        # The ECS GPU-optimised AMI, resolved at deploy time from the public SSM
+        # parameter. Hardcoding an AMI ID pins you to one region and to whatever
+        # driver version was current the day it was written.
+        ImageId: "{{resolve:ssm:/aws/service/ecs/optimized-ami/amazon-linux-2023/gpu/recommended/image_id}}"
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        SecurityGroupIds: [!Ref InstanceSecurityGroup]
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: !Ref RootVolumeSizeGb
+              VolumeType: gp3
+              # gp3 baseline is 125 MB/s; a model download saturates it. Raising
+              # throughput is cheap and cuts minutes off every cold start.
+              Throughput: 500
+              Encrypted: true
+              DeleteOnTermination: true
+        MetadataOptions:
+          # IMDSv2 required: a token-less metadata request from inside a
+          # container is how instance credentials get exfiltrated through SSRF.
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        Monitoring:
+          Enabled: true
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            echo "ECS_CLUSTER=${ClusterName}" >> /etc/ecs/ecs.config
+            echo "ECS_ENABLE_GPU_SUPPORT=true" >> /etc/ecs/ecs.config
+            echo "ECS_ENABLE_CONTAINER_METADATA=true" >> /etc/ecs/ecs.config
+            # A large image plus a large model needs a longer pull timeout than
+            # the 2-minute default, or the first task is killed mid-download.
+            echo "ECS_IMAGE_PULL_BEHAVIOR=default" >> /etc/ecs/ecs.config
+            echo "ECS_CONTAINER_CREATE_TIMEOUT=10m" >> /etc/ecs/ecs.config
+            echo "ECS_CONTAINER_START_TIMEOUT=15m" >> /etc/ecs/ecs.config
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub "${NamePrefix}-${Environment}-${ServiceSuffix}"
+      VPCZoneIdentifier: !Ref SubnetIds
+      MinSize: !Ref MinInstanceCount
+      MaxSize: !Ref MaxInstanceCount
+      DesiredCapacity: !Ref MinInstanceCount
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      # Managed by the ECS capacity provider below, so the ASG must not fight it.
+      NewInstancesProtectedFromScaleIn: true
+      MixedInstancesPolicy:
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref LaunchTemplate
+            Version: !GetAtt LaunchTemplate.LatestVersionNumber
+        InstancesDistribution:
+          OnDemandBaseCapacity: 0
+          OnDemandPercentageAboveBaseCapacity: !If [UsesSpot, 0, 100]
+          SpotAllocationStrategy: capacity-optimized
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-${ServiceSuffix}-gpu"
+          PropagateAtLaunch: true
+
+  CapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      Name: !Sub "${NamePrefix}-${Environment}-${ServiceSuffix}-gpu"
+      AutoScalingGroupProvider:
+        AutoScalingGroupArn: !Ref AutoScalingGroup
+        ManagedScaling:
+          Status: ENABLED
+          TargetCapacity: 100
+          MinimumScalingStepSize: 1
+          MaximumScalingStepSize: 1
+        # Stops the ASG terminating an instance that is still running a task —
+        # without it, a scale-in can kill a request mid-generation.
+        ManagedTerminationProtection: ENABLED
+
+  # WARNING: this resource is authoritative for the cluster. It replaces the
+  # cluster's entire capacity provider list, so FARGATE and FARGATE_SPOT are
+  # re-listed here — omitting them silently detaches every Fargate service on
+  # the cluster from its capacity.
+  ClusterProviders:
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties:
+      Cluster: !Ref ClusterName
+      CapacityProviders:
+        - !Ref CapacityProvider
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Base: 0
+          Weight: 1
+
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        - !If
+          - HasHuggingFaceToken
+          - PolicyName: read-hub-token
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action: secretsmanager:GetSecretValue
+                  Resource: !Ref HuggingFaceTokenSecretArn
+          - !Ref AWS::NoValue
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${NamePrefix}-${ServiceSuffix}-${Environment}"
+      RequiresCompatibilities: [EC2]
+      # bridge, not awsvpc: an awsvpc task on EC2 consumes an ENI per task, and
+      # GPU instance types have a low ENI limit.
+      NetworkMode: bridge
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemoryMb
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: !Ref ServiceSuffix
+          Image: !Ref ServingImageUri
+          Essential: true
+          ResourceRequirements:
+            - Type: GPU
+              Value: !Ref GpuCount
+          PortMappings:
+            - ContainerPort: !Ref ContainerPort
+              Protocol: tcp
+          Command:
+            - --model
+            - !Ref ModelId
+            - --served-model-name
+            - !Ref ServedModelName
+            - --max-model-len
+            - !Ref MaxModelLength
+            - --gpu-memory-utilization
+            - !Ref GpuMemoryUtilization
+            - --port
+            - !Ref ContainerPort
+          Environment:
+            - Name: ENVIRONMENT
+              Value: !Ref Environment
+            # Weights live on the instance volume, so a task restart on the same
+            # instance reuses them instead of re-downloading tens of gigabytes.
+            - Name: HF_HOME
+              Value: /root/.cache/huggingface
+          Secrets: !If
+            - HasHuggingFaceToken
+            - - Name: HUGGING_FACE_HUB_TOKEN
+                ValueFrom: !Ref HuggingFaceTokenSecretArn
+            - !Ref AWS::NoValue
+          # Model servers allocate large pinned host buffers for CUDA transfers
+          # and will fail at startup on the 64 MB default.
+          LinuxParameters:
+            SharedMemorySize: 8192
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: vllm
+              mode: non-blocking
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Port: !Ref ContainerPort
+      Protocol: HTTP
+      TargetType: instance
+      HealthCheckPath: !Ref HealthCheckPath
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        # Generation requests are long. Draining too fast cuts a response off
+        # mid-stream during a deploy.
+        - Key: deregistration_delay.timeout_seconds
+          Value: "120"
+
+  ListenerRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref ListenerArn
+      Priority: !Ref ListenerRulePriority
+      Conditions:
+        - Field: path-pattern
+          PathPatternConfig:
+            Values: [!Ref PathPattern]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: [ListenerRule, ClusterProviders]
+    Properties:
+      ServiceName: !Sub "${NamePrefix}-${ServiceSuffix}"
+      Cluster: !Ref ClusterName
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref MinInstanceCount
+      CapacityProviderStrategy:
+        - CapacityProvider: !Ref CapacityProvider
+          Weight: 1
+      PlacementStrategies:
+        # One task per instance: two model servers on one GPU means both fail to
+        # allocate their KV cache.
+        - Type: spread
+          Field: instanceId
+      HealthCheckGracePeriodSeconds: !Ref HealthCheckGracePeriodSeconds
+      LoadBalancers:
+        - ContainerName: !Ref ServiceSuffix
+          ContainerPort: !Ref ContainerPort
+          TargetGroupArn: !Ref TargetGroup
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+        # GPU capacity is scarce and expensive: 100/200 would require double the
+        # fleet during a deploy, and may simply not be available.
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+
+Outputs:
+  ServiceName:
+    Description: ECS service name.
+    Value: !GetAtt Service.Name
+
+  TargetGroupArn:
+    Description: Target group the model server registers with.
+    Value: !Ref TargetGroup
+
+  CapacityProviderName:
+    Description: >-
+      GPU capacity provider. Other services on this cluster can target it by
+      name to run on the same fleet.
+    Value: !Ref CapacityProvider
+
+  AutoScalingGroupName:
+    Description: GPU Auto Scaling group, for manual capacity changes and alarms.
+    Value: !Ref AutoScalingGroup
+
+  InstanceSecurityGroupId:
+    Description: Security group of the GPU instances.
+    Value: !Ref InstanceSecurityGroup
+
+  LogGroupName:
+    Description: >-
+      Log group holding model server output. Model load progress and CUDA
+      out-of-memory errors both appear here.
+    Value: !Ref LogGroup
+
+  ApiPathPattern:
+    Description: Path this service answers on, e.g. /v1/* for the OpenAI-compatible API.
+    Value: !Ref PathPattern

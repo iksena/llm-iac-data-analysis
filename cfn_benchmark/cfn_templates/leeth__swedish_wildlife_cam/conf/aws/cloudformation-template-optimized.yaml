@@ -1,0 +1,538 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Wildlife Pipeline - Optimized AWS Infrastructure with Spot Instances and TensorRT'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: production
+    AllowedValues: [development, staging, production]
+    Description: Environment name
+
+  ProjectName:
+    Type: String
+    Default: wildlife-pipeline
+    Description: Project name for resource naming
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC ID for the infrastructure
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs for compute resources
+
+  SpotBidPercentage:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    MaxValue: 100
+    Description: Spot instance bid percentage (1-100)
+
+  MaxvCpus:
+    Type: Number
+    Default: 1000
+    MinValue: 0
+    MaxValue: 10000
+    Description: Maximum vCPUs for compute environment
+
+  GPUInstanceTypes:
+    Type: CommaDelimitedList
+    Default: "g4dn.xlarge,g4dn.2xlarge,g4dn.4xlarge,g4dn.8xlarge,g5.xlarge,g5.2xlarge,g5.4xlarge,g5.8xlarge"
+    Description: Comma-separated list of GPU instance types
+
+Resources:
+  # S3 Buckets
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-data-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - StorageClass: STANDARD_IA
+                TransitionInDays: 30
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+
+  ModelsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectName}-${Environment}-models-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+
+  # ECR Repository
+  ECRRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${ProjectName}-${Environment}"
+      ImageScanningConfiguration:
+        ScanOnPush: true
+      LifecyclePolicy:
+        LifecyclePolicyText: |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 10 images",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 10
+                },
+                "action": {
+                  "type": "expire"
+                }
+              }
+            ]
+          }
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+
+  # IAM Roles
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-batch-service-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+
+  BatchInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-batch-instance-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+      Policies:
+        - PolicyName: WildlifePipelineBatchPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub "${DataBucket.Arn}/*"
+                  - !GetAtt ModelsBucket.Arn
+                  - !Sub "${ModelsBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: "*"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+
+  BatchInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref BatchInstanceRole
+
+  # Security Groups
+  BatchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub "${ProjectName}-${Environment}-batch-sg"
+      GroupDescription: Security group for AWS Batch compute instances
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+          Description: SSH access
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP access
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS access
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: All outbound traffic
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+
+  # Launch Template for GPU instances
+  GPULaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub "${ProjectName}-${Environment}-gpu-template"
+      LaunchTemplateData:
+        ImageId: ami-12345678  # Replace with actual GPU-optimized AMI
+        InstanceType: g4dn.xlarge
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref BatchSecurityGroup
+        IamInstanceProfile:
+          Name: !Ref BatchInstanceProfile
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            yum update -y
+            yum install -y docker
+            systemctl start docker
+            systemctl enable docker
+            usermod -a -G docker ec2-user
+            # Install NVIDIA drivers
+            curl -O https://developer.download.nvidia.com/compute/cuda/repos/rhel7/x86_64/cuda-repo-rhel7-11.8.0-1.x86_64.rpm
+            rpm -i cuda-repo-rhel7-11.8.0-1.x86_64.rpm
+            yum clean all
+            yum -y install cuda-drivers
+            # Install nvidia-docker2
+            distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+            curl -s -L https://nvidia.github.io/nvidia-docker2/$distribution/nvidia-docker2.repo | tee /etc/yum.repos.d/nvidia-docker2.repo
+            yum install -y nvidia-docker2
+            systemctl restart docker
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Environment
+                Value: !Ref Environment
+              - Key: Application
+                Value: !Ref ProjectName
+              - Key: InstanceType
+                Value: GPU
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+
+  # Placement Group for GPU instances
+  GPUPlacementGroup:
+    Type: AWS::EC2::PlacementGroup
+    Properties:
+      Strategy: cluster
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+
+  # Compute Environment with Spot Instances
+  SpotComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      ComputeEnvironmentName: !Sub "${ProjectName}-${Environment}-spot-gpu"
+      Type: MANAGED
+      State: ENABLED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeResources:
+        Type: EC2
+        MinvCpus: 0
+        MaxvCpus: !Ref MaxvCpus
+        DesiredvCpus: 0
+        InstanceTypes: !Ref GPUInstanceTypes
+        Subnets: !Ref SubnetIds
+        SecurityGroupIds:
+          - !Ref BatchSecurityGroup
+        InstanceRole: !GetAtt BatchInstanceProfile.Arn
+        Tags:
+          Environment: !Ref Environment
+          Application: !Ref ProjectName
+          InstanceType: spot
+          GPU: enabled
+        BidPercentage: !Ref SpotBidPercentage
+        SpotIamFleetRole: !GetAtt SpotFleetRole.Arn
+        LaunchTemplate:
+          LaunchTemplateName: !Ref GPULaunchTemplate
+          Version: $Latest
+        PlacementGroup: !Ref GPUPlacementGroup
+
+  # Spot Fleet Role
+  SpotFleetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-${Environment}-spot-fleet-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: spotfleet.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+
+  # Job Queue
+  JobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: !Sub "${ProjectName}-${Environment}-queue"
+      State: ENABLED
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref SpotComputeEnvironment
+
+  # Job Definition with TensorRT
+  TensorRTJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      JobDefinitionName: !Sub "${ProjectName}-${Environment}-tensorrt-job"
+      Type: container
+      PlatformCapabilities:
+        - EC2
+      Timeout:
+        AttemptDurationSeconds: 3600
+      RetryStrategy:
+        Attempts: 3
+        EvaluateOnExit:
+          - OnStatusReason: GPU_ERROR
+            Action: RETRY
+          - OnStatusReason: OutOfMemory
+            Action: RETRY
+          - OnExitCode: 1
+            Action: RETRY
+          - OnExitCode: 2
+            Action: EXIT
+      ContainerProperties:
+        Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}:latest"
+        Vcpus: 4
+        Memory: 16384
+        JobRoleArn: !GetAtt BatchInstanceRole.Arn
+        ExecutionRoleArn: !GetAtt BatchInstanceRole.Arn
+        ResourceRequirements:
+          - Type: GPU
+            Value: "1"
+        Environment:
+          - Name: CUDA_VISIBLE_DEVICES
+            Value: "0"
+          - Name: PYTORCH_CUDA_ALLOC_CONF
+            Value: "max_split_size_mb:512"
+          - Name: OPENCV_GPU_ENABLED
+            Value: "1"
+          - Name: TENSORRT_CACHE_DIR
+            Value: "/tmp/tensorrt_cache"
+          - Name: ONNX_CACHE_DIR
+            Value: "/tmp/onnx_cache"
+          - Name: BATCH_SIZE
+            Value: "32"
+          - Name: IMAGE_SIZE
+            Value: "640"
+          - Name: MAX_IMAGES_PER_JOB
+            Value: "1000"
+          - Name: PREFETCH_BATCHES
+            Value: "2"
+          - Name: GPU_MEMORY_FRACTION
+            Value: "0.8"
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+        MountPoints:
+          - SourceVolume: tensorrt-cache
+            ContainerPath: /tmp/tensorrt_cache
+            ReadOnly: false
+          - SourceVolume: onnx-cache
+            ContainerPath: /tmp/onnx_cache
+            ReadOnly: false
+        Volumes:
+          - Name: tensorrt-cache
+            Host:
+              SourcePath: /tmp/tensorrt_cache
+          - Name: onnx-cache
+            Host:
+              SourcePath: /tmp/onnx_cache
+        Ulimits:
+          - Name: memlock
+            SoftLimit: -1
+            HardLimit: -1
+          - Name: stack
+            SoftLimit: 67108864
+            HardLimit: 67108864
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: !Ref CloudWatchLogGroup
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: tensorrt
+      Tags:
+        Environment: !Ref Environment
+        Application: !Ref ProjectName
+        Optimization: tensorrt
+        GPU: enabled
+
+  # CloudWatch Log Group
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/batch/${ProjectName}-${Environment}"
+      RetentionInDays: 30
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref ProjectName
+
+  # CloudWatch Dashboard
+  CloudWatchDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub "${ProjectName}-${Environment}-dashboard"
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Batch", "RunningJobs", "JobQueue", "${JobQueue}"],
+                  ["AWS/Batch", "PendingJobs", "JobQueue", "${JobQueue}"],
+                  ["AWS/Batch", "FailedJobs", "JobQueue", "${JobQueue}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "Batch Job Metrics"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${SpotComputeEnvironment}"],
+                  ["AWS/EC2", "NetworkIn", "AutoScalingGroupName", "${SpotComputeEnvironment}"],
+                  ["AWS/EC2", "NetworkOut", "AutoScalingGroupName", "${SpotComputeEnvironment}"]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "${AWS::Region}",
+                "title": "EC2 Metrics"
+              }
+            }
+          ]
+        }
+
+Outputs:
+  DataBucketName:
+    Description: S3 bucket for data storage
+    Value: !Ref DataBucket
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-DataBucket"
+
+  ModelsBucketName:
+    Description: S3 bucket for model storage
+    Value: !Ref ModelsBucket
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-ModelsBucket"
+
+  ECRRepositoryURI:
+    Description: ECR repository URI
+    Value: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${ECRRepository}"
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-ECRRepository"
+
+  JobQueueName:
+    Description: AWS Batch job queue name
+    Value: !Ref JobQueue
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-JobQueue"
+
+  JobDefinitionName:
+    Description: AWS Batch job definition name
+    Value: !Ref TensorRTJobDefinition
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-JobDefinition"
+
+  ComputeEnvironmentName:
+    Description: AWS Batch compute environment name
+    Value: !Ref SpotComputeEnvironment
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-ComputeEnvironment"
+
+  CloudWatchDashboardURL:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${CloudWatchDashboard}"
+    Export:
+      Name: !Sub "${ProjectName}-${Environment}-DashboardURL"

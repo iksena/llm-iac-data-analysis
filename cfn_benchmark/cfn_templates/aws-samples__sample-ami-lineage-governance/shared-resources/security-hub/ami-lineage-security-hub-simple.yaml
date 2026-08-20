@@ -1,0 +1,293 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simplified Security Hub integration for AMI lineage governance'
+
+Parameters:
+  NeptuneEndpoint:
+    Type: String
+    Description: Neptune cluster endpoint
+    Default: ''
+
+  SNSTopicArn:
+    Type: String
+    Description: SNS topic ARN for notifications
+    Default: ''
+
+Resources:
+  # Security Hub Insights (using standard CloudFormation resources)
+  AMIComplianceInsight:
+    Type: AWS::SecurityHub::Insight
+    Properties:
+      Name: AMI Compliance Overview
+      Filters:
+        GeneratorId:
+          - Value: ami-compliance-evaluator
+            Comparison: EQUALS
+        Type:
+          - Value: Sensitive Data Identifications/Compliance
+            Comparison: EQUALS
+      GroupByAttribute: ComplianceStatus
+
+  AMISecurityInsight:
+    Type: AWS::SecurityHub::Insight
+    Properties:
+      Name: AMI Security Findings
+      Filters:
+        GeneratorId:
+          - Value: ami-lineage-governance
+            Comparison: EQUALS
+        Type:
+          - Value: Sensitive Data Identifications/PII
+            Comparison: EQUALS
+      GroupByAttribute: SeverityLabel
+
+  AMILineageInsight:
+    Type: AWS::SecurityHub::Insight
+    Properties:
+      Name: AMI Lineage Issues
+      Filters:
+        GeneratorId:
+          - Value: ami-compliance-evaluator
+            Comparison: EQUALS
+      GroupByAttribute: ResourceType
+
+  # Lambda Function to Process Security Hub Findings
+  SecurityHubProcessor:
+    Type: AWS::Lambda::Function
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: "Security Hub processor does not require VPC access as it only processes events and calls AWS APIs"
+          - id: W92
+            reason: "ReservedConcurrentExecutions is already configured for this function"
+      checkov:
+        skip:
+          - id: CKV_AWS_117
+            comment: "Security Hub processor does not require VPC access as it only processes events and calls AWS APIs"
+          - id: CKV_AWS_173
+            comment: "Lambda environment variables do not contain sensitive data, only Neptune endpoint and SNS topic ARN"
+          - id: CKV_AWS_116
+            comment: "DLQ not required for Security Hub event processing function as failures are logged and monitored"
+          - id: CKV_AWS_115
+            comment: "ReservedConcurrencyLimit is already configured for this function"
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-security-hub-processor'
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Role: !GetAtt SecurityHubProcessorRole.Arn
+      Timeout: 300
+      ReservedConcurrencyLimit: 10
+      Environment:
+        Variables:
+          NEPTUNE_ENDPOINT: !Ref NeptuneEndpoint
+          SNS_TOPIC_ARN: !Ref SNSTopicArn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          from datetime import datetime
+
+          ec2_client = boto3.client('ec2')
+          sns_client = boto3.client('sns')
+          securityhub_client = boto3.client('securityhub')
+
+          def lambda_handler(event, context):
+              print(f"Received event: {json.dumps(event)}")
+
+              # Process Security Hub findings
+              for record in event.get('Records', []):
+                  if 'Sns' in record:
+                      message = json.loads(record['Sns']['Message'])
+                      process_security_hub_finding(message)
+
+              return {'statusCode': 200}
+
+          def process_security_hub_finding(finding):
+              """Process Security Hub finding and take appropriate action"""
+              try:
+                  finding_id = finding.get('Id', '')
+                  severity = finding.get('Severity', {}).get('Label', 'MEDIUM')
+
+                  # Extract AMI ID from finding
+                  ami_id = extract_ami_id_from_finding(finding)
+
+                  if ami_id:
+                      # Send notification about the finding
+                      send_notification(f'Security Hub finding for AMI {ami_id}', finding)
+
+              except Exception as e:
+                  print(f"Error processing finding: {str(e)}")
+
+          def extract_ami_id_from_finding(finding):
+              """Extract AMI ID from Security Hub finding"""
+              resources = finding.get('Resources', [])
+              for resource in resources:
+                  resource_id = resource.get('Id', '')
+                  if 'ami-' in resource_id:
+                      # Extract AMI ID from ARN or resource ID
+                      if 'ami-' in resource_id:
+                          start = resource_id.find('ami-')
+                          return resource_id[start:start+21]
+              return None
+
+          def send_notification(subject, finding):
+              """Send notification via SNS"""
+              try:
+                  if os.environ.get('SNS_TOPIC_ARN'):
+                      sns_client.publish(
+                          TopicArn=os.environ['SNS_TOPIC_ARN'],
+                          Subject=subject,
+                          Message=json.dumps(finding, indent=2, default=str)
+                      )
+              except Exception as e:
+                  print(f"Error sending notification: {str(e)}")
+
+  # IAM Role for Security Hub Processor
+  SecurityHubProcessorRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit RoleName is required for organizational governance and cross-stack references"
+          - id: W11
+            reason: "EC2 describe and tag operations require wildcard permissions for cross-account AMI governance, Security Hub operations require wildcard permissions for cross-account finding management"
+      checkov:
+        skip:
+          - id: CKV_AWS_111
+            comment: "EC2 describe and tag operations require wildcard permissions for cross-account AMI governance, Security Hub operations require wildcard permissions for cross-account finding management"
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-SecurityHub-Processor-Role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SecurityHubProcessorPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeImages
+                  - ec2:DescribeTags
+                  - ec2:CreateTags
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - securityhub:BatchUpdateFindings
+                  - securityhub:GetFindings
+                  - securityhub:BatchImportFindings
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SNSTopicArn
+
+  # CloudWatch Dashboard for Security Hub Metrics
+  SecurityHubDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit DashboardName is required for organizational governance and cross-stack references"
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-SecurityHub-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/SecurityHub", "Findings", "CompanyName", "${AWS::AccountId}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Security Hub Findings",
+                "period": 300
+              }
+            },
+            {
+              "type": "log",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "query": "SOURCE '/aws/lambda/${SecurityHubProcessor}'\n| fields @timestamp, @message\n| filter @message like /AMI/\n| sort @timestamp desc\n| limit 100",
+                "region": "${AWS::Region}",
+                "title": "Recent AMI Security Events",
+                "view": "table"
+              }
+            }
+          ]
+        }
+
+  # CloudWatch Alarms for Security Hub
+  HighSeverityFindingsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit Name is required for organizational governance and cross-stack references"
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-HighSeverity-SecurityHub-Findings'
+      AlarmDescription: Alarm for high severity AMI findings in Security Hub
+      MetricName: Findings
+      Namespace: AWS/SecurityHub
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: CompanyName
+          Value: !Ref 'AWS::AccountId'
+      AlarmActions:
+        - !Ref SNSTopicArn
+      TreatMissingData: notBreaching
+
+Outputs:
+  ComplianceInsightArn:
+    Description: ARN of the compliance insight
+    Value: !Ref AMIComplianceInsight
+    Export:
+      Name: !Sub '${AWS::StackName}-ComplianceInsightArn'
+
+  SecurityInsightArn:
+    Description: ARN of the security insight
+    Value: !Ref AMISecurityInsight
+    Export:
+      Name: !Sub '${AWS::StackName}-SecurityInsightArn'
+
+  LineageInsightArn:
+    Description: ARN of the lineage insight
+    Value: !Ref AMILineageInsight
+    Export:
+      Name: !Sub '${AWS::StackName}-LineageInsightArn'
+
+  ProcessorArn:
+    Description: ARN of the Security Hub processor Lambda
+    Value: !GetAtt SecurityHubProcessor.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ProcessorArn'
+
+  DashboardURL:
+    Description: URL of the CloudWatch dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${SecurityHubDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'

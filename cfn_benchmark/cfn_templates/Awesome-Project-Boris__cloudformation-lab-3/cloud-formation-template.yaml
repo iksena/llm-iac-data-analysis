@@ -1,0 +1,282 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Chain demo: Cognito→API Gateway→Lambda→S3→Lambda→Rekognition→SNS→SQS→ECS→DynamoDB→API Lambda
+
+Parameters:
+  EnvPrefix:
+    Type: String
+    Description: Prefix for naming resources (e.g., dev, test, prod)
+
+Resources:
+  # 1. S3 bucket with event notification to ProcessImageFunction
+  UploadBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${EnvPrefix}-image-bucket"
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ProcessImageFunction.Arn
+
+  # 2. IAM Role for Lambdas
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaFullPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [
+                  logs:CreateLogGroup,
+                  logs:CreateLogStream,
+                  logs:PutLogEvents
+                ]
+                Resource: '*'
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${EnvPrefix}-image-bucket/*"
+              - Effect: Allow
+                Action: rekognition:DetectLabels
+                Resource: '*'
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref ImageAnalysisTopic
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt ResultsTable.Arn
+
+  # 3. Lambda: GenerateUploadUrl
+  GenerateUploadUrlFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaExecutionRole
+    Properties:
+      FunctionName: !Sub "${EnvPrefix}-generate-upload-url"
+      Runtime: nodejs16.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          BUCKET: !Sub "${EnvPrefix}-image-bucket"
+      Code:
+        ZipFile: |
+          exports.handler = async () => {
+            const AWS = require('aws-sdk');
+            const s3 = new AWS.S3();
+            const url = await s3.getSignedUrlPromise('putObject', {
+              Bucket: process.env.BUCKET,
+              Key: `${Date.now()}.jpg`,
+              Expires: 300
+            });
+            return { statusCode: 200, body: JSON.stringify({ uploadUrl: url }) };
+          };
+
+  # 4. Lambda: ProcessImage (triggered by S3)
+  ProcessImageFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaExecutionRole
+    Properties:
+      FunctionName: !Sub "${EnvPrefix}-process-image"
+      Runtime: nodejs16.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ImageAnalysisTopic
+          BUCKET: !Sub "${EnvPrefix}-image-bucket"
+      Code:
+        ZipFile: |
+          exports.handler = async event => {
+            const AWS = require('aws-sdk');
+            const rek = new AWS.Rekognition();
+            const sns = new AWS.SNS();
+            const record = event.Records[0].s3;
+            const params = {
+              Image: { S3Object: { Bucket: process.env.BUCKET, Name: record.object.key } },
+              MaxLabels: 5
+            };
+            const res = await rek.detectLabels(params).promise();
+            await sns.publish({
+              TopicArn: process.env.SNS_TOPIC_ARN,
+              Message: JSON.stringify({ key: record.object.key, labels: res.Labels })
+            }).promise();
+          };
+
+  # 5. Permission allowing S3 to invoke ProcessImageFunction
+  ProcessImagePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ProcessImageFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt UploadBucket.Arn
+
+  # 6. Cognito User Pool + Client
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${EnvPrefix}-user-pool"
+      AutoVerifiedAttributes: [email]
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${EnvPrefix}-user-pool-client"
+      UserPoolId: !Ref CognitoUserPool
+
+  # 7. API Gateway + Authorizer + Method for GenerateUploadUrl
+  ApiRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${EnvPrefix}-api"
+
+  ApiAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      Type: COGNITO_USER_POOLS
+      RestApiId: !Ref ApiRestApi
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt CognitoUserPool.Arn
+
+  ApiResourceUpload:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiRestApi
+      ParentId: !GetAtt ApiRestApi.RootResourceId
+      PathPart: upload-url
+
+  ApiMethodUpload:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiRestApi
+      ResourceId: !Ref ApiResourceUpload
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub |
+          arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GenerateUploadUrlFunction.Arn}/invocations
+
+  # 8. SNS Topic → SQS Queue → Subscription
+  ImageAnalysisTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${EnvPrefix}-image-topic"
+
+  ImageQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${EnvPrefix}-image-queue"
+
+  ImageSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref ImageAnalysisTopic
+      Protocol: sqs
+      Endpoint: !GetAtt ImageQueue.Arn
+
+  # 9. ECR Repo for ECS image
+  EcrRepo:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub "${EnvPrefix}-processor-repo"
+
+  # 10. ECS Cluster + Roles + Task + Service
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${EnvPrefix}-cluster"
+
+  EcsTaskExecRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  EcsTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SQSandDDBPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage]
+                Resource: !GetAtt ImageQueue.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt ResultsTable.Arn
+
+  ProcessorTaskDef:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${EnvPrefix}-processor"
+      Cpu: '256'
+      Memory: '512'
+      NetworkMode: awsvpc
+      RequiresCompatibilities: [FARGATE]
+      ExecutionRoleArn: !GetAtt EcsTaskExecRole.Arn
+      TaskRoleArn: !GetAtt EcsTaskRole.Arn
+      ContainerDefinitions:
+        - Name: image-processor
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EnvPrefix}-processor-repo:latest"
+          Essential: true
+          Environment:
+            - Name: QUEUE_URL
+              Value: !Ref ImageQueue
+
+  ProcessorService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub "${EnvPrefix}-processor-service"
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref ProcessorTaskDef
+      LaunchType: FARGATE
+      DesiredCount: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: [subnet-xxxx, subnet-yyyy]  # update as needed
+          SecurityGroups: [sg-zzzz]           # update as needed
+
+  # 11. DynamoDB Table for results
+  ResultsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${EnvPrefix}-results"
+      AttributeDefinitions:
+        - AttributeName: ImageId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: ImageId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint for upload-url
+    Value: !Sub "https://${ApiRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/upload-url"

@@ -1,0 +1,957 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for zzip.to redirect service with WAF protection'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - prod
+      - test
+      - dev
+    Description: Environment type for resource naming and configuration
+
+  DomainName:
+    Type: String
+    Default: zzip.to
+    Description: Domain name for the service
+
+  CertificateArn:
+    Type: String
+    Description: ARN of ACM certificate for the domain (must be in us-east-1)
+
+  HostedZoneId:
+    Type: String
+    Description: Route 53 Hosted Zone ID for the domain
+
+  AllowedEmails:
+    Type: String
+    Description: Comma-separated list of whitelisted email addresses for admin access
+
+  AdminDomainName:
+    Type: String
+    Default: admin.zzip.to
+    Description: Domain name for the admin UI (used for CORS origin)
+
+  KvsSyncCodeS3Bucket:
+    Type: String
+    Description: S3 bucket containing the KVS sync Lambda code package
+
+  KvsSyncCodeS3Key:
+    Type: String
+    Description: S3 key for the KVS sync Lambda code package
+
+Resources:
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Environment}-${AWS::StackName}-cf-logs-${AWS::AccountId}"
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireLogs
+            Status: Enabled
+            ExpirationInDays: 90
+
+  RedirectKVS:
+    Type: AWS::CloudFront::KeyValueStore
+    Properties:
+      Name: !Sub "${Environment}-${AWS::StackName}-redirects"
+      Comment: "Stores redirect mappings for zzip.to service"
+
+  RedirectFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${Environment}-${AWS::StackName}-redirect"
+      AutoPublish: true
+      FunctionConfig:
+        Comment: "Redirect handler for zzip.to"
+        Runtime: cloudfront-js-2.0
+        KeyValueStoreAssociations:
+          - KeyValueStoreARN: !GetAtt RedirectKVS.Arn
+      FunctionCode: !Sub |
+        import cf from 'cloudfront';
+
+        var kvsId = '${RedirectKVS.Id}';
+        var kvsHandle = cf.kvs(kvsId);
+
+        function validatePath(path) {
+          if (path.length > 256) {
+            return false;
+          }
+          if (path.includes('..')) {
+            return false;
+          }
+          if (path.includes('//')) {
+            return false;
+          }
+          if (path.includes('%2F') || path.includes('%2f')) {
+            return false;
+          }
+          var allowedPattern = /^[A-Za-z0-9_\-\/]+$/;
+          if (!allowedPattern.test(path)) {
+            return false;
+          }
+          return true;
+        }
+
+        function parsePath(uri) {
+          var path = uri.startsWith('/') ? uri.slice(1) : uri;
+          if (path === '') {
+            return { key: null, rest: null };
+          }
+          var segments = path.split('/');
+          var key = segments[0];
+          var rest = segments.length > 1 ? segments.slice(1).join('/') : null;
+          return { key: key, rest: rest };
+        }
+
+        function buildQueryString(querystring) {
+          if (!querystring || Object.keys(querystring).length === 0) {
+            return '';
+          }
+          var params = [];
+          for (var k in querystring) {
+            var param = querystring[k];
+            if (param.multiValue) {
+              param.multiValue.forEach(function(mv) {
+                params.push(mv.value ? k + '=' + mv.value : k);
+              });
+            } else {
+              params.push(param.value ? k + '=' + param.value : k);
+            }
+          }
+          return params.length > 0 ? '?' + params.join('&') : '';
+        }
+
+        function buildRedirectUrl(target, rest, querystring) {
+          var url = target;
+          var isWildcard = target.endsWith('/*');
+          if (isWildcard) {
+            url = target.slice(0, -2);
+            if (rest) {
+              url = url.endsWith('/') ? url + rest : url + '/' + rest;
+            } else {
+              if (!url.endsWith('/')) {
+                url = url + '/';
+              }
+            }
+          }
+          url += buildQueryString(querystring);
+          return url;
+        }
+
+        function redirect301(location) {
+          return {
+            statusCode: 301,
+            statusDescription: 'Moved Permanently',
+            headers: {
+              'location': { value: location },
+              'cache-control': { value: 'public, max-age=86400' }
+            }
+          };
+        }
+
+        function notFound() {
+          return {
+            statusCode: 404,
+            statusDescription: 'Not Found',
+            headers: {
+              'content-type': { value: 'text/plain' }
+            },
+            body: 'Not Found'
+          };
+        }
+
+        async function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          var querystring = request.querystring;
+          if (uri === '/' || uri === '') {
+            return notFound();
+          }
+          if (!validatePath(uri)) {
+            return notFound();
+          }
+          var parsed = parsePath(uri);
+          var key = parsed.key;
+          var rest = parsed.rest;
+          if (!key) {
+            return notFound();
+          }
+          var target;
+          try {
+            target = await kvsHandle.get(key);
+          } catch (err) {
+            return notFound();
+          }
+          if (!target) {
+            return notFound();
+          }
+          var isWildcard = target.endsWith('/*');
+          if (!isWildcard && rest) {
+            return notFound();
+          }
+          var redirectUrl = buildRedirectUrl(target, rest, querystring);
+          return redirect301(redirectUrl);
+        }
+
+  DummyOriginBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Environment}-${AWS::StackName}-origin-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${Environment}-${AWS::StackName}-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${Environment} zzip.to redirect service"
+        Aliases:
+          - !Ref DomainName
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        DefaultCacheBehavior:
+          TargetOriginId: dummy-origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt RedirectFunction.FunctionARN
+        Origins:
+          - Id: dummy-origin
+            DomainName: !GetAtt DummyOriginBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+        Logging:
+          Bucket: !GetAtt LoggingBucket.RegionalDomainName
+          Prefix: !Sub "${Environment}/"
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_All
+
+  DNSRecordA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  DNSRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  PreAuthLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-${AWS::StackName}-pre-auth-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  PreAuthLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-${AWS::StackName}-pre-auth"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt PreAuthLambdaRole.Arn
+      Environment:
+        Variables:
+          ALLOWED_EMAILS: !Ref AllowedEmails
+      Code:
+        ZipFile: |
+          exports.handler = async (event) => {
+            const allowedEmails = (process.env.ALLOWED_EMAILS || '').split(',').map(e => e.trim().toLowerCase()).filter(e => e.length > 0);
+            if (allowedEmails.length === 0) {
+              throw new Error('No allowed emails configured');
+            }
+            const email = (event.request.userAttributes.email || '').toLowerCase();
+            if (!allowedEmails.includes(email)) {
+              throw new Error('User is not authorized');
+            }
+            return event;
+          };
+
+  PreAuthLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt PreAuthLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt CognitoUserPool.Arn
+
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${Environment}-${AWS::StackName}-user-pool"
+      UsernameAttributes:
+        - email
+      AutoVerifiedAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      LambdaConfig:
+        PreAuthentication: !GetAtt PreAuthLambda.Arn
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${Environment}-${AWS::StackName}-client"
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  CognitoDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "${Environment}-zzip-to"
+      UserPoolId: !Ref CognitoUserPool
+
+  LinksTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub "${Environment}-${AWS::StackName}-links"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: key
+          KeyType: HASH
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+
+  ApiGateway:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub "${Environment}-${AWS::StackName}-api"
+      Description: API for managing zzip.to redirect links
+
+  CognitoAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: CognitoAuthorizer
+      Type: COGNITO_USER_POOLS
+      RestApiId: !Ref ApiGateway
+      IdentitySource: method.request.header.Authorization
+      ProviderARNs:
+        - !GetAtt CognitoUserPool.Arn
+
+  LinksResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !GetAtt ApiGateway.RootResourceId
+      PathPart: links
+
+  LinkKeyResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ParentId: !Ref LinksResource
+      PathPart: "{key}"
+
+  LinksOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref LinksResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${AdminDomainName}'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  LinkKeyOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref LinkKeyResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+        IntegrationResponses:
+          - StatusCode: "200"
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: !Sub "'https://${AdminDomainName}'"
+      MethodResponses:
+        - StatusCode: "200"
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-${AWS::StackName}-lambda-exec-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:Scan
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                Resource: !GetAtt LinksTable.Arn
+
+  ListLinksFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-${AWS::StackName}-list-links"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref LinksTable
+          ADMIN_ORIGIN: !Sub "https://${AdminDomainName}"
+      Code:
+        ZipFile: |
+          const { DynamoDBClient, ScanCommand } = require('@aws-sdk/client-dynamodb');
+          const client = new DynamoDBClient();
+          exports.handler = async (event) => {
+            const headers = {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': process.env.ADMIN_ORIGIN,
+              'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+              'Access-Control-Allow-Methods': 'GET,OPTIONS'
+            };
+            try {
+              let allItems = [];
+              let lastKey;
+              do {
+                const params = { TableName: process.env.TABLE_NAME };
+                if (lastKey) params.ExclusiveStartKey = lastKey;
+                const result = await client.send(new ScanCommand(params));
+                allItems = allItems.concat(result.Items || []);
+                lastKey = result.LastEvaluatedKey;
+              } while (lastKey);
+              const items = allItems.filter(item => item.key && item.value).map(item => ({
+                key: item.key.S,
+                value: item.value.S
+              })).sort((a, b) => a.key.localeCompare(b.key));
+              return { statusCode: 200, headers, body: JSON.stringify(items) };
+            } catch (err) {
+              console.error('Error listing links:', err);
+              return { statusCode: 500, headers, body: JSON.stringify({ error: 'Internal server error' }) };
+            }
+          };
+
+  CreateLinkFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-${AWS::StackName}-create-link"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref LinksTable
+          ADMIN_ORIGIN: !Sub "https://${AdminDomainName}"
+      Code:
+        ZipFile: |
+          const { DynamoDBClient, PutItemCommand } = require('@aws-sdk/client-dynamodb');
+          const client = new DynamoDBClient();
+          exports.handler = async (event) => {
+            const headers = {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': process.env.ADMIN_ORIGIN,
+              'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+              'Access-Control-Allow-Methods': 'PUT,DELETE,OPTIONS'
+            };
+            try {
+              const key = event.pathParameters && event.pathParameters.key;
+              if (!key) {
+                return { statusCode: 400, headers, body: JSON.stringify({ error: 'Missing key parameter' }) };
+              }
+              if (!/^[a-zA-Z0-9_-]+$/.test(key)) {
+                return { statusCode: 400, headers, body: JSON.stringify({ error: 'Invalid key format. Only alphanumeric characters, hyphens, and underscores are allowed.' }) };
+              }
+              if (key.length > 128) {
+                return { statusCode: 400, headers, body: JSON.stringify({ error: 'Key must be 128 characters or fewer' }) };
+              }
+              let body;
+              try {
+                body = JSON.parse(event.body || '{}');
+              } catch (e) {
+                return { statusCode: 400, headers, body: JSON.stringify({ error: 'Invalid JSON body' }) };
+              }
+              const value = body.value;
+              if (!value || typeof value !== 'string') {
+                return { statusCode: 400, headers, body: JSON.stringify({ error: 'Missing or invalid value field' }) };
+              }
+              if (/[\x00-\x1f\x7f]/.test(value)) {
+                return { statusCode: 400, headers, body: JSON.stringify({ error: 'Value must not contain control characters' }) };
+              }
+              if (value.length > 1024) {
+                return { statusCode: 400, headers, body: JSON.stringify({ error: 'URL must be 1024 characters or fewer' }) };
+              }
+              const urlPattern = /^https?:\/\/[a-zA-Z0-9][a-zA-Z0-9.\-]+(:\d+)?(\/.*)?$/;
+              const isWildcard = value.endsWith('/*');
+              const urlToValidate = isWildcard ? value.slice(0, -2) : value;
+              if (!urlPattern.test(urlToValidate)) {
+                return { statusCode: 400, headers, body: JSON.stringify({ error: 'Value must be a valid HTTP/HTTPS URL' }) };
+              }
+              await client.send(new PutItemCommand({
+                TableName: process.env.TABLE_NAME,
+                Item: { key: { S: key }, value: { S: value } }
+              }));
+              return { statusCode: 200, headers, body: JSON.stringify({ key, value }) };
+            } catch (err) {
+              console.error('Error creating link:', err);
+              return { statusCode: 500, headers, body: JSON.stringify({ error: 'Internal server error' }) };
+            }
+          };
+
+  DeleteLinkFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-${AWS::StackName}-delete-link"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref LinksTable
+          ADMIN_ORIGIN: !Sub "https://${AdminDomainName}"
+      Code:
+        ZipFile: |
+          const { DynamoDBClient, DeleteItemCommand } = require('@aws-sdk/client-dynamodb');
+          const client = new DynamoDBClient();
+          exports.handler = async (event) => {
+            const headers = {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': process.env.ADMIN_ORIGIN,
+              'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+              'Access-Control-Allow-Methods': 'PUT,DELETE,OPTIONS'
+            };
+            try {
+              const key = event.pathParameters && event.pathParameters.key;
+              if (!key) {
+                return { statusCode: 400, headers, body: JSON.stringify({ error: 'Missing key parameter' }) };
+              }
+              if (!/^[a-zA-Z0-9_-]+$/.test(key) || key.length > 128) {
+                return { statusCode: 400, headers, body: JSON.stringify({ error: 'Invalid key format' }) };
+              }
+              await client.send(new DeleteItemCommand({
+                TableName: process.env.TABLE_NAME,
+                Key: { key: { S: key } }
+              }));
+              return { statusCode: 200, headers, body: JSON.stringify({ deleted: key }) };
+            } catch (err) {
+              console.error('Error deleting link:', err);
+              return { statusCode: 500, headers, body: JSON.stringify({ error: 'Internal server error' }) };
+            }
+          };
+
+  ListLinksMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref LinksResource
+      HttpMethod: GET
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ListLinksFunction.Arn}/invocations"
+
+  CreateLinkMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref LinkKeyResource
+      HttpMethod: PUT
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateLinkFunction.Arn}/invocations"
+
+  DeleteLinkMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGateway
+      ResourceId: !Ref LinkKeyResource
+      HttpMethod: DELETE
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref CognitoAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DeleteLinkFunction.Arn}/invocations"
+
+  ListLinksPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt ListLinksFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/GET/links"
+
+  CreateLinkPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CreateLinkFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/PUT/links/*"
+
+  DeleteLinkPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DeleteLinkFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGateway}/*/DELETE/links/*"
+
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ListLinksMethod
+      - CreateLinkMethod
+      - DeleteLinkMethod
+      - LinksOptionsMethod
+      - LinkKeyOptionsMethod
+    Properties:
+      RestApiId: !Ref ApiGateway
+
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref ApiGateway
+      DeploymentId: !Ref ApiDeployment
+      StageName: !Ref Environment
+
+  KvsSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${Environment}-${AWS::StackName}-kvs-sync-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBStreamsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetRecords
+                  - dynamodb:GetShardIterator
+                  - dynamodb:DescribeStream
+                  - dynamodb:ListStreams
+                Resource: !Sub "${LinksTable.Arn}/stream/*"
+        - PolicyName: CloudFrontKVSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudfront-keyvaluestore:DescribeKeyValueStore
+                  - cloudfront-keyvaluestore:GetKey
+                  - cloudfront-keyvaluestore:PutKey
+                  - cloudfront-keyvaluestore:DeleteKey
+                Resource: !GetAtt RedirectKVS.Arn
+        - PolicyName: SQSDLQAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt KvsSyncDLQ.Arn
+
+  KvsSyncFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${Environment}-${AWS::StackName}-kvs-sync"
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt KvsSyncRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          KVS_ARN: !GetAtt RedirectKVS.Arn
+      Code:
+        S3Bucket: !Ref KvsSyncCodeS3Bucket
+        S3Key: !Ref KvsSyncCodeS3Key
+
+  KvsSyncDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${Environment}-${AWS::StackName}-kvs-sync-dlq"
+      MessageRetentionPeriod: 1209600
+
+  KvsSyncEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      EventSourceArn: !GetAtt LinksTable.StreamArn
+      FunctionName: !GetAtt KvsSyncFunction.Arn
+      StartingPosition: TRIM_HORIZON
+      BatchSize: 10
+      MaximumRetryAttempts: 3
+      BisectBatchOnFunctionError: true
+      DestinationConfig:
+        OnFailure:
+          Destination: !GetAtt KvsSyncDLQ.Arn
+
+  AdminBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${Environment}-${AWS::StackName}-admin-ui-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  AdminOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${Environment}-${AWS::StackName}-admin-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  AdminBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AdminBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${AdminBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${AdminDistribution}"
+
+  AdminDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${Environment} zzip.to admin UI"
+        Aliases:
+          - !Ref AdminDomainName
+        ViewerCertificate:
+          AcmCertificateArn: !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        DefaultRootObject: index.html
+        DefaultCacheBehavior:
+          TargetOriginId: admin-s3-origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+          Compress: true
+        Origins:
+          - Id: admin-s3-origin
+            DomainName: !GetAtt AdminBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt AdminOriginAccessControl.Id
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100
+
+  AdminDNSRecordA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref AdminDomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt AdminDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  AdminDNSRecordAAAA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref AdminDomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt AdminDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+Outputs:
+
+  DistributionId:
+    Description: ID of the CloudFront Distribution
+    Value: !Ref Distribution
+    Export:
+      Name: !Sub "${AWS::StackName}-DistributionId"
+
+  DistributionDomainName:
+    Description: Domain name of the CloudFront Distribution
+    Value: !GetAtt Distribution.DomainName
+    Export:
+      Name: !Sub "${AWS::StackName}-DistributionDomain"
+
+  KeyValueStoreArn:
+    Description: ARN of the CloudFront KeyValueStore
+    Value: !GetAtt RedirectKVS.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-KVSArn"
+
+  KeyValueStoreId:
+    Description: ID of the CloudFront KeyValueStore
+    Value: !GetAtt RedirectKVS.Id
+    Export:
+      Name: !Sub "${AWS::StackName}-KVSId"
+
+  RedirectFunctionArn:
+    Description: ARN of the CloudFront Function
+    Value: !GetAtt RedirectFunction.FunctionARN
+    Export:
+      Name: !Sub "${AWS::StackName}-FunctionArn"
+
+  UserPoolId:
+    Description: ID of the Cognito User Pool
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolId"
+
+  UserPoolClientId:
+    Description: ID of the Cognito User Pool Client
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolClientId"
+
+  CognitoDomainOutput:
+    Description: Cognito domain for hosted UI
+    Value: !Sub "${Environment}-zzip-to"
+    Export:
+      Name: !Sub "${AWS::StackName}-CognitoDomain"
+
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${ApiGateway}.execute-api.${AWS::Region}.amazonaws.com/${Environment}"
+    Export:
+      Name: !Sub "${AWS::StackName}-ApiEndpoint"
+
+  LinksTableName:
+    Description: Name of the DynamoDB Links table
+    Value: !Ref LinksTable
+    Export:
+      Name: !Sub "${AWS::StackName}-LinksTableName"
+
+  AdminDistributionId:
+    Description: ID of the Admin UI CloudFront Distribution
+    Value: !Ref AdminDistribution
+    Export:
+      Name: !Sub "${AWS::StackName}-AdminDistributionId"
+
+  AdminBucketName:
+    Description: Name of the Admin UI S3 bucket
+    Value: !Ref AdminBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-AdminBucketName"

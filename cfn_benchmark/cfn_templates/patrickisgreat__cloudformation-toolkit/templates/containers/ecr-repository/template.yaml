@@ -1,0 +1,232 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  ECR repository with immutable tags, scan on push, encryption, a lifecycle
+  policy built from two knobs, and optional cross-account pull access.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Naming
+        Parameters:
+          - NamePrefix
+          - RepositorySuffix
+      - Label:
+          default: Image hygiene
+        Parameters:
+          - ImageTagMutability
+          - ScanOnPush
+      - Label:
+          default: Lifecycle (controls storage cost)
+        Parameters:
+          - EnableLifecyclePolicy
+          - KeepLastNImages
+          - ExpireUntaggedAfterDays
+          - LifecyclePolicyText
+      - Label:
+          default: Encryption
+        Parameters:
+          - EncryptionType
+          - KmsKeyArn
+      - Label:
+          default: Access
+        Parameters:
+          - CrossAccountPullAccountIds
+          - EmptyOnDelete
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: Prefix for the repository name.
+    AllowedPattern: "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+    ConstraintDescription: 3-32 lowercase characters, digits and hyphens.
+
+  RepositorySuffix:
+    Type: String
+    Description: >-
+      Suffix identifying the image, giving <NamePrefix>/<RepositorySuffix>. Use
+      one repository per image, not per environment.
+    Default: app
+    AllowedPattern: "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$"
+    ConstraintDescription: >-
+      Lowercase alphanumeric, optionally separated by . _ or - (ECR naming rules).
+
+  ImageTagMutability:
+    Type: String
+    Description: >-
+      IMMUTABLE means a tag, once pushed, always points at the same digest.
+      MUTABLE lets a push move it, which means what you tested is not necessarily
+      what is running.
+    Default: IMMUTABLE
+    AllowedValues: [IMMUTABLE, MUTABLE]
+
+  ScanOnPush:
+    Type: String
+    Description: Run a vulnerability scan on every push. Basic scanning is free.
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  EnableLifecyclePolicy:
+    Type: String
+    Description: >-
+      Apply the generated lifecycle policy. Without one, every image ever built
+      is stored forever at $0.10/GB-month, which for a busy CI pipeline is the
+      largest ECR line item by an order of magnitude.
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  KeepLastNImages:
+    Type: Number
+    Description: >-
+      How many images to keep. Set it above your rollback depth: expiring an
+      image you might roll back to turns a bad deploy into an outage.
+    Default: 30
+    MinValue: 1
+    MaxValue: 1000
+
+  ExpireUntaggedAfterDays:
+    Type: Number
+    Description: >-
+      Days to keep untagged images. Untagged images are usually orphaned layers
+      from an overwritten tag; nothing can deploy them.
+    Default: 14
+    MinValue: 1
+    MaxValue: 365
+
+  LifecyclePolicyText:
+    Type: String
+    Description: >-
+      Raw ECR lifecycle policy JSON. When set it replaces the generated policy
+      entirely - the escape hatch for rules the two knobs cannot express, such as
+      keeping tagged releases forever while expiring feature branches.
+    Default: ""
+
+  EncryptionType:
+    Type: String
+    Description: >-
+      AES256 uses ECR's own key at no cost. KMS uses a customer-managed key,
+      which you need for cross-account or key-level audit.
+    Default: AES256
+    AllowedValues: [AES256, KMS]
+
+  KmsKeyArn:
+    Type: String
+    Description: KMS key ARN, used only when EncryptionType is KMS.
+    Default: ""
+
+  CrossAccountPullAccountIds:
+    Type: CommaDelimitedList
+    Description: >-
+      AWS account IDs allowed to pull from this repository, e.g. a staging and a
+      prod account pulling images built in a shared CI account. Leave empty for
+      same-account access only.
+    Default: ""
+
+  EmptyOnDelete:
+    Type: String
+    Description: >-
+      Let CloudFormation delete the repository even when it still holds images.
+      Off by default: the images are your deploy history and your rollback path.
+    Default: "false"
+    AllowedValues: ["true", "false"]
+
+Conditions:
+  HasLifecyclePolicy: !Or
+    - !Equals [!Ref EnableLifecyclePolicy, "true"]
+    - !Not [!Equals [!Ref LifecyclePolicyText, ""]]
+  HasRawLifecyclePolicy: !Not [!Equals [!Ref LifecyclePolicyText, ""]]
+  UsesKms: !Equals [!Ref EncryptionType, "KMS"]
+  HasCrossAccountPull: !Not [!Equals [!Join ["", !Ref CrossAccountPullAccountIds], ""]]
+
+Resources:
+  Repository:
+    Type: AWS::ECR::Repository
+    # The images in here are the deploy history and the rollback path. A stack
+    # rollback must not be able to take them.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub "${NamePrefix}/${RepositorySuffix}"
+      ImageTagMutability: !Ref ImageTagMutability
+      EmptyOnDelete: !Ref EmptyOnDelete
+      ImageScanningConfiguration:
+        ScanOnPush: !Ref ScanOnPush
+      EncryptionConfiguration:
+        EncryptionType: !Ref EncryptionType
+        KmsKey: !If [UsesKms, !Ref KmsKeyArn, !Ref "AWS::NoValue"]
+
+      # The two rules are ordered deliberately. ECR requires the tagStatus=any
+      # rule to carry the highest rulePriority, and evaluates rules in priority
+      # order — so untagged cleanup (1) runs before the keep-last-N sweep (2).
+      LifecyclePolicy: !If
+        - HasLifecyclePolicy
+        - LifecyclePolicyText: !If
+            - HasRawLifecyclePolicy
+            - !Ref LifecyclePolicyText
+            - !Sub |
+                {
+                  "rules": [
+                    {
+                      "rulePriority": 1,
+                      "description": "Expire untagged images after ${ExpireUntaggedAfterDays} days",
+                      "selection": {
+                        "tagStatus": "untagged",
+                        "countType": "sinceImagePushed",
+                        "countUnit": "days",
+                        "countNumber": ${ExpireUntaggedAfterDays}
+                      },
+                      "action": { "type": "expire" }
+                    },
+                    {
+                      "rulePriority": 2,
+                      "description": "Keep only the last ${KeepLastNImages} images",
+                      "selection": {
+                        "tagStatus": "any",
+                        "countType": "imageCountMoreThan",
+                        "countNumber": ${KeepLastNImages}
+                      },
+                      "action": { "type": "expire" }
+                    }
+                  ]
+                }
+        - !Ref AWS::NoValue
+
+      RepositoryPolicyText: !If
+        - HasCrossAccountPull
+        - Version: "2012-10-17"
+          Statement:
+            - Sid: AllowCrossAccountPull
+              Effect: Allow
+              Principal:
+                # ECR accepts bare account IDs here and normalises them to the
+                # account root ARN.
+                AWS: !Ref CrossAccountPullAccountIds
+              Action:
+                - ecr:GetDownloadUrlForLayer
+                - ecr:BatchGetImage
+                - ecr:BatchCheckLayerAvailability
+                - ecr:DescribeImages
+              # A pull-only policy. Push stays with whoever builds the image;
+              # adding ecr:PutImage here is how a consumer account ends up able
+              # to overwrite the tag it is deploying.
+        - !Ref AWS::NoValue
+
+Outputs:
+  RepositoryUri:
+    Description: URI to docker push/pull, without a tag.
+    Value: !GetAtt Repository.RepositoryUri
+
+  RepositoryArn:
+    Description: Repository ARN, for IAM policies on the task execution role.
+    Value: !GetAtt Repository.Arn
+
+  RepositoryName:
+    Description: Repository name (<NamePrefix>/<RepositorySuffix>).
+    Value: !Ref Repository
+
+  RegistryId:
+    Description: >-
+      Registry ID (the account hosting the repository), for `aws ecr
+      get-login-password --registry-ids`.
+    Value: !Ref AWS::AccountId

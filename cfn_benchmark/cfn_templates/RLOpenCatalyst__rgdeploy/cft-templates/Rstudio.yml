@@ -1,0 +1,224 @@
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: Sets up RStudio environment on AWS
+
+Parameters:
+  Namespace:
+    Type: String
+    Description: An environment name that will be prefixed to resource names
+  S3Mounts:
+    Type: String
+    Description: A JSON array of objects with name, bucket, and prefix properties used to mount data
+  IamPolicyDocument:
+    Type: String
+    Description: The IAM policy to be associated with the launched workstation
+  EnvironmentInstanceFiles:
+    Type: String
+    Description: >-
+      An S3 URI (starting with "s3://") that specifies the location of files to be copied to
+      the environment instance, including any bootstrap scripts
+  EBSVolumeSize:
+    Description: The initial size of the volume (in GBs)  EBS will use for storage.
+    Type: Number
+    Default: 8
+  InstanceType:
+    Type: String
+    Description: Choose the instance type e.g t3.medium (2vCPU , 2GiB RAM), t3.large (2vCPU, 8GiB RAM), t3.xlarge(4vCPU, 16GiB RAM)
+    AllowedValues:
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+    ConstraintDescription: Valid instance type in the t3 families
+    Default: t3.medium
+  InitialUser:
+    Type: String
+    Description: User Name for RStudio. Do not use 'root' and 'ec2-user'
+    Default: rstudio
+  KeyPair:
+    Type: "AWS::EC2::KeyPair::KeyName"
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance. If no key pairs exist, please create one from the button next to the dropdown. Please contact your Administrator if you are unable to create one.
+  AvailabilityZone:
+    Description: Select the availability zone in which to create the instance. If you plan to attach a secondary volume to the instance, create this instance in the same AvailabilityZone as the volume you created.
+    Type: AWS::EC2::AvailabilityZone::Name
+
+Conditions:
+  IamPolicyEmpty: !Equals [!Ref IamPolicyDocument, '{}']
+
+Resources:
+  IAMRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Join ['-', [Ref: Namespace, 'rstudio-role']]
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'ec2.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - !If
+          - IamPolicyEmpty
+          - !Ref 'AWS::NoValue'
+          - PolicyName: !Join ['-', [Ref: Namespace, 's3-studydata-policy']]
+            PolicyDocument: !Ref IamPolicyDocument
+        - PolicyName: param-store-access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: 'Allow'
+                Action:
+                  - 'ssm:GetParameter'
+                  - 'ssm:PutParameter'
+                Resource: !Sub 'arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/*'
+
+  InstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      InstanceProfileName: !Join ['-', [Ref: Namespace, 'rstudio-profile']]
+      Path: '/'
+      Roles:
+        - Ref: IAMRole
+
+  RstudioEC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      SecurityGroupIngress:
+        - CidrIp: "0.0.0.0/0"
+          FromPort: 22
+          ToPort: 22
+          IpProtocol: tcp
+        - CidrIp: "0.0.0.0/0"
+          FromPort: 443
+          ToPort: 443
+          IpProtocol: tcp
+      GroupDescription: RStudio Security Group
+
+  RstudioEC2Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT10M
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          default:
+            - config1
+            - config2
+        config1:
+          files:
+            '/root/mount_study.sh':
+              mode: '000755'
+              owner: 'root'
+              group: 'root'
+              content: !Sub |
+                #!/bin/sh
+                su - ${InitialUser} -c "env PATH=$PATH:/usr/local/bin mount_s3.sh" 2>&1 >> /root/mount_s3.log
+            '/root/set_user_token.sh':
+              mode: '000755'
+              owner: 'root'
+              group: 'root'
+              content: !Sub |
+                #!/usr/bin/env bash
+                # Get the session token
+                TOKEN=$(curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+
+                # Get the region to build the parameter name
+                instance_region=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/region)
+                echo "Retrieved region ${instance_region} from metadata service"
+
+                # Get the instance id to build the parameter name
+                instance_id=$(curl -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/instance-id)
+
+                secret=`uuidgen`
+                echo "setting ${InitialUser} password and starting rstudio"
+                password=$(echo -n "$instance_id$secret" | sha256sum | awk '{print $1}')
+                echo "${InitialUser}:$password" | /usr/sbin/chpasswd
+                echo "Set rstudio-user password"
+
+                sleep 10
+                public_key=$(curl http://localhost:8787/auth-public-key)
+
+                aws ssm put-parameter --name "/RL/RG/rstudio/public-key/$instance_id" --value '{"secret":"'$secret'","public_key":"'$public_key'"}' --region $instance_region --type SecureString --overwrite
+                echo "Stored rstudio public key in SSM"
+            '/var/log/rstudio.log':
+              content: "\n"
+              mode: '000664'
+              owner: 'root'
+              group: 'root'
+
+        config2:
+          commands:
+            01_mount_study:
+              cwd: '/root'
+              command: '/root/mount_study.sh'
+            02_set_user_token:
+              cwd: '/root'
+              command: '/root/set_user_token.sh'
+
+    Properties:
+      ImageId : '{{resolve:ssm:/RL/RG/StandardCatalog/RStudio}}'
+      InstanceType: !Ref 'InstanceType'
+      AvailabilityZone: !Ref AvailabilityZone
+      SecurityGroups: [!Ref 'RstudioEC2SecurityGroup']
+      KeyName: !Ref 'KeyPair'
+      IamInstanceProfile: !Ref InstanceProfile
+      PropagateTagsToVolumeOnCreation: true
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref EBSVolumeSize
+            Encrypted: true
+      Tags:
+        - Key: Name
+          Value: !Join ['-', [Ref: Namespace, 'rstudio-server']]
+        - Key: Description
+          Value: EC2 linux based Rstudio server
+        - Key: cost_resource
+          Value: !Sub ${AWS::StackName}
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          exec > >(tee /var/log/user-data.log|logger -t user-data -s 2>/dev/console) 2>&1
+          trap '/opt/aws/bin/cfn-signal --exit-code 1 --resource RstudioEC2Instance --region ${AWS::Region} --stack ${AWS::StackName}' ERR
+          sudo yum update -y --security
+
+          #add user(s)
+          sudo useradd -m -s /bin/bash ${InitialUser}
+          #Add user to the sudo group
+          sudo usermod -a -G wheel ${InitialUser}
+
+          #Download and execute bootstrap script
+          aws s3 cp "${EnvironmentInstanceFiles}/get_bootstrap.sh" "/tmp"
+          chmod 500 "/tmp/get_bootstrap.sh"
+          /tmp/get_bootstrap.sh "${EnvironmentInstanceFiles}" '${S3Mounts}' "${InitialUser}"
+
+          # Add command to start on reboot
+          crontab -l 2>/dev/null > "/tmp/crontab"
+          echo '@reboot su - ${InitialUser} -c "env PATH=$PATH:/usr/local/bin mount_s3.sh" 2>&1 >> /root/mount_s3.log' >> "/tmp/crontab"
+          echo '@reboot /root/set_user_token.sh 2>&1 >> /var/log/set_user_token.log' >> "/tmp/crontab"
+          crontab "/tmp/crontab"
+
+          # Run init script to create files
+          /opt/aws/bin/cfn-init --verbose --stack ${AWS::StackName} --resource RstudioEC2Instance --region ${AWS::Region}
+
+          /opt/aws/bin/cfn-signal --exit-code 0 --resource RstudioEC2Instance --region ${AWS::Region} --stack ${AWS::StackName}
+
+Outputs:
+  InstanceDNSName:
+    Value: !GetAtt RstudioEC2Instance.PublicDnsName
+    Description: Public DNS Name
+  InstanceIPAddress:
+    Value: !GetAtt RstudioEC2Instance.PublicIp
+  InstanceId:
+    Value: !Ref 'RstudioEC2Instance'
+  ApplicationPort:
+    Value: '443'
+  AvailabilityZone:
+    Description: AvailabilityZone of newly created Rstudio EC2Instance
+    Value: !Ref AvailabilityZone

@@ -47,6 +47,197 @@ a comparable conference; paper sources live in `../Papers/` — `introduction.te
   final CFN+TF frozen benchmark numbers have not yet been dropped into the paper's Table 2 /
   Figures 3–4 (`../Papers/benchmark.tex`); that requires the TF LocalStack run above.
 
+## Session log: key decisions & current state (2026-08-18/19)
+
+**Key decisions**
+
+- **Licence filter held firm.** Rejected relaxing the ethical-licence filter (cell 3b) to
+  include no-LICENSE repos. GitHub ToS §D.5 / default copyright: absence of a LICENSE file
+  means all rights reserved by default, not an implicit permissive/open-source grant. This
+  stance holds even though it constrains the L5 candidate pool and the benchmark is headed
+  for academic publication/redistribution — do not revisit without genuinely new legal
+  grounds.
+- **L5 scarcity root-caused away from licensing.** Diagnosed the real L5 bottleneck as high
+  lint failure rate (~53%, dominated by E2533 deprecated-runtime and E2531) plus a
+  317-row deploy-testing backlog of already-qualified candidates — licensing waste among
+  newly-discovered repos was only ~59% and already filtered upstream of lint/deploy. Effort
+  went into (a) expanding GitHub search queries (Strategy C/D/E, cell 2.5) for more complex
+  multi-resource scenarios, and (b) triaging existing L5 deploy failures for minimal,
+  verifiable fixes rather than chasing more repos.
+- **`trivy_medium` no longer gates the benchmark** — commented out in both cell 9b and cell
+  11; only CRITICAL/HIGH severity findings block a scenario now.
+- **Near-dup detection extended to source-path matching**, not just content-similarity: two
+  files can be "the same scenario" via matching normalized source path (stripping the
+  `cfn_templates_greenfield/` vs `cfn_templates/` prefix) even when a manual fix's content
+  diverges below the difflib 0.90 `quick_ratio` threshold. A dedicated post-resample dual
+  near-dup check cell (`cell-14b-postdup-check`) was added for this, run after cell 14.
+- **`sync_source` (cell 14) must always prefer `PROMPTS_CSV` over `FINAL_EVAL_CSV`** when
+  both exist — never mtime-based. `FINAL_EVAL_CSV` (`cfn_eval_benchmark.csv`) is only ever
+  derived FROM `PROMPTS_CSV` and its narrow schema can't carry `source_category`/`cfn_code`;
+  an earlier mtime-based version silently dropped all manual-fix rows once the eval CSV got
+  regenerated after the prompts CSV in a live run. This is now a hard rule — do not
+  reintroduce mtime comparison here.
+- **`source_category == 'manual-fix'` convention established** for hand-repaired ground
+  truth: fixed files live under `cfn_templates_greenfield/<same relative path as the
+  original>`, are carved out of cell 14's `df_deployable`-based reconciliation via an
+  explicit keep-list, and carry their `cfn_code`/`final_cfn_code`/`final_user_prompt`/
+  `source_category` columns forward via a generic "any column in `df_old` not in
+  `df_deployable`" backfill mechanism.
+- **Prompt rubric source clarified**: the canonical rubric for prompt generation/audit is
+  `generate_cfn_prompts.py`'s `SYSTEM_PROMPT`, **not** `audit/cfn_prompt_rubric_review.py`'s
+  separate rubric — corrected after an initial subagent review batch used the wrong one.
+- **Self-containment policy enforced strictly** on subagent-proposed prompt fixes: never
+  describe a dependency as "existing"/"pre-existing"/"already exists"/"parent stack"/
+  "related stack" — reframe as a template Parameter instead. Several Haiku-subagent fixes
+  that regressed into this language were manually rewritten before being applied.
+
+**Current state (as of 2026-08-19)**
+
+- CFN benchmark was at 250 rows / 50-per-level as of the last full cell-14 run in this
+  session's history, but that will shift once the 9 manual-fix scenarios below are
+  deploy-tested and folded in via a rerun.
+- **9 L5 minimal-fixes implemented**, written to `cfn_benchmark/cfn_templates_greenfield/`,
+  registered into the pipeline via two new notebook cells. The registration design went
+  through two iterations before landing on the current one:
+  - **v1** (initial): a single cell after the 9c L5-only-slice, right before cell 10,
+    that both *defined and re-applied* the 9 fixes via `_fix_*` functions, ran cfn-lint +
+    Trivy itself, appended results into `lint_cache.csv`/`security_cache.csv`, and spliced
+    rows straight into `df_deploy_ready`. Dropped: redundant with cells 8/9 (which already
+    do lint/security with their own caching) and its own cache-append hit a real bug —
+    `lint_cache.csv` has `content_hash` LAST, `security_cache.csv` has it FIRST, and a naive
+    `{'content_hash': ..., **result}` + `to_csv(mode='a', header=False)` silently
+    column-shifted the new `lint_cache.csv` rows.
+  - **v2**: simplified to stop re-deriving the fixes (they're already correct on disk in
+    `cfn_templates_greenfield/` — just read them), but still ran lint/Trivy itself and
+    still spliced into `df_deploy_ready` after cell 9b. Still crashed cell 10 with
+    `TypeError: write() argument must be str, not float`, because it appended a `content`
+    key but not `content_norm` — cell 10's `validate_template()`/`deploy_stack()` read
+    `row['content_norm']` specifically (the canonical column name used everywhere from
+    cell 5c onward), so `content_norm` was `NaN` for those 9 rows after `pd.concat`.
+  - **v3 (current) — register BEFORE validation, not after.** `cell-register-manual-fixes`
+    now lives right after cell 7 (AWS-targeting filter, which writes `df_aws_cache.csv`)
+    and before cell 8 (cfn-lint) — not after 9c. It only reads the already-fixed files from
+    `cfn_templates_greenfield/`, computes the same base metadata cells 5b/6/7 compute for
+    every other template (reusing `parse_cfn_metrics`/`count_tokens`/`extract_aws_service`/
+    `calculate_difficulty_cfn` from globals when available, with local fallbacks for a
+    fresh kernel), looks up `source_slug`/`licence_spdx`/`github_url`/`file_path` from
+    `df_aws_cache.csv` by the original (pre-fix) `dest_file`, and injects the 9 rows
+    (`source_category='manual-fix'`) into both `df_aws` (in-memory, if present) and
+    `df_aws_cache.csv` (on disk, dedup'd by `content_hash`). It does **not** run cfn-lint or
+    Trivy itself and does **not** touch `df_deploy_ready` — cells 8 → 9 → 9b → 10 process
+    these 9 rows exactly like every other AWS-targeted template, using their own existing
+    caches, so there is no second implementation of lint/security/deploy logic left to drift
+    out of sync. Verified standalone (outside the live kernel) that the 9 injected
+    `df_aws_cache.csv` rows are fully populated (no NaNs in `content`/`content_norm`/
+    `content_hash`/`loc`/`n_resources`/`file_ext`/`is_aws_target`) and that cfn-lint runs
+    clean (0 errors) on all 9 using the exact tempfile mechanism cell 8 uses.
+  - `cell-inspect-manual-fixes` (after cell 10, Deployability Check) — self-contained
+    re-evaluation of the 9 scenarios' lint/security/deploy status by `content_hash`; safe
+    to run in a fresh kernel with no in-memory state required. Unchanged by the v3 redesign.
+  - Correct run order is now: cell 7 → `cell-register-manual-fixes` → cell 8 (cfn-lint) →
+    cell 9 (security) → 9b (severity gate) → 9c (optional L5 slice) → cell 10 (deploy check)
+    → `cell-inspect-manual-fixes`. Running `cell-register-manual-fixes` in its old position
+    (after 9c) no longer does anything useful under v3 — it must run before cell 8.
+  - A 10th candidate (`aws/sagemaker-hyperpod-cluster-setup`,
+    `eks/cloudformation/private-subnet-template.yaml`) was investigated and **dropped**:
+    its `VpcId` is already a correctly-declared Parameter, so the real gap is that
+    `deploy_stack()` never passes `Parameters=` to `create_stack` — a generic
+    deploy-tooling limitation, not a per-file content bug.
+- **Cache-corruption bug found and fixed** while registering the 9 fixes: `lint_cache.csv`
+  has `content_hash` as its LAST column while `security_cache.csv` has it FIRST; a naive
+  `{'content_hash': ..., **result}` dict + `to_csv(mode='a', header=False)` append had
+  silently column-shifted the 9 new `lint_cache.csv` rows (surfaced as `lint_pass=nan` in
+  the inspect cell). Fixed by reindexing to the on-disk header
+  (`reindex(columns=pd.read_csv(cache_path, nrows=0).columns)`) before appending — matching
+  the pattern cell 10 already used for exactly this reason. If you add another cache-append
+  path anywhere in the notebook, reuse this reindex pattern; don't assume dict key order
+  matches the CSV's column order.
+- **CFN difficulty thresholds are now byte-for-byte aligned with Terraform's** (see
+  "Difficulty-level methodology" above): L5 `loc>=400 & res>=12`, L4 `loc>=250 & res>=8`,
+  L3 `loc>=150 & res>=4`, L2 `loc>=80 & res>=2`, else L1 — no more CFN-specific lower LOC
+  bars. `df_aws_cache.csv` and `cfn_benchmark.csv` have both been retroactively
+  recalculated to these thresholds.
+- GitHub search query cells (2.5, both repo-search and code-search) were expanded
+  (Strategy C/D/E) specifically to surface complex, multi-dependent-resource scenarios
+  likely to land in L4/L5.
+- **Deploy-tested (2026-08-19, later)**: user ran cell 9b → `cell-register-manual-fixes` →
+  cell 10 → `cell-inspect-manual-fixes` — **5 of the 9 are fully deployable** (lint+security+
+  deploy all pass): `quick_admin_suite_vended_logs`, `flexclone-serverless-pipeline`,
+  `amazon-guardduty-automated-response`, `autotag_event_main-template`, `nih-grants-ws-api`.
+  4 failed deploy, triaged as follows:
+  - `Tianyi2/template_05405_cf-example-10.json` — `InvalidAMIID.NotFound` on hardcoded
+    `pmEc2ImageId` default `ami-28456852` (stale, unrelated to the policy-typo fix already
+    applied). **Minimal fix available**: swap the default for an SSM public AMI alias
+    (`{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2}}`).
+  - `wazuh/vpc-management.template` — `InvalidSubnet.Conflict` on `10.10.10.0/24`. Root
+    cause is a genuine copy-paste bug in the **original** template (predates our AZ fix):
+    `pManagementDMZSubnetACIDR` and `pManagementPrivateSubnetACIDR` both default to the
+    identical CIDR `10.10.10.0/24` (and the B-pair both default to `10.10.20.0/24`) despite
+    being different subnets in the same VPC. **Minimal fix available**: give each of the 4
+    subnet-CIDR parameter defaults a distinct, non-overlapping value.
+  - `eijikominami/sam-app/template.yaml` — `SNSForAlert`/`EventsRule`/
+    `AlarmLambdaSendNotificationToSlack` are `AWS::Serverless::Application` nested-app
+    resources pointing at Serverless Application Repository ARNs that require account-level
+    SAR subscription. **Not a minimal content fix** — external-dependency problem, same
+    category as the already-dropped `sagemaker-hyperpod` candidate; leave dropped.
+  - `sample-ai-campaign-orchestrator/template.yaml` — `CampaignStateMachine`'s
+    `DefinitionUri: statemachine/campaign_orchestrator.asl.json` points at a file that was
+    never cloned (same root cause class as the 10 Lambda `CodeUri` fixes already applied to
+    this same file, just missed on the state machine resource). **Minimal fix available**:
+    replace `DefinitionUri` with an inline `Definition:` stub (a trivial single-state ASL
+    document), mirroring the `InlineCode` pattern already used for this file's Lambdas.
+  - User explicitly deferred applying the 3 available minimal fixes (2026-08-19) to prioritize
+    starting the multi-agent evaluation instead — pick this triage back up whenever L5 backlog
+    work resumes; none of it blocks evaluation since these 9 rows aren't in the frozen
+    250-row assembly yet regardless.
+
+**Resample + prompt review round (2026-08-19, later same day)** — the user ran the full
+pipeline through cell 14 independently and reported "all 50 scenarios per level fulfilled."
+Verification and follow-up:
+- Confirmed 250 rows / 50-per-level in `final_benchmark_with_prompts.csv`. Diffed against
+  the last **git-committed** version (not the stale/partial `cfn_prompt_review_final.csv`
+  archive, which only had 41/290 rows with a non-null `dest_file` and was unreliable as a
+  diff baseline) and found 29 `dest_file`s changed — mostly new L5 candidates plus a few
+  L3/L4 swaps, consistent with the L5-pool-expansion effort. Only 3 of the 29 had a blank
+  `user_prompt` (the rest already had prompts from earlier uncommitted local runs) — ran
+  `generate_cfn_prompts.py` to backfill just those 3 (row_numbers 372/373/374; the script's
+  resume-by-existing-`user_prompt` logic left everything else untouched).
+- Rubric-reviewed all 29 changed rows against `generate_cfn_prompts.py`'s `SYSTEM_PROMPT`
+  by spawning 3 Haiku subagents in parallel (batches of ~10), each reading the ground-truth
+  template fresh from disk rather than trusting the CSV. Found 10 `critical_defect=true`
+  verdicts. **One (row 361) was a Haiku false positive** — it claimed the template used
+  custom "Cloud Provider" policies instead of the named AWS-managed EKS policies the prompt
+  cited, but manual re-verification against the actual template showed BOTH are genuinely
+  present (3 core CAPA roles use custom managed policies, 3 separate EKS-specific roles use
+  the exact named AWS-managed policies) — the reviewer had conflated the two role groups.
+  Left unchanged after confirming it was correct as written. **Trust-but-verify held up
+  again here**: don't apply a subagent's critical-defect verdict without re-checking the
+  specific claim against the template yourself, even at the review stage (not just repairs).
+- The other 9 were genuine defects, hand-repaired (not re-delegated) after reading each
+  ground-truth template directly: row 149 (S3/KMS endpoint policy falsely claimed as
+  parameters when the template hardcodes/imports VPC+route-table IDs — reworded for
+  self-containment per the `Fn::ImportValue` policy); 346 (prompt said "GET method", template
+  resource is `HttpMethod: POST`); 348 (prompt said "provided SageMaker Studio domain" —
+  template imports it via `!ImportValue`, self-containment violation — reworded to create
+  the domain too); 351 (prompt claimed cluster/VPC/listener ARN as parameters, template
+  cross-stack-imports all three — reworded to a self-contained ECS+VPC+ALB stack); 352 (SAM
+  translator test fixture with placeholder cert ARN/hosted zone ID/domains — added "should be
+  supplied as inputs... rather than hardcoded"); 356 (numeral error: prompt said "five IAM
+  roles", template has exactly 4 `AWS::IAM::Role` resources); 357 (prompt over-specified
+  "specific egress rules for each component type" when in reality all three security groups
+  share one identical HTTPS-to-endpoint rule and only two also get a DynamoDB rule —
+  generalized per the inference-space rule rather than trying to describe the asymmetry
+  exactly); 358 ("CloudFront distributions" plural implied several, but all
+  frontend/www/prod-root aliases share one single hardcoded CloudFront domain — softened to
+  "a shared CloudFront distribution"); 366 (prompt fabricated a whole Network ACL
+  configuration paragraph — template has zero `AWS::EC2::NetworkAcl`/`NetworkAclEntry`
+  resources anywhere — deleted the fabricated sentences entirely).
+- Re-ran cell 15's logic standalone to regenerate `cfn_eval_benchmark.csv` (250 rows, no
+  `row_number` duplicates) from the repaired `final_benchmark_with_prompts.csv`.
+- Updated `cfn_prompt_review_final.csv` (the per-row rubric-verdict archive) with the 29
+  fresh verdicts, replacing any stale prior entries for the same `dest_file`s rather than
+  appending duplicates.
+
 ## Key notebooks and scripts
 
 ### Benchmark construction
@@ -334,10 +525,10 @@ else:                          return 1
 **CloudFormation** (`calculate_difficulty_cfn()`, `cfn_benchmark_builder.ipynb`, section 6)
 — mirrors the above shape with CFN-calibrated thresholds:
 ```python
-if   loc >= 200 and res >= 12: return 5
-elif loc >= 150 and res >= 8:  return 4
-elif loc >= 100 and res >= 4:  return 3
-elif loc >= 50  and res >= 2:  return 2
+if   loc >= 400 and res >= 12: return 5
+elif loc >= 250 and res >= 8:  return 4
+elif loc >= 150 and res >= 4:  return 3
+elif loc >= 80  and res >= 2:  return 2
 else:                          return 1
 ```
 (Resource-count bars for L3–L5 currently match Terraform's 1:1; only the LOC bars were

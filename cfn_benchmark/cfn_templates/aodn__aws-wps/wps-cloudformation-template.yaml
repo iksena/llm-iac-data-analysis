@@ -1,0 +1,873 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  A template for AWS-WPS
+Parameters:
+  geoserver:
+    Type: String
+    Description: Geoserver from which to source files to aggregate
+  dockerImage:
+    Type: String
+  templatesURL:
+    Type: String
+  geonetworkCatalogueURL:
+    Type: String
+  dataDownloadUrlPrefix:
+    Type: String
+    Default: https://imos-data.s3-ap-southeast-2.amazonaws.com/
+  sourceArn:
+    Type: String
+    Default: ''
+  sumoEndpoint:
+    Type: String
+    Default: ''
+  sumoCollectorStack:
+    Type: String
+    Default: ''
+  maxVCPUs:
+    Type: Number
+    Default: 4
+  wpsDomainName:
+    Type: String
+    Default: ''
+    Description: The WPS API Gateway endpoint's domain name prefix (excluding the domain)
+  externalDomainName:
+    Type: String
+    Default: ''
+    Description: Add additional external domain name to support external alias (i.e. allow a CNAME aliasing WpsRoute53RecordSet to work correctly against the API)
+  administratorEmail:
+    Type: String
+    Default: ''
+    Description: Email address of an administrator - used to send failed job emails for attention of administrators
+  bucketName:
+    Type: String
+    Default: aws-wps-dev
+  awsRegionSes:
+    Type: String
+    Default: us-east-1
+    AllowedValues:
+      - us-east-1
+      - us-west-2
+      - eu-west-1
+      - ap-southeast-2
+  SeSLimitRecipients:
+    Type: String
+    Default: "*"
+  AllowEphemeralBuckets:
+    Type: String
+    AllowedValues: [ true, false ]
+    Default: false
+  ParentVPCStack:
+    Description: 'Stack name of parent VPC stack based on vpc/vpc-*azs.yaml template.'
+    Type: String
+    Default: ci-network-vpc
+  ParentConstantsStack:
+    Description: 'Stack name of parent constants stack based on infrastructure/accountconstants-template.yaml template.'
+    Type: String
+    Default: ci-network-constants
+  ParentZoneStack:
+    Description: 'Stack name of parent Route 53 zone stack based on vpc/zone-*.yaml template.'
+    Type: String
+    Default: ci-network-zone
+
+Mappings:
+  Constants:
+    ConstantMap:
+      ContainerWorkingDir: /tmp
+      S3JobKeyPrefix: jobs/
+      requestHandlerApiPath: wps
+      jobStatusApiPath: jobStatus
+      wpsApiStage: LATEST
+  ConfigurationFileMap:
+    Filename:
+      status: status.xml
+      request: request.xml
+Conditions:
+  CreateEphemeralBucket: !And
+    - !Equals [!Ref bucketName, aws-wps-dev]
+    - !Equals [true, !Ref AllowEphemeralBuckets]
+  ConfigureSumoLogicForLambda: !Not [!Equals ['', !Ref sumoCollectorStack]]
+  CreateWpsApiGatewayDomainName: !Not [!Equals ['', !Ref wpsDomainName]]
+  HasExternalDomainName: !Not [!Equals ['', !Ref externalDomainName]]
+  HasCustomDomain: !Or [!Condition CreateWpsApiGatewayDomainName, !Condition HasExternalDomainName]
+Resources:
+
+  #
+  # S3 bucket
+  #
+
+  EphemeralS3Bucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateEphemeralBucket
+    DeletionPolicy: Delete
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: False
+        BlockPublicPolicy: False
+        IgnorePublicAcls: True
+        RestrictPublicBuckets: True
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      LifecycleConfiguration:
+        Rules:
+          - Id: JobExpirationInDays
+            Prefix: !FindInMap [Constants, ConstantMap, S3JobKeyPrefix]
+            Status: Enabled
+            ExpirationInDays: 7
+      Tags:
+        - Key: EphemeralBucket
+          Value: true
+  S3BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: CreateEphemeralBucket
+    Properties:
+      Bucket: !Ref EphemeralS3Bucket
+      PolicyDocument:
+        Statement:
+          -
+            Action:
+              - s3:GetObject
+            Effect: Allow
+            Resource: !Sub
+              - 'arn:aws:s3:::${EphemeralS3Bucket}/${S3Prefix}*'
+              - S3Prefix: !FindInMap [Constants, ConstantMap, S3JobKeyPrefix]
+            Principal: '*'
+  EmptyBucketLambdaFunction:
+    Type: AWS::Lambda::Function
+    Condition: CreateEphemeralBucket
+    Properties:
+      Code:
+        ZipFile: |
+          import os
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  if event['RequestType'] == 'Delete':
+                      s3 = boto3.resource('s3')
+                      bucket = s3.Bucket(os.environ['BUCKET'])
+
+                      is_ephemeral = any(
+                          l for l in bucket.Tagging().tag_set if l['Key'] == 'EphemeralBucket' and l['Value'] == 'true')
+                      if not is_ephemeral:
+                          raise ValueError("bucket '{bucket}' is not ephemeral".format(bucket=bucket))
+
+                      bucket.objects.filter(Prefix=os.environ['JOBS_KEY']).delete()
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Data': 'OK'}, 'EmptyBucketLambdaFunction')
+              except Exception as e:
+                  print("error deleting ephemeral bucket contents: {e}".format(e=e))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Data': 'OK'}, 'EmptyBucketLambdaFunction')
+      Description: Used to put objects into S3.
+      FunctionName: !Sub 'EmptyBucket-${AWS::StackName}'
+      Handler: index.handler
+      Role: !GetAtt EmptyBucketLambdaFunctionRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      Environment:
+        Variables:
+          BUCKET: !Ref EphemeralS3Bucket
+          JOBS_KEY: !FindInMap [Constants, ConstantMap, S3JobKeyPrefix]
+  EmptyBucket:
+    Type: Custom::EmptyBucket
+    Condition: CreateEphemeralBucket
+    Properties:
+      ServiceToken: !GetAtt EmptyBucketLambdaFunction.Arn
+  EmptyBucketLambdaFunctionRole:
+      Type: AWS::IAM::Role
+      Condition: CreateEphemeralBucket
+      Properties:
+        AssumeRolePolicyDocument:
+          Version: 2012-10-17
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service:
+                  - lambda.amazonaws.com
+              Action:
+                - sts:AssumeRole
+        Path: /
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        Policies:
+          - PolicyName: PublishVersion
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - lambda:PublishVersion
+                  Resource: '*'
+          - PolicyName: S3Access
+            PolicyDocument:
+              Version: 2012-10-17
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:Delete*
+                    - s3:List*
+                    - s3:Get*
+                  Resource:
+                    - !Sub 'arn:aws:s3:::${EphemeralS3Bucket}'
+                    - !Sub 'arn:aws:s3:::${EphemeralS3Bucket}/*'
+
+  #
+  # Batch service
+  #
+
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: batch.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+  SpotIamFleetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: spot.amazonaws.com
+            Action: sts:AssumeRole
+          - Effect: Allow
+            Principal:
+              Service: spotfleet.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2SpotFleetTaggingRole
+  IamInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EcsInstanceRole
+  EcsInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2008-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
+  JobInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2008-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        -
+          PolicyName: wps-job-s3-access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}'
+                    - { BucketName: !If [CreateEphemeralBucket, !Ref EphemeralS3Bucket, !Ref bucketName] }
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}/*'
+                    - { BucketName: !If [CreateEphemeralBucket, !Ref EphemeralS3Bucket, !Ref bucketName] }
+        -
+          PolicyName: AllowSESAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+                Condition:
+                  ForAllValues:StringLike:
+                    'ses:Recipients': !Ref SeSLimitRecipients
+  BatchEC2LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - Ebs:
+              VolumeSize: 1600
+              VolumeType: gp2
+              DeleteOnTermination: true
+              Encrypted: true
+            DeviceName: /dev/xvda
+  JobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: container
+      JobDefinitionName: !Sub 'JavaDuckSmall1-${AWS::StackName}'
+      ContainerProperties:
+        Image: !Ref dockerImage
+        Vcpus: 2
+        Memory: 4000
+        JobRoleArn: !Ref JobInstanceRole
+        Volumes:
+          -
+            Name: work
+        Environment:
+          -
+            Name: JAVA_TOOL_OPTIONS
+            Value: -Xmx2g
+          -
+            Name: OUTPUT_S3_FILENAME
+            Value: output
+          -
+            Name: OUTPUT_S3_BUCKET
+            Value: !If [CreateEphemeralBucket, !Ref EphemeralS3Bucket, !Ref bucketName]
+          -
+            Name: STATUS_S3_FILENAME
+            Value: !FindInMap [ConfigurationFileMap, Filename, status]
+          -
+            Name: REQUEST_S3_FILENAME
+            Value: !FindInMap [ConfigurationFileMap, Filename, request]
+          -
+            Name: AWS_REGION
+            Value: !Ref 'AWS::Region'
+          -
+            Name: AWS_REGION_SES
+            Value: !Ref awsRegionSes
+          -
+            Name: DATA_DOWNLOAD_URL_PREFIX
+            Value: !Ref dataDownloadUrlPrefix
+          -
+            Name: SUMO_ENDPOINT
+            Value: !Ref sumoEndpoint
+          -
+            Name: AGGREGATOR_TEMPLATE_FILE_URL
+            Value: !Ref templatesURL
+          -
+            Name: GEOSERVER_CATALOGUE_ENDPOINT_URL
+            Value: !Ref geoserver
+          -
+            Name: CHUNK_SIZE
+            Value: 100000000
+          -
+            Name: DOWNLOAD_ATTEMPTS
+            Value: 4
+          -
+            Name: WORKING_DIR
+            Value: !FindInMap [Constants, ConstantMap, ContainerWorkingDir]
+          -
+            Name: LOCAL_STORAGE_LIMIT_BYTES
+            Value: 104857600
+          -
+            Name: POOL_SIZE
+            Value: 8
+          -
+            Name: RETRY_INTERVAL_MS
+            Value: 60000
+          -
+            Name: GEONETWORK_CATALOGUE_URL
+            Value: !Ref geonetworkCatalogueURL
+          -
+            Name: SOURCE_ARN
+            Value: !Ref sourceArn
+          -
+            Name: ADMINISTRATOR_EMAIL
+            Value: !Ref administratorEmail
+          -
+            Name: GEONETWORK_LAYER_SEARCH_FIELD
+            Value: layer
+          -
+            Name: JOB_S3_KEY
+            Value: !FindInMap [Constants, ConstantMap, S3JobKeyPrefix]
+          -
+            Name: STATUS_SERVICE_ENDPOINT_URL
+            Value: !If
+              - HasCustomDomain
+              - !Sub ['https://${customEndpoint}/${requestHandlerApiPath}/${jobStatusApiPath}',{customEndpoint: !If [HasExternalDomainName, !Ref externalDomainName, !Ref WpsRoute53RecordSet], requestHandlerApiPath: !FindInMap [Constants, ConstantMap, requestHandlerApiPath], jobStatusApiPath: !FindInMap [Constants, ConstantMap, jobStatusApiPath]}]
+              - !Sub ['https://${WPSRestApi}.execute-api.${AWS::Region}.amazonaws.com/${wpsApiStage}/${requestHandlerApiPath}/${jobStatusApiPath}',{wpsApiStage: !FindInMap [Constants, ConstantMap, wpsApiStage], requestHandlerApiPath: !FindInMap [Constants, ConstantMap, requestHandlerApiPath], jobStatusApiPath: !FindInMap [Constants, ConstantMap, jobStatusApiPath]}]
+          -
+            Name: AWS_WPS_ENDPOINT_URL
+            Value: !If
+              - HasCustomDomain
+              - !Sub ['https://${customEndpoint}/${requestHandlerApiPath}',{customEndpoint: !If [HasExternalDomainName, !Ref externalDomainName, !Ref WpsRoute53RecordSet], requestHandlerApiPath: !FindInMap [Constants, ConstantMap, requestHandlerApiPath]}]
+              - !Sub ['https://${WPSRestApi}.execute-api.${AWS::Region}.amazonaws.com/${wpsApiStage}/${requestHandlerApiPath}',{wpsApiStage: !FindInMap [Constants, ConstantMap, wpsApiStage], requestHandlerApiPath: !FindInMap [Constants, ConstantMap, requestHandlerApiPath]}]
+        MountPoints:
+          -
+            SourceVolume: work
+            ContainerPath: !FindInMap [Constants, ConstantMap, ContainerWorkingDir]
+            ReadOnly: false
+      RetryStrategy:
+        Attempts: 2
+    DependsOn:  JobInstanceRole
+  JobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: !Sub 'JavaDuckExecuteQueue-${AWS::StackName}'
+      Priority: 2
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref JobComputeEnvironment
+  TestQueue:
+      Type: AWS::Batch::JobQueue
+      Properties:
+        JobQueueName: !Sub 'JavaDuckTestQueue-${AWS::StackName}'
+        Priority: 2
+        ComputeEnvironmentOrder:
+          - Order: 1
+            ComputeEnvironment: !Ref TestComputeEnvironment
+  JobComputeEnvironment:
+    Metadata:
+      Comment: Please apply any changes made to this ComputeEnvironment to TestComputeEnvironment also!!!!!
+    Type: AWS::Batch::ComputeEnvironment
+    DeletionPolicy: Delete
+    Properties:
+      Type: MANAGED
+      ComputeResources:
+        LaunchTemplate:
+          LaunchTemplateId: !Ref BatchEC2LaunchTemplate
+        Type: SPOT
+        MinvCpus: 0
+        DesiredvCpus: 0
+        MaxvCpus: !Ref maxVCPUs
+        InstanceTypes:
+          - m3.large
+          - m4.large
+          - r5.large
+          - r4.large
+          - r3.large
+        Subnets: !Split [ ',', {'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetsPublic'} ]
+        SecurityGroupIds:
+          - !Ref ComputeEnvironmentInstanceSecurityGroup
+        InstanceRole: !Ref IamInstanceProfile
+        SpotIamFleetRole: !Ref SpotIamFleetRole
+        BidPercentage: 100
+        Tags: { "Name" : "AWS-WPS Worker", "AutoOff" : "False" }
+      ServiceRole: !Ref BatchServiceRole
+  TestComputeEnvironment:
+      Metadata:
+        Comment: Please keep in sync with JobComputeEnvironment!!!!!
+      Type: AWS::Batch::ComputeEnvironment
+      DeletionPolicy: Delete
+      Properties:
+        Type: MANAGED
+        ComputeResources:
+          Type: SPOT
+          MinvCpus: 0
+          DesiredvCpus: 0
+          MaxvCpus: !Ref maxVCPUs
+          InstanceTypes:
+            - m3.large
+            - m4.large
+            - r5.large
+            - r4.large
+            - r3.large
+          Subnets: !Split [ ',', {'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetsPublic'} ]
+          SecurityGroupIds:
+            - !Ref ComputeEnvironmentInstanceSecurityGroup
+          InstanceRole: !Ref IamInstanceProfile
+          SpotIamFleetRole: !Ref SpotIamFleetRole
+          BidPercentage: 100
+          Tags: { "Name" : "AWS-WPS Test Worker", "AutoOff" : "False" }
+        ServiceRole: !Ref BatchServiceRole
+  ComputeEnvironmentInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to client host
+      VpcId: {'Fn::ImportValue': !Sub '${ParentVPCStack}-VPC'}
+      SecurityGroupIngress:
+      - IpProtocol: '-1'
+        FromPort: '-1'
+        ToPort: '-1'
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: '-1'
+        FromPort: '-1'
+        ToPort: '-1'
+        CidrIp: 0.0.0.0/0
+
+  #
+  # Request handler service
+  #
+
+  WPSRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'WPS API-${AWS::StackName}'
+      Description: API used for WPS requests
+      FailOnWarnings: true
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+  WpsApiGatewayStage:
+    DependsOn:
+      - WPSRestApi
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref WpsApiGatewayDeployment
+      MethodSettings:
+          -
+            DataTraceEnabled: true
+            HttpMethod: '*'
+            LoggingLevel: INFO
+            ResourcePath: /*
+      RestApiId: !Ref WPSRestApi
+      StageName: !FindInMap [Constants, ConstantMap, wpsApiStage]
+  WpsApiGatewayDomainName:
+    Type: AWS::ApiGateway::DomainName
+    Condition: CreateWpsApiGatewayDomainName
+    Properties:
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      RegionalCertificateArn: {'Fn::ImportValue': !Sub '${ParentConstantsStack}-SSLCertificateId'}
+      DomainName: !Join ['.', [!Ref wpsDomainName, {'Fn::ImportValue': !Sub '${ParentConstantsStack}-ZoneNameNoTrailingDot'}]]
+  ExternalWpsApiGatewayDomainName:
+    Type: AWS::ApiGateway::DomainName
+    Condition: HasExternalDomainName
+    Properties:
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      RegionalCertificateArn: {'Fn::ImportValue': !Sub '${ParentConstantsStack}-SSLCertificateId'}
+      DomainName: !Ref externalDomainName
+  WpsDomainToAPIMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Condition: CreateWpsApiGatewayDomainName
+    DependsOn:
+      - WpsApiGatewayStage
+      - WpsRoute53RecordSet
+    Properties:
+      DomainName: !Ref WpsApiGatewayDomainName
+      RestApiId: !Ref WPSRestApi
+      Stage: !FindInMap [Constants, ConstantMap, wpsApiStage]
+  ExternalWpsDomainToAPIMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Condition: HasExternalDomainName
+    DependsOn:
+      - WpsApiGatewayStage
+      - WpsRoute53RecordSet
+    Properties:
+      DomainName: !Ref ExternalWpsApiGatewayDomainName
+      RestApiId: !Ref WPSRestApi
+      Stage: !FindInMap [Constants, ConstantMap, wpsApiStage]
+  WpsRoute53RecordSet:
+    Type: AWS::Route53::RecordSet
+    Condition: CreateWpsApiGatewayDomainName
+    Properties:
+      AliasTarget:
+        DNSName: !GetAtt WpsApiGatewayDomainName.RegionalDomainName
+        HostedZoneId: !GetAtt WpsApiGatewayDomainName.RegionalHostedZoneId
+      HostedZoneName: {'Fn::ImportValue': !Sub '${ParentZoneStack}-HostedZoneName'}
+      Name: !Join ['.', [!Ref wpsDomainName, {'Fn::ImportValue': !Sub '${ParentConstantsStack}-ZoneNameNoTrailingDot'}]]
+      Type: 'A'
+  WpsApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - RequestHandlerApiGatewayRequest
+      - JobStatusApiGatewayRequest
+    Properties:
+      RestApiId: !Ref WPSRestApi
+  RequestHandlerApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WPSRestApi
+      ParentId: !GetAtt WPSRestApi.RootResourceId
+      PathPart: !FindInMap [Constants, ConstantMap, requestHandlerApiPath]
+  RequestHandlerApiGatewayRequest:
+    DependsOn: RequestHandlerLambdaPermission
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations'
+          - { FunctionArn: !GetAtt RequestHandlerLambdaFunction.Arn }
+        IntegrationResponses:
+          - StatusCode: 200
+      ResourceId: !Ref RequestHandlerApiGatewayResource
+      RestApiId: !Ref WPSRestApi
+      MethodResponses:
+        - StatusCode: 200
+  RequestHandlerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !GetAtt RequestHandlerLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WPSRestApi}/*'
+  RequestHandlerLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Make a wps request
+      FunctionName: !Sub 'wps-request-handler-${AWS::StackName}'
+      Handler: au.org.aodn.aws.wps.lambda.WpsLambdaRequestHandler
+      MemorySize: 1536
+      Role: !GetAtt RequestHandlerLambdaExecutionRole.Arn
+      Runtime: java11
+      Timeout: 60
+      Code: lambda/request-handler-lambda-package.zip
+      Environment:
+        Variables:
+          GEONETWORK_CATALOGUE_URL: !Ref geonetworkCatalogueURL
+          GEONETWORK_LAYER_SEARCH_FIELD: layer
+          AWS_BATCH_JOB_NAME: javaduck
+          AWS_BATCH_JOB_QUEUE_NAME: !Ref JobQueue
+          AWS_BATCH_TEST_QUEUE_NAME: !Ref TestQueue
+          AWS_BATCH_JOB_DEFINITION_NAME: !Select [1, !Split ['/', !Ref JobDefinition]]
+          ADMINISTRATOR_EMAIL: !Ref administratorEmail
+          SOURCE_ARN: !Ref sourceArn
+          OUTPUT_S3_BUCKET: !If [CreateEphemeralBucket, !Ref EphemeralS3Bucket, !Ref bucketName]
+          STATUS_S3_FILENAME: !FindInMap [ConfigurationFileMap, Filename, status]
+          REQUEST_S3_FILENAME: !FindInMap [ConfigurationFileMap, Filename, request]
+          AWS_WPS_ENDPOINT_URL: !If
+            - HasCustomDomain
+            - !Sub ['https://${customEndpoint}/${requestHandlerApiPath}',{customEndpoint: !If [HasExternalDomainName, !Ref externalDomainName, !Ref WpsRoute53RecordSet], requestHandlerApiPath: !FindInMap [Constants, ConstantMap, requestHandlerApiPath]}]
+            - !Sub ['https://${WPSRestApi}.execute-api.${AWS::Region}.amazonaws.com/${wpsApiStage}/${requestHandlerApiPath}',{wpsApiStage: !FindInMap [Constants, ConstantMap, wpsApiStage], requestHandlerApiPath: !FindInMap [Constants, ConstantMap, requestHandlerApiPath]}]
+          AWS_REGION_SES: !Ref awsRegionSes
+          JOB_S3_KEY: !FindInMap [Constants, ConstantMap, S3JobKeyPrefix]
+          STATUS_SERVICE_ENDPOINT_URL: !If
+            - HasCustomDomain
+            - !Sub ['https://${customEndpoint}/${requestHandlerApiPath}/${jobStatusApiPath}',{customEndpoint: !If [HasExternalDomainName, !Ref externalDomainName, !Ref WpsRoute53RecordSet], requestHandlerApiPath: !FindInMap [Constants, ConstantMap, requestHandlerApiPath], jobStatusApiPath: !FindInMap [Constants, ConstantMap, jobStatusApiPath]}]
+            - !Sub ['https://${WPSRestApi}.execute-api.${AWS::Region}.amazonaws.com/${wpsApiStage}/${requestHandlerApiPath}/${jobStatusApiPath}',{wpsApiStage: !FindInMap [Constants, ConstantMap, wpsApiStage], requestHandlerApiPath: !FindInMap [Constants, ConstantMap, requestHandlerApiPath], jobStatusApiPath: !FindInMap [Constants, ConstantMap, jobStatusApiPath]}]
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Split [ ',', {'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetsPrivate'} ]
+  RequestHandlerLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/AWSBatchFullAccess
+      Policies:
+        - PolicyName: PublishVersion
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:PublishVersion
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}'
+                    - { BucketName: !If [CreateEphemeralBucket, !Ref EphemeralS3Bucket, !Ref bucketName] }
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}/*'
+                    - { BucketName: !If [CreateEphemeralBucket, !Ref EphemeralS3Bucket, !Ref bucketName] }
+        -
+          PolicyName: AllowSESAccess
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+                Condition:
+                  ForAllValues:StringLike:
+                    'ses:Recipients': !Ref SeSLimitRecipients
+
+  #
+  # Job status service
+  #
+
+  JobStatusApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref WPSRestApi
+      ParentId: !Ref RequestHandlerApiGatewayResource
+      PathPart: !FindInMap [Constants, ConstantMap, jobStatusApiPath]
+  JobStatusApiGatewayRequest:
+    DependsOn:
+      - JobStatusLambdaPermission
+      - RequestHandlerApiGatewayRequest
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: ANY
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub
+          - 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionArn}/invocations'
+          - { FunctionArn: !GetAtt JobStatusLambdaFunction.Arn }
+        IntegrationResponses:
+          - StatusCode: 200
+      ResourceId: !Ref JobStatusApiGatewayResource
+      RestApiId: !Ref WPSRestApi
+      MethodResponses:
+        - StatusCode: 200
+  JobStatusLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !GetAtt JobStatusLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WPSRestApi}/*'
+  JobStatusLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Return wps job status
+      FunctionName: !Sub 'wps-job-status-${AWS::StackName}'
+      Handler: au.org.aodn.aws.wps.lambda.JobStatusServiceRequestHandler
+      MemorySize: 1536
+      Role: !GetAtt JobStatusLambdaExecutionRole.Arn
+      Runtime: java11
+      Timeout: 60
+      Code: lambda/job-status-service-lambda-package.zip
+      Environment:
+        Variables:
+          OUTPUT_S3_BUCKET: !If [CreateEphemeralBucket, !Ref EphemeralS3Bucket, !Ref bucketName]
+          STATUS_S3_FILENAME: !FindInMap [ConfigurationFileMap, Filename, status]
+          REQUEST_S3_FILENAME: !FindInMap [ConfigurationFileMap, Filename, request]
+          JOB_S3_KEY: !FindInMap [Constants, ConstantMap, S3JobKeyPrefix]
+          AWS_BATCH_JOB_QUEUE_NAME: !Ref JobQueue
+          AWS_BATCH_LOG_GROUP_NAME: /aws/batch/job
+          STATUS_SERVICE_ENDPOINT_URL: !If
+            - HasCustomDomain
+            - !Sub ['https://${customEndpoint}/${requestHandlerApiPath}/${jobStatusApiPath}',{customEndpoint: !If [HasExternalDomainName, !Ref externalDomainName, !Ref WpsRoute53RecordSet], requestHandlerApiPath: !FindInMap [Constants, ConstantMap, requestHandlerApiPath], jobStatusApiPath: !FindInMap [Constants, ConstantMap, jobStatusApiPath]}]
+            - !Sub ['https://${WPSRestApi}.execute-api.${AWS::Region}.amazonaws.com/${wpsApiStage}/${requestHandlerApiPath}/${jobStatusApiPath}',{wpsApiStage: !FindInMap [Constants, ConstantMap, wpsApiStage], requestHandlerApiPath: !FindInMap [Constants, ConstantMap, requestHandlerApiPath], jobStatusApiPath: !FindInMap [Constants, ConstantMap, jobStatusApiPath]}]
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds: !Split [ ',', {'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetsPrivate'} ]
+
+  JobStatusLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+        - arn:aws:iam::aws:policy/AWSBatchFullAccess
+      Policies:
+        - PolicyName: PublishVersion
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:PublishVersion
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource:
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}'
+                    - { BucketName: !If [CreateEphemeralBucket, !Ref EphemeralS3Bucket, !Ref bucketName] }
+                  - !Sub
+                    - 'arn:aws:s3:::${BucketName}/*'
+                    - { BucketName: !If [CreateEphemeralBucket, !Ref EphemeralS3Bucket, !Ref bucketName] }
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to client host
+      VpcId: {'Fn::ImportValue': !Sub '${ParentVPCStack}-VPC'}
+      SecurityGroupIngress:
+      - IpProtocol: '-1'
+        FromPort: '-1'
+        ToPort: '-1'
+        CidrIp: 0.0.0.0/0
+      SecurityGroupEgress:
+      - IpProtocol: '-1'
+        FromPort: '-1'
+        ToPort: '-1'
+        CidrIp: 0.0.0.0/0
+
+  RequestHandlerLambdaLogsSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Condition: ConfigureSumoLogicForLambda
+    Properties:
+      DestinationArn: {'Fn::ImportValue': !Sub '${sumoCollectorStack}-SumoCWLogsLambdaArn'}
+      FilterPattern: ''
+      LogGroupName: !Ref RequestHandlerLogGroup
+  JobStatusLambdaLogsSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    Condition: ConfigureSumoLogicForLambda
+    Properties:
+      DestinationArn: {'Fn::ImportValue': !Sub '${sumoCollectorStack}-SumoCWLogsLambdaArn'}
+      FilterPattern: ''
+      LogGroupName: !Ref JobStatusLogGroup
+  JobStatusLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${JobStatusLambdaFunction}'
+  RequestHandlerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${RequestHandlerLambdaFunction}'
+Outputs:
+  RequestHandlerApiGatewayUrl:
+    Value: !If
+      - HasCustomDomain
+      - !Sub ['https://${customEndpoint}/${requestHandlerApiPath}',{customEndpoint: !If [HasExternalDomainName, !Ref externalDomainName, !Ref WpsRoute53RecordSet], requestHandlerApiPath: !FindInMap [Constants, ConstantMap, requestHandlerApiPath]}]
+      - !Sub ['https://${WPSRestApi}.execute-api.${AWS::Region}.amazonaws.com/${wpsApiStage}/${requestHandlerApiPath}',{wpsApiStage: !FindInMap [Constants, ConstantMap, wpsApiStage], requestHandlerApiPath: !FindInMap [Constants, ConstantMap, requestHandlerApiPath]}]
+  JobStatusApiGatewayUrl:
+    Value: !If
+      - HasCustomDomain
+      - !Sub ['https://${customEndpoint}/${requestHandlerApiPath}/${jobStatusApiPath}',{customEndpoint: !If [HasExternalDomainName, !Ref externalDomainName, !Ref WpsRoute53RecordSet], requestHandlerApiPath: !FindInMap [Constants, ConstantMap, requestHandlerApiPath], jobStatusApiPath: !FindInMap [Constants, ConstantMap, jobStatusApiPath]}]
+      - !Sub ['https://${WPSRestApi}.execute-api.${AWS::Region}.amazonaws.com/${wpsApiStage}/${requestHandlerApiPath}/${jobStatusApiPath}',{wpsApiStage: !FindInMap [Constants, ConstantMap, wpsApiStage], requestHandlerApiPath: !FindInMap [Constants, ConstantMap, requestHandlerApiPath], jobStatusApiPath: !FindInMap [Constants, ConstantMap, jobStatusApiPath]}]
+  JobComputeEnvironmentArn:
+    Value: !Ref JobComputeEnvironment
+  TestComputeEnvironmentArn:
+    Value: !Ref TestComputeEnvironment
+  JobQueueArn:
+    Value: !Ref JobQueue
+  TestQueueArn:
+    Value: !Ref TestQueue
+  JobDefinitionArn:
+    Value: !Ref JobDefinition

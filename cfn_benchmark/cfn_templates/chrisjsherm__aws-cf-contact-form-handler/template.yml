@@ -1,0 +1,423 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Ingest contact form and send email with its contents
+
+Parameters:
+  DockerHubUsername:
+    Description: Username for authenticating with Docker Hub
+    Type: String
+
+  DockerImageName:
+    Description: Name of the Docker image stored in ECR
+    Type: String
+
+  EmailAddress:
+    Description: Email address to which to send the form data
+    Type: String
+
+  GitHubSourceHTTPS:
+    Description: HTTPS clone URL to the repository that contains the source and
+      the buildspec file.
+    Type: String
+
+  HasCodeBuildRun:
+    Description: Has CodeBuild run, thereby uploading Docker Image to ECR?
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "false"
+
+  ProjectName:
+    Description: Name must be unique across all projects in your AWS account
+    Type: String
+
+# Optional parameters
+  CorsOrigins:
+    Description: (Optional) Valid origins to be matched in the Access-Control-Allow-Origin header
+    Type: CommaDelimitedList
+    Default: "*"
+
+  EmailSubjectSuffix:
+    Description: (Optional) Suffix to append to the email's subject
+    Type: String
+    Default: ''
+
+  CaptchaEnabled:
+    Description: (Optional) Whether to validate a captcha token against
+      Cloudflare Turnstile.
+    Type: String
+    AllowedValues:
+      - "true"
+      - "false"
+    Default: "false"
+
+  CaptchaFieldName:
+    Description: Field name in the request body containing the captcha's client
+      token
+    Type: String
+    Default: 'cfTurnstileResponse'
+
+Conditions:
+  IsImageInEcr: !Equals
+    - !Ref HasCodeBuildRun
+    - "true"
+
+Resources:
+##########################################################################
+#   IAM Role to be assumed by the Systems Manager Automation Document                                                       #
+##########################################################################
+  RoleAutomaticallyUpdateLambda:
+    Type: AWS::IAM::Role
+    Condition: IsImageInEcr
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: automation-update-function-code
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:UpdateFunctionCode
+                Resource: !GetAtt LambdaFnContactFormHandler.Arn
+
+###################################################################################################################
+# SSM document of type "Automation" for updating Lambda function code
+###################################################################################################################
+  SsmAutomationDocument:
+    Type: AWS::SSM::Document
+    Condition: IsImageInEcr
+    Properties:
+      DocumentType: Automation
+      Content:
+        schemaVersion: "0.3"
+        assumeRole: !GetAtt RoleAutomaticallyUpdateLambda.Arn
+        description: "Automation document for updating a lambda function"
+        mainSteps:
+        - name: cli_invoke
+          description: Call the AWS CLI UpdateFunctionCode command
+          action: 'aws:executeAwsApi'
+          onFailure: Abort
+          inputs:
+            Service: "lambda"
+            Api: "UpdateFunctionCode"
+            FunctionName: !Ref LambdaFnContactFormHandler
+            ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}:latest"
+
+###################################################################################################################
+# Docker image repository
+###################################################################################################################
+  EcrRepository:
+     Type: AWS::ECR::Repository
+     Properties:
+       RepositoryName: !Ref DockerImageName
+       LifecyclePolicy:
+         LifecyclePolicyText: |
+            {
+                "rules": [
+                    {
+                        "rulePriority": 1,
+                        "description": "Keep only one untagged image, expire all others",
+                        "selection": {
+                            "tagStatus": "untagged",
+                            "countType": "imageCountMoreThan",
+                            "countNumber": 1
+                        },
+                        "action": {
+                            "type": "expire"
+                        }
+                    }
+                ]
+            }
+
+###################################################################################################################
+# Event rule to identify/filter Docker image uploads to ECR
+###################################################################################################################
+  EventRule:
+    Type: AWS::Events::Rule
+    Condition: IsImageInEcr
+    Properties:
+      Description: "Watch for Docker image pushes to ECR"
+      EventPattern:
+        account:
+          - !Sub '${AWS::AccountId}'
+        source:
+          - "aws.ecr"
+        detail-type:
+          - "ECR Image Action"
+        detail:
+          action-type:
+            - "PUSH"
+          result:
+            - "SUCCESS"
+          repository-name:
+            - !Ref EcrRepository
+          image-tag:
+            - "latest"
+      Targets:
+        - Arn: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${SsmAutomationDocument}:$DEFAULT"
+          Id: "SystemsManagerAutomation"
+          RoleArn: !GetAtt RoleEventBridgeToToSsm.Arn
+
+###################################################################################################################
+# IAM role to allow EventBridge to start Systems Manager automation
+###################################################################################################################
+  RoleEventBridgeToToSsm:
+    Type: AWS::IAM::Role
+    Condition: IsImageInEcr
+    Properties:
+      Description: "Allow EventBridge to start Systems Manager automation"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: send-event-to-ssm
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:StartAutomationExecution
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:automation-definition/${SsmAutomationDocument}:$DEFAULT"
+
+###################################################################################################################
+# Build a new Docker image when pull requests get merged to the Lambda Fn repo
+###################################################################################################################
+  CodeBuildLambdaRepo:
+    Type: AWS::CodeBuild::Project
+    DependsOn: LogGroupCodeBuild
+    Properties:
+      Name: !Ref ProjectName
+      Description: "Build Docker image and push to ECR"
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:4.0
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        PrivilegedMode: true
+        EnvironmentVariables:
+          - Name: AWS_DEFAULT_REGION
+            Value: !Ref AWS::Region
+          - Name: AWS_ACCOUNT_ID
+            Value: !Ref "AWS::AccountId"
+          - Name: AWS_ECR_REPOSITORY_URI
+            Value: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}
+          - Name: DOCKERHUB_USERNAME
+            Value: !Ref DockerHubUsername
+          - Name: IMAGE_REPO_NAME
+            Value: !Ref EcrRepository
+          - Name: IMAGE_TAG
+            Value: "latest"
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref LogGroupCodeBuild
+          Status: ENABLED
+      ServiceRole: !GetAtt RoleCodeBuild.Arn
+      Source:
+        Auth:
+          Type: "OAUTH"
+        Type: "GITHUB"
+        Location: !Ref GitHubSourceHTTPS
+      Triggers:
+        Webhook: true
+        FilterGroups:
+          - - Type: EVENT
+              Pattern: PULL_REQUEST_MERGED
+
+###################################################################################################################
+# IAM role to give CodeBuild permission to push to ECR and write logs
+###################################################################################################################
+  RoleCodeBuild:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "GetEcrAuthToken"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*" # Login command in buildspec.yml does not seem to allow specifying
+        - PolicyName: "PushImageToEcr"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:CompleteLayerUpload
+                  - ecr:InitiateLayerUpload
+                  - ecr:PutImage
+                  - ecr:UploadLayerPart
+                Resource: "*" # Login command in buildspec.yml does not seem to allow specifying
+        - PolicyName: "WriteLogs"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+        - PolicyName: "ReadParameterStoreDockerHubPassword"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/docker/DOCKER_HUB_PASSWORD"
+
+###################################################################################################################
+# Lambda Fn to handle contact form submissions
+###################################################################################################################
+  LambdaFnContactFormHandler:
+    Type: AWS::Lambda::Function
+    Condition: IsImageInEcr
+    DependsOn: LogGroupLambdaFunction
+    Properties:
+      FunctionName: !Ref ProjectName
+      Description: "Handle a new contact form submission"
+      PackageType: Image
+      Code:
+        ImageUri: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${EcrRepository}:latest"
+      Environment:
+        Variables:
+          CaptchaEnabled: !Ref CaptchaEnabled
+          CaptchaFieldName: !Ref CaptchaFieldName
+          CaptchaSecretKeyParameterPath: !Sub "/cloudflare/${ProjectName}/TURNSTILE_SECRET_KEY"
+          EmailSubjectSuffix: !Ref EmailSubjectSuffix
+          ValidatedEmailAddress: !Ref EmailAddress
+      Role: !GetAtt RoleLambdaContactHandler.Arn
+
+###################################################################################################################
+# Publish the Lambda Fn to a publicly-accessible URL
+###################################################################################################################
+  LambdaUrlContactFormHandler:
+    Type: AWS::Lambda::Url
+    Condition: IsImageInEcr
+    Properties:
+      TargetFunctionArn: !Ref LambdaFnContactFormHandler
+      AuthType: NONE
+      Cors:
+        AllowOrigins: !Ref CorsOrigins
+        AllowMethods:
+          - "POST"
+        AllowHeaders:
+          - "Content-Type"
+
+###################################################################################################################
+# Permission for the Lambda Fn to be invoked by anyone
+###################################################################################################################
+  LambdaPermissionContactFormHandler:
+    Type: AWS::Lambda::Permission
+    Condition: IsImageInEcr
+    Properties:
+      FunctionName: !Ref LambdaFnContactFormHandler
+      Principal: '*'
+      Action: lambda:InvokeFunctionUrl
+      FunctionUrlAuthType: NONE
+
+###################################################################################################################
+# IAM role to allow the Lambda Fn to write logs, send emails, and get the Turnstile key from SSM
+###################################################################################################################
+  RoleLambdaContactHandler:
+    Type: AWS::IAM::Role
+    Condition: IsImageInEcr
+    Properties:
+      Description: "Allow Lambda Fn to write logs, send emails, and get the Turnstile key from SSM"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: "WriteLogs"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+        - PolicyName: "SendEmails"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                Resource: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:*"
+        - PolicyName: "ReadParameterStoreTurnstileSecretKey"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/cloudflare/${ProjectName}/TURNSTILE_SECRET_KEY"
+
+###################################################################################################################
+# SES Verified Identity to use as the from email address
+###################################################################################################################
+  SESEmailIdentityFromEmailDomain:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Select [1, !Split ["@", !Ref EmailAddress]]
+      DkimAttributes:
+        SigningEnabled: true
+      MailFromAttributes:
+        MailFromDomain: !Sub
+          - aws-ses.${RootDomain}
+          - RootDomain: !Select [1, !Split ["@", !Ref EmailAddress]]
+        BehaviorOnMxFailure: REJECT_MESSAGE
+      FeedbackAttributes:
+        EmailForwardingEnabled: true
+
+###################################################################################################################
+# CloudWatch Log Group for CodeBuild
+###################################################################################################################
+  LogGroupCodeBuild:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/codebuild/${ProjectName}"
+      RetentionInDays: 30
+
+###################################################################################################################
+# CloudWatch Log Group for Lambda Function
+###################################################################################################################
+  LogGroupLambdaFunction:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}"
+      RetentionInDays: 30

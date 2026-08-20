@@ -1,0 +1,353 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFront distribution with S3 origin and async download via SQS"
+
+Parameters:
+  OriginDomainName:
+    Type: String
+    Description: The domain name of the origin server (e.g., example.com)
+
+Resources:
+  ContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${AWS::StackName}-cache
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DownloadQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-cache-download-queue
+      VisibilityTimeout: 900 # 15 minutes
+      MessageRetentionPeriod: 1209600 # 14 days
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt DownloadQueueDLQ.Arn
+        maxReceiveCount: 3
+
+  DownloadQueueDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-cache-download-queue-dlq
+      MessageRetentionPeriod: 1209600 # 14 days
+
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-OAC
+        Description: Origin Access Control for S3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+        OriginAccessControlOriginType: s3
+
+  ContentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ContentBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action:
+              - s3:GetObject
+            Resource: !Sub ${ContentBucket.Arn}/*
+
+  OriginRequestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-edge
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+
+          def handler(event, context):
+              print(event)
+              # Get the request from the event
+              response = event['Records'][0]['cf']['response']
+              request = event['Records'][0]['cf']['request']
+
+              try:
+                  if int(response['status']) < 400 and int(response['status']) > 599:
+                      return response
+                  # Check if the object exists in S3
+                  s3 = boto3.client('s3')
+                  bucket_domain = request['origin']['s3']['domainName']
+                  bucket_name = bucket_domain.split('.')[0]
+                  path = request['uri']
+                  key = path[1:] if path.startswith('/') else path
+                  # Get the origin domain from request headers
+                  origin_domain = request['origin']['s3']['customHeaders']['x-origin-domain'][0]['value']
+
+                  # Submit download task to SQS
+                  sqs = boto3.client('sqs', region_name='us-east-1')
+                  # Extract headers from request
+                  headers = {}
+                  if 'headers' in request:
+                      for header_name, header_value_list in request['headers'].items():
+                          if not header_name.startswith('cloudfront-') and header_name != 'host':
+                              headers[header_name] = [item['value'] for item in header_value_list]
+                  message = {
+                      'bucket': bucket_name,
+                      'key': key,
+                      'origin_domain': origin_domain,
+                      'path': path,
+                      'headers': headers
+                  }
+                  print(message)
+
+                  # Get account ID from context
+                  account_id = context.invoked_function_arn.split(':')[4]
+                  # Construct SQS queue URL
+                  queue_url = f'https://sqs.us-east-1.amazonaws.com/{account_id}/{bucket_name}-download-queue'
+
+                  sqs.send_message(
+                      QueueUrl=queue_url,
+                      MessageBody=json.dumps(message)
+                  )
+
+                  # Return 302 redirect to origin
+                  return {
+                      'status': '302',
+                      'statusDescription': 'Found',
+                      'headers': {
+                          'location': [{
+                              'key': 'Location',
+                              'value': f'https://{origin_domain}{path}'
+                          }],
+                          'cache-control': [{
+                              'key': 'Cache-Control',
+                              'value': 'no-cache'
+                          }],
+                          'body': ''
+                      }
+                  }
+
+              except Exception as e:
+                  print(f"Error in handler: {str(e)}")
+                  return request  # Return original request on error
+      Description: Lambda@Edge function to handle 404s from S3 and redirect to origin
+      Timeout: 5
+      MemorySize: 128
+
+  DownloadFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-download
+      Handler: index.handler
+      Role: !GetAtt DownloadFunctionRole.Arn
+      Runtime: python3.9
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import urllib.request
+          import urllib.error
+          import mimetypes
+          from botocore.exceptions import ClientError
+
+          def handler(event, context):
+              print(event)
+              for record in event['Records']:
+                  try:
+                      message = json.loads(record['body'])
+                      bucket = message['bucket']
+                      key = message['key']
+                      origin_domain = message['origin_domain']
+                      path = message['path']
+
+                      # Get headers from message
+                      headers = message.get('headers', {})
+
+                      # Fetch content from origin
+                      content = fetch_from_origin(origin_domain, path, headers)
+
+                      if content and content['status_code'] == 200:
+                          # Upload to S3
+                          s3 = boto3.client('s3')
+                          s3.put_object(
+                              Bucket=bucket,
+                              Key=key,
+                              Body=base64.b64decode(content['body']),
+                              ContentType=content['content_type'],
+                              CacheControl='max-age=86400'
+                          )
+                          print(f"Successfully downloaded and stored {key}")
+                      else:
+                          raise Exception(f"Failed to fetch content from origin: {origin_domain}{path}")
+
+                  except Exception as e:
+                      print(f"Error processing message: {str(e)}")
+                      raise  # Re-raise to trigger SQS retry
+
+          def fetch_from_origin(domain, path, request_headers=None):
+              """Fetch content from origin server"""
+              try:
+                  url = f'https://{domain}{path}'
+                  # Process headers - convert arrays to single values
+                  processed_headers = {}
+                  if request_headers:
+                      for key, value in request_headers.items():
+                          # If value is an array, take the first element
+                          if isinstance(value, list) and value:
+                              processed_headers[key] = value[0]
+                          else:
+                              processed_headers[key] = value
+
+                  # Ensure User-Agent is set if not provided
+                  if 'user-agent' not in {k.lower(): v for k, v in processed_headers.items()}:
+                      processed_headers['User-Agent'] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36'
+
+                  req = urllib.request.Request(url, headers=processed_headers)
+                  with urllib.request.urlopen(req) as response:
+                      if response.status == 200:
+                          content = response.read()
+                          content_type = response.getheader('content-type')
+                          if not content_type:
+                              content_type = mimetypes.guess_type(path)[0] or 'application/octet-stream'
+
+                          return {
+                              'status_code': response.status,
+                              'content_type': content_type,
+                              'body': base64.b64encode(content).decode('utf-8')
+                          }
+
+                      print(f"Origin returned status code {response.status}")
+                      return None
+
+              except Exception as e:
+                  print(f"Error fetching from origin: {str(e)}")
+                  return None
+      Description: Lambda function to process download tasks from SQS
+      Timeout: 900 # 15 minutes
+      MemorySize: 512
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-edge-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt DownloadQueue.Arn
+
+  DownloadFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-download-role
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub ${ContentBucket.Arn}/*
+        - PolicyName: SQSAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ReceiveMessage
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                Resource: !GetAtt DownloadQueue.Arn
+
+  DownloadFunctionEventSourceMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      Enabled: true
+      EventSourceArn: !GetAtt DownloadQueue.Arn
+      FunctionName: !GetAtt DownloadFunction.Arn
+
+  LambdaVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref OriginRequestFunction
+      Description: Initial version of origin request function
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac # AllViewerExceptHostHeader managed policy ID
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # CachingOptimized managed policy ID
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          LambdaFunctionAssociations:
+            - EventType: origin-request
+              LambdaFunctionARN: !Ref LambdaVersion
+        Origins:
+          - Id: S3Origin
+            DomainName: !Sub ${ContentBucket.DomainName}
+            S3OriginConfig: {}
+            OriginAccessControlId: !GetAtt CloudFrontOriginAccessControl.Id
+            OriginCustomHeaders:
+              - HeaderName: X-Origin-Domain
+                HeaderValue: !Ref OriginDomainName
+
+Outputs:
+  CloudFrontDomainName:
+    Description: Domain name of the CloudFront distribution
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  S3BucketName:
+    Description: Name of the S3 bucket storing cached content
+    Value: !Ref ContentBucket
+
+  DownloadQueueURL:
+    Description: URL of the SQS queue for download tasks
+    Value: !Ref DownloadQueue
+
+  DownloadQueueDLQURL:
+    Description: URL of the Dead Letter Queue for failed download tasks
+    Value: !Ref DownloadQueueDLQ

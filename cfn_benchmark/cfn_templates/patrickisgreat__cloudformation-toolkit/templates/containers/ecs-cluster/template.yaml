@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  ECS cluster with Fargate and Fargate Spot capacity providers, Container
+  Insights, encrypted ECS Exec logging, and an optional Service Connect
+  namespace.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Naming
+        Parameters:
+          - NamePrefix
+          - Environment
+      - Label:
+          default: Capacity strategy (controls cost and interruption risk)
+        Parameters:
+          - SpotWeight
+          - OnDemandWeight
+          - OnDemandBaseCount
+      - Label:
+          default: Observability
+        Parameters:
+          - ContainerInsights
+          - LogRetentionDays
+      - Label:
+          default: ECS Exec
+        Parameters:
+          - EnableExecuteCommandLogging
+      - Label:
+          default: Service Connect
+        Parameters:
+          - CreateServiceConnectNamespace
+          - ServiceConnectNamespaceName
+          - VpcId
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: Prefix for the cluster name and namespace.
+    AllowedPattern: "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+    ConstraintDescription: 3-32 lowercase characters, digits and hyphens.
+
+  Environment:
+    Type: String
+    Description: Environment this cluster serves.
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  OnDemandBaseCount:
+    Type: Number
+    Description: >-
+      Tasks placed on on-demand Fargate before the weights apply at all. This is
+      your interruption floor: set it to the number of tasks that must survive a
+      Spot reclamation. Zero means every task is interruptible.
+    Default: 1
+    MinValue: 0
+    MaxValue: 100
+
+  OnDemandWeight:
+    Type: Number
+    Description: >-
+      Relative share of tasks above the base placed on on-demand Fargate.
+    Default: 1
+    MinValue: 0
+    MaxValue: 100
+
+  SpotWeight:
+    Type: Number
+    Description: >-
+      Relative share placed on Fargate Spot, which is around 70% cheaper and can
+      be reclaimed with a two-minute warning. Zero disables Spot. A stateless
+      HTTP service behind a load balancer handles reclamation well; a queue
+      consumer mid-batch or anything holding a long-lived connection does not.
+    Default: 0
+    MinValue: 0
+    MaxValue: 100
+
+  ContainerInsights:
+    Type: String
+    Description: >-
+      Per-task CPU, memory, network and storage metrics. `enabled` is the classic
+      metric set. `enhanced` adds per-container detail and costs meaningfully more
+      on a large cluster. `disabled` saves money and leaves you diagnosing a
+      memory leak by guesswork.
+    Default: enabled
+    AllowedValues: [enabled, enhanced, disabled]
+
+  EnableExecuteCommandLogging:
+    Type: String
+    Description: >-
+      Record every ECS Exec session to CloudWatch Logs. ECS Exec is an
+      interactive shell inside a running production container; without this,
+      there is no record of what was typed.
+    Default: "true"
+    AllowedValues: ["true", "false"]
+
+  LogRetentionDays:
+    Type: Number
+    Description: Retention for the ECS Exec audit log group.
+    Default: 90
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+  CreateServiceConnectNamespace:
+    Type: String
+    Description: >-
+      Create a Cloud Map namespace so services in this cluster can address each
+      other by name (http://orders/) with retries and per-call metrics, instead
+      of through a load balancer.
+    Default: "false"
+    AllowedValues: ["true", "false"]
+
+  ServiceConnectNamespaceName:
+    Type: String
+    Description: >-
+      DNS namespace for Service Connect, e.g. "internal". Services become
+      reachable as <service>.<namespace>.
+    Default: internal
+    AllowedPattern: "^[a-z0-9][a-z0-9.-]{0,60}[a-z0-9]$"
+
+  VpcId:
+    Type: String
+    Description: >-
+      VPC the Service Connect namespace resolves inside. Required only when
+      CreateServiceConnectNamespace is true; a private DNS namespace has to be
+      attached to exactly one VPC.
+    Default: ""
+
+Conditions:
+  ShouldUseSpot: !Not [!Equals [!Ref SpotWeight, 0]]
+  ShouldLogExecSessions: !Equals [!Ref EnableExecuteCommandLogging, "true"]
+  ShouldCreateNamespace: !Equals [!Ref CreateServiceConnectNamespace, "true"]
+
+Resources:
+  ExecuteCommandLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: ShouldLogExecSessions
+    # This is an audit trail of shell sessions in production. It must outlive
+    # the stack that created it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/${Environment}/${NamePrefix}/ecs-exec"
+      RetentionInDays: !Ref LogRetentionDays
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${NamePrefix}-${Environment}"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: !Ref ContainerInsights
+      Configuration:
+        ExecuteCommandConfiguration:
+          # ECS Exec traffic is encrypted in transit by SSM regardless; this
+          # additionally logs the session so there is a record of what was run
+          # inside a production container.
+          Logging: !If [ShouldLogExecSessions, OVERRIDE, DEFAULT]
+          LogConfiguration: !If
+            - ShouldLogExecSessions
+            - CloudWatchLogGroupName: !Ref ExecuteCommandLogGroup
+              CloudWatchEncryptionEnabled: false
+            - !Ref AWS::NoValue
+      # Both providers are registered even when SpotWeight is 0, so switching a
+      # service to Spot later is a parameter change rather than a cluster
+      # replacement — capacity providers cannot be added to a live cluster
+      # without disruption in every case.
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Base: !Ref OnDemandBaseCount
+          Weight: !Ref OnDemandWeight
+        - !If
+          - ShouldUseSpot
+          - CapacityProvider: FARGATE_SPOT
+            Base: 0
+            Weight: !Ref SpotWeight
+          - !Ref AWS::NoValue
+
+  ServiceConnectNamespace:
+    Type: AWS::ServiceDiscovery::PrivateDnsNamespace
+    Condition: ShouldCreateNamespace
+    Properties:
+      Name: !Ref ServiceConnectNamespaceName
+      Description: !Sub "Service Connect namespace for ${NamePrefix} (${Environment})"
+      Vpc: !Ref VpcId
+
+Outputs:
+  ClusterName:
+    Description: Cluster name, for the ECS service's Cluster property and the CLI.
+    Value: !Ref Cluster
+
+  ClusterArn:
+    Description: Cluster ARN, for IAM policies and cross-stack references.
+    Value: !GetAtt Cluster.Arn
+
+  ServiceConnectNamespaceArn:
+    Description: Cloud Map namespace ARN, for a service's ServiceConnectConfiguration.
+    Condition: ShouldCreateNamespace
+    Value: !GetAtt ServiceConnectNamespace.Arn
+
+  ServiceConnectNamespaceName:
+    Description: DNS namespace services are addressable under.
+    Condition: ShouldCreateNamespace
+    Value: !Ref ServiceConnectNamespaceName
+
+  ExecuteCommandLogGroupName:
+    Description: Log group holding the ECS Exec session audit trail.
+    Condition: ShouldLogExecSessions
+    Value: !Ref ExecuteCommandLogGroup

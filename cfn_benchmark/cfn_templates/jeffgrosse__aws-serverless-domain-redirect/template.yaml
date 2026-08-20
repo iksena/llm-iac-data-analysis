@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Redirects a custom domain (apex + optional www) to a target URL over HTTPS
+  using CloudFront + a CloudFront Function. Must be deployed in us-east-1:
+  CloudFront requires its ACM certificate to live in that region, and this
+  template keeps everything in a single stack rather than adding a nested
+  stack / custom resource to work around the region requirement.
+
+Parameters:
+  SourceDomain:
+    Type: String
+    Description: >
+      Apex domain to redirect from, e.g. jeffgrosse.com. Must match a domain
+      you control in the hosted zone given by HostedZoneId.
+    AllowedPattern: '^[^''$]+$'
+    ConstraintDescription: >-
+      must not contain single quotes or $ characters -- both are spliced
+      via Fn::Sub into the CloudFront Function's JavaScript source (see
+      README)
+
+  TargetUrl:
+    Type: String
+    Description: >
+      Full URL to redirect to, e.g. https://www.linkedin.com/in/jeffreygrosse/.
+      Must include the scheme (https://).
+    AllowedPattern: '^https://[^''$]+$'
+    ConstraintDescription: >-
+      must start with https:// and must not contain single quotes or $
+      characters -- both are spliced via Fn::Sub into the CloudFront
+      Function's JavaScript source (see README)
+
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: >
+      Existing Route 53 public hosted zone ID for SourceDomain. This template
+      does not create the hosted zone; bring your own.
+
+  IncludeWww:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to also redirect www.SourceDomain.
+
+Conditions:
+  ShouldIncludeWww: !Equals [!Ref IncludeWww, 'true']
+
+Rules:
+  MustDeployToUsEast1:
+    Assertions:
+      - Assert: !Equals [!Ref 'AWS::Region', 'us-east-1']
+        AssertDescription: >-
+          This template must be deployed in us-east-1. CloudFront only
+          accepts ACM certificates issued in us-east-1, and this template
+          creates the certificate in whatever region the stack runs in.
+
+Resources:
+
+  # DNS-validated ACM cert. CloudFormation creates the validation CNAME(s) in
+  # HostedZoneId automatically and blocks until validation completes, so no
+  # manual step is needed beyond owning the hosted zone.
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref SourceDomain
+      ValidationMethod: DNS
+      SubjectAlternativeNames: !If
+        - ShouldIncludeWww
+        - - !Sub 'www.${SourceDomain}'
+        - !Ref 'AWS::NoValue'
+      DomainValidationOptions: !If
+        - ShouldIncludeWww
+        - - DomainName: !Ref SourceDomain
+            HostedZoneId: !Ref HostedZoneId
+          - DomainName: !Sub 'www.${SourceDomain}'
+            HostedZoneId: !Ref HostedZoneId
+        - - DomainName: !Ref SourceDomain
+            HostedZoneId: !Ref HostedZoneId
+
+  # ==========================================================================
+  # SYNC WARNING: FunctionCode below is the actual deployed source. It is
+  # mirrored in src/redirect.js for readability/local testing only -- that
+  # file is NOT read by CloudFormation. If you change the logic below, you
+  # MUST update src/redirect.js too.
+  # ==========================================================================
+  # Viewer-request function: 301s every request to TargetUrl, regardless of
+  # which alias (apex or www) or path it arrived on. TargetUrl is baked in at
+  # deploy time via Fn::Sub since CloudFront Functions have no env vars.
+  RedirectFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub '${AWS::StackName}-redirect'
+      AutoPublish: true
+      FunctionConfig:
+        Comment: !Sub 'Redirect ${SourceDomain} to ${TargetUrl}'
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub |
+        function handler(event) {
+            var response = {
+                statusCode: 301,
+                statusDescription: 'Moved Permanently',
+                headers: {
+                    location: { value: '${TargetUrl}' }
+                }
+            };
+            return response;
+        }
+
+  # PriceClass_100, TLS 1.2 minimum, aliases = apex (+ www if enabled).
+  # Origin is a dummy (example.com) since the function short-circuits every
+  # request on viewer-request before any origin fetch happens.
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'Redirect ${SourceDomain} to target URL'
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Aliases: !If
+          - ShouldIncludeWww
+          - - !Ref SourceDomain
+            - !Sub 'www.${SourceDomain}'
+          - - !Ref SourceDomain
+        ViewerCertificate:
+          AcmCertificateArn: !Ref Certificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+        Origins:
+          - Id: dummy-origin
+            DomainName: example.com
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: dummy-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          # Managed "CachingDisabled" policy: redirects are cheap to compute
+          # and TargetUrl changes should take effect immediately, without
+          # needing a cache invalidation.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt RedirectFunction.FunctionARN
+
+  # Alias records use CloudFront's fixed hosted zone ID (Z2FDTNDATAQYW2),
+  # constant across all CloudFront distributions.
+  ApexRecordSetA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref SourceDomain
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+  ApexRecordSetAAAA:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref SourceDomain
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+  WwwRecordSetA:
+    Type: AWS::Route53::RecordSet
+    Condition: ShouldIncludeWww
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'www.${SourceDomain}'
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+  WwwRecordSetAAAA:
+    Type: AWS::Route53::RecordSet
+    Condition: ShouldIncludeWww
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Sub 'www.${SourceDomain}'
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt Distribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+        EvaluateTargetHealth: false
+
+Outputs:
+  DistributionDomainName:
+    Description: >
+      CloudFront distribution domain name. Useful for verifying the redirect
+      before DNS has propagated, e.g. curl -I https://<this-value>.
+    Value: !GetAtt Distribution.DomainName
+
+  DistributionId:
+    Description: CloudFront distribution ID (for cache invalidation or sam delete).
+    Value: !Ref Distribution
+
+  CertificateArn:
+    Description: ACM certificate ARN.
+    Value: !Ref Certificate

@@ -1,0 +1,258 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'n8n youtube botEC2 Instance with SSH, CloudWatch Logging, and Scheduled Start/Stop'
+
+Parameters:
+  ProjectName:
+    Description: Prefix for resources
+    Type: String
+    Default: "n8n-youtube-bot"
+
+  InstanceProfileName:
+    Description: PASTE HERE The Output value from the IAM Role Stack
+    Type: String
+    Default: "n8n-youtube-bot-profile"
+
+  KeyName:
+    Description: Name of your existing EC2 KeyPair
+    Type: AWS::EC2::KeyPair::KeyName
+
+  MyIP:
+    Description: Your Public IP (e.g. 1.2.3.4/32).
+    Type: String
+    Default: 0.0.0.0/0
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+
+  # --- Schedule Configuration ---
+  Timezone:
+    Type: String
+    Default: "Asia/Kolkata"
+  StartTime1:
+    Type: String
+    Default: "cron(0 9 * * ? *)"
+  StopTime1:
+    Type: String
+    Default: "cron(0 12 * * ? *)"
+  StartTime2:
+    Type: String
+    Default: "cron(0 18 * * ? *)"
+  StopTime2:
+    Type: String
+    Default: "cron(0 21 * * ? *)"
+
+Resources:
+  # -------------------------------------------------------------------------
+  # 1. Log Group
+  # -------------------------------------------------------------------------
+  N8nLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/ec2/${ProjectName}"
+      RetentionInDays: 7
+
+  # -------------------------------------------------------------------------
+  # 2. Security Group
+  # -------------------------------------------------------------------------
+  N8nSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "Firewall for ${ProjectName}"
+      GroupName: !Sub "${ProjectName}-firewall"
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref MyIP
+        - IpProtocol: tcp
+          FromPort: 5678
+          ToPort: 5678
+          CidrIp: !Ref MyIP
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-firewall"
+
+  # -------------------------------------------------------------------------
+  # 3. EC2 Instance (25GB Storage + Custom Build)
+  # -------------------------------------------------------------------------
+  N8nInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: 'resolve:ssm:/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id'
+      KeyName: !Ref KeyName
+
+      # --- LINK TO SEPARATE ROLE ---
+      IamInstanceProfile: !Ref InstanceProfileName
+
+      SecurityGroupIds: [ !Ref N8nSecurityGroup ]
+
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: 25
+            VolumeType: gp3
+            DeleteOnTermination: true
+
+      Tags:
+        - Key: Name
+          Value: !Sub "${ProjectName}-server"
+        - Key: Project
+          Value: !Ref ProjectName
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # 1. Install CloudWatch Agent
+          wget https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+          dpkg -i -E ./amazon-cloudwatch-agent.deb
+
+          TOKEN=`curl -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600"`
+          INSTANCE_ID=`curl -H "X-aws-ec2-metadata-token: $TOKEN" -v http://169.254.169.254/latest/meta-data/instance-id`
+          PUBLIC_IP=`curl -H "X-aws-ec2-metadata-token: $TOKEN" -v http://169.254.169.254/latest/meta-data/public-ipv4`
+
+          # Config for Setup Logs
+          cat <<EOF > /opt/aws/amazon-cloudwatch-agent/bin/config.json
+          {
+            "agent": { "run_as_user": "root" },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {
+                      "file_path": "/var/log/cloud-init-output.log",
+                      "log_group_name": "/aws/ec2/${ProjectName}",
+                      "log_stream_name": "system-setup-{instance_id}",
+                      "timezone": "UTC"
+                    }
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json -s
+
+          # 2. Install Docker
+          echo "Installing Docker..."
+          apt-get update -y
+          apt-get install -y ca-certificates curl gnupg
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          chmod a+r /etc/apt/keyrings/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+          $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+          apt-get update -y
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+          usermod -aG docker ubuntu
+
+          # 3. Setup n8n
+          echo "Setting up n8n..."
+          mkdir -p /home/ubuntu/n8n
+          chown ubuntu:ubuntu /home/ubuntu/n8n
+          cd /home/ubuntu/n8n
+
+          cat <<EOF > Dockerfile
+          FROM node:20-alpine
+          RUN apk add --update --no-cache python3 py3-pip build-base
+          RUN npm install -g n8n
+          RUN mkdir -p /home/node/.n8n && chown -R node:node /home/node/.n8n
+          WORKDIR /home/node
+          USER node
+          ENTRYPOINT ["n8n"]
+          EOF
+
+          cat <<EOF > docker-compose.yml
+          services:
+            n8n:
+              build: .
+              restart: always
+              ports:
+                - "5678:5678"
+              environment:
+                - N8N_HOST=$PUBLIC_IP
+                - WEBHOOK_URL=http://$PUBLIC_IP:5678/
+                - GENERIC_TIMEZONE=${Timezone}
+                - N8N_SECURE_COOKIE=false
+              volumes:
+                - n8n_data:/home/node/.n8n
+              logging:
+                driver: awslogs
+                options:
+                  awslogs-region: ${AWS::Region}
+                  awslogs-group: /aws/ec2/${ProjectName}
+                  awslogs-stream: n8n-app-$INSTANCE_ID
+                  awslogs-create-group: "true"
+          volumes:
+            n8n_data:
+          EOF
+
+          echo "Starting n8n Container..."
+          docker compose up -d --build
+          echo "n8n Started Successfully."
+
+  # -------------------------------------------------------------------------
+  # 4. Schedules (Requires its own Role)
+  # -------------------------------------------------------------------------
+  # Note: This is the SCHEDULER Role (Service Role), distinct from EC2 Role
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-scheduler-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartStopEC2
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [ 'ec2:StartInstances', 'ec2:StopInstances' ]
+                Resource: !Sub "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${N8nInstance}"
+
+  ScheduleStart1:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-wake-morning"
+      ScheduleExpression: !Ref StartTime1
+      ScheduleExpressionTimezone: !Ref Timezone
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target: { Arn: "arn:aws:scheduler:::aws-sdk:ec2:startInstances", RoleArn: !GetAtt SchedulerRole.Arn, Input: !Sub '{"InstanceIds": ["${N8nInstance}"]}' }
+
+  ScheduleStop1:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-sleep-morning"
+      ScheduleExpression: !Ref StopTime1
+      ScheduleExpressionTimezone: !Ref Timezone
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target: { Arn: "arn:aws:scheduler:::aws-sdk:ec2:stopInstances", RoleArn: !GetAtt SchedulerRole.Arn, Input: !Sub '{"InstanceIds": ["${N8nInstance}"]}' }
+
+  ScheduleStart2:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-wake-evening"
+      ScheduleExpression: !Ref StartTime2
+      ScheduleExpressionTimezone: !Ref Timezone
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target: { Arn: "arn:aws:scheduler:::aws-sdk:ec2:startInstances", RoleArn: !GetAtt SchedulerRole.Arn, Input: !Sub '{"InstanceIds": ["${N8nInstance}"]}' }
+
+  ScheduleStop2:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: !Sub "${ProjectName}-sleep-evening"
+      ScheduleExpression: !Ref StopTime2
+      ScheduleExpressionTimezone: !Ref Timezone
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target: { Arn: "arn:aws:scheduler:::aws-sdk:ec2:stopInstances", RoleArn: !GetAtt SchedulerRole.Arn, Input: !Sub '{"InstanceIds": ["${N8nInstance}"]}' }
+
+Outputs:
+  N8nUrl:
+    Value: !Sub "http://${N8nInstance.PublicIp}:5678"
+  LogGroup:
+    Value: !Ref N8nLogGroup

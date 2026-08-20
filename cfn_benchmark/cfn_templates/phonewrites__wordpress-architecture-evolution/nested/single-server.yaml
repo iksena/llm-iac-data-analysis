@@ -1,0 +1,162 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: WordPress evolution stage 1 standalone server with direct configuration.
+
+Parameters:
+  LatestAmiId:
+    Description: Resolved Amazon Linux 2023 AMI ID from the parent stage template.
+    Type: AWS::EC2::Image::Id
+  CfnMetadataNonce:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 2147483647
+    Description: Increase on stack update so metadata changes and cfn-hup re-runs cfn-init.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+  InstanceProfileName:
+    Type: String
+
+Resources:
+  SGWordpress:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: Allow HTTP traffic to WordPress web server
+      SecurityGroupIngress:
+        - Description: Allow HTTP IPv4 from anywhere
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: wordpress-sg
+
+  WordpressEC2:
+    Type: AWS::EC2::Instance
+    Metadata:
+      AWS::CloudFormation::Init:
+        configSets:
+          wordpress_always:
+            - sync_public_endpoint
+        sync_public_endpoint:
+          commands:
+            00_add_timestamp:
+              command: !Sub 'echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) cfn-init CfnMetadataNonce=${CfnMetadataNonce}" >> /var/log/cfn-wp-refresh.log'
+            01_wp_sync_public_ip:
+              command: |
+                IMDS_SESSION_TOKEN=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+                IMDS_PUBLIC_IPV4=$(curl -fsS -H "X-aws-ec2-metadata-token: $IMDS_SESSION_TOKEN" http://169.254.169.254/latest/meta-data/public-ipv4 2>/dev/null || true)
+                if [ -z "$IMDS_PUBLIC_IPV4" ]; then echo "No public IPv4; skipping wp option sync" >> /var/log/cfn-wp-refresh.log; exit 0; fi
+                if [ ! -f /var/www/html/wp-cli.phar ]; then curl -fsSLo /var/www/html/wp-cli.phar https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar || exit 0; fi
+                cd /var/www/html
+                php /var/www/html/wp-cli.phar --path=/var/www/html --allow-root option update home "http://$IMDS_PUBLIC_IPV4" >> /var/log/cfn-wp-refresh.log 2>&1 || true
+                php /var/www/html/wp-cli.phar --path=/var/www/html --allow-root option update siteurl "http://$IMDS_PUBLIC_IPV4" >> /var/log/cfn-wp-refresh.log 2>&1 || true
+              cwd: /var/www/html
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    Properties:
+      InstanceType: t2.micro
+      ImageId: !Ref LatestAmiId
+      IamInstanceProfile: !Ref InstanceProfileName
+      SubnetId: !Ref PublicSubnetId
+      SecurityGroupIds:
+        - !Ref SGWordpress
+      Tags:
+        - Key: Name
+          Value: Wordpress-solo-built
+        - Key: CfnMetadataNonce
+          Value: !Sub '${CfnMetadataNonce}'
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          DBName=$(aws ssm get-parameters --region ${AWS::Region} --names /Wordpress/DBName --query Parameters[0].Value --output text)
+          DBUser=$(aws ssm get-parameters --region ${AWS::Region} --names /Wordpress/DBUser --query Parameters[0].Value --output text)
+          DBEndpoint=$(aws ssm get-parameters --region ${AWS::Region} --names /Wordpress/DBEndpoint --query Parameters[0].Value --output text)
+          DBPassword=$(aws ssm get-parameters --region ${AWS::Region} --names /Wordpress/DBPassword --with-decryption --query Parameters[0].Value --output text)
+          DBRootPassword=$(aws ssm get-parameters --region ${AWS::Region} --names /Wordpress/DBRootPassword --with-decryption --query Parameters[0].Value --output text)
+
+          dnf -y --refresh upgrade
+          dnf install -y aws-cfn-bootstrap wget httpd php php-mysqlnd php-fpm php-mysqli php-json php-mbstring php-xml php-gd php-opcache php-intl php-zip php-devel stress mariadb1011-server
+
+          systemctl enable httpd mariadb
+          systemctl start httpd mariadb
+
+          mysqladmin -u root password "$DBRootPassword"
+
+          wget https://wordpress.org/latest.tar.gz -P /var/www/html
+          cd /var/www/html
+          tar -zxvf latest.tar.gz
+          cp -rvf wordpress/* .
+          rm -rf wordpress latest.tar.gz
+
+          cp ./wp-config-sample.php ./wp-config.php
+          sed -i "s/'database_name_here'/'$DBName'/g" wp-config.php
+          sed -i "s/'username_here'/'$DBUser'/g" wp-config.php
+          sed -i "s/'password_here'/'$DBPassword'/g" wp-config.php
+          sed -i "s/'localhost'/'$DBEndpoint'/g" wp-config.php
+
+          if ! grep -q 'Follow browser hostname for WP_HOME' wp-config.php; then
+            WPCONFIG_INSERT_TMP=$(mktemp)
+            WPCONFIG_MERGED_TMP=$(mktemp)
+            cat > "$WPCONFIG_INSERT_TMP" <<'WPCONFIG_BROWSER_HOST_SNIPPET'
+          /* Follow browser hostname for WP_HOME and WP_SITEURL (HTTP_HOST; no fixed public IP in redirects). */
+          if (php_sapi_name() !== 'cli' && !empty($_SERVER['HTTP_HOST'])) {
+              define('WP_HOME', 'http://' . $_SERVER['HTTP_HOST']);
+              define('WP_SITEURL', 'http://' . $_SERVER['HTTP_HOST']);
+          }
+          WPCONFIG_BROWSER_HOST_SNIPPET
+            awk 'NR==FNR { buf = buf $0 ORS; next } /stop editing! Happy publishing/ && !done { printf "%s", buf; done=1 } { print }' "$WPCONFIG_INSERT_TMP" wp-config.php > "$WPCONFIG_MERGED_TMP"
+            mv "$WPCONFIG_MERGED_TMP" wp-config.php
+            rm -f "$WPCONFIG_INSERT_TMP"
+          fi
+
+          usermod -a -G apache ec2-user
+          chown -R ec2-user:apache /var/www
+          chmod 2775 /var/www
+          find /var/www -type d -exec chmod 2775 {} \;
+          find /var/www -type f -exec chmod 0664 {} \;
+
+          cat > /tmp/db.setup <<DBSETUP
+          CREATE DATABASE $DBName;
+          CREATE USER '$DBUser'@'localhost' IDENTIFIED BY '$DBPassword';
+          GRANT ALL ON $DBName.* TO '$DBUser'@'localhost';
+          FLUSH PRIVILEGES;
+          DBSETUP
+          mysql -u root --password="$DBRootPassword" < /tmp/db.setup
+          rm -f /tmp/db.setup
+
+          mkdir -p /etc/cfn/hooks.d
+          touch /var/log/cfn-wp-refresh.log
+          {
+            echo '[main]'
+            echo "stack=${AWS::StackId}"
+            echo "region=${AWS::Region}"
+            echo 'verbose=true'
+            echo 'interval=5'
+          } >/etc/cfn/cfn-hup.conf
+          {
+            echo '[cfn-auto-reloader-hook]'
+            echo 'triggers=post.update'
+            echo 'path=Resources.WordpressEC2.Metadata'
+            echo "action=/opt/aws/bin/cfn-init -v -c wordpress_always --stack ${AWS::StackId} --resource WordpressEC2 --region ${AWS::Region}"
+          } >/etc/cfn/hooks.d/cfn-auto-reloader.conf
+          /opt/aws/bin/cfn-init -v -c wordpress_always --stack ${AWS::StackId} --resource WordpressEC2 --region ${AWS::Region} || echo "cfn-init non-zero exit" >> /var/log/cfn-wp-refresh.log
+          nohup /opt/aws/bin/cfn-hup >/var/log/cfn-hup.log 2>&1 &
+
+          /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackId} --resource WordpressEC2 --region ${AWS::Region}
+
+Outputs:
+  WordpressURL:
+    Description: WordPress URL based on the instance public DNS name.
+    Value: !Sub 'http://${WordpressEC2.PublicDnsName}'
+  WordpressInstanceId:
+    Value: !Ref WordpressEC2
+  WordpressInstanceAutoIP:
+    Description: Ephemeral public IPv4 assigned while the instance is running.
+    Value: !GetAtt WordpressEC2.PublicIp
+  WordpressSecurityGroupId:
+    Value: !Ref SGWordpress

@@ -1,0 +1,186 @@
+Description: Aurora Serverless v2 for MMA Test Manager repository
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: At least 2 subnets in different AZs
+
+  SecurityGroupId:
+    Type: String
+    Description: EC2 security group ID for database access
+
+  StackPrefix:
+    Type: String
+
+  DBName:
+    Type: String
+    Default: mma_test
+
+  KmsKeyId:
+    Type: String
+    Description: KMS CMK ARN for Secrets Manager encryption
+
+Resources:
+  ###############################################################################################
+  ### Secret for Database
+  ###############################################################################################
+
+  TestManagerDBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${StackPrefix}-testmgr-db-secret'
+      KmsKeyId: !Ref KmsKeyId
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "postgres"}'
+        GenerateStringKey: 'password'
+        PasswordLength: 16
+        ExcludeCharacters: '|\.+%"@/\\&<>;,[]{}()#?*=!''`:$~ '
+        ExcludePunctuation: false
+        RequireEachIncludedType: true
+
+  ###############################################################################################
+  ### Database Resources
+  ###############################################################################################
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${StackPrefix}-testmgr-subnet-group'
+      DBSubnetGroupDescription: Subnet group for Test Manager Aurora cluster
+      SubnetIds: !Ref SubnetIds
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W40
+            reason: "IpProtocol -1 to localhost (127.0.0.1/32) effectively blocks all outbound traffic"
+    Properties:
+      GroupDescription: Security group for Test Manager Aurora cluster
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - Description: Allow PostgreSQL from EC2
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref SecurityGroupId
+      SecurityGroupEgress:
+        - Description: Remove default egress rule - limit to localhost only
+          CidrIp: 127.0.0.1/32
+          IpProtocol: "-1"
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackPrefix}-testmgr-db-sg'
+
+  DBSecurityGroupEgressSelf:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref DBSecurityGroup
+      DestinationSecurityGroupId: !GetAtt DBSecurityGroup.GroupId
+      IpProtocol: -1
+      Description: Allow outbound to same security group only
+
+  DBCluster:
+    #checkov:skip=CKV_AWS_162:IAM authentication not required for internal repo database
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBClusterIdentifier: !Sub '${StackPrefix}-testmgr-repo-cluster'
+      Engine: aurora-postgresql
+      EngineVersion: '17.7'
+      Port: 5432
+      DatabaseName: !Ref DBName
+      MasterUsername: !Sub '{{resolve:secretsmanager:${TestManagerDBSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${TestManagerDBSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref DBSecurityGroup
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 8
+      BackupRetentionPeriod: 7
+      StorageEncrypted: true
+      DeletionProtection: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${StackPrefix}-testmgr-cluster'
+
+  DBInstance:
+    #checkov:skip=CKV_AWS_118:Enhanced monitoring not required for internal repo database
+    Type: AWS::RDS::DBInstance
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit name required for demo environment identification"
+    Properties:
+      Engine: aurora-postgresql
+      DBInstanceIdentifier: !Sub '${StackPrefix}-testmgr-repo-instance'
+      DBInstanceClass: db.serverless
+      DBClusterIdentifier: !Ref DBCluster
+      PubliclyAccessible: false
+
+  SetupDatabaseDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: !Sub '${StackPrefix}-setup-repo-database'
+      DocumentType: Command
+      Content:
+        schemaVersion: '2.2'
+        description: Setup Test Manager repository database
+        mainSteps:
+          - action: aws:runShellScript
+            name: setupDatabase
+            inputs:
+              runCommand:
+                - !Sub |
+                  #!/bin/bash
+                  set -e
+
+                  DB_HOST="${DBCluster.Endpoint.Address}"
+                  SECRET_ARN="${TestManagerDBSecret}"
+                  REGION=${AWS::Region}
+
+                  SECRET_JSON=$(aws secretsmanager get-secret-value --region $REGION --secret-id $SECRET_ARN --query SecretString --output text)
+                  DB_USER=$(echo $SECRET_JSON | jq -r .username)
+                  DB_PASS=$(echo $SECRET_JSON | jq -r .password)
+
+                  # Update repo db secret with additional host/port/dbname
+                  UPDATE_SECRET_JSON=$(echo $SECRET_JSON | jq --arg host "$DB_HOST" --arg port "5432" --arg dbname "${DBName}" '. + {host: $host, port: $port, dbname: $dbname, engine: "postgres"}')
+                  aws secretsmanager put-secret-value --secret-id $SECRET_ARN --region $REGION --secret-string "$UPDATE_SECRET_JSON"
+
+                  # Verify database exists (it's created by CFN, but check connectivity)
+                  echo "Verifying database ${DBName}..."
+                  PGPASSWORD=$DB_PASS psql -h $DB_HOST -U $DB_USER -d ${DBName} -c "SELECT version();" || {
+                    echo "Database ${DBName} not accessible, this should not happen as CFN creates it"
+                    exit 1
+                  }
+
+                  echo "Repository database ${DBName} verified successfully"
+
+Outputs:
+  DBEndpoint:
+    Description: Aurora cluster endpoint
+    Value: !GetAtt DBCluster.Endpoint.Address
+    Export:
+      Name: !Sub '${AWS::StackName}-Endpoint'
+
+  DBPort:
+    Description: Aurora cluster port
+    Value: !GetAtt DBCluster.Endpoint.Port
+    Export:
+      Name: !Sub '${AWS::StackName}-Port'
+
+  DBSecretArn:
+    Description: Secret ARN for database credentials
+    Value: !Ref TestManagerDBSecret
+    Export:
+      Name: !Sub '${AWS::StackName}-SecretArn'
+
+  SetupDocumentName:
+    Description: SSM document name for database setup
+    Value: !Ref SetupDatabaseDocument
+    Export:
+      Name: !Sub '${AWS::StackName}-SetupDocumentName'

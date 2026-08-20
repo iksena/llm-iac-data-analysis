@@ -1,0 +1,298 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Data Ingestion Pipeline with HTTP API, Lambda, Kinesis Firehose, and S3'
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: data-ingestion
+    Description: Name prefix for the resources created by this template
+  ApiKey:
+    Type: String
+    NoEcho: true
+    Description: API Key for authentication
+    MinLength: 16
+    MaxLength: 64
+
+Resources:
+  # S3 Bucket for data storage
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-data-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToStandardIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+          - Id: TransitionToGlacier
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+
+  # Store API Key in Secrets Manager
+  ApiKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${ProjectName}/api-key'
+      Description: 'API Key for data ingestion authentication'
+      SecretString: !Ref ApiKey
+
+  # IAM Role for Lambda
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-lambda-firehose-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !GetAtt DeliveryStream.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref ApiKeySecret
+
+  # IAM Role for Firehose
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub '${ProjectName}-firehose-s3-policy'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub '${DataBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  # Kinesis Firehose Delivery Stream
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub '${ProjectName}-delivery-stream'
+      DeliveryStreamType: DirectPut
+      S3DestinationConfiguration:
+        BucketARN: !GetAtt DataBucket.Arn
+        BufferingHints:
+          IntervalInSeconds: 600  # 10 minutes
+          SizeInMBs: 5
+        CompressionFormat: UNCOMPRESSED
+        Prefix: 'data/'
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+
+  # Lambda Function
+  IngestFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-ingest-function'
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DELIVERY_STREAM_NAME: !Ref DeliveryStream
+          API_KEY_SECRET_NAME: !Ref ApiKeySecret
+      Code:
+        ZipFile: |
+          const { FirehoseClient, PutRecordCommand } = require('@aws-sdk/client-firehose');
+          const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+
+          const firehoseClient = new FirehoseClient({});
+          const secretsManagerClient = new SecretsManagerClient({});
+
+          let cachedApiKey = null;
+          let cacheExpiry = 0;
+
+          async function getApiKey() {
+            // Cache the API key for 5 minutes to reduce Secrets Manager calls
+            if (cachedApiKey && Date.now() < cacheExpiry) {
+              return cachedApiKey;
+            }
+
+            const command = new GetSecretValueCommand({
+              SecretId: process.env.API_KEY_SECRET_NAME
+            });
+
+            const data = await secretsManagerClient.send(command);
+            cachedApiKey = data.SecretString;
+            cacheExpiry = Date.now() + (5 * 60 * 1000); // 5 minutes cache
+            return cachedApiKey;
+          }
+
+          exports.handler = async (event) => {
+            try {
+              console.log('Received event:', JSON.stringify(event, null, 2));
+
+              // Validate API key
+              const providedApiKey = event.headers['x-api-key'];
+              if (!providedApiKey) {
+                return {
+                  statusCode: 401,
+                  body: JSON.stringify({ message: 'API key is required' })
+                };
+              }
+
+              const validApiKey = await getApiKey();
+              if (providedApiKey !== validApiKey) {
+                return {
+                  statusCode: 403,
+                  body: JSON.stringify({ message: 'Invalid API key' })
+                };
+              }
+
+              // Parse the incoming data
+              let data;
+              if (event.body) {
+                try {
+                  data = JSON.parse(event.body);
+                } catch (e) {
+                  return {
+                    statusCode: 400,
+                    body: JSON.stringify({ message: 'Invalid JSON in request body' })
+                  };
+                }
+              } else {
+                return {
+                  statusCode: 400,
+                  body: JSON.stringify({ message: 'Missing request body' })
+                };
+              }
+
+              // Add timestamp if not present
+              if (!data.timestamp) {
+                data.timestamp = new Date().toISOString();
+              }
+
+              // Send to Kinesis Firehose
+              const command = new PutRecordCommand({
+                DeliveryStreamName: process.env.DELIVERY_STREAM_NAME,
+                Record: {
+                  Data: JSON.stringify(data) + '\n'
+                }
+              });
+
+              await firehoseClient.send(command);
+
+              return {
+                statusCode: 200,
+                body: JSON.stringify({ message: 'Data ingested successfully' })
+              };
+            } catch (error) {
+              console.error('Error:', error);
+              return {
+                statusCode: 500,
+                body: JSON.stringify({ message: 'Error ingesting data', error: error.message })
+              };
+            }
+          };
+
+  # HTTP API
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub '${ProjectName}-http-api'
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowHeaders:
+          - Content-Type
+          - x-api-key
+        AllowMethods:
+          - POST
+        AllowOrigins:
+          - '*'
+
+  # API Integration
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt IngestFunction.Arn
+      PayloadFormatVersion: '2.0'
+      IntegrationMethod: POST
+
+  # API Route
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: 'POST /ingest'
+      Target: !Sub 'integrations/${HttpApiIntegration}'
+
+  # API Stage
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: '$default'
+      AutoDeploy: true
+
+  # Lambda Permission for HTTP API
+  LambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref IngestFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*'
+
+Outputs:
+  ApiEndpoint:
+    Description: 'HTTP API endpoint URL'
+    Value: !Sub '${HttpApi.ApiEndpoint}/ingest'
+
+  S3BucketName:
+    Description: 'S3 bucket for data storage'
+    Value: !Ref DataBucket
+
+  FirehoseDeliveryStreamName:
+    Description: 'Kinesis Firehose Delivery Stream Name'
+    Value: !Ref DeliveryStream

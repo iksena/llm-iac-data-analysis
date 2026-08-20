@@ -1,0 +1,814 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: |
+  AI-CPaaS campaign orchestrator: parse a marketer's natural-language instruction,
+  segment customers, predict the best channel per customer, suppress fatigued or
+  unhappy contacts, adapt content per channel, and dispatch via AWS End User
+  Messaging and SES. Coordinated end-to-end by AWS Step Functions. Companion to
+  the AWS blog "Build an AI-powered campaign orchestrator using Amazon Bedrock
+  and AWS End User Messaging".
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  ProjectName:
+    Type: String
+    Default: ai-cpaas-demo
+    Description: Project name used in resource naming
+
+  WhatsAppPhoneNumberId:
+    Type: String
+    Default: ''
+    Description: |
+      AWS End User Messaging Social phone number ID used as the originating WhatsApp sender
+      (e.g. phone-number-id-9997bfa8...). Leave blank to skip WhatsApp. Find with:
+      aws socialmessaging get-linked-whatsapp-business-account --id <waba-id>.
+
+  PhonePoolId:
+    Type: String
+    Default: ''
+    Description: SMS phone pool ID for AWS End User Messaging (sms-voice). Leave blank to skip SMS.
+
+  SenderEmail:
+    Type: String
+    Default: 'noreply@example.com'
+    Description: Verified SES sender email address
+    AllowedPattern: '^[^@\s]+@[^@\s]+\.[^@\s]+$'
+
+  BedrockModelId:
+    Type: String
+    Default: 'global.anthropic.claude-haiku-4-5-20251001-v1:0'
+    Description: |
+      Bedrock model or inference profile used for content adaptation and parsing.
+      Claude 4.x models require an inference profile (global. / apac. / us. prefix).
+    AllowedValues:
+      - 'global.anthropic.claude-haiku-4-5-20251001-v1:0'
+      - 'global.anthropic.claude-sonnet-4-5-20250929-v1:0'
+
+  EnableSemanticSearch:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: |
+      Provision an OpenSearch Serverless Vector search NextGen collection and
+      embed customer profiles for semantic segmentation. NextGen collections
+      scale OCUs to zero after 10 minutes of inactivity, so idle cost is near
+      $0; expect a 30-60s cold start on the first query of the day.
+
+  EmbeddingModelId:
+    Type: String
+    Default: 'amazon.titan-embed-text-v2:0'
+    Description: Bedrock embedding model used when EnableSemanticSearch is true.
+
+  SeederPrincipalArn:
+    Type: String
+    Default: ''
+    Description: |
+      Optional IAM principal ARN (typically the user/role running
+      scripts/seed_demo_data.py) that needs write access to the vector
+      collection. Required when EnableSemanticSearch is true.
+
+Conditions:
+  SemanticSearchEnabled: !Equals [!Ref EnableSemanticSearch, 'true']
+
+Globals:
+  Function:
+    Runtime: python3.13
+    Timeout: 60
+    MemorySize: 1024
+    Tracing: Active
+    Architectures: [arm64]
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        PROJECT_NAME: !Ref ProjectName
+        BEDROCK_MODEL_ID: !Ref BedrockModelId
+    Tags:
+      Project: !Ref ProjectName
+      Environment: !Ref Environment
+
+Resources:
+
+  # ===========================================================================
+  # Encryption
+  # ===========================================================================
+
+  AppKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub 'CMK for ${ProjectName} - ${Environment}'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - sns.amazonaws.com
+                - states.amazonaws.com
+            Action:
+              - 'kms:GenerateDataKey*'
+              - 'kms:Decrypt'
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt*'
+              - 'kms:Decrypt*'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:Describe*'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+
+  AppKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${ProjectName}-${Environment}'
+      TargetKeyId: !Ref AppKmsKey
+
+  # ===========================================================================
+  # State stores
+  # ===========================================================================
+
+  RateLimitsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-rate-limits-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: limiter_key
+          AttributeType: S
+      KeySchema:
+        - AttributeName: limiter_key
+          KeyType: HASH
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: ttl
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref AppKmsKey
+
+  DeliveryTrackingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-delivery-tracking-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: message_id
+          AttributeType: S
+        - AttributeName: customer_id
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: message_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: customer-index
+          KeySchema:
+            - AttributeName: customer_id
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: ttl
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref AppKmsKey
+
+  CustomerProfilesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${ProjectName}-customer-profiles-${Environment}'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: customer_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customer_id
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref AppKmsKey
+
+  CampaignAssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-assets-${Environment}-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref AppKmsKey
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+
+  # ===========================================================================
+  # OpenSearch Serverless (vector search) -- optional, enabled by EnableSemanticSearch
+  # NextGen collection: scales indexing and search OCUs to zero after 10 min idle.
+  # ===========================================================================
+
+  VectorCollectionEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Condition: SemanticSearchEnabled
+    Properties:
+      Name: !Sub '${ProjectName}-vec-enc-${Environment}'
+      Type: encryption
+      Policy: !Sub |
+        {
+          "Rules": [
+            {"ResourceType": "collection", "Resource": ["collection/${ProjectName}-vec-${Environment}"]}
+          ],
+          "AWSOwnedKey": true
+        }
+
+  VectorCollectionNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Condition: SemanticSearchEnabled
+    Properties:
+      Name: !Sub '${ProjectName}-vec-net-${Environment}'
+      Type: network
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {"ResourceType": "collection", "Resource": ["collection/${ProjectName}-vec-${Environment}"]},
+              {"ResourceType": "dashboard", "Resource": ["collection/${ProjectName}-vec-${Environment}"]}
+            ],
+            "AllowFromPublic": true
+          }
+        ]
+
+  VectorCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    Condition: SemanticSearchEnabled
+    DependsOn:
+      - VectorCollectionEncryptionPolicy
+      - VectorCollectionNetworkPolicy
+    Properties:
+      Name: !Sub '${ProjectName}-vec-${Environment}'
+      Type: VECTORSEARCH
+      StandbyReplicas: DISABLED
+      Description: Customer profile embeddings for semantic segmentation
+
+  # Data-access policy is attached to the stage Lambda roles + the seeder caller.
+  # We grant aoss:APIAccessAll via IAM and grant index permissions here.
+  VectorCollectionAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Condition: SemanticSearchEnabled
+    Properties:
+      Name: !Sub '${ProjectName}-vec-acc-${Environment}'
+      Type: data
+      Policy: !Sub |
+        [
+          {
+            "Rules": [
+              {
+                "ResourceType": "collection",
+                "Resource": ["collection/${ProjectName}-vec-${Environment}"],
+                "Permission": ["aoss:CreateCollectionItems", "aoss:UpdateCollectionItems", "aoss:DescribeCollectionItems"]
+              },
+              {
+                "ResourceType": "index",
+                "Resource": ["index/${ProjectName}-vec-${Environment}/*"],
+                "Permission": ["aoss:CreateIndex", "aoss:DescribeIndex", "aoss:ReadDocument", "aoss:WriteDocument", "aoss:UpdateIndex"]
+              }
+            ],
+            "Principal": [
+              "${SegmentCustomersFunctionRole.Arn}",
+              "${SeederPrincipalArn}"
+            ]
+          }
+        ]
+
+  # Standalone IAM role for SegmentCustomersFunction. Defined as a top-level
+  # resource so the OpenSearch data-access policy above can reference its ARN
+  # without creating a circular dependency on the SAM-managed auto-role.
+  SegmentCustomersFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: SegmentStagePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['dynamodb:GetItem', 'dynamodb:Query', 'dynamodb:Scan', 'dynamodb:BatchGetItem']
+                Resource: !GetAtt CustomerProfilesTable.Arn
+              - Effect: Allow
+                Action: ['kms:Decrypt', 'kms:GenerateDataKey']
+                Resource: !GetAtt AppKmsKey.Arn
+
+  # Optional add-on policy: only attached when EnableSemanticSearch=true.
+  SegmentCustomersSemanticSearchPolicy:
+    Type: AWS::IAM::Policy
+    Condition: SemanticSearchEnabled
+    Properties:
+      PolicyName: SemanticSearchAccess
+      Roles: [!Ref SegmentCustomersFunctionRole]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: ['bedrock:InvokeModel']
+            Resource:
+              - !Sub 'arn:aws:bedrock:${AWS::Region}::foundation-model/${EmbeddingModelId}'
+          - Effect: Allow
+            Action: ['aoss:APIAccessAll']
+            Resource: !GetAtt VectorCollection.Arn
+
+  # ===========================================================================
+  # Stage Lambdas
+  # ===========================================================================
+
+  ParseInstructionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-parse-instruction-${Environment}'
+      InlineCode: |
+        def lambda_handler(event, context):
+            return {"statusCode": 200}
+      Handler: index.lambda_handler
+      Description: Parse marketer instruction into structured campaign fields via Bedrock
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action: ['bedrock:InvokeModel']
+              Resource:
+                # Inference profile in the calling region...
+                - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}'
+                # ...plus the underlying foundation model in every region the
+                # profile may route to (global. profiles span multiple regions).
+                - 'arn:aws:bedrock:*::foundation-model/anthropic.*'
+
+  SegmentCustomersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-segment-customers-${Environment}'
+      InlineCode: |
+        def lambda_handler(event, context):
+            return {"statusCode": 200}
+      Handler: index.lambda_handler
+      Description: Match parsed criteria to customer profiles in DynamoDB, optionally combined with OpenSearch vector search
+      Role: !GetAtt SegmentCustomersFunctionRole.Arn
+      Environment:
+        Variables:
+          CUSTOMER_PROFILES_TABLE: !Ref CustomerProfilesTable
+          EMBEDDING_MODEL_ID: !Ref EmbeddingModelId
+          VECTOR_COLLECTION_ENDPOINT: !If [SemanticSearchEnabled, !GetAtt VectorCollection.CollectionEndpoint, '']
+          VECTOR_INDEX_NAME: !If [SemanticSearchEnabled, !Sub '${ProjectName}-customers-${Environment}', '']
+
+  PredictChannelsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-predict-channels-${Environment}'
+      InlineCode: |
+        def lambda_handler(event, context):
+            return {"statusCode": 200}
+      Handler: index.lambda_handler
+      Description: Predict the best channel per customer using SageMaker + heuristic fallback
+      Environment:
+        Variables:
+          CUSTOMER_PROFILES_TABLE: !Ref CustomerProfilesTable
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBReadPolicy:
+            TableName: !Ref CustomerProfilesTable
+        - Statement:
+            - Effect: Allow
+              Action: ['kms:Decrypt', 'kms:GenerateDataKey']
+              Resource: !GetAtt AppKmsKey.Arn
+            - Effect: Allow
+              Action: ['sagemaker:InvokeEndpoint']
+              Resource: !Sub 'arn:aws:sagemaker:${AWS::Region}:${AWS::AccountId}:endpoint/${ProjectName}-channel-prediction-${Environment}'
+
+  CheckSafetyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-check-safety-${Environment}'
+      InlineCode: |
+        def lambda_handler(event, context):
+            return {"statusCode": 200}
+      Handler: index.lambda_handler
+      Description: Suppress messages to fatigued or negative-sentiment customers
+      Environment:
+        Variables:
+          CUSTOMER_PROFILES_TABLE: !Ref CustomerProfilesTable
+          RATE_LIMITS_TABLE: !Ref RateLimitsTable
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBReadPolicy:
+            TableName: !Ref CustomerProfilesTable
+        - DynamoDBReadPolicy:
+            TableName: !Ref RateLimitsTable
+        - Statement:
+            - Effect: Allow
+              Action: ['kms:Decrypt', 'kms:GenerateDataKey']
+              Resource: !GetAtt AppKmsKey.Arn
+
+  AdaptContentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-adapt-content-${Environment}'
+      InlineCode: |
+        def lambda_handler(event, context):
+            return {"statusCode": 200}
+      Handler: index.lambda_handler
+      Description: Generate channel-specific message variants via Bedrock
+      Timeout: 120
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Statement:
+            - Effect: Allow
+              Action: ['bedrock:InvokeModel']
+              Resource:
+                # Inference profile in the calling region...
+                - !Sub 'arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}'
+                # ...plus the underlying foundation model in every region the
+                # profile may route to (global. profiles span multiple regions).
+                - 'arn:aws:bedrock:*::foundation-model/anthropic.*'
+
+  DeliverMessagesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-deliver-messages-${Environment}'
+      InlineCode: |
+        def lambda_handler(event, context):
+            return {"statusCode": 200}
+      Handler: index.lambda_handler
+      Description: Dispatch messages via AWS End User Messaging and SES
+      Timeout: 300
+      Environment:
+        Variables:
+          PHONE_POOL_ID: !Ref PhonePoolId
+          WHATSAPP_PHONE_NUMBER_ID: !Ref WhatsAppPhoneNumberId
+          SENDER_EMAIL: !Ref SenderEmail
+          DELIVERY_TRACKING_TABLE: !Ref DeliveryTrackingTable
+          RATE_LIMITS_TABLE: !Ref RateLimitsTable
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DeliveryTrackingTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref RateLimitsTable
+        - Statement:
+            - Effect: Allow
+              Action: ['kms:Decrypt', 'kms:GenerateDataKey']
+              Resource: !GetAtt AppKmsKey.Arn
+            - Effect: Allow
+              Action:
+                - 'sms-voice:SendTextMessage'
+                - 'social-messaging:SendWhatsAppMessage'
+              Resource: '*'
+            - Effect: Allow
+              Action:
+                - 'ses:SendEmail'
+                - 'ses:SendRawEmail'
+              Resource: '*'
+
+  RecordResultsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-record-results-${Environment}'
+      InlineCode: |
+        def lambda_handler(event, context):
+            return {"statusCode": 200}
+      Handler: index.lambda_handler
+      Description: Persist campaign summary to delivery tracking table
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          DELIVERY_TRACKING_TABLE: !Ref DeliveryTrackingTable
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DeliveryTrackingTable
+        - Statement:
+            - Effect: Allow
+              Action: ['kms:Decrypt', 'kms:GenerateDataKey']
+              Resource: !GetAtt AppKmsKey.Arn
+
+  CampaignLauncherFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-campaign-launcher-${Environment}'
+      InlineCode: |
+        def lambda_handler(event, context):
+            return {"statusCode": 200}
+      Handler: index.lambda_handler
+      Description: API Gateway entry point that starts the campaign state machine
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref CampaignStateMachine
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt CampaignStateMachine.Name
+      Events:
+        LaunchCampaign:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampaignApi
+            Path: /campaigns
+            Method: POST
+
+  CampaignStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-campaign-status-${Environment}'
+      InlineCode: |
+        def lambda_handler(event, context):
+            return {"statusCode": 200}
+      Handler: index.lambda_handler
+      Description: Return the campaign summary for a given campaign_id
+      MemorySize: 256
+      Timeout: 10
+      Environment:
+        Variables:
+          DELIVERY_TRACKING_TABLE: !Ref DeliveryTrackingTable
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBReadPolicy:
+            TableName: !Ref DeliveryTrackingTable
+        - Statement:
+            - Effect: Allow
+              Action: ['kms:Decrypt']
+              Resource: !GetAtt AppKmsKey.Arn
+      Events:
+        GetCampaign:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref CampaignApi
+            Path: /campaigns/{campaign_id}
+            Method: GET
+
+  # ===========================================================================
+  # Step Functions state machine
+  # ===========================================================================
+
+  StateMachineLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/states/${ProjectName}-orchestrator-${Environment}'
+      RetentionInDays: 30
+      KmsKeyId: !GetAtt AppKmsKey.Arn
+
+  CampaignStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub '${ProjectName}-orchestrator-${Environment}'
+      Type: STANDARD
+      DefinitionUri: statemachine/campaign_orchestrator.asl.json
+      DefinitionSubstitutions:
+        ParseArn: !GetAtt ParseInstructionFunction.Arn
+        SegmentArn: !GetAtt SegmentCustomersFunction.Arn
+        PredictArn: !GetAtt PredictChannelsFunction.Arn
+        SafetyArn: !GetAtt CheckSafetyFunction.Arn
+        AdaptArn: !GetAtt AdaptContentFunction.Arn
+        DeliverArn: !GetAtt DeliverMessagesFunction.Arn
+        RecordArn: !GetAtt RecordResultsFunction.Arn
+      Logging:
+        Level: ALL
+        IncludeExecutionData: false
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineLogGroup.Arn
+      Tracing:
+        Enabled: true
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ParseInstructionFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref SegmentCustomersFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref PredictChannelsFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CheckSafetyFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref AdaptContentFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref DeliverMessagesFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref RecordResultsFunction
+        - CloudWatchLogsFullAccess
+
+  # ===========================================================================
+  # Amazon Cognito user pool used to authenticate the campaign launcher API.
+  # Callers must present a JWT access token from this pool in the
+  # Authorization header when hitting the HTTP API.
+  # ===========================================================================
+
+  CampaignUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${ProjectName}-users-${Environment}'
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 12
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+
+  CampaignUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub '${ProjectName}-launcher-${Environment}'
+      UserPoolId: !Ref CampaignUserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AccessTokenValidity: 60      # minutes
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30     # days
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+  # ===========================================================================
+  # API Gateway entry point (protected by the Cognito user pool above)
+  # ===========================================================================
+
+  CampaignApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      Description: !Sub 'Campaign launcher API for ${ProjectName}-${Environment}'
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 100
+        ThrottlingRateLimit: 50
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: [POST, GET, OPTIONS]
+        AllowHeaders: [content-type, authorization]
+        MaxAge: 600
+      Auth:
+        DefaultAuthorizer: CampaignCognitoAuthorizer
+        Authorizers:
+          CampaignCognitoAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              audience:
+                - !Ref CampaignUserPoolClient
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${CampaignUserPool}'
+
+  # ===========================================================================
+  # Delivery status callback wiring (EventBridge -> DynamoDB)
+  # ===========================================================================
+
+  DeliveryStatusProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-delivery-processor-${Environment}'
+      InlineCode: |
+        def lambda_handler(event, context):
+            return {"statusCode": 200}
+      Handler: index.lambda_handler
+      Description: Update delivery tracking when AWS End User Messaging emits status events
+      MemorySize: 256
+      Timeout: 30
+      Environment:
+        Variables:
+          DELIVERY_TRACKING_TABLE: !Ref DeliveryTrackingTable
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - DynamoDBCrudPolicy:
+            TableName: !Ref DeliveryTrackingTable
+        - Statement:
+            - Effect: Allow
+              Action: ['kms:Decrypt', 'kms:GenerateDataKey']
+              Resource: !GetAtt AppKmsKey.Arn
+      Events:
+        SmsDeliveryStatus:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: ['aws.end-user-messaging']
+              detail-type: ['SMS Delivery Status']
+        WhatsAppDeliveryStatus:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: ['aws.end-user-messaging']
+              detail-type: ['WhatsApp Delivery Status']
+
+  # ===========================================================================
+  # Alarms
+  # ===========================================================================
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-alarms-${Environment}'
+      DisplayName: !Sub '${ProjectName} alarms (${Environment})'
+      KmsMasterKeyId: !Ref AppKmsKey
+
+  StateMachineFailedExecutionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-orchestrator-failures-${Environment}'
+      AlarmDescription: Campaign orchestrator executions are failing
+      AlarmActions: [!Ref AlarmTopic]
+      MetricName: ExecutionsFailed
+      Namespace: AWS/States
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref CampaignStateMachine
+
+Outputs:
+  CampaignApiEndpoint:
+    Description: HTTP API endpoint for launching campaigns (POST /campaigns)
+    Value: !Sub 'https://${CampaignApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/campaigns'
+
+  UserPoolId:
+    Description: Cognito user pool that authenticates campaign launcher requests
+    Value: !Ref CampaignUserPool
+
+  UserPoolClientId:
+    Description: Cognito app client used to obtain access tokens for the API
+    Value: !Ref CampaignUserPoolClient
+
+  StateMachineArn:
+    Description: Step Functions state machine ARN
+    Value: !Ref CampaignStateMachine
+
+  CustomerProfilesTableName:
+    Description: DynamoDB table for customer profiles
+    Value: !Ref CustomerProfilesTable
+
+  DeliveryTrackingTableName:
+    Description: DynamoDB table for delivery tracking
+    Value: !Ref DeliveryTrackingTable
+
+  CampaignAssetsBucketName:
+    Description: S3 bucket for campaign assets
+    Value: !Ref CampaignAssetsBucket
+
+  AlarmTopicArn:
+    Description: SNS topic for orchestrator alarms (subscribe your email)
+    Value: !Ref AlarmTopic
+
+  VectorCollectionEndpoint:
+    Condition: SemanticSearchEnabled
+    Description: OpenSearch Serverless Vector search collection endpoint (set on seeder)
+    Value: !GetAtt VectorCollection.CollectionEndpoint
+
+  VectorIndexName:
+    Condition: SemanticSearchEnabled
+    Description: Index name expected by the segment Lambda and seeder
+    Value: !Sub '${ProjectName}-customers-${Environment}'

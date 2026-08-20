@@ -1,0 +1,436 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Configures the Method AWS Integration for security posture evaluation
+
+Parameters:
+  MethodClientId:
+    Description: >-
+      OAuth2 Client ID for the Method platform (obtain from Method dashboard)
+    Type: String
+    NoEcho: true
+  MethodClientSecret:
+    Description: >-
+      OAuth2 Client Secret for the Method platform (obtain from Method dashboard)
+    Type: String
+    NoEcho: true
+  MethodDomain:
+    Description: >-
+      Domain for the Method platform (do not include 'https://')
+    Type: String
+  ProviderName:
+    Description: >-
+      Name for the provider in Method platform (leave empty for default)
+    Type: String
+    Default: Method AWS Integration
+  IAMRoleName:
+    Description: Customize the name of IAM role for Method AWS integration
+    Type: String
+    Default: MethodIntegrationRole
+  MethodAWSAccountId:
+    Description: Method's AWS Account ID that will assume this role
+    Type: String
+    Default: "340350203523"
+
+Resources:
+  # Lambda execution role for Method API handler
+  MethodAPIHandlerLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  # Custom resource to register with Method platform and get external ID
+  MethodAWSAccountIntegration:
+    Type: "Custom::MethodAWSAccountIntegration"
+    Properties:
+      ServiceToken: !GetAtt MethodAPICallFunction.Arn
+      ClientId: !Ref MethodClientId
+      ClientSecret: !Ref MethodClientSecret
+      MethodDomain: !Ref MethodDomain
+      ProviderName: !Ref ProviderName
+      IAMRoleName: !Ref IAMRoleName
+      AccountId: !Ref AWS::AccountId
+      AWSPartition: !Ref AWS::Partition
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+  # Lambda function for Method API integration
+  MethodAPICallFunction:
+    Type: "AWS::Lambda::Function"
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+    Properties:
+      Description: "A function to generate external ID for Method AWS integration."
+      Role: !GetAtt MethodAPIHandlerLambdaExecutionRole.Arn
+      Handler: "index.handler"
+      Runtime: "python3.11"
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import logging
+          import urllib.request
+          import urllib.error
+          import urllib.parse
+          import cfnresponse
+
+          LOGGER = logging.getLogger()
+          LOGGER.setLevel(logging.INFO)
+
+          def get_oauth_token(method_domain, client_id, client_secret):
+              """Get OAuth2 access token using client credentials (form-encoded)."""
+              url = f"https://{method_domain}/method-api-gateway/api/auth/getToken"
+
+              form = {
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "grant_type": "client_credentials",
+              }
+
+              data = urllib.parse.urlencode(form).encode("utf-8")
+              headers = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+              }
+
+              try:
+                  req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      response_body = response.read().decode('utf-8')
+                      response_data = json.loads(response_body)
+                      access_token = response_data.get("access_token", "")
+
+                      if not access_token:
+                          raise Exception("No access token received from OAuth2 endpoint")
+
+                      LOGGER.info("Successfully obtained OAuth2 access token")
+                      return access_token
+              except urllib.error.HTTPError as e:
+                  error_body = e.read().decode('utf-8') if e.fp else "No error details"
+                  LOGGER.error(f"OAuth2 HTTP Error {e.code}: {error_body}")
+                  raise Exception(f"OAuth2 token request failed with HTTP {e.code}: {error_body}")
+              except Exception as e:
+                  LOGGER.error(f"OAuth2 request failed: {str(e)}")
+                  raise
+
+          def register_provider_with_method(method_domain, auth_token, provider_name, role_arn):
+              """Register AWS provider with Method platform"""
+              url = f"https://{method_domain}/cloud-credentials/api/provider/register"
+
+              payload = {
+                  "metadata": {
+                      "name": provider_name
+                  },
+                  "provider": {
+                      "type": "aws",
+                      "aws": {
+                          "arn": role_arn
+                      }
+                  }
+              }
+
+              data = json.dumps(payload).encode('utf-8')
+              headers = {
+                  'Content-Type': 'application/json',
+                  'Authorization': f'Bearer {auth_token}'
+              }
+
+              try:
+                  req = urllib.request.Request(url, data=data, headers=headers, method='PUT')
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      response_body = response.read().decode('utf-8')
+                      response_data = json.loads(response_body)
+                      LOGGER.info(f"Method API response: {response_data}")
+                      return response_data
+              except urllib.error.HTTPError as e:
+                  error_body = e.read().decode('utf-8') if e.fp else "No error details"
+                  LOGGER.error(f"HTTP Error {e.code}: {error_body}")
+                  raise Exception(f"Method API call failed with HTTP {e.code}: {error_body}")
+              except Exception as e:
+                  LOGGER.error(f"Request failed: {str(e)}")
+                  raise
+
+          def delete_provider_from_method(method_domain, auth_token, role_arn):
+              """Delete AWS provider from Method platform. This is best effort and will not fail the stack set operation."""
+              url = f"https://{method_domain}/cloud-credentials/api/provider/delete"
+
+              payload = {
+                  "type": "aws",
+                  "aws": {
+                      "arn": role_arn
+                  }
+              }
+              data = json.dumps(payload).encode('utf-8')
+              headers = {
+                  'Content-Type': 'application/json',
+                  'Authorization': f'Bearer {auth_token}'
+              }
+
+              try:
+                  LOGGER.info(f"Deleting provider from Method platform: {url} with payload: {payload}")
+                  req = urllib.request.Request(url, data=data, headers=headers, method='DELETE')
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      response_body = response.read().decode('utf-8')
+                      response_data = json.loads(response_body)
+                      LOGGER.info(f"Method API response: {response_data}")
+                      return response_data
+              except urllib.error.HTTPError as e:
+                  error_body = e.read().decode('utf-8') if e.fp else "No error details"
+                  LOGGER.error(f"HTTP Error {e.code}: {error_body}")
+                  return
+              except Exception as e:
+                  LOGGER.error(f"Request failed: {str(e)}")
+                  return
+
+          def update_provider_in_method(method_domain, auth_token, provider_name, role_arn):
+              """Update AWS provider in Method platform. This is best effort and will not fail the stack set operation."""
+              url = f"https://{method_domain}/cloud-credentials/api/provider/update"
+
+              payload = {
+                  "type": "aws",
+                  "aws": {
+                      "arn": role_arn
+                  }
+              }
+              data = json.dumps(payload).encode('utf-8')
+              headers = {
+                  'Content-Type': 'application/json',
+                  'Authorization': f'Bearer {auth_token}'
+              }
+
+              try:
+                  LOGGER.info(f"Updating provider in Method platform: {url} with payload: {payload}")
+                  req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      response_body = response.read().decode('utf-8')
+                      response_data = json.loads(response_body)
+                      LOGGER.info(f"Method API response: {response_data}")
+                      return response_data
+              except urllib.error.HTTPError as e:
+                  error_body = e.read().decode('utf-8') if e.fp else "No error details"
+                  LOGGER.error(f"HTTP Error {e.code}: {error_body}")
+                  return
+              except Exception as e:
+                  LOGGER.error(f"Request failed: {str(e)}")
+                  return
+
+          def handler(event, context):
+              """Handle Lambda event from AWS CloudFormation"""
+              external_id = ""
+              provider_id = ""
+              provider_name = ""
+              account_id = ""
+
+              try:
+                  request_type = event["RequestType"]
+                  LOGGER.info(f"Received {request_type} request.")
+
+                  properties = event["ResourceProperties"]
+                  client_id = properties.get("ClientId", "")
+                  client_secret = properties.get("ClientSecret", "")
+                  method_domain = properties.get("MethodDomain", "")
+                  provider_name = properties.get("ProviderName", "")
+                  iam_role_name = properties.get("IAMRoleName", "")
+                  account_id = properties.get("AccountId", "")
+                  aws_partition = properties.get("AWSPartition", "aws")
+
+                  # Construct the role ARN from the role name
+                  role_arn = f"arn:{aws_partition}:iam::{account_id}:role/{iam_role_name}"
+
+                  if request_type == "Create":
+                      # Validate required parameters
+                      if not all([client_id, client_secret, method_domain, iam_role_name]):
+                          raise Exception("Missing required parameters: ClientId, ClientSecret, MethodDomain, and IAMRoleName are required")
+
+                      # Set default provider name if not provided
+                      if not provider_name:
+                          provider_name = f"Method AWS Integration Account {account_id}"
+
+                      # Get OAuth2 access token
+                      LOGGER.info("Obtaining OAuth2 access token")
+                      access_token = get_oauth_token(method_domain, client_id, client_secret)
+
+                      # Register with Method platform using the access token
+                      LOGGER.info(f"Registering provider '{provider_name}' with Method platform")
+                      response_data = register_provider_with_method(method_domain, access_token, provider_name, role_arn)
+
+                      # Extract external ID from response
+                      external_id = response_data.get("registration", {}).get("aws", {}).get("externalId", "")
+                      provider_id = response_data.get("provider", {}).get("id", "")
+
+                      if not external_id:
+                          raise Exception("No external ID received from Method platform")
+
+                      LOGGER.info(f"Successfully registered with Method. Provider ID: {provider_id}, External ID: {external_id[:8]}...")
+
+                      # Return success with external ID and other data
+                      cfResponse = {
+                          "Message": f"Method AWS Integration {request_type} request was successful.",
+                          "ExternalId": external_id,
+                          "AccountId": account_id,
+                          "ProviderId": provider_id,
+                          "ProviderName": provider_name
+                      }
+
+                  elif request_type == "Update":
+                      # For updates, update the provider in Method platform
+                      LOGGER.info("Update operation - updating provider in Method platform")
+                      # Get OAuth2 access token
+                      access_token = get_oauth_token(method_domain, client_id, client_secret)
+                      update_provider_in_method(method_domain, access_token, provider_name, role_arn)
+                      cfResponse = {
+                          "Message": "Method AWS Integration Update request was successful.",
+                          "ExternalId": "",
+                          "AccountId": account_id,
+                          "ProviderId": "",
+                          "ProviderName": provider_name
+                      }
+
+                  elif request_type == "Delete":
+                      # For deletes, delete the provider from Method platform
+                      LOGGER.info("Delete operation - deleting provider from Method platform")
+                      # Get OAuth2 access token
+                      access_token = get_oauth_token(method_domain, client_id, client_secret)
+                      delete_provider_from_method(method_domain, access_token, role_arn)
+
+                      cfResponse = {
+                          "Message": "Method AWS Integration Delete request was successful.",
+                          "ExternalId": "",
+                          "AccountId": account_id,
+                          "ProviderId": "",
+                          "ProviderName": provider_name
+                      }
+
+                  else:
+                      LOGGER.error("Received unexpected request type.")
+                      cfResponse = {"Message": f"Received unexpected request type: {request_type}"}
+                      cfnresponse.send(
+                          event,
+                          context,
+                          "FAILED",
+                          responseData=cfResponse,
+                          reason=json.dumps(cfResponse),
+                      )
+                      return
+
+                  # Return success
+                  LOGGER.info(f"Success - Method integration {request_type} completed.")
+                  cfnresponse.send(
+                      event,
+                      context,
+                      "SUCCESS",
+                      responseData=cfResponse,
+                  )
+
+              except Exception as e:
+                  LOGGER.error(f"Failed - exception thrown during processing: {e}")
+                  cfResponse = {"Message": f"Exception during processing: {e}"}
+                  cfnresponse.send(
+                      event,
+                      context,
+                      "FAILED",
+                      responseData=cfResponse,
+                      reason=json.dumps(cfResponse),
+                  )
+
+  # IAM role for cross-account access from Method platform
+  MethodIntegrationRole:
+    Type: "AWS::IAM::Role"
+    DependsOn: MethodAWSAccountIntegration
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${MethodAWSAccountId}:root"
+            Action:
+              - "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "sts:ExternalId": !GetAtt MethodAWSAccountIntegration.ExternalId
+      Path: /
+      RoleName: !Ref IAMRoleName
+      ManagedPolicyArns:
+        - !Sub "arn:${AWS::Partition}:iam::aws:policy/SecurityAudit"
+      Tags:
+        - Key: "Purpose"
+          Value: "MethodSecurityIntegration"
+        - Key: "CreatedBy"
+          Value: "MethodCloudFormation"
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+
+Outputs:
+  MethodIntegrationRoleArn:
+    Description: ARN of the Method Integration Role
+    Value: !GetAtt MethodIntegrationRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-MethodIntegrationRoleArn"
+
+  ExternalId:
+    Description: External ID for cross-account access from Method platform
+    Value: !GetAtt MethodAWSAccountIntegration.ExternalId
+    Export:
+      Name: !Sub "${AWS::StackName}-ExternalId"
+
+  ProviderId:
+    Description: Provider ID assigned by Method platform
+    Value: !GetAtt MethodAWSAccountIntegration.ProviderId
+    Export:
+      Name: !Sub "${AWS::StackName}-ProviderId"
+
+  ProviderName:
+    Description: Provider name registered with Method platform
+    Value: !GetAtt MethodAWSAccountIntegration.ProviderName
+    Export:
+      Name: !Sub "${AWS::StackName}-ProviderName"
+
+  RoleName:
+    Description: Name of the Method Integration Role
+    Value: !Ref MethodIntegrationRole
+    Export:
+      Name: !Sub "${AWS::StackName}-RoleName"
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Required"
+        Parameters:
+          - MethodClientId
+          - MethodClientSecret
+          - MethodDomain
+      - Label:
+          default: "Optional"
+        Parameters:
+          - ProviderName
+      - Label:
+          default: "Advanced"
+        Parameters:
+          - IAMRoleName
+          - MethodAWSAccountId
+    ParameterLabels:
+      MethodClientId:
+        default: "Method OAuth2 Client ID *"
+      MethodClientSecret:
+        default: "Method OAuth2 Client Secret *"
+      MethodDomain:
+        default: "Method Platform Domain *"
+      ProviderName:
+        default: "Method Cloud Credentials Provider Name"
+      IAMRoleName:
+        default: "IAM Role Name"
+      MethodAWSAccountId:
+        default: "Method AWS Account ID"

@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Smart-Hospital data pipeline scaffolding for the Cloud Computing & Big Data S3
+  final project. Provisions one S3 data-lake bucket, a Glue database + crawler
+  (with its own IAM role), an Athena workgroup with a fixed result location, and
+  five pre-loaded saved queries (1 ETL CTAS + 4 analytics). After deploy you only
+  need to: (1) upload admissions.csv and vitals.jsonl, (2) run the crawler,
+  (3) run the saved queries.
+
+Parameters:
+  ProjectTag:
+    Type: String
+    Default: smart-hospital
+    Description: Tag applied to all resources.
+
+Resources:
+
+  # ------------------------------------------------------------------
+  # 1. S3 data-lake bucket. Name includes the account ID so it is
+  #    globally unique without you guessing. The Bronze/Silver/Gold
+  #    "zones" are just key prefixes created when objects are written.
+  # ------------------------------------------------------------------
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${ProjectTag}-${AWS::AccountId}-data"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  # ------------------------------------------------------------------
+  # 2. Glue Data Catalog database (your single Athena database).
+  # ------------------------------------------------------------------
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: hospital_db
+        Description: Catalog for synthetic smart-hospital data.
+
+  # ------------------------------------------------------------------
+  # 3. IAM role the crawler assumes. AWS managed Glue policy covers the
+  #    catalog + logs; the inline policy grants read on THIS bucket
+  #    (the managed policy only covers buckets named aws-glue-*).
+  # ------------------------------------------------------------------
+  CrawlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectTag}-glue-crawler-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: read-data-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt DataBucket.Arn
+                  - !Sub "${DataBucket.Arn}/*"
+
+  # ------------------------------------------------------------------
+  # 4. Crawler over the Bronze zone. Creates one table per subfolder
+  #    (admissions, vitals). CFN creates it; you press "Run" once.
+  # ------------------------------------------------------------------
+  BronzeCrawler:
+    Type: AWS::Glue::Crawler
+    Properties:
+      Name: hospital-bronze-crawler
+      Role: !GetAtt CrawlerRole.Arn
+      DatabaseName: !Ref GlueDatabase
+      Targets:
+        S3Targets:
+          - Path: !Sub "s3://${DataBucket}/bronze/"
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: LOG
+
+  # ------------------------------------------------------------------
+  # 5. Athena workgroup with a fixed result location -> no manual
+  #    "set output location" step before querying.
+  # ------------------------------------------------------------------
+  AnalyticsWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: hospital-wg
+      State: ENABLED
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: false
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataBucket}/athena-results/"
+
+  # ------------------------------------------------------------------
+  # 6. Saved queries. They appear under Athena > Saved queries, ready
+  #    to click+Run during the demo.
+  # ------------------------------------------------------------------
+  QueryEtlSilver:
+    Type: AWS::Athena::NamedQuery
+    DependsOn: AnalyticsWorkGroup
+    Properties:
+      Name: 00_ETL_admissions_to_parquet_silver
+      Database: hospital_db
+      WorkGroup: hospital-wg
+      Description: Bronze CSV -> partitioned Parquet in the Silver zone.
+      QueryString: !Sub |
+        CREATE TABLE hospital_db.admissions_silver
+        WITH (format='PARQUET', parquet_compression='SNAPPY',
+              external_location='s3://${DataBucket}/silver/admissions/',
+              partitioned_by=ARRAY['department']) AS
+        SELECT admission_id, patient_id,
+               CAST(admission_datetime AS timestamp) AS admission_ts,
+               CAST(discharge_datetime AS timestamp) AS discharge_ts,
+               wait_time_minutes, length_of_stay_hours, severity, age, sex,
+               readmitted_30d, adm_date, department
+        FROM hospital_db.admissions;
+
+  QueryWaitByDept:
+    Type: AWS::Athena::NamedQuery
+    DependsOn: AnalyticsWorkGroup
+    Properties:
+      Name: 01_avg_wait_by_department
+      Database: hospital_db
+      WorkGroup: hospital-wg
+      QueryString: |
+        SELECT department, ROUND(AVG(wait_time_minutes),1) AS avg_wait_min,
+               COUNT(*) AS admissions
+        FROM hospital_db.admissions_silver
+        GROUP BY department ORDER BY avg_wait_min DESC;
+
+  QueryDailyTrend:
+    Type: AWS::Athena::NamedQuery
+    DependsOn: AnalyticsWorkGroup
+    Properties:
+      Name: 02_daily_admissions_and_los
+      Database: hospital_db
+      WorkGroup: hospital-wg
+      QueryString: |
+        SELECT adm_date, COUNT(*) AS admissions,
+               ROUND(AVG(length_of_stay_hours),1) AS avg_los_h
+        FROM hospital_db.admissions_silver
+        GROUP BY adm_date ORDER BY adm_date;
+
+  QueryReadmission:
+    Type: AWS::Athena::NamedQuery
+    DependsOn: AnalyticsWorkGroup
+    Properties:
+      Name: 03_readmission_by_dept_severity
+      Database: hospital_db
+      WorkGroup: hospital-wg
+      QueryString: |
+        SELECT department, severity,
+               ROUND(AVG(readmitted_30d)*100,1) AS readmit_pct, COUNT(*) AS n
+        FROM hospital_db.admissions_silver
+        GROUP BY department, severity ORDER BY department, severity;
+
+  QueryVitalsRisk:
+    Type: AWS::Athena::NamedQuery
+    DependsOn: AnalyticsWorkGroup
+    Properties:
+      Name: 04_iot_vitals_risk_by_department
+      Database: hospital_db
+      WorkGroup: hospital-wg
+      QueryString: |
+        SELECT department,
+               COUNT_IF(spo2<90 OR heart_rate>130 OR temperature>38.5
+                        OR systolic_bp>160) AS critical_readings,
+               COUNT(*) AS total_readings,
+               ROUND(100.0*COUNT_IF(spo2<90 OR heart_rate>130 OR temperature>38.5
+                        OR systolic_bp>160)/COUNT(*),2) AS critical_pct
+        FROM hospital_db.vitals
+        GROUP BY department ORDER BY critical_pct DESC;
+
+Outputs:
+  BucketName:
+    Description: Upload admissions.csv to bronze/admissions/ and vitals.jsonl to bronze/vitals/ in this bucket.
+    Value: !Ref DataBucket
+  CrawlerName:
+    Description: Run this crawler after uploading the files.
+    Value: !Ref BronzeCrawler
+  WorkGroup:
+    Description: Select this workgroup in the Athena console before running saved queries.
+    Value: !Ref AnalyticsWorkGroup

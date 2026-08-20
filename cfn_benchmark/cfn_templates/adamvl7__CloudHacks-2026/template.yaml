@@ -1,0 +1,453 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  EcoShift Workload Scheduler - carbon-aware serverless auto-scaler for AWS Batch.
+  Shifts compute workloads to times when the local grid is greener.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 60
+    MemorySize: 256
+    Architectures: [arm64]
+    Tracing: Active
+    LoggingConfig:
+      LogFormat: JSON
+
+Parameters:
+  GridZone:
+    Type: String
+    Default: US-CAL-CISO
+    Description: ElectricityMaps zone code for the AWS region's grid (e.g. US-CAL-CISO for California).
+  GreenThresholdGCO2:
+    Type: Number
+    Default: 250
+    Description: Carbon intensity threshold in gCO2/kWh. Below = green (scale up), above = dirty (scale down).
+  MaxVcpusGreen:
+    Type: Number
+    Default: 16
+    Description: vCPUs to provision for the Batch compute env during green windows.
+  MaxVcpusDirty:
+    Type: Number
+    Default: 0
+    Description: vCPUs to provision during dirty windows (0 = full pause, jobs queue).
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-sonnet-4-5-20250929-v1:0
+    Description: Bedrock Claude model ID for narrative summaries (direct foundation-model ID, no marketplace subscription required).
+  ReportEmail:
+    Type: String
+    Description: Email address (SES-verified) to receive the daily sustainability report.
+  MockCarbon:
+    Type: String
+    Default: '1'
+    AllowedValues: ['0', '1']
+    Description: '1 = use mock CAISO fixture (no ElectricityMaps key needed). 0 = call real API.'
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC for the AWS Batch Fargate compute environment (default VPC is fine).
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnet IDs for the Batch Fargate compute environment.
+
+Resources:
+
+  # ---------------- DynamoDB ----------------
+  DecisionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: ecoshift-decisions
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  # ---------------- Reports archive ----------------
+  ReportsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ecoshift-reports-${AWS::AccountId}-${AWS::Region}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  # ---------------- Dashboard hosting ----------------
+  DashboardBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ecoshift-dashboard-${AWS::AccountId}-${AWS::Region}
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  DashboardBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DashboardBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal: {Service: cloudfront.amazonaws.com}
+            Action: s3:GetObject
+            Resource: !Sub ${DashboardBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${DashboardDistribution}
+
+  DashboardOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ecoshift-dashboard-oac-${AWS::StackName}
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  DashboardDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: S3Dashboard
+            DomainName: !GetAtt DashboardBucket.RegionalDomainName
+            S3OriginConfig: {OriginAccessIdentity: ''}
+            OriginAccessControlId: !GetAtt DashboardOAC.Id
+        DefaultCacheBehavior:
+          TargetOriginId: S3Dashboard
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # CachingOptimized
+          Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  # ---------------- SES verified identity ----------------
+  ReportEmailIdentity:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref ReportEmail
+
+  # ---------------- AWS Batch (Fargate) ----------------
+  BatchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EcoShift Batch Fargate egress
+      VpcId: !Ref VpcId
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+
+  BatchServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: batch.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole
+
+  BatchJobExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  BatchComputeEnv:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      ComputeEnvironmentName: ecoshift-jobs-ce
+      Type: MANAGED
+      State: ENABLED
+      ServiceRole: !GetAtt BatchServiceRole.Arn
+      ComputeResources:
+        Type: FARGATE
+        MaxvCpus: !Ref MaxVcpusGreen
+        Subnets: !Ref SubnetIds
+        SecurityGroupIds: [!Ref BatchSecurityGroup]
+
+  BatchJobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: ecoshift-jobs-queue
+      State: ENABLED
+      Priority: 1
+      ComputeEnvironmentOrder:
+        - Order: 1
+          ComputeEnvironment: !Ref BatchComputeEnv
+
+  BatchJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      JobDefinitionName: ecoshift-sample-job
+      Type: container
+      PlatformCapabilities: [FARGATE]
+      ContainerProperties:
+        Image: public.ecr.aws/amazonlinux/amazonlinux:2023
+        Command: ['sh', '-c', 'echo "EcoShift sample job running at $(date)"; sleep 30; echo done']
+        ResourceRequirements:
+          - {Type: VCPU, Value: '0.25'}
+          - {Type: MEMORY, Value: '512'}
+        ExecutionRoleArn: !GetAtt BatchJobExecutionRole.Arn
+        NetworkConfiguration: {AssignPublicIp: ENABLED}
+        FargatePlatformConfiguration: {PlatformVersion: LATEST}
+
+  # ---------------- Scheduler Lambda ----------------
+  SchedulerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecoshift-scheduler
+      CodeUri: lambdas/scheduler/
+      Handler: handler.lambda_handler
+      Timeout: 70
+      Environment:
+        Variables:
+          GRID_ZONE: !Ref GridZone
+          GREEN_THRESHOLD_GCO2: !Ref GreenThresholdGCO2
+          BATCH_COMPUTE_ENV: !Ref BatchComputeEnv
+          MAX_VCPUS_GREEN: !Ref MaxVcpusGreen
+          MAX_VCPUS_DIRTY: !Ref MaxVcpusDirty
+          DYNAMO_TABLE: !Ref DecisionsTable
+          MOCK_CARBON: !Ref MockCarbon
+          ELECTRICITYMAPS_SECRET_NAME: ecoshift/electricitymaps-api-key
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref DecisionsTable}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - batch:UpdateComputeEnvironment
+                - batch:DescribeComputeEnvironments
+              Resource: '*'
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:ecoshift/electricitymaps-api-key-*
+      Events:
+        EveryMinute:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: rate(1 minute)
+            Description: EcoShift decision tick - runs twice per invocation for 30s resolution
+
+  # ---------------- Reporter Lambda ----------------
+  ReporterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecoshift-reporter
+      CodeUri: lambdas/reporter/
+      Handler: handler.lambda_handler
+      Timeout: 120
+      MemorySize: 512
+      Environment:
+        Variables:
+          DYNAMO_TABLE: !Ref DecisionsTable
+          REPORTS_BUCKET: !Ref ReportsBucket
+          BEDROCK_MODEL_ID: !Ref BedrockModelId
+          REPORT_EMAIL: !Ref ReportEmail
+          GREEN_THRESHOLD_GCO2: !Ref GreenThresholdGCO2
+          MAX_VCPUS_GREEN: !Ref MaxVcpusGreen
+          MAX_VCPUS_DIRTY: !Ref MaxVcpusDirty
+          REGION: !Ref AWS::Region
+          ELECTRICITYMAPS_SECRET_NAME: ecoshift/electricitymaps-api-key
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref DecisionsTable}
+        - S3WritePolicy: {BucketName: !Ref ReportsBucket}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+                - bedrock:Converse
+              Resource:
+                - !Sub arn:aws:bedrock:${AWS::Region}::foundation-model/${BedrockModelId}
+                - !Sub arn:aws:bedrock:*::foundation-model/${BedrockModelId}
+                - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockModelId}
+                - arn:aws:bedrock:*::foundation-model/amazon.*
+                - arn:aws:bedrock:*:*:inference-profile/*
+            - Effect: Allow
+              Action:
+                - aws-marketplace:ViewSubscriptions
+                - aws-marketplace:Subscribe
+                - aws-marketplace:Unsubscribe
+              Resource: '*'
+            - Effect: Allow
+              Action: ses:SendEmail
+              Resource: '*'
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:ecoshift/electricitymaps-api-key-*
+      Events:
+        DailyMidnightUTC:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: cron(0 0 * * ? *)
+            ScheduleExpressionTimezone: UTC
+            Description: EcoShift daily sustainability report at midnight UTC
+        GenerateSummary:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /summary/generate
+            Method: POST
+
+  # ---------------- Dashboard API Lambda ----------------
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: ecoshift-api
+      CodeUri: lambdas/api/
+      Handler: handler.lambda_handler
+      Environment:
+        Variables:
+          DYNAMO_TABLE: !Ref DecisionsTable
+          GREEN_THRESHOLD_GCO2: !Ref GreenThresholdGCO2
+          GRID_ZONE: !Ref GridZone
+          MAX_VCPUS_GREEN: !Ref MaxVcpusGreen
+          MAX_VCPUS_DIRTY: !Ref MaxVcpusDirty
+          ELECTRICITYMAPS_SECRET_NAME: ecoshift/electricitymaps-api-key
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref DecisionsTable}
+        - Statement:
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Sub arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:ecoshift/electricitymaps-api-key-*
+      Events:
+        GetDecisions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /decisions
+            Method: GET
+        GetLatestSummary:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /summary/latest
+            Method: GET
+        GetSummaries:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /summaries
+            Method: GET
+        GetCurrent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /current
+            Method: GET
+        GetRegions:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /regions
+            Method: GET
+        GetGridCurrent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /grid/current
+            Method: GET
+        GetGridHistory:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /grid/history
+            Method: GET
+        GetPowerBreakdown:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /power-breakdown
+            Method: GET
+        GetForecast:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /forecast
+            Method: GET
+        GetRegionCompare:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DashboardApi
+            Path: /region-compare
+            Method: GET
+
+  DashboardApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: ['*']
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: ['*']
+
+Outputs:
+  DashboardUrl:
+    Description: CloudFront URL for the React dashboard
+    Value: !Sub https://${DashboardDistribution.DomainName}
+  DashboardDistributionId:
+    Description: CloudFront distribution ID for dashboard invalidations
+    Value: !Ref DashboardDistribution
+  DashboardBucketName:
+    Description: S3 bucket to sync the built frontend into
+    Value: !Ref DashboardBucket
+  ApiBaseUrl:
+    Description: Base URL for the dashboard API (set as VITE_API_BASE_URL at build time)
+    Value: !Sub https://${DashboardApi}.execute-api.${AWS::Region}.amazonaws.com
+  BatchComputeEnvName:
+    Description: AWS Batch compute environment name (controlled by EcoShift)
+    Value: !Ref BatchComputeEnv
+  BatchJobQueueName:
+    Description: Submit test jobs to this queue
+    Value: !Ref BatchJobQueue
+  BatchJobDefinitionName:
+    Description: Sample Batch job definition
+    Value: !Ref BatchJobDefinition
+  DecisionsTableName:
+    Value: !Ref DecisionsTable
+  ReportsBucketName:
+    Value: !Ref ReportsBucket

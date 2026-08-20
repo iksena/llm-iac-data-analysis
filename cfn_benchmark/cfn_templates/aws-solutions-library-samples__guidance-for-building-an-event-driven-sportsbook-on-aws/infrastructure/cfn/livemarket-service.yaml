@@ -1,0 +1,370 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+
+Globals:
+
+  Function:
+    Runtime: python3.12
+    Tracing: Active
+    Layers:
+      - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python312-x86_64:10
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: livemarket
+
+Parameters:
+
+  AppSyncApiId:
+    Type: String
+
+  AppSyncApiUrl:
+    Type: String
+
+  EventBus:
+    Type: String
+
+  AppSyncLambdaLayer:
+    Type: String
+
+  LambdaEnvKmsKeyArn:
+    Type: String
+    Default: ""
+    Description: ARN of the KMS key for Lambda environment variable encryption
+
+Resources:
+
+  LiveMarketDataStore:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: marketstatus.name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+      - IndexName: MarketStatusIndex
+        KeySchema:
+          - AttributeName: eventId
+            KeyType: HASH
+          - AttributeName: marketstatus.name
+            KeyType: RANGE
+        Projection:
+          ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+
+  LiveMarketHistoryStore:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+      KeySchema:
+        - AttributeName: eventId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: expiry
+        Enabled: true
+
+  SeedLambda:
+    Type: AWS::Serverless::Function
+    Description: Custom resource for seeding dynamo
+    Properties:
+      Handler: app.lambda_handler
+      CodeUri: ../lambda/livemarket/seed/
+      Timeout: 30
+      KmsKeyArn: !Ref LambdaEnvKmsKeyArn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LiveMarketDataStore
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:DescribeKey
+              Resource: !Ref LambdaEnvKmsKeyArn
+      Environment:
+        Variables:
+          DB_TABLE: !Ref LiveMarketDataStore
+
+  # This populates some initial data in our events table
+  LiveMarketDataSeed:
+    Type: Custom::Seed
+    Properties:
+      ServiceToken: !GetAtt SeedLambda.Arn
+
+  SQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        maxReceiveCount: 2
+        deadLetterTargetArn: !GetAtt DLQ.Arn
+
+  DLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Live market receiver for trading events"
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source:
+          - "com.trading"
+          - "com.thirdparty"
+      Targets:
+        - Arn: !GetAtt SQSQueue.Arn
+          Id: SQSqueue
+
+  EventBridgeToToSqsPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: events.amazonaws.com
+          Action: sqs:SendMessage
+          Resource:  !GetAtt SQSQueue.Arn
+          Condition:
+            StringEqualsIfExists:
+              aws:SourceAccount: !Ref AWS::AccountId
+            Bool:
+              aws:SecureTransport: "true"
+      Queues:
+        - Ref: SQSQueue
+
+  LiveMarketBatchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.lambda_handler
+      CodeUri: ../lambda/livemarket/receiver/
+      Description: Lambda for receiving events for this service
+      Timeout: 10
+      MemorySize: 256
+      KmsKeyArn: !Ref LambdaEnvKmsKeyArn
+      Layers:
+        - !Ref AppSyncLambdaLayer
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SQSQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+      DeadLetterQueue:
+        Type: SQS  # Can be SQS or SNS
+        TargetArn: !GetAtt DLQ.Arn
+      Policies:
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBus
+        - Statement:
+            - Effect: Allow
+              Action:
+                - appsync:GraphQL
+              Resource:
+                - !Sub arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncApiId}/types/Mutation/fields/updateEventOdds
+                - !Sub arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncApiId}/types/Mutation/fields/finishEvent
+                - !Sub arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncApiId}/types/Mutation/fields/suspendMarket
+                - !Sub arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncApiId}/types/Mutation/fields/unsuspendMarket
+                - !Sub arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncApiId}/types/Mutation/fields/addEvent
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:DescribeKey
+              Resource: !Ref LambdaEnvKmsKeyArn
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          APPSYNC_URL: !Ref AppSyncApiUrl
+          EVENT_BUS: !Ref EventBus
+
+  LiveMarketResolverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.lambda_handler
+      CodeUri: ../lambda/livemarket/resolvers/
+      Description: Lambda for AppSync resolvers
+      Timeout: 10
+      MemorySize: 256
+      KmsKeyArn: !Ref LambdaEnvKmsKeyArn
+      Policies:
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBus
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LiveMarketDataStore
+        - DynamoDBCrudPolicy:
+            TableName: !Ref LiveMarketHistoryStore
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:DescribeKey
+              Resource: !Ref LambdaEnvKmsKeyArn
+      Environment:
+        Variables:
+          DB_TABLE: !Ref LiveMarketDataStore
+          DB_HISTORY_TABLE: !Ref LiveMarketHistoryStore
+          ACCOUNT_ID: !Ref AWS::AccountId
+          APPSYNC_API_ID: !Ref AppSyncApiId
+          DB_HISTORY_RETENTION: 3600
+          EVENT_BUS: !Ref EventBus
+
+  LiveMarketAppSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-AppSyncRole
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt LiveMarketResolverFunction.Arn
+
+  LiveMarketLambdaDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      Name: LiveMarket_Lambda_Source
+      Description: Live Market Lambda AppSync Data Source
+      Type: AWS_LAMBDA
+      ServiceRoleArn: !GetAtt LiveMarketAppSyncRole.Arn
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt LiveMarketResolverFunction.Arn
+
+  GetEventsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      TypeName: Query
+      FieldName: getEvents
+      DataSourceName: !GetAtt LiveMarketLambdaDataSource.Name
+
+  GetEventResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      TypeName: Query
+      FieldName: getEvent
+      DataSourceName: !GetAtt LiveMarketLambdaDataSource.Name
+
+  UpdateEventOddsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      TypeName: Mutation
+      FieldName: updateEventOdds
+      DataSourceName: !GetAtt LiveMarketLambdaDataSource.Name
+
+  FinishEventResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      TypeName: Mutation
+      FieldName: finishEvent
+      DataSourceName: !GetAtt LiveMarketLambdaDataSource.Name
+
+  TriggerFinishEventResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      TypeName: Mutation
+      FieldName: triggerFinishEvent
+      DataSourceName: !GetAtt LiveMarketLambdaDataSource.Name
+
+  TriggerSuspendMarketResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      TypeName: Mutation
+      FieldName: triggerSuspendMarket
+      DataSourceName: !GetAtt LiveMarketLambdaDataSource.Name
+
+  TriggerUnsuspendMarketResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      TypeName: Mutation
+      FieldName: triggerUnsuspendMarket
+      DataSourceName: !GetAtt LiveMarketLambdaDataSource.Name
+
+  SuspendMarketResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      TypeName: Mutation
+      FieldName: suspendMarket
+      DataSourceName: !GetAtt LiveMarketLambdaDataSource.Name
+
+  UnsuspendMarketResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      TypeName: Mutation
+      FieldName: unsuspendMarket
+      DataSourceName: !GetAtt LiveMarketLambdaDataSource.Name
+
+  CloseMarketResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      TypeName: Mutation
+      FieldName: closeMarket
+      DataSourceName: !GetAtt LiveMarketLambdaDataSource.Name
+
+  AddEventsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      TypeName: Mutation
+      FieldName: addEvent
+      DataSourceName: !GetAtt LiveMarketLambdaDataSource.Name
+
+Outputs:
+  QueueName:
+    Description: SNS queue name
+    Value: !GetAtt SQSQueue.QueueName
+
+  QueueARN:
+    Description: SQS queue ARN
+    Value: !GetAtt SQSQueue.Arn
+
+  QueueURL:
+    Description: SQS queue URL
+    Value: !Ref SQSQueue
+
+  LiveMarketDataStoreName:
+    Description: Live market data store name
+    Value: !Ref LiveMarketDataStore

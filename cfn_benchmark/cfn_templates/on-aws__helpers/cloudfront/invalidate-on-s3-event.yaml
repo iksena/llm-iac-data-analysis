@@ -1,0 +1,211 @@
+Description: >
+  Create Amazon CloudFront invalidation on Amazon S3 event notifications.
+  This template deploys AWS Lambda which can be used as a target for Amazon S3 event notifications.
+
+Resources:
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 30
+
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          Effect: Allow
+          Action:
+            - sqs:SendMessage
+          Principal:
+            AWS: !Ref AWS::AccountId
+            Service:
+              - s3.amazonaws.com
+          Resource: !GetAtt Queue.Arn
+      Queues:
+        - !Ref Queue
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSLambdaExecute
+        - arn:aws:iam::aws:policy/CloudFrontFullAccess
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+
+  Invalidator:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: nodejs12.x
+      Timeout: 15
+      ReservedConcurrentExecutions: 100
+      Code:
+        ZipFile: |
+          'use strict';
+          const AWS = require('aws-sdk');
+          const cloudfront = new AWS.CloudFront({apiVersion: '2019-03-26'});
+          const lambda = new AWS.Lambda();
+          exports.handler = async (event, context) => {
+            console.log(JSON.stringify(event));
+            const { Distribution, S3Objects, Origin, PathPattern } = event;
+            const Bucket = Object.keys(S3Objects)[0];
+            if (Origin === undefined) {
+              const Origins = Distribution.Origins.Items.filter(o => o.DomainName === Bucket + '.s3.amazonaws.com');
+              if (Origins.length === 0) return;
+              return Promise.all(Origins.map((x) => {
+                event.Origin = { Id: x.Id, Path: x.OriginPath };
+                return lambda.invoke({
+                  FunctionName: context.functionName,
+                  InvocationType: 'RequestResponse',
+                  Payload: JSON.stringify(event)
+                }).promise();
+              }));
+            } else if (PathPattern === undefined) {
+              const Behaviors = Distribution.CacheBehaviors.Items.filter(x => x.TargetOriginId === Origin.Id);
+              if (Distribution.DefaultCacheBehavior.TargetOriginId == Origin.Id) Behaviors.push({ PathPattern: '/' });
+              if (Behaviors.length === 0) return;
+              return Promise.all(Behaviors.map((x) => {
+                event.PathPattern = x.PathPattern;
+                return lambda.invoke({
+                  FunctionName: context.functionName,
+                  InvocationType: 'RequestResponse',
+                  Payload: JSON.stringify(event)
+                }).promise();
+              }));
+            } else {
+              console.log('Distribution', Distribution.Id);
+              console.log({ PathPattern });
+              console.log('Origin.Path', Origin.Path);
+              const Items = S3Objects[Bucket].filter(x => addTrailingSlash(x).startsWith(Origin.Path)).map(x => addTrailingSlash(x).replace(Origin.Path, PathPattern !== '/' ? PathPattern : ''));
+              return createInvalidations(Distribution.Id, Items);
+            }
+          };
+
+          async function createInvalidations(DistributionId, Items) {
+            console.log({ Items });
+            if (Items.length === 0) return;
+            const params = {
+              DistributionId,
+              InvalidationBatch: {
+                CallerReference: new Date().getTime().toString(),
+                Paths: {
+                  Quantity: Items.length,
+                  Items
+                }
+              }
+            };
+            return cloudfront.createInvalidation(params).promise();
+          }
+
+          function addTrailingSlash(string) {
+            if (string.charAt(0) === '/') return string;
+            return '/' + string;
+          }
+
+  InvalidatorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Invalidator}
+      RetentionInDays: 7
+
+  Launcher:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: nodejs12.x
+      Timeout: 20
+      ReservedConcurrentExecutions: 1
+      Code:
+        ZipFile: !Sub |
+          'use strict';
+          const AWS = require('aws-sdk');
+          const cloudfront = new AWS.CloudFront({apiVersion: '2019-03-26'});
+          const lambda = new AWS.Lambda();
+          var DistributionList = []; // we cache DistributionList to avoid throttling
+          exports.handler = async (event, context) => {
+            console.log(JSON.stringify(event));
+            const { Records } = event;
+            const S3Objects = getS3Objects(Records);
+            if (Object.keys(S3Objects).length === 0) return;                   // s3:TestEvent
+            if (Object.keys(S3Objects).length > 1) throw Error('UNSUPPORTED'); // Is it possible to receive events from multiple S3 in a single SQS payload?
+            const Bucket = Object.keys(S3Objects)[0];
+            const Distributions = await getDistributions(Bucket);
+            if (Distributions.length === 0) return;
+            return Promise.all(Distributions.map(d => invalidateDistribution(d, S3Objects)));
+          };
+
+          var groupByBucket = function(xs) {
+            return xs.reduce((rv, x) => {
+              (rv[x['bucket']] = rv[x['bucket']] || []).push(x.key);
+              return rv;
+            }, {});
+          };
+
+          function getS3Objects(Records) {
+            let result = [];
+            Records.forEach((r) => {
+              let innerRecords = JSON.parse(r.body).Records;
+              if (innerRecords) {
+                result = result.concat(innerRecords.filter(e => e.Event !== 's3:TestEvent' && e.eventSource === 'aws:s3')
+                  .map((o) => {
+                    return { bucket: o.s3.bucket.name, key: o.s3.object.key };
+                  })
+                );
+              }
+            });
+            return groupByBucket(result);
+          }
+
+          async function getDistributions(Bucket) {
+            if (DistributionList.length === 0) {
+              DistributionList = await cloudfront.listDistributions().promise();
+            }
+            return DistributionList.Items.filter(d => d.Enabled && d.Origins.Items.filter(o => o.DomainName === Bucket + '.s3.amazonaws.com').length > 0);
+          }
+
+          async function invalidateDistribution(Distribution, S3Objects) {
+            return lambda.invoke({
+              FunctionName: '${Invalidator}',
+              InvocationType: 'RequestResponse',
+              Payload: JSON.stringify({ Distribution, S3Objects })
+            }).promise();
+          }
+
+  LauncherLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Launcher}
+      RetentionInDays: 7
+
+  QueueInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt Launcher.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+
+  SubscribeToQueue:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 10
+      EventSourceArn: !GetAtt Queue.Arn
+      FunctionName: !GetAtt Launcher.Arn
+      Enabled: true
+
+Outputs:
+  Queue:
+    Value: !GetAtt Queue.Arn

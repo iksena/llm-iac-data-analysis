@@ -1,0 +1,442 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: BOA - Backend on AWS serverless stack (API Gateway, WAF, Aurora DSQL, Lambda, S3)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Description: Prefix for all resource names
+    Default: boa-app
+    AllowedPattern: '[a-z0-9\-]+'
+    ConstraintDescription: Lowercase alphanumeric characters and hyphens only
+  LambdaS3Bucket:
+    Type: String
+    Description: S3 bucket holding the packaged Lambda zip
+  LambdaS3Key:
+    Type: String
+    Description: S3 key of the packaged Lambda zip
+  FunctionsLambdaS3Key:
+    Type: String
+    Description: S3 key of the packaged Functions Lambda zip
+    Default: ''
+  FunctionsSchedulesTemplateUrl:
+    Type: String
+    Default: ''
+    Description: S3 URL for the schedules nested stack template
+  AllowedOrigins:
+    Type: CommaDelimitedList
+    Description: >
+      Comma-separated list of origins allowed for S3 CORS and API Gateway CORS.
+      Leave empty to omit CORS rules entirely (same-origin only).
+    Default: ''
+
+Conditions:
+  HasAllowedOrigins: !Not [!Equals [!Join ['', !Ref AllowedOrigins], '']]
+  HasSchedules:
+    !Not [!Equals [!Ref FunctionsSchedulesTemplateUrl, '']]
+
+Resources:
+  # -------------------------------------------------------
+  # Database — Aurora DSQL (serverless PostgreSQL-compatible)
+  # -------------------------------------------------------
+  DsqlCluster:
+    Type: AWS::DSQL::Cluster
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      DeletionProtectionEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # -------------------------------------------------------
+  # Storage — S3 bucket (private, CORS for presigned URLs)
+  # -------------------------------------------------------
+  StorageBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub '${ProjectName}-storage-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      CorsConfiguration: !If
+        - HasAllowedOrigins
+        - CorsRules:
+            - AllowedHeaders:
+                - '*'
+              AllowedMethods:
+                - GET
+                - PUT
+                - POST
+              AllowedOrigins: !Ref AllowedOrigins
+              MaxAge: 3600
+        - !Ref AWS::NoValue
+
+  # -------------------------------------------------------
+  # Compute — Lambda execution role
+  # -------------------------------------------------------
+  ApiFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DsqlConnect
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dsql:DbConnect
+                  - dsql:DbConnectAdmin
+                Resource: !Sub 'arn:aws:dsql:${AWS::Region}:${AWS::AccountId}:cluster/${DsqlCluster}'
+        # Expanded from the SAM S3CrudPolicy policy template so the
+        # default stack no longer depends on the SAM transform.
+        - PolicyName: StorageBucketCrud
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectAcl
+                  - s3:GetObjectVersion
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                  - s3:ListBucketMultipartUploads
+                  - s3:ListMultipartUploadParts
+                  - s3:AbortMultipartUpload
+                  - s3:DeleteObject
+                  - s3:DeleteObjectTagging
+                  - s3:DeleteObjectVersion
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:PutObjectTagging
+                  - s3:RestoreObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${StorageBucket}'
+                  - !Sub 'arn:aws:s3:::${StorageBucket}/*'
+
+  # -------------------------------------------------------
+  # Compute — Lambda API function
+  # -------------------------------------------------------
+  ApiFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-api'
+      Handler: index.handler
+      Runtime: nodejs20.x
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt ApiFunctionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref LambdaS3Key
+      Environment:
+        Variables:
+          DSQL_ENDPOINT: !GetAtt DsqlCluster.Endpoint
+          REGION_NAME: !Ref 'AWS::Region'
+          BUCKET_NAME: !Ref StorageBucket
+          JWT_SECRET: !Sub '{{resolve:ssm:/${ProjectName}/jwt-secret}}'
+          BETTER_AUTH_SECRET: !Sub '{{resolve:ssm:/${ProjectName}/better-auth-secret}}'
+          AUTH_PROVIDER: better-auth
+          POLICIES_PATH: ./policies
+          ALLOWED_ORIGINS: !Join [',', !Ref AllowedOrigins]
+
+  # -------------------------------------------------------
+  # Traffic layer — API Gateway REST + WAF
+  # -------------------------------------------------------
+  # CORS is handled inside the Lambda (origin-echo against the
+  # ALLOWED_ORIGINS env var) rather than at the API Gateway level.
+  # This lets us validate the request Origin against an allowlist
+  # and avoid returning `Access-Control-Allow-Origin: *`. Empty
+  # allowlist → no CORS headers (same-origin still works).
+  Api:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${ProjectName}-api'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  ApiProxyPlusResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: '{proxy+}'
+
+  ApiRootMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !GetAtt Api.RootResourceId
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiFunction.Arn}/invocations'
+
+  ApiProxyPlusMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref ApiProxyPlusResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ApiFunction.Arn}/invocations'
+
+  # -------------------------------------------------------
+  # Functions Lambda — single Lambda for all user functions
+  # -------------------------------------------------------
+  FunctionsLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DsqlConnect
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dsql:DbConnect
+                  - dsql:DbConnectAdmin
+                Resource: !Sub 'arn:aws:dsql:${AWS::Region}:${AWS::AccountId}:cluster/${DsqlCluster}'
+        - PolicyName: SsmRead
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/functions/*'
+        - PolicyName: LambdaInvokeSelf
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-functions'
+
+  FunctionsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-functions'
+      Handler: handler.handler
+      Runtime: nodejs20.x
+      Timeout: 30
+      MemorySize: 256
+      Role: !GetAtt FunctionsLambdaRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaS3Bucket
+        S3Key: !Ref FunctionsLambdaS3Key
+      Environment:
+        Variables:
+          DSQL_ENDPOINT: !GetAtt DsqlCluster.Endpoint
+          REGION_NAME: !Ref 'AWS::Region'
+          STACK_NAME: !Ref ProjectName
+          JWT_SECRET: !Sub '{{resolve:ssm:/${ProjectName}/jwt-secret}}'
+          API_URL: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod'
+          ANON_KEY: !Sub '{{resolve:ssm:/${ProjectName}/anon-key}}'
+          SERVICE_ROLE_KEY: !Sub '{{resolve:ssm:/${ProjectName}/service-role-key}}'
+
+  FunctionsLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${ProjectName}-functions'
+      RetentionInDays: 30
+
+  FunctionsApiResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !GetAtt Api.RootResourceId
+      PathPart: functions
+
+  FunctionsApiV1Resource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !Ref FunctionsApiResource
+      PathPart: v1
+
+  FunctionsApiNameResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref Api
+      ParentId: !Ref FunctionsApiV1Resource
+      PathPart: '{name+}'
+
+  FunctionsApiMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref Api
+      ResourceId: !Ref FunctionsApiNameResource
+      HttpMethod: ANY
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FunctionsLambda.Arn}/invocations'
+
+  FunctionsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FunctionsLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/*/*'
+
+  # -------------------------------------------------------
+  # Functions Schedules — EventBridge Scheduler resources
+  # -------------------------------------------------------
+  FunctionsScheduleRole:
+    Type: AWS::IAM::Role
+    Condition: HasSchedules
+    Properties:
+      RoleName: !Sub '${ProjectName}-functions-schedule'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: scheduler.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeFunctionsLambda
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt FunctionsLambda.Arn
+
+  FunctionsSchedulesStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: HasSchedules
+    Properties:
+      TemplateURL: !Ref FunctionsSchedulesTemplateUrl
+      Parameters:
+        FunctionsLambdaArn: !GetAtt FunctionsLambda.Arn
+        FunctionsScheduleRoleArn: !GetAtt FunctionsScheduleRole.Arn
+        ProjectName: !Ref ProjectName
+
+  # Deployment must depend on every Method the stage exposes so that
+  # CloudFormation does not race the stage past a partial API.
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiRootMethod
+      - ApiProxyPlusMethod
+      - FunctionsApiMethod
+    Properties:
+      RestApiId: !Ref Api
+
+  ApiprodStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref Api
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+
+  ApiFunctionProxyRootPermissionprod:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/*/'
+
+  ApiFunctionProxyPlusPermissionprod:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ApiFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${Api}/*/*/*'
+
+  WafWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${ProjectName}-waf'
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${ProjectName}-waf'
+      Rules:
+        - Name: rate-limit
+          Priority: 1
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${ProjectName}-rate-limit'
+          Statement:
+            RateBasedStatement:
+              Limit: 1000
+              AggregateKeyType: IP
+        - Name: ip-reputation
+          Priority: 2
+          OverrideAction:
+            None: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub '${ProjectName}-ip-reputation'
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+
+  WafApiGatewayAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn: ApiprodStage
+    Properties:
+      ResourceArn: !Sub 'arn:aws:apigateway:${AWS::Region}::/restapis/${Api}/stages/prod'
+      WebACLArn: !GetAtt WafWebAcl.Arn
+
+Outputs:
+  ApiGatewayUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${Api}.execute-api.${AWS::Region}.amazonaws.com/prod'
+
+  RestApiId:
+    Description: API Gateway REST API ID
+    Value: !Ref Api
+
+  BucketName:
+    Description: S3 storage bucket name
+    Value: !Ref StorageBucket
+
+  DsqlEndpoint:
+    Description: Aurora DSQL cluster endpoint
+    Value: !GetAtt DsqlCluster.Endpoint

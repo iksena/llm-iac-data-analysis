@@ -1,0 +1,249 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  LambdaStore — Authentication & Security Stack
+  DVA-C02 Stage S1: Cognito, KMS, Secrets Manager, IAM
+
+# DVA S1 Questions mapped to this stack:
+#   Q027 — AMI encryption with customer managed key (cross-region scenario)
+#   Q101 — Cognito user pools for social sign-up (Google/Facebook OAuth)
+#   Q116 — Lambda function URL auth restricted to group
+#   Q132 — Lambda VPC + NAT gateway for public API access
+#   Q174 — IAM permissions for CodeCommit branch operations
+
+Parameters:
+  Stage:
+    Type: String
+  ProjectName:
+    Type: String
+    Default: lambdastore
+  TrustedEmailDomains:
+    Type: String
+    Default: ''
+    Description: Comma-separated trusted email domains for auto-confirm
+
+Resources:
+
+  # ── Cognito User Pool ────────────────────────────────────────────────────────
+  # DVA S1: Q101 — user pools handle social IdP (Google/Facebook) federation
+  # DVA S1: Q116 — user pool JWT authorizer gates Lambda access by group
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${ProjectName}-${Stage}
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireUppercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: false
+        - Name: role
+          AttributeDataType: String
+          Required: false
+          Mutable: true
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignupFunction.Arn
+      UserPoolAddOns:
+        AdvancedSecurityMode: ENFORCED
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      DeletionProtection: INACTIVE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: !Ref Stage
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${ProjectName}-${Stage}-web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH        # secure SRP password auth
+        - ALLOW_REFRESH_TOKEN_AUTH   # allow token refresh
+      PreventUserExistenceErrors: ENABLED  # don't reveal if email exists
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      # DVA S1: Q101 — social IdP federation (Google/Facebook)
+      # SupportedIdentityProviders: [COGNITO, Google]
+      # CallbackURLs: [!Sub "https://api.${ProjectName}-${Stage}.example.com/auth/callback"]
+
+  # Admin group — only admins can create/update/delete products
+  AdminGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      GroupName: admin
+      UserPoolId: !Ref UserPool
+      Description: Admin users with full product management access
+      Precedence: 1
+
+  # ── Cognito Identity Pool ────────────────────────────────────────────────────
+  # DVA S3: Q003 — Identity pool for per-user S3 folder access via IAM
+  # DVA S3: Q012 — Cognito + S3 presigned URL for photo upload (least overhead)
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub ${ProjectName} ${Stage}
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  AuthenticatedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Stage}-cognito-authenticated
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                cognito-identity.amazonaws.com:aud: !Ref IdentityPool
+              ForAnyValue:StringLike:
+                cognito-identity.amazonaws.com:amr: authenticated
+      Policies:
+        - PolicyName: S3UserFolderAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # DVA S3: Q003 — per-user S3 prefix using Cognito identity variable
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+                Resource: !Sub
+                  - arn:aws:s3:::${Bucket}/${!cognito-identity.amazonaws.com:sub}/*
+                  - Bucket: !Sub ${ProjectName}-${Stage}-uploads
+
+  IdentityPoolRoleAttachment:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt AuthenticatedRole.Arn
+
+  # ── Pre-Signup Lambda Trigger ─────────────────────────────────────────────
+  PreSignupFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub ${ProjectName}-${Stage}-auth-pre-signup
+      CodeUri: ../src/auth/
+      Handler: pre_signup.lambda_handler
+      Runtime: python3.12
+      Tracing: Active
+      Description: "DVA S1: Auto-confirm Cognito users from trusted email domains"
+      Environment:
+        Variables:
+          TRUSTED_DOMAINS: !Ref TrustedEmailDomains
+
+  PreSignupPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PreSignupFunction
+      Principal: cognito-idp.amazonaws.com
+      SourceArn: !GetAtt UserPool.Arn
+
+  # ── KMS Customer Managed Key ─────────────────────────────────────────────────
+  # DVA S1: Q027 — CMK needed for cross-account/cross-region encryption
+  # DVA S1 Exam Trap: AWS managed key can't be used cross-account → need CMK
+  EncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub ${ProjectName}-${Stage} data encryption key
+      EnableKeyRotation: true   # DVA S1: annual automatic rotation
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow Lambda functions to use the key
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+    DeletionPolicy: Delete       # LAB: allow deletion; prod = Retain
+    UpdateReplacePolicy: Delete
+
+  EncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${ProjectName}-${Stage}
+      TargetKeyId: !Ref EncryptionKey
+
+  # ── Secrets Manager (credentials rotation) ──────────────────────────────────
+  # DVA S1: Build 20 — Secrets Manager for DB credentials with auto-rotation
+  # DVA S1 Cost Alert: $0.40/secret/month — delete after lab
+  DbCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub /${ProjectName}/${Stage}/db-credentials
+      Description: Database credentials for LambdaStore
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "lambdastore"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\'
+      KmsKeyId: !Ref EncryptionKey  # DVA S1: encrypt secret with CMK
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: !Ref Stage
+    DeletionPolicy: Delete
+
+Outputs:
+  UserPoolId:
+    Value: !Ref UserPool
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-UserPoolId
+
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-UserPoolClientId
+
+  IdentityPoolId:
+    Value: !Ref IdentityPool
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-IdentityPoolId
+
+  EncryptionKeyArn:
+    Value: !GetAtt EncryptionKey.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-EncryptionKeyArn
+
+  EncryptionKeyAlias:
+    Value: !Ref EncryptionKeyAlias
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-EncryptionKeyAlias
+
+  DbCredentialsSecretArn:
+    Value: !Ref DbCredentialsSecret
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-DbCredentialsSecretArn

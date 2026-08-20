@@ -1,0 +1,578 @@
+#####################################################
+# foundation.yml
+#
+# Author: Denes Solti
+#####################################################
+Description: Foundation infrastructure. Can be deployed in any region
+
+Parameters:
+  app:
+    Type: String
+    Description: The application name (including prefix)
+    MaxLength: '32'
+  dbName:
+    Type: String
+    Description: Name of the application database
+    MaxLength: '32'
+    Default: AppDb
+  deploymentId:
+    Type: String
+    Description: The unique deployment id. Must be changed in each deployment
+    MaxLength: '50'
+
+Resources:
+  #####################
+  # 404 handler
+  #####################
+
+  404HandlerLambda:
+    Type: AWS::Lambda::Function
+    Description: Function returning 404
+    Properties:
+      Code:
+        ZipFile: |
+          'use strict';
+          exports.handler = function(event, context, callback) {
+            try {
+              console.log(`Returning 404 for request: ${JSON.stringify(event)}`);
+              return callback(null, {
+                statusCode: 404,
+                headers: {
+                  'Content-Type': 'text/html'
+                },
+                body: `
+                  <!DOCTYPE html>
+                  <html lang="en">
+                    <head>
+                      <meta charset="utf-8">
+                      <title>Not Found</title>
+                    </head>
+                    <body>
+                      <p>Not found</p>
+                    </body>
+                  </html>
+                `
+              });
+            } catch (err) {
+              console.error(err);
+              return callback(err);
+            }
+          };
+      FunctionName: !Sub "${app}-404-handler-lambda"
+      Handler: index.handler
+      Role: !GetAtt 404HandlerLambdaRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 10
+      MemorySize: 128
+
+  404HandlerLambdaUrl:
+    Type: "AWS::Lambda::Url"
+    Properties:
+      AuthType: AWS_IAM
+      TargetFunctionArn: !Ref 404HandlerLambda
+
+  404HandlerLambdaRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: "Allow"
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+      Policies:
+        - PolicyName: allowLambdaLogging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:*"
+                Resource: "*"
+
+  404HandlerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref 404HandlerLambda
+      Principal: !GetAtt RequestSignerLambdaRoleArn.Value
+      Action: lambda:InvokeFunctionUrl
+      FunctionUrlAuthType: AWS_IAM
+
+  #####################
+  # CloudFront
+  #####################
+
+  CloudFrontDistro:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        HttpVersion: http2
+        Origins:
+          - DomainName: !Select
+            - 2
+            - !Split
+              - /
+              - !GetAtt 404HandlerLambdaUrl.FunctionUrl
+            Id: '404HandlerLambdaOrigin'
+            CustomOriginConfig:
+              OriginProtocolPolicy: https-only
+        DefaultCacheBehavior:
+          AllowedMethods:
+            - HEAD
+            - GET
+            - OPTIONS
+            - PUT
+            - PATCH
+            - POST
+            - DELETE
+          ViewerProtocolPolicy: redirect-to-https
+          OriginRequestPolicyId: "b689b0a8-53d0-40ab-baf2-68738e2966ac" # Managed-AllViewerExceptHostHeader
+          CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # Managed-CachingDisabled
+          TargetOriginId: 404HandlerLambdaOrigin
+          LambdaFunctionAssociations:
+            - EventType: origin-request
+              LambdaFunctionARN: !GetAtt RequestSignerLambdaArn.Value
+              IncludeBody: true
+
+  #####################
+  # CloudFront updater
+  #####################
+
+  CloudFrontUpdaterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          'use strict';
+          const
+            {send, SUCCESS, FAILED} = require('cfn-response'),
+            {CloudFrontClient, GetDistributionCommand, UpdateDistributionCommand} = require('@aws-sdk/client-cloudfront');
+
+          exports.handler = async function(event, context) {
+            console.log('Updating CloudFront distro: "${CloudFrontDistro}"');
+            try {
+              const
+                client = new CloudFrontClient(),
+                {RequestType, ResourceProperties: {OriginId, Domain, Path, AllowedMethods}} = event,
+                {ETag, Distribution: {DistributionConfig}} = await client.send(new GetDistributionCommand({Id: '${CloudFrontDistro}'})),
+                {Origins, CacheBehaviors, DefaultCacheBehavior} = DistributionConfig;
+
+              switch (RequestType) {
+                case 'Create':
+                  console.log('Creating new lambda association: ' + OriginId);
+                  const cachedMethods = AllowedMethods.filter(m => ['HEAD', 'GET', 'OPTIONS'].indexOf(m) >= 0);
+
+                  Origins.Items.push({
+                    ...Origins.Items.filter(origin => origin.Id === '404HandlerLambdaOrigin')[0],
+                    Id: OriginId,
+                    DomainName: Domain
+                  });
+                  Origins.Quantity++;
+
+                  CacheBehaviors.Items = CacheBehaviors.Items || [];
+                  CacheBehaviors.Items.push({
+                    ...DefaultCacheBehavior,
+                    PathPattern: Path,
+                    TargetOriginId: OriginId,
+                    AllowedMethods: {
+                      Quantity: AllowedMethods.length,
+                      Items: AllowedMethods,
+                      CachedMethods: {
+                        Quantity: cachedMethods.length,
+                        Items: cachedMethods
+                      }
+                    }
+                  });
+                  CacheBehaviors.Quantity++;
+
+                  break;
+                case 'Delete':
+                  console.log('Removing lambda association: ' + OriginId);
+                  Origins.Items = Origins.Items.filter(origin => origin.Id !== OriginId);
+                  Origins.Quantity = Origins.Items.length;
+
+                  CacheBehaviors.Items = CacheBehaviors.Items.filter(cb => cb.PathPattern !== Path);
+                  CacheBehaviors.Quantity = CacheBehaviors.Items.length;
+
+                  break;
+                case 'Update': throw 'Update NOT supported';
+              }
+
+              await client.send(new UpdateDistributionCommand({
+                Id: '${CloudFrontDistro}',
+                DistributionConfig,
+                IfMatch: ETag
+              }));
+
+              do {
+                const {Distribution: {Status}} = await client.send(new GetDistributionCommand({Id: '${CloudFrontDistro}'}));
+                console.log(Status);
+                if (Status !== 'InProgress')
+                  break;
+                await new Promise(resolve => setTimeout(resolve, 2000));
+              } while(true);
+
+              console.log('Update complete');
+              await send(event, context, SUCCESS, {});
+            } catch (err) {
+              console.error(err);
+              await send(event, context, FAILED, err);
+            }
+          };
+      Handler: index.handler
+      Runtime: nodejs18.x
+      FunctionName: !Sub "${app}-cloudfront-updater-lambda"
+      Role: !GetAtt CloudFrontUpdaterFunctionExecutionRole.Arn
+      MemorySize: 128
+      Timeout: 600
+
+  CloudFrontUpdaterFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: allowLambdaLogging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:*"
+                Resource: "*"
+        - PolicyName: allowCloudFrontAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudfront:GetDistribution
+                  - cloudfront:UpdateDistribution
+                Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistro}"
+        - PolicyName: allowLambdaAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:GetFunction
+                Resource: "*"
+
+  #####################
+  # Global access
+  #####################
+
+  RequestSignerLambdaArn:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      DeploymentId: !Ref deploymentId
+      Stack: !Sub "${app}-globals"
+      Export: !Sub "${app}-request-signer-lambda-arn"
+      ServiceToken: !GetAtt FetchGlobalOutputFunction.Arn
+
+  RequestSignerLambdaRoleArn:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      DeploymentId: !Ref deploymentId
+      Stack: !Sub "${app}-globals"
+      Export: !Sub "${app}-request-signer-lambda-role-arn"
+      ServiceToken: !GetAtt FetchGlobalOutputFunction.Arn
+
+  FetchGlobalOutputFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          'use strict';
+          const
+            {send, SUCCESS, FAILED} = require('cfn-response'),
+            {CloudFormationClient, DescribeStacksCommand} = require('@aws-sdk/client-cloudformation');
+
+          exports.handler = async function(event, context) {
+            console.log('Getting outputs...');
+            try {
+              const
+                client = new CloudFormationClient({region: 'us-east-1'}),
+                {ResourceProperties: {Stack, Export}} = event,
+                {Stacks: [{Outputs}]} = await client.send(new DescribeStacksCommand({StackName: Stack}));
+
+              console.log(`Outputs fetched: ${JSON.stringify(Outputs)}`);
+
+              await send(event, context, SUCCESS, {
+                Value: Outputs
+                  .find(o => o.ExportName === Export)
+                  .OutputValue
+              });
+            } catch (err) {
+              console.error(err);
+              await send(event, context, FAILED, err);
+            }
+          };
+      Handler: index.handler
+      Runtime: nodejs18.x
+      FunctionName: !Sub "${app}-fetch-global-output-lambda"
+      Role: !GetAtt FetchGlobalOutputFunctionExecutionRole.Arn
+      MemorySize: 128
+      Timeout: 20
+
+  FetchGlobalOutputFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: allowLambdaLogging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:*"
+                Resource: "*"
+        - PolicyName: allowCFAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: '*'
+
+  ###################
+  # VPC
+  ###################
+
+  Vpc:
+    Type: "AWS::EC2::VPC"
+    Properties:
+      CidrBlock: 192.168.0.0/16
+      InstanceTenancy: default
+
+  VpcPrivateSubnet1:
+      Type: "AWS::EC2::Subnet"
+      Description: Resources in private subnet can access the internet but cannot be accessed outside the subnet
+      Properties:
+        VpcId: !Ref Vpc
+        CidrBlock: 192.168.10.0/24
+        AvailabilityZone: !Select
+          - 0
+          - Fn::GetAZs: !Ref "AWS::Region"
+
+  VpcPrivateSubnet1RouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref VpcNatRouteTable
+      SubnetId: !Ref VpcPrivateSubnet1
+
+  VpcPrivateSubnet2:  # AWS::RDS::DBSubnetGroup requires at least 2 subnets
+    Type: "AWS::EC2::Subnet"
+    Description: Resources in private subnet can access the internet but cannot be accessed outside the subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 192.168.20.0/24
+      AvailabilityZone: !Select
+        - 1
+        - Fn::GetAZs: !Ref "AWS::Region"
+
+  VpcPrivateSubnet2RouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref VpcNatRouteTable
+      SubnetId: !Ref VpcPrivateSubnet2
+
+  VpcPublicSubnet:
+    Type: "AWS::EC2::Subnet"
+    Description: Resources in public subnet can access the internet and also can be accessed outside the subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 192.168.30.0/24
+
+  VpcPublicSubnetRouteTableAssociation:
+    Type: "AWS::EC2::SubnetRouteTableAssociation"
+    Properties:
+      RouteTableId: !Ref VpcInternetRouteTable
+      SubnetId: !Ref VpcPublicSubnet
+
+  VpcInternetGateway:
+    Type: "AWS::EC2::InternetGateway"
+
+  VpcInternetGatewayAttachment:
+    Type: "AWS::EC2::VPCGatewayAttachment"
+    Properties:
+      VpcId: !Ref "Vpc"
+      InternetGatewayId: !Ref "VpcInternetGateway"
+
+  VpcInternetRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref "Vpc"
+
+  VpcInternetRoute:
+    Type: "AWS::EC2::Route"
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      GatewayId: !Ref "VpcInternetGateway"
+      RouteTableId: !Ref "VpcInternetRouteTable"
+
+  VpcNatElasticIP:
+    Type: "AWS::EC2::EIP"
+    Properties:
+      Domain: "vpc"
+
+  VpcNatGateway:
+    Type: "AWS::EC2::NatGateway"
+    Properties:
+      AllocationId: !GetAtt "VpcNatElasticIP.AllocationId"
+      SubnetId: !Ref "VpcPublicSubnet"
+
+  VpcNatRouteTable:
+    Type: "AWS::EC2::RouteTable"
+    Properties:
+      VpcId: !Ref "Vpc"
+
+  VpcNatRoute:
+    Type: "AWS::EC2::Route"
+    Properties:
+      DestinationCidrBlock: "0.0.0.0/0"
+      NatGatewayId: !Ref VpcNatGateway
+      RouteTableId: !Ref VpcNatRouteTable
+
+  ###################
+  # DB
+  ###################
+
+  DbCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      DBClusterIdentifier: !Sub "${app}-db-cluster"
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      Engine: aurora-mysql
+      EngineVersion: 8.0.mysql_aurora.3.06.0
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      DatabaseName: !Ref dbName
+      EnableHttpEndpoint: false
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 1
+      VpcSecurityGroupIds:
+        - !Ref DbSecurityGroup
+
+  DbInstance1:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DbCluster
+      DBInstanceIdentifier: !Sub "${app}-db-instance1"
+      DBInstanceClass: db.serverless
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      Engine: aurora-mysql
+      EngineVersion: 8.0.mysql_aurora.3.06.0
+      PubliclyAccessible: false
+
+  DbInstance2:   # we need at least 2 instances, a reader and a writer
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBClusterIdentifier: !Ref DbCluster
+      DBInstanceIdentifier: !Sub "${app}-db-instance2"
+      DBInstanceClass: db.serverless
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      Engine: aurora-mysql
+      EngineVersion: 8.0.mysql_aurora.3.06.0
+      PubliclyAccessible: false
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${app}-db-secret"
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "root"}'
+        GenerateStringKey: "password"
+        ExcludePunctuation: true
+        PasswordLength: 16
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Db subnet group
+      SubnetIds:
+        - !Ref VpcPrivateSubnet1
+        - !Ref VpcPrivateSubnet2
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: DB cluster VPC security group
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !GetAtt VpcPrivateSubnet1.CidrBlock
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          CidrIp: !GetAtt VpcPrivateSubnet2.CidrBlock
+
+#####################
+# Outputs
+#####################
+
+Outputs:
+  CloudFrontUpdaterFunctionArn:
+    Value: !GetAtt CloudFrontUpdaterFunction.Arn
+    Export:
+      Name: !Sub "${app}-cloudfront-updater-lambda-arn"
+  DbName:
+    Value: !Ref dbName
+    Export:
+      Name: !Sub "${app}-db-name"
+  DbEndpoint:
+    Value: !GetAtt DbCluster.Endpoint.Address
+    Export:
+      Name: !Sub "${app}-db-endpoint"
+  DbReaderEndpoint:
+    Value: !GetAtt DbCluster.ReadEndpoint.Address
+    Export:
+      Name: !Sub "${app}-db-reader-endpoint"
+  DbPort:
+    Value: !GetAtt DbCluster.Endpoint.Port
+    Export:
+      Name: !Sub "${app}-db-port"
+  DbSecretArn:
+    Value: !Ref DbSecret
+    Export:
+      Name: !Sub "${app}-db-secret-arn"
+  RequestSignerRoleArn:
+    Value: !GetAtt RequestSignerLambdaRoleArn.Value
+    Export:
+      Name: !Sub "${app}-request-signer-role-arn"
+  Subnet1Id:
+    Value: !Ref VpcPrivateSubnet1
+    Export:
+      Name: !Sub "${app}-vpc-subnet-1-id"
+  Subnet2Id:
+    Value: !Ref VpcPrivateSubnet2
+    Export:
+      Name: !Sub "${app}-vpc-subnet-2-id"
+  VpcId:
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub "${app}-vpc-id"

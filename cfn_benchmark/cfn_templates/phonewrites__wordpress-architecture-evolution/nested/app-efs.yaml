@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: WordPress evolution stage 4 app server backed by RDS and EFS.
+
+Parameters:
+  LatestAmiId:
+    Type: AWS::EC2::Image::Id
+  SourceAmiId:
+    Type: String
+    Default: ''
+    AllowedPattern: '^$|^ami-[a-z0-9]+$'
+  CfnMetadataNonce:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 2147483647
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetId:
+    Type: AWS::EC2::Subnet::Id
+  InstanceProfileName:
+    Type: String
+  EfsId:
+    Type: String
+
+Conditions:
+  HasSourceAmi: !Not [!Equals [!Ref SourceAmiId, '']]
+
+Resources:
+  SGWordpress:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: Allow HTTP traffic to WordPress web server
+      SecurityGroupIngress:
+        - Description: Allow HTTP IPv4 from anywhere
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: wordpress-sg
+
+  WordpressEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: Wordpress-EIP
+
+  WordpressAppTierLT:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      VersionDescription: Stage 4 WordPress app tier with RDS and EFS
+      LaunchTemplateData:
+        ImageId: !If [HasSourceAmi, !Ref SourceAmiId, !Ref LatestAmiId]
+        InstanceType: t2.micro
+        SecurityGroupIds:
+          - !Ref SGWordpress
+        IamInstanceProfile:
+          Name: !Ref InstanceProfileName
+        DisableApiTermination: false
+        CreditSpecification:
+          CpuCredits: standard
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -xe
+            SOURCE_AMI_ID='${SourceAmiId}'
+            EFS_ID='${EfsId}'
+            NEW_PUBLIC_SITE_URL='http://${WordpressEIP}'
+
+            if ! rpm -q aws-cfn-bootstrap >/dev/null 2>&1; then dnf install -y aws-cfn-bootstrap; fi
+            _cfn_exit() {
+              local s=$?
+              /opt/aws/bin/cfn-signal -e "$s" --stack ${AWS::StackId} --resource WordpressEC2 --region ${AWS::Region} || true
+            }
+            trap _cfn_exit EXIT
+
+            DBName=$(aws ssm get-parameters --region ${AWS::Region} --names /Wordpress/DBName --query Parameters[0].Value --output text)
+            DBUser=$(aws ssm get-parameters --region ${AWS::Region} --names /Wordpress/DBUser --query Parameters[0].Value --output text)
+            DBEndpoint=$(aws ssm get-parameters --region ${AWS::Region} --names /Wordpress/DBEndpoint --query Parameters[0].Value --output text)
+            DBPassword=$(aws ssm get-parameters --region ${AWS::Region} --names /Wordpress/DBPassword --with-decryption --query Parameters[0].Value --output text)
+
+            dnf -y --refresh upgrade || true
+            dnf install -y aws-cfn-bootstrap wget rsync httpd php php-mysqlnd php-fpm php-mysqli php-json php-mbstring php-xml php-gd php-opcache php-intl php-zip php-devel
+            dnf install -y amazon-efs-utils || true
+            systemctl enable httpd
+            systemctl start httpd
+
+            if [ -n "$SOURCE_AMI_ID" ]; then
+              systemctl daemon-reload || true
+              systemctl disable mariadb || true
+              systemctl stop mariadb || true
+              if [ -f /var/www/html/wp-config.php ]; then
+                sed -i "s/'localhost'/'$DBEndpoint'/g" /var/www/html/wp-config.php
+                sed -i "s/'127.0.0.1'/'$DBEndpoint'/g" /var/www/html/wp-config.php
+              fi
+            else
+              mkdir -p /var/www/html
+              wget https://wordpress.org/latest.tar.gz -P /var/www/html
+              cd /var/www/html
+              tar -zxvf latest.tar.gz
+              cp -rvf wordpress/* .
+              rm -rf wordpress latest.tar.gz
+              cp ./wp-config-sample.php ./wp-config.php
+              sed -i "s/'database_name_here'/'$DBName'/g" wp-config.php
+              sed -i "s/'username_here'/'$DBUser'/g" wp-config.php
+              sed -i "s/'password_here'/'$DBPassword'/g" wp-config.php
+              sed -i "s/'localhost'/'$DBEndpoint'/g" wp-config.php
+            fi
+
+            cd /var/www/html
+            if [ -f wp-config.php ] && ! grep -q 'Follow browser hostname for WP_HOME' wp-config.php; then
+              WPCONFIG_INSERT_TMP=$(mktemp)
+              WPCONFIG_MERGED_TMP=$(mktemp)
+              cat > "$WPCONFIG_INSERT_TMP" <<'WPCONFIG_BROWSER_HOST_SNIPPET'
+            /* Follow browser hostname for WP_HOME and WP_SITEURL (HTTP_HOST; no fixed public IP in redirects). */
+            if (php_sapi_name() !== 'cli' && !empty($_SERVER['HTTP_HOST'])) {
+                define('WP_HOME', 'http://' . $_SERVER['HTTP_HOST']);
+                define('WP_SITEURL', 'http://' . $_SERVER['HTTP_HOST']);
+            }
+            WPCONFIG_BROWSER_HOST_SNIPPET
+              awk 'NR==FNR { buf = buf $0 ORS; next } /stop editing! Happy publishing/ && !done { printf "%s", buf; done=1 } { print }' "$WPCONFIG_INSERT_TMP" wp-config.php > "$WPCONFIG_MERGED_TMP"
+              mv "$WPCONFIG_MERGED_TMP" wp-config.php
+              rm -f "$WPCONFIG_INSERT_TMP"
+            fi
+
+            usermod -a -G apache ec2-user || true
+            mkdir -p /var/www/html/wp-content/uploads
+            chown -R ec2-user:apache /var/www
+            chmod 2775 /var/www
+            find /var/www -type d -exec chmod 2775 {} \; 2>/dev/null || true
+            find /var/www -type f -exec chmod 0664 {} \; 2>/dev/null || true
+            SELINUX_STATE=$(getenforce 2>/dev/null || true)
+            if [ "$SELINUX_STATE" = "Enforcing" ] || [ "$SELINUX_STATE" = "Permissive" ]; then
+              chcon -R -t httpd_sys_rw_content_t /var/www/html/wp-content || true
+              setsebool -P httpd_use_nfs 1 2>/dev/null || true
+            fi
+
+            mkdir -p /mnt/wp-content-efs
+            for attempt in $(seq 1 90); do
+              mount -t efs -o tls,iam "$EFS_ID:/" /mnt/wp-content-efs 2>/dev/null || mount -t nfs4 -o nfsvers=4.1 "$EFS_ID.efs.${AWS::Region}.amazonaws.com:/" /mnt/wp-content-efs 2>/dev/null || true
+              mountpoint -q /mnt/wp-content-efs && break
+              sleep 5
+            done
+            mountpoint -q /mnt/wp-content-efs
+            rsync -a /var/www/html/wp-content/ /mnt/wp-content-efs/ || true
+            umount /mnt/wp-content-efs || true
+            if ! grep -qE '^[^#].*[[:space:]]/var/www/html/wp-content[[:space:]]+' /etc/fstab; then
+              echo "$EFS_ID:/ /var/www/html/wp-content efs _netdev,tls,iam 0 0" >> /etc/fstab
+            fi
+            mount /var/www/html/wp-content || mount -t nfs4 -o nfsvers=4.1 "$EFS_ID.efs.${AWS::Region}.amazonaws.com:/" /var/www/html/wp-content
+            mkdir -p /var/www/html/wp-content/uploads
+            chown -R ec2-user:apache /var/www/html/wp-content
+            find /var/www/html/wp-content -type d -exec chmod 2775 {} \; 2>/dev/null || true
+            find /var/www/html/wp-content -type f -exec chmod 0664 {} \; 2>/dev/null || true
+
+            if [ ! -f /var/www/html/wp-cli.phar ]; then curl -fsSLo /var/www/html/wp-cli.phar https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar || true; fi
+            if [ -f /var/www/html/wp-cli.phar ]; then
+              PREVIOUS_HOME_URL=$(php /var/www/html/wp-cli.phar --path=/var/www/html --allow-root option get home 2>/dev/null || true)
+              PREVIOUS_SITEURL=$(php /var/www/html/wp-cli.phar --path=/var/www/html --allow-root option get siteurl 2>/dev/null || true)
+              php /var/www/html/wp-cli.phar --path=/var/www/html --allow-root option update home "$NEW_PUBLIC_SITE_URL" || true
+              php /var/www/html/wp-cli.phar --path=/var/www/html --allow-root option update siteurl "$NEW_PUBLIC_SITE_URL" || true
+              wp_search_replace_if_changed() {
+                old_value="$1"
+                new_value="$2"
+                if [ -n "$old_value" ] && [ "$old_value" != "$new_value" ]; then
+                  php /var/www/html/wp-cli.phar --path=/var/www/html --allow-root search-replace "$old_value" "$new_value" --all-tables || true
+                  old_no_slash=$(printf '%s' "$old_value" | sed 's|/*$||')
+                  new_no_slash=$(printf '%s' "$new_value" | sed 's|/*$||')
+                  php /var/www/html/wp-cli.phar --path=/var/www/html --allow-root search-replace "$old_no_slash/" "$new_no_slash/" --all-tables || true
+                fi
+              }
+              wp_search_replace_if_changed "$PREVIOUS_HOME_URL" "$NEW_PUBLIC_SITE_URL"
+              wp_search_replace_if_changed "$PREVIOUS_SITEURL" "$NEW_PUBLIC_SITE_URL"
+            fi
+
+  WordpressEC2:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT45M
+    Properties:
+      SubnetId: !Ref PublicSubnetId
+      LaunchTemplate:
+        LaunchTemplateId: !Ref WordpressAppTierLT
+        Version: !GetAtt WordpressAppTierLT.LatestVersionNumber
+      Tags:
+        - Key: Name
+          Value: Wordpress-LT-Db-Fs-Split
+        - Key: CfnMetadataNonce
+          Value: !Sub '${CfnMetadataNonce}'
+
+  WordpressEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref WordpressEC2
+      EIP: !Ref WordpressEIP
+
+Outputs:
+  WordpressURL:
+    Value: !Sub 'http://${WordpressEIP}'
+  WordpressInstanceId:
+    Value: !Ref WordpressEC2
+  WordpressInstanceAutoIP:
+    Value: !GetAtt WordpressEC2.PublicIp
+  WordpressSecurityGroupId:
+    Value: !Ref SGWordpress
+  WordpressLaunchTemplateId:
+    Value: !Ref WordpressAppTierLT

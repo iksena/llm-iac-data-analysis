@@ -1,0 +1,990 @@
+# Companion code for "The Backend of Luck" - Chapter 35, Incident Management.
+# https://thebackendofluck.com | https://github.com/thebackendofluck/book
+# SPDX-License-Identifier: Apache-2.0
+#
+# FOR TESTING AND EVALUATION ONLY. NOT FOR PRODUCTION USE.
+# Published to demonstrate the patterns explained in the book. This code is
+# not certified for real-money gaming: operating a gambling platform requires
+# your own licence, independent test-lab certification (GLI, eCOGRA or
+# equivalent) and regulator approval.
+
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  DDoS Detection, Campaign-Aware Autoscaling, and Incident Response System
+  for iGaming platforms. Deploys Lambda functions, DynamoDB tables,
+  CloudWatch alarms, EventBridge rules, WAF WebACL, and SNS topics.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment name.
+
+  ALBFullName:
+    Type: String
+    Description: >
+      Full ALB resource path (e.g. app/casino-prod-alb/0123456789abcdef).
+      Found in ALB ARN after the region prefix.
+
+  CloudFrontDistributionId:
+    Type: String
+    Description: CloudFront distribution ID to protect.
+
+  ASGNames:
+    Type: String
+    Default: "casino-app-asg,casino-api-asg"
+    Description: Comma-separated Auto Scaling Group names.
+
+  ECSServices:
+    Type: String
+    Default: "casino-prod:casino-app,casino-prod:casino-worker"
+    Description: Comma-separated ECS cluster:service pairs.
+
+  ElastiCacheGroups:
+    Type: String
+    Default: "casino-session-cache,casino-odds-cache"
+    Description: Comma-separated ElastiCache replication group IDs.
+
+  ShieldALBArn:
+    Type: String
+    Default: ""
+    Description: ALB ARN for Shield Advanced protection (leave blank to skip).
+
+  ShieldCloudFrontArn:
+    Type: String
+    Default: ""
+    Description: CloudFront ARN for Shield Advanced protection.
+
+  AthenaDatabase:
+    Type: String
+    Default: cloudfront_logs
+    Description: Athena database containing CloudFront and WAF log tables.
+
+  AthenaResultsBucket:
+    Type: String
+    Description: S3 bucket for Athena query results.
+
+  EvidenceBucket:
+    Type: String
+    Description: S3 bucket for attack evidence files.
+
+  SESFromAddress:
+    Type: String
+    Default: ""
+    Description: Verified SES sender address for abuse reports (optional).
+
+  # CloudWatch alarm thresholds
+  RequestCountAlarmThreshold:
+    Type: Number
+    Default: 50000
+    Description: ALB RequestCount per 5 minutes that triggers the alarm.
+
+  ErrorRateAlarmThreshold:
+    Type: Number
+    Default: 500
+    Description: ALB 5xx count per 5 minutes that triggers the alarm.
+
+  LambdaCodeBucket:
+    Type: String
+    Description: S3 bucket containing the packaged Lambda deployment ZIPs.
+
+  LambdaCodeVersion:
+    Type: String
+    Default: "latest"
+    Description: S3 object version / key prefix for Lambda packages.
+
+# ---------------------------------------------------------------------------
+# Metadata
+# ---------------------------------------------------------------------------
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Environment" }
+        Parameters: [Environment]
+      - Label: { default: "Application Resources" }
+        Parameters: [ALBFullName, CloudFrontDistributionId, ASGNames, ECSServices, ElastiCacheGroups]
+      - Label: { default: "Security" }
+        Parameters: [ShieldALBArn, ShieldCloudFrontArn]
+      - Label: { default: "Data & Storage" }
+        Parameters: [AthenaDatabase, AthenaResultsBucket, EvidenceBucket, SESFromAddress]
+      - Label: { default: "Alarm Thresholds" }
+        Parameters: [RequestCountAlarmThreshold, ErrorRateAlarmThreshold]
+      - Label: { default: "Lambda Deployment" }
+        Parameters: [LambdaCodeBucket, LambdaCodeVersion]
+
+# ---------------------------------------------------------------------------
+# Resources
+# ---------------------------------------------------------------------------
+Resources:
+
+  # -------------------------------------------------------------------------
+  # S3 — Evidence bucket (created only if caller passes a non-empty name)
+  # -------------------------------------------------------------------------
+  AttackEvidenceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${EvidenceBucket}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldEvidence
+            Status: Enabled
+            ExpirationInDays: 365
+            NoncurrentVersionExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Purpose
+          Value: ddos-evidence
+
+  # -------------------------------------------------------------------------
+  # DynamoDB — Marketing Campaign Calendar
+  # -------------------------------------------------------------------------
+  MarketingCampaignCalendarTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "marketing-campaign-calendar-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      TableClass: STANDARD
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: campaign_id
+          AttributeType: S
+        - AttributeName: start_time
+          AttributeType: S
+      KeySchema:
+        - AttributeName: campaign_id
+          KeyType: HASH
+        - AttributeName: start_time
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: status-start-index
+          KeySchema:
+            - AttributeName: start_time
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          OnDemandThroughput:
+            MaxReadRequestUnits: 1000
+            MaxWriteRequestUnits: 100
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # DynamoDB — Campaign Scaling State
+  CampaignScalingStateTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "campaign-scaling-state-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: campaign_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: campaign_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # DynamoDB — WAF IP Block Audit Log
+  WAFIPBlockLogTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    Properties:
+      TableName: !Sub "waf-ip-block-log-${Environment}"
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: event_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: event_id
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # -------------------------------------------------------------------------
+  # SNS — NOC Alerts Topic
+  # -------------------------------------------------------------------------
+  NOCAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "casino-noc-alerts-${Environment}"
+      DisplayName: !Sub "Casino NOC Alerts (${Environment})"
+      KmsMasterKeyId: alias/aws/sns
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  NOCAlertsTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref NOCAlertsTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - cloudwatch.amazonaws.com
+                - lambda.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref NOCAlertsTopic
+
+  # -------------------------------------------------------------------------
+  # IAM — Lambda Execution Role (shared, least-privilege)
+  # -------------------------------------------------------------------------
+  DDoSDetectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "ddos-detector-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DDoSDetectorPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # CloudWatch metrics read
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: "*"
+              # Shield read
+              - Effect: Allow
+                Action:
+                  - shield:DescribeAttack
+                  - shield:DescribeAttackStatistics
+                  - shield:ListAttacks
+                  - shield:DescribeProtection
+                Resource: "*"
+              # Athena
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                  - athena:StopQueryExecution
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${AthenaResultsBucket}"
+                  - !Sub "arn:aws:s3:::${AthenaResultsBucket}/*"
+                  - !GetAtt AttackEvidenceBucket.Arn
+                  - !Sub "${AttackEvidenceBucket.Arn}/*"
+              # DynamoDB
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource:
+                  - !GetAtt MarketingCampaignCalendarTable.Arn
+                  - !GetAtt CampaignScalingStateTable.Arn
+                  - !GetAtt WAFIPBlockLogTable.Arn
+                  - !Sub "${MarketingCampaignCalendarTable.Arn}/index/*"
+              # SNS publish
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NOCAlertsTopic
+              # CloudWatch metrics write (custom metrics)
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+
+  CampaignAutoscalerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "campaign-autoscaler-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CampaignAutoscalerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # ASG
+              - Effect: Allow
+                Action:
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:UpdateAutoScalingGroup
+                  - autoscaling:SetDesiredCapacity
+                Resource: "*"
+              # ECS
+              - Effect: Allow
+                Action:
+                  - ecs:DescribeServices
+                  - ecs:UpdateService
+                Resource: "*"
+              # ElastiCache
+              - Effect: Allow
+                Action:
+                  - elasticache:DescribeReplicationGroups
+                  - elasticache:IncreaseReplicaCount
+                  - elasticache:DecreaseReplicaCount
+                Resource: "*"
+              # CloudFront
+              - Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                  - cloudfront:GetDistributionConfig
+                  - cloudfront:UpdateDistribution
+                Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistributionId}"
+              # DynamoDB
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                Resource:
+                  - !GetAtt CampaignScalingStateTable.Arn
+              # SNS, CloudWatch
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NOCAlertsTopic
+              - Effect: Allow
+                Action: cloudwatch:PutMetricData
+                Resource: "*"
+
+  WAFShieldManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "waf-shield-manager-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: WAFShieldManagerPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              # WAFv2 full management
+              - Effect: Allow
+                Action:
+                  - wafv2:GetIPSet
+                  - wafv2:UpdateIPSet
+                  - wafv2:CreateIPSet
+                  - wafv2:ListIPSets
+                  - wafv2:GetWebACL
+                  - wafv2:UpdateWebACL
+                  - wafv2:ListWebACLs
+                Resource: "*"
+              # Shield
+              - Effect: Allow
+                Action:
+                  - shield:CreateProtection
+                  - shield:DescribeProtection
+                  - shield:ListProtections
+                Resource: "*"
+              # CloudFront
+              - Effect: Allow
+                Action:
+                  - cloudfront:GetDistributionConfig
+                  - cloudfront:UpdateDistribution
+                Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistributionId}"
+              # DynamoDB
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt WAFIPBlockLogTable.Arn
+              # SNS
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NOCAlertsTopic
+
+  EvidenceCollectorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "evidence-collector-lambda-role-${Environment}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EvidenceCollectorPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${AthenaResultsBucket}"
+                  - !Sub "arn:aws:s3:::${AthenaResultsBucket}/*"
+                  - !GetAtt AttackEvidenceBucket.Arn
+                  - !Sub "${AttackEvidenceBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: "*"
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref NOCAlertsTopic
+
+  # -------------------------------------------------------------------------
+  # Lambda Functions
+  # -------------------------------------------------------------------------
+  DDoSDetectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "ddos-detector-${Environment}"
+      Description: Classifies traffic as ATTACK, CAMPAIGN, or ORGANIC using CloudWatch, WAF, Shield, and Athena signals.
+      Runtime: python3.12
+      Handler: ddos_detector_lambda.handler
+      Role: !GetAtt DDoSDetectorRole.Arn
+      Timeout: 120
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub "${LambdaCodeVersion}/ddos_detector_lambda.zip"
+      Environment:
+        Variables:
+          AWS_REGION_OVERRIDE: !Ref AWS::Region
+          ALB_FULL_NAME: !Ref ALBFullName
+          CLOUDFRONT_DIST_ID: !Ref CloudFrontDistributionId
+          SHIELD_PROTECTION_ID: !Ref ShieldALBArn
+          DYNAMO_CALENDAR_TABLE: !Ref MarketingCampaignCalendarTable
+          ATHENA_DATABASE: !Ref AthenaDatabase
+          ATHENA_RESULTS_BUCKET: !Ref AthenaResultsBucket
+          SNS_NOC_TOPIC_ARN: !Ref NOCAlertsTopic
+          LOOKBACK_MINUTES: "5"
+      ReservedConcurrentExecutions: 10
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  DDoSDetectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/ddos-detector-${Environment}"
+      RetentionInDays: 90
+
+  CampaignAutoscalerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "campaign-autoscaler-${Environment}"
+      Description: Pre-scales ASG, ECS, and ElastiCache resources for marketing campaigns.
+      Runtime: python3.12
+      Handler: campaign_autoscaler.handler
+      Role: !GetAtt CampaignAutoscalerRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub "${LambdaCodeVersion}/campaign_autoscaler.zip"
+      Environment:
+        Variables:
+          ASG_NAMES: !Ref ASGNames
+          ECS_SERVICES: !Ref ECSServices
+          ELASTICACHE_GROUPS: !Ref ElastiCacheGroups
+          CLOUDFRONT_DIST_ID: !Ref CloudFrontDistributionId
+          DYNAMO_CAMPAIGN_STATE_TABLE: !Ref CampaignScalingStateTable
+          SNS_NOC_TOPIC_ARN: !Ref NOCAlertsTopic
+          WARMUP_LEAD_MINUTES: "15"
+          SCALEDOWN_GRACE_MINUTES: "30"
+      ReservedConcurrentExecutions: 5
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  CampaignAutoscalerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/campaign-autoscaler-${Environment}"
+      RetentionInDays: 90
+
+  WAFShieldManagerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "waf-shield-manager-${Environment}"
+      Description: Automates WAF IP blocking, Shield Advanced activation, and CloudFront emergency mode during attacks.
+      Runtime: python3.12
+      Handler: waf_shield_manager.handler
+      Role: !GetAtt WAFShieldManagerRole.Arn
+      Timeout: 180
+      MemorySize: 512
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub "${LambdaCodeVersion}/waf_shield_manager.zip"
+      Environment:
+        Variables:
+          WAF_SCOPE: "CLOUDFRONT"
+          CLOUDFRONT_DIST_ID: !Ref CloudFrontDistributionId
+          SHIELD_ALB_ARN: !Ref ShieldALBArn
+          SHIELD_CF_ARN: !Ref ShieldCloudFrontArn
+          DYNAMO_BLOCK_LOG_TABLE: !Ref WAFIPBlockLogTable
+          SNS_NOC_TOPIC_ARN: !Ref NOCAlertsTopic
+      ReservedConcurrentExecutions: 5
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  WAFShieldManagerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/waf-shield-manager-${Environment}"
+      RetentionInDays: 90
+
+  EvidenceCollectorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "attack-evidence-collector-${Environment}"
+      Description: Post-attack evidence collection — queries WAF logs, resolves ASNs, generates abuse reports.
+      Runtime: python3.12
+      Handler: attack_evidence_collector.handler
+      Role: !GetAtt EvidenceCollectorRole.Arn
+      Timeout: 600
+      MemorySize: 1024
+      Code:
+        S3Bucket: !Ref LambdaCodeBucket
+        S3Key: !Sub "${LambdaCodeVersion}/attack_evidence_collector.zip"
+      Environment:
+        Variables:
+          ATHENA_DATABASE: !Ref AthenaDatabase
+          ATHENA_RESULTS_BUCKET: !Ref AthenaResultsBucket
+          EVIDENCE_BUCKET: !Sub "${EvidenceBucket}"
+          SES_FROM_ADDRESS: !Ref SESFromAddress
+          SNS_NOC_TOPIC_ARN: !Ref NOCAlertsTopic
+      ReservedConcurrentExecutions: 3
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  EvidenceCollectorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/attack-evidence-collector-${Environment}"
+      RetentionInDays: 90
+
+  # -------------------------------------------------------------------------
+  # Lambda Permissions — allow EventBridge to invoke
+  # -------------------------------------------------------------------------
+  DDoSDetectorEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt DDoSDetectorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+
+  CampaignAutoscalerEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt CampaignAutoscalerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+
+  WAFShieldManagerEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt WAFShieldManagerFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+
+  EvidenceCollectorEventBridgePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt EvidenceCollectorFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:rule/*"
+
+  # -------------------------------------------------------------------------
+  # CloudWatch Alarms
+  # -------------------------------------------------------------------------
+
+  # Alarm: ALB request count spike (potential DDoS or campaign traffic)
+  ALBHighRequestCountAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "casino-alb-high-request-count-${Environment}"
+      AlarmDescription: >
+        ALB request count exceeded threshold — possible DDoS or campaign traffic spike.
+        Triggers DDoS detector Lambda for classification.
+      Namespace: AWS/ApplicationELB
+      MetricName: RequestCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref ALBFullName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref RequestCountAlarmThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref ALBHighRequestCountAlarmEventRule
+        - !Ref NOCAlertsTopic
+      OKActions:
+        - !Ref NOCAlertsTopic
+
+  # Alarm: 5xx error rate spike
+  ALBHigh5xxErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "casino-alb-high-5xx-${Environment}"
+      AlarmDescription: >
+        ALB 5xx error count exceeded threshold — origin may be overwhelmed.
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref ALBFullName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ErrorRateAlarmThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DDoSDetectorHighErrorEventRule
+        - !Ref NOCAlertsTopic
+
+  # Alarm: Active connection count spike
+  ALBConnectionSpikeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "casino-alb-connection-spike-${Environment}"
+      AlarmDescription: >
+        ALB active connection count spike — likely SYN flood or connection exhaustion attempt.
+      Namespace: AWS/ApplicationELB
+      MetricName: ActiveConnectionCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !Ref ALBFullName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 3
+      Threshold: 50000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NOCAlertsTopic
+
+  # Alarm: WAF blocked requests spike
+  WAFHighBlockRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "casino-waf-high-block-rate-${Environment}"
+      AlarmDescription: >
+        WAF blocked request count exceeded threshold — active attack pattern detected.
+      Namespace: AWS/WAFV2
+      MetricName: BlockedRequests
+      Dimensions:
+        - Name: WebACL
+          Value: !Sub "casino-prod-webacl-${Environment}"
+        - Name: Region
+          Value: !Ref AWS::Region
+        - Name: Rule
+          Value: ALL
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10000
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref NOCAlertsTopic
+
+  # -------------------------------------------------------------------------
+  # EventBridge Rules — Alarm → Lambda
+  # -------------------------------------------------------------------------
+
+  # Rule: High request count alarm → DDoS Detector
+  ALBHighRequestCountAlarmEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "casino-alb-high-requests-to-detector-${Environment}"
+      Description: Routes ALB high-request-count alarm to DDoS detector Lambda.
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          alarmName:
+            - !Sub "casino-alb-high-request-count-${Environment}"
+          state:
+            value:
+              - ALARM
+      State: ENABLED
+      Targets:
+        - Id: DDoSDetectorTarget
+          Arn: !GetAtt DDoSDetectorFunction.Arn
+
+  # Rule: High 5xx error → DDoS Detector
+  DDoSDetectorHighErrorEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "casino-high-5xx-to-detector-${Environment}"
+      Description: Routes high 5xx rate alarm to DDoS detector for classification.
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          alarmName:
+            - !Sub "casino-alb-high-5xx-${Environment}"
+          state:
+            value:
+              - ALARM
+      State: ENABLED
+      Targets:
+        - Id: DDoSDetectorHighErrorTarget
+          Arn: !GetAtt DDoSDetectorFunction.Arn
+
+  # Rule: Scheduled campaign autoscaler (every 5 minutes — checks DynamoDB
+  # for campaigns starting in the next WARMUP_LEAD_MINUTES window)
+  CampaignAutoscalerScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "casino-campaign-autoscaler-schedule-${Environment}"
+      Description: >
+        Periodic trigger for campaign autoscaler to check for upcoming campaigns
+        and pre-scale resources within the warmup window.
+      ScheduleExpression: "rate(5 minutes)"
+      State: ENABLED
+      Targets:
+        - Id: CampaignAutoscalerTarget
+          Arn: !GetAtt CampaignAutoscalerFunction.Arn
+          Input: '{"action": "check_upcoming"}'
+
+  # -------------------------------------------------------------------------
+  # WAF WebACL
+  # -------------------------------------------------------------------------
+  CasinoWebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub "casino-prod-webacl-${Environment}"
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      Description: >
+        Casino platform WAF — includes rate-based rules, AWS managed rule groups,
+        and IP block sets for DDoS mitigation.
+      Rules:
+        # Rule 1: AWS Managed Core Rule Set
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 10
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesCommonRuleSet
+
+        # Rule 2: AWS Managed Known Bad Inputs
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 20
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesKnownBadInputs
+
+        # Rule 3: AWS Managed Anonymous IP List (Tor, VPN, proxies)
+        - Name: AWSManagedRulesAnonymousIpList
+          Priority: 30
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAnonymousIpList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: AWSManagedRulesAnonymousIpList
+
+        # Rule 4: Rate-based baseline (5000 requests / 5 min per IP)
+        - Name: BaselineRateLimit
+          Priority: 40
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 5000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: BaselineRateLimit
+
+        # Rule 5: Block IPs from primary DDoS block set
+        - Name: DDoSIPBlockPrimary
+          Priority: 5
+          Action:
+            Block: {}
+          Statement:
+            IPSetReferenceStatement:
+              Arn: !GetAtt DDoSBlockPrimaryIPSet.Arn
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: DDoSIPBlockPrimary
+
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "casino-prod-webacl-${Environment}"
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # WAF IP Set — Primary DDoS Block List
+  DDoSBlockPrimaryIPSet:
+    Type: AWS::WAFv2::IPSet
+    Properties:
+      Name: !Sub "ddos-block-primary-${Environment}"
+      Scope: CLOUDFRONT
+      IPAddressVersion: IPV4
+      Description: Primary DDoS IP block set — managed by waf_shield_manager Lambda.
+      Addresses: []
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: waf-shield-manager-lambda
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  NOCAlertTopicArn:
+    Description: SNS topic ARN for NOC alerts.
+    Value: !Ref NOCAlertsTopic
+    Export:
+      Name: !Sub "${AWS::StackName}-NOCAlertTopicArn"
+
+  DDoSDetectorFunctionArn:
+    Description: DDoS Detector Lambda ARN.
+    Value: !GetAtt DDoSDetectorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-DDoSDetectorFunctionArn"
+
+  CampaignAutoscalerFunctionArn:
+    Description: Campaign Autoscaler Lambda ARN.
+    Value: !GetAtt CampaignAutoscalerFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-CampaignAutoscalerFunctionArn"
+
+  WAFShieldManagerFunctionArn:
+    Description: WAF & Shield Manager Lambda ARN.
+    Value: !GetAtt WAFShieldManagerFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-WAFShieldManagerFunctionArn"
+
+  EvidenceCollectorFunctionArn:
+    Description: Attack Evidence Collector Lambda ARN.
+    Value: !GetAtt EvidenceCollectorFunction.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EvidenceCollectorFunctionArn"
+
+  MarketingCalendarTableName:
+    Description: DynamoDB marketing campaign calendar table name.
+    Value: !Ref MarketingCampaignCalendarTable
+    Export:
+      Name: !Sub "${AWS::StackName}-MarketingCalendarTable"
+
+  WAFWebACLId:
+    Description: WAF WebACL ID.
+    Value: !GetAtt CasinoWebACL.Id
+    Export:
+      Name: !Sub "${AWS::StackName}-WAFWebACLId"
+
+  WAFWebACLArn:
+    Description: WAF WebACL ARN (associate with CloudFront distribution).
+    Value: !GetAtt CasinoWebACL.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-WAFWebACLArn"
+
+  EvidenceBucketName:
+    Description: S3 bucket for attack evidence.
+    Value: !Ref AttackEvidenceBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-EvidenceBucket"

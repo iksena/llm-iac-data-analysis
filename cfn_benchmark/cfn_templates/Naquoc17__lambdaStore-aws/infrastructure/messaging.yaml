@@ -1,0 +1,189 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  LambdaStore — Messaging Stack
+  DVA-C02 Stage S5: SQS FIFO, SNS, EventBridge, Kinesis
+
+# DVA S5 Questions mapped to this stack:
+#   SQS FIFO — MessageGroupId, MessageDeduplicationId, visibility timeout
+#   SNS fan-out — one topic → multiple subscribers
+#   Kinesis — real-time stream, multiple consumers, replay
+#   DynamoDB Streams → Lambda event source mapping
+#   DLQ — dead letter queue for failed message handling
+#   EventBridge — scheduled rules, event bus patterns
+
+Parameters:
+  Stage:
+    Type: String
+  ProjectName:
+    Type: String
+    Default: lambdastore
+
+Resources:
+
+  # ── SQS FIFO: Order Queue ────────────────────────────────────────────────────
+  # DVA S5: FIFO = ordered + exactly-once delivery
+  # DVA S5: MessageGroupId = userId (orders per-user are ordered)
+  # DVA S5: MessageDeduplicationId = orderId (idempotent)
+  # DVA S5 Exam Trap: FIFO max 3000 msg/s (vs Standard = near unlimited)
+  # DVA S5 Exam Trap: Visibility timeout MUST be > Lambda timeout
+  OrderQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-${Stage}-orders.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: false   # use explicit MessageDeduplicationId
+      VisibilityTimeout: 60              # must be > Lambda timeout (30s)
+      MessageRetentionPeriod: 86400      # 1 day (default 4 days)
+      # DVA S5: DLQ after 3 failed processing attempts
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrderDLQ.Arn
+        maxReceiveCount: 3
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # DVA S5: Dead Letter Queue — stores unprocessable orders for investigation
+  # DVA S5 Q: DLQ is on the SOURCE queue, not the Lambda
+  OrderDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-${Stage}-orders-dlq.fifo
+      FifoQueue: true
+      MessageRetentionPeriod: 1209600   # 14 days — time to investigate
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # CloudWatch Alarm on DLQ depth — alert when dead letters accumulate
+  OrderDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${ProjectName}-${Stage}-order-dlq-depth
+      AlarmDescription: Orders failing to process — check DLQ
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt OrderDLQ.QueueName
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # ── SNS: Order Notification Topic ────────────────────────────────────────────
+  # DVA S5: SNS fan-out — one publish reaches all subscribers simultaneously
+  # Subscribers: SQS queue (email worker), Lambda (webhook), SQS (audit log)
+  OrderNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${ProjectName}-${Stage}-order-notifications
+      DisplayName: LambdaStore Order Notifications
+      # DVA S5: Filter policies on subscriptions (not on topic)
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # SNS → SQS subscription for email notifications
+  # DVA S5: SNS+SQS fan-out = durable delivery (SQS buffers if subscriber down)
+  EmailWorkerQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${ProjectName}-${Stage}-email-notifications
+      MessageRetentionPeriod: 3600
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  EmailWorkerSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref OrderNotificationTopic
+      Protocol: sqs
+      Endpoint: !GetAtt EmailWorkerQueue.Arn
+      # DVA S5: Filter policy — only receive ORDER_PROCESSING events
+      FilterPolicy:
+        eventType:
+          - ORDER_PROCESSING
+          - ORDER_SHIPPED
+
+  EmailWorkerQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues: [!Ref EmailWorkerQueue]
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: sns.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EmailWorkerQueue.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !Ref OrderNotificationTopic
+
+  # ── EventBridge: Scheduled Rules ────────────────────────────────────────────
+  # DVA S5: Q — EventBridge scheduled rule (cron) for recurring jobs
+  # DVA S2: Q004 — Step Functions for complex orchestration (vs EventBridge for simple schedules)
+  CleanupRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ProjectName}-${Stage}-cart-cleanup
+      Description: Daily cleanup of abandoned carts
+      # DVA S5: cron expression — every day at 02:00 UTC
+      ScheduleExpression: cron(0 2 * * ? *)
+      State: ENABLED
+      Targets:
+        - Id: CartCleanupLambda
+          # TODO Build Stage 18: Add CartCleanupFunction and reference it here
+          Arn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${ProjectName}-${Stage}-cart-cleanup
+
+  # ── Kinesis Data Stream: Analytics ───────────────────────────────────────────
+  # DVA S5: Kinesis for real-time analytics — ordered, replayable, multi-consumer
+  # DVA S5 Exam: Kinesis shard = 1MB/s write, 2MB/s read per consumer
+  # DVA S5 Exam Trap: Kinesis is NOT for work queue (use SQS) — Kinesis for analytics/streaming
+  AnalyticsStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub ${ProjectName}-${Stage}-analytics
+      # DVA S5: On-demand mode avoids shard capacity planning
+      StreamModeDetails:
+        StreamMode: ON_DEMAND
+      RetentionPeriodHours: 24   # DVA S5: replay up to 24h of data
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+Outputs:
+  OrderQueueUrl:
+    Value: !Ref OrderQueue
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-OrderQueueUrl
+
+  OrderQueueArn:
+    Value: !GetAtt OrderQueue.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-OrderQueueArn
+
+  OrderDLQUrl:
+    Value: !Ref OrderDLQ
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-OrderDLQUrl
+
+  OrderNotificationTopicArn:
+    Value: !Ref OrderNotificationTopic
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-OrderNotificationTopicArn
+
+  AnalyticsStreamArn:
+    Value: !GetAtt AnalyticsStream.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-AnalyticsStreamArn
+
+  AnalyticsStreamName:
+    Value: !Ref AnalyticsStream
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-AnalyticsStreamName

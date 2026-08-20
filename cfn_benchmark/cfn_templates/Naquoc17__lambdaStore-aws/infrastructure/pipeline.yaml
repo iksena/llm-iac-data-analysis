@@ -1,0 +1,339 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  LambdaStore — CI/CD Pipeline Stack
+  DVA-C02 Stage S6: CodePipeline, CodeBuild, CodeDeploy
+
+# DVA S6 Questions mapped to this stack (71 questions — largest stage):
+#   CodePipeline orchestration (Source → Build → Deploy stages)
+#   CodeBuild — buildspec.yml, environment, artifacts, cache
+#   CodeDeploy — Lambda canary, ECS blue/green, deployment strategies
+#   Lambda versioning + aliases (stable reference for CodeDeploy)
+#   CloudFormation + SAM — nested stacks, change sets
+#   Elastic Beanstalk — worker tier, rolling deployments
+#   ECS blue/green via CodeDeploy
+
+Parameters:
+  Stage:
+    Type: String
+  ProjectName:
+    Type: String
+    Default: lambdastore
+  CodeCommitRepoName:
+    Type: String
+    Default: lambdastore
+    Description: CodeCommit repository name (Build Stage 33)
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Email for pipeline notifications
+
+Resources:
+
+  # ── S3 Artifact Bucket ───────────────────────────────────────────────────────
+  # DVA S6: CodePipeline stores artifacts (source ZIP, built packages) in S3
+  # DVA S6 Exam: Artifact bucket must be in same region as pipeline
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Stage}-artifacts-${AWS::AccountId}
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled             # DVA S6: versioning for artifact history
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30    # keep artifacts for 30 days
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── IAM Roles ────────────────────────────────────────────────────────────────
+  # DVA S6: CodePipeline needs IAM role to access CodeCommit, CodeBuild, CloudFormation
+  CodePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Stage}-pipeline-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                Resource: !Sub arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepoName}
+              - Effect: Allow
+                Action: [codebuild:BatchGetBuilds, codebuild:StartBuild]
+                Resource: !GetAtt BuildProject.Arn
+              - Effect: Allow
+                Action: [cloudformation:*, iam:PassRole]
+                Resource: '*'
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:GetBucketVersioning]
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub ${ArtifactBucket.Arn}/*
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Stage}-codebuild-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonS3FullAccess
+        - arn:aws:iam::aws:policy/AWSCloudFormationFullAccess
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*
+              - Effect: Allow
+                Action: [ssm:GetParameters, ssm:GetParameter]
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*
+
+  # ── CodeBuild Project ─────────────────────────────────────────────────────────
+  # DVA S6: CodeBuild runs buildspec.yml — install, pre_build, build, post_build phases
+  # DVA S6 Exam: CodeBuild = managed build server (no EC2 to maintain)
+  BuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub ${ProjectName}-${Stage}-build
+      Description: Build LambdaStore SAM application
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: CODEPIPELINE               # DVA S6: artifacts passed from pipeline
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL  # cheapest tier for small Lambda projects
+        Image: aws/codebuild/standard:7.0  # Python 3.12 available
+        EnvironmentVariables:
+          - Name: STAGE
+            Value: !Ref Stage
+          - Name: ARTIFACT_BUCKET
+            Value: !Ref ArtifactBucket
+          - Name: REGION
+            Value: !Ref AWS::Region
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: buildspec.yml           # relative to repo root
+      Cache:
+        # DVA S6: S3 cache speeds up builds (avoids reinstalling pip packages)
+        Type: S3
+        Location: !Sub ${ArtifactBucket}/cache/codebuild
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Sub /aws/codebuild/${ProjectName}-${Stage}
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── CodeDeploy ────────────────────────────────────────────────────────────────
+  # DVA S6: CodeDeploy for Lambda canary deployments
+  # DVA S6 Strategy: Canary10Percent5Minutes — safest for prod Lambda
+  CodeDeployApp:
+    Type: AWS::CodeDeploy::Application
+    Properties:
+      ApplicationName: !Sub ${ProjectName}-${Stage}
+      ComputePlatform: Lambda           # DVA S6: Lambda platform (vs EC2 or ECS)
+
+  LambdaDeploymentGroup:
+    Type: AWS::CodeDeploy::DeploymentGroup
+    Properties:
+      ApplicationName: !Ref CodeDeployApp
+      DeploymentGroupName: !Sub ${ProjectName}-${Stage}-lambda
+      ServiceRoleArn: !GetAtt CodeDeployRole.Arn
+      DeploymentConfigName: CodeDeployDefault.LambdaCanary10Percent5Minutes
+      # DVA S6: Auto-rollback on CloudWatch alarm or deployment failure
+      AutoRollbackConfiguration:
+        Enabled: true
+        Events:
+          - DEPLOYMENT_FAILURE
+          - DEPLOYMENT_STOP_ON_ALARM
+      # DVA S6: Alarm to trigger rollback if error rate spikes during canary
+      AlarmConfiguration:
+        Enabled: true
+        Alarms:
+          - Name: !Sub ${ProjectName}-${Stage}-products-error-rate
+
+  CodeDeployRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${ProjectName}-${Stage}-codedeploy-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codedeploy.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSCodeDeployRoleForLambda
+
+  # ── CodePipeline ──────────────────────────────────────────────────────────────
+  # DVA S6: Pipeline stages — Source → Build → Deploy
+  # DVA S6 Exam: Each stage has actions; actions can be parallel (runOrder=same)
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub ${ProjectName}-${Stage}
+      RoleArn: !GetAtt CodePipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        # DVA S6 Stage 1: Source — poll CodeCommit for changes
+        - Name: Source
+          Actions:
+            - Name: SourceCode
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: '1'
+              Configuration:
+                RepositoryName: !Ref CodeCommitRepoName
+                BranchName: main
+                PollForSourceChanges: false   # use EventBridge rule instead
+              OutputArtifacts:
+                - Name: SourceArtifact
+              RunOrder: 1
+
+        # DVA S6 Stage 2: Build — run buildspec.yml in CodeBuild
+        - Name: Build
+          Actions:
+            - Name: BuildAndTest
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: '1'
+              Configuration:
+                ProjectName: !Ref BuildProject
+              InputArtifacts:
+                - Name: SourceArtifact
+              OutputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+
+        # DVA S6 Stage 3: Deploy — CloudFormation changeset + execute
+        - Name: Deploy
+          Actions:
+            # DVA S6: CreateChangeSet action previews changes
+            - Name: CreateChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_REPLACE
+                StackName: !Sub ${ProjectName}-${Stage}
+                ChangeSetName: !Sub ${ProjectName}-${Stage}-changeset
+                TemplatePath: BuildArtifact::packaged.yaml
+                Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+              InputArtifacts:
+                - Name: BuildArtifact
+              RunOrder: 1
+            # DVA S6: ExecuteChangeSet applies the changeset
+            - Name: ExecuteChangeSet
+              ActionTypeId:
+                Category: Deploy
+                Owner: AWS
+                Provider: CloudFormation
+                Version: '1'
+              Configuration:
+                ActionMode: CHANGE_SET_EXECUTE
+                StackName: !Sub ${ProjectName}-${Stage}
+                ChangeSetName: !Sub ${ProjectName}-${Stage}-changeset
+              RunOrder: 2
+
+  # EventBridge rule to trigger pipeline on CodeCommit push
+  # DVA S6: EventBridge (not polling) is the recommended trigger for CodePipeline
+  PipelineTriggerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${ProjectName}-${Stage}-pipeline-trigger
+      Description: Trigger pipeline on CodeCommit push to main
+      EventPattern:
+        source: [aws.codecommit]
+        detail-type: [CodeCommit Repository State Change]
+        detail:
+          event: [referenceCreated, referenceUpdated]
+          referenceName: [main]
+          referenceType: [branch]
+        resources:
+          - !Sub arn:aws:codecommit:${AWS::Region}:${AWS::AccountId}:${CodeCommitRepoName}
+      Targets:
+        - Id: TriggerPipeline
+          Arn: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+          RoleArn: !GetAtt EventBridgePipelineRole.Arn
+
+  EventBridgePipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: TriggerPipeline
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub arn:aws:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}
+
+Outputs:
+  PipelineName:
+    Value: !Ref Pipeline
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-PipelineName
+
+  ArtifactBucketName:
+    Value: !Ref ArtifactBucket
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-ArtifactBucketName
+
+  BuildProjectName:
+    Value: !Ref BuildProject
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-BuildProjectName
+
+  CodeDeployAppName:
+    Value: !Ref CodeDeployApp
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-CodeDeployAppName

@@ -1,0 +1,524 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Best-practice multi-AZ web application stack: VPC with 2 public + 2 private
+  subnets across two Availability Zones, Internet Gateway, NAT Gateway(s),
+  route tables, an internet-facing Application Load Balancer, two EC2 app
+  instances in the private subnets (managed via SSM Session Manager, no SSH),
+  and an encrypted RDS MySQL database in the private subnets. Layered
+  security groups: Internet -> ALB -> EC2 -> RDS.
+
+# ------------------------------------------------------------------------------
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: Network Configuration }
+        Parameters:
+          - VpcCidr
+          - PublicSubnet1Cidr
+          - PublicSubnet2Cidr
+          - PrivateSubnet1Cidr
+          - PrivateSubnet2Cidr
+          - HighlyAvailableNat
+      - Label: { default: Application Tier }
+        Parameters:
+          - InstanceType
+          - LatestAmiId
+      - Label: { default: Database Tier }
+        Parameters:
+          - DBName
+          - DBInstanceClass
+          - DBMultiAZ
+          - DBAllocatedStorage
+    ParameterLabels:
+      HighlyAvailableNat: { default: 'Deploy one NAT Gateway per AZ (HA, extra cost)?' }
+
+# ------------------------------------------------------------------------------
+Parameters:
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC.
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+
+  PublicSubnet1Cidr:
+    Type: String
+    Default: 10.0.0.0/24
+    Description: CIDR for public subnet in AZ1 (ALB / NAT).
+  PublicSubnet2Cidr:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR for public subnet in AZ2 (ALB / NAT).
+  PrivateSubnet1Cidr:
+    Type: String
+    Default: 10.0.10.0/24
+    Description: CIDR for private subnet in AZ1 (EC2 + RDS).
+  PrivateSubnet2Cidr:
+    Type: String
+    Default: 10.0.11.0/24
+    Description: CIDR for private subnet in AZ2 (EC2 + RDS).
+
+  HighlyAvailableNat:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      true = one NAT Gateway in each AZ (recommended for production,
+      doubles NAT cost). false = single NAT Gateway in AZ1.
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium, t3.large]
+    Description: EC2 instance type for the application servers.
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI resolved from SSM (never hardcode AMIs).
+
+  DBName:
+    Type: String
+    Default: appdb
+    MinLength: 1
+    MaxLength: 64
+    AllowedPattern: '[a-zA-Z][a-zA-Z0-9]*'
+    Description: Initial database name.
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t3.medium, db.m5.large]
+    Description: RDS instance class.
+  DBMultiAZ:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Multi-AZ standby replica for the database (recommended for production).
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 1000
+    Description: Database storage in GiB (gp3, encrypted).
+
+# ------------------------------------------------------------------------------
+Conditions:
+  CreateSecondNat: !Equals [!Ref HighlyAvailableNat, 'true']
+
+# ------------------------------------------------------------------------------
+Resources:
+
+  # ---------------------------- VPC & Internet Gateway -----------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-vpc' }
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-igw' }
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # ---------------------------- Subnets (2 AZs) ------------------------------
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public-1' }
+        - { Key: Tier, Value: public }
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public-2' }
+        - { Key: Tier, Value: public }
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-1' }
+        - { Key: Tier, Value: private }
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: false
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-2' }
+        - { Key: Tier, Value: private }
+
+  # ---------------------------- NAT Gateways ---------------------------------
+  NatEip1:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-nat-eip-1' }
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEip1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-nat-1' }
+
+  NatEip2:
+    Type: AWS::EC2::EIP
+    Condition: CreateSecondNat
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-nat-eip-2' }
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Condition: CreateSecondNat
+    Properties:
+      AllocationId: !GetAtt NatEip2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-nat-2' }
+
+  # ---------------------------- Route Tables ---------------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-public-rt' }
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-rt-1' }
+
+  PrivateDefaultRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-private-rt-2' }
+
+  PrivateDefaultRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !If [CreateSecondNat, !Ref NatGateway2, !Ref NatGateway1]
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  # ---------------------------- Security Groups ------------------------------
+  # Layered access: Internet(80/443) -> ALB -> App(80) -> DB(3306)
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - allow HTTP/HTTPS from the internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP from anywhere
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS from anywhere
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-alb-sg' }
+
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App instances - allow HTTP only from the ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSecurityGroup
+          Description: HTTP from ALB only
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-app-sg' }
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS - allow MySQL only from app instances
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSecurityGroup
+          Description: MySQL from app tier only
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-db-sg' }
+
+  # ---------------------------- IAM (SSM, no SSH) ----------------------------
+  AppInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-app-role' }
+
+  AppInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref AppInstanceRole]
+
+  # ---------------------------- Launch Template + EC2 ------------------------
+  AppLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub '${AWS::StackName}-app-lt'
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt AppInstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref AppSecurityGroup
+        MetadataOptions:
+          HttpTokens: required        # enforce IMDSv2
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 20
+              Encrypted: true         # encrypt root volumes
+              DeleteOnTermination: true
+        Monitoring: { Enabled: true } # detailed CloudWatch monitoring
+        UserData:
+          Fn::Base64: |
+            #!/bin/bash
+            dnf -y update
+            dnf -y install httpd
+            systemctl enable --now httpd
+            TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+            AZ=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/placement/availability-zone)
+            echo "<h1>App server in $AZ</h1>" > /var/www/html/index.html
+
+  AppInstance1:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PrivateSubnet1
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-app-1' }
+
+  AppInstance2:
+    Type: AWS::EC2::Instance
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref AppLaunchTemplate
+        Version: !GetAtt AppLaunchTemplate.LatestVersionNumber
+      SubnetId: !Ref PrivateSubnet2
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-app-2' }
+
+  # ---------------------------- Load Balancer --------------------------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Name: !Sub '${AWS::StackName}-alb'
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref AlbSecurityGroup
+      LoadBalancerAttributes:
+        - { Key: idle_timeout.timeout_seconds, Value: '60' }
+        - { Key: routing.http.drop_invalid_header_fields.enabled, Value: 'true' }
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-alb' }
+
+  AppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${AWS::StackName}-tg'
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 80
+      TargetType: instance
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher: { HttpCode: '200' }
+      Targets:
+        - { Id: !Ref AppInstance1, Port: 80 }
+        - { Id: !Ref AppInstance2, Port: 80 }
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-tg' }
+
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AppTargetGroup
+      # Production: add an HTTPS (443) listener with an ACM certificate and
+      # change this one to redirect HTTP -> HTTPS.
+
+  # ---------------------------- RDS ------------------------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for RDS (2 AZs)
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-db-subnets' }
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${AWS::StackName}-db'
+      Engine: mysql
+      EngineVersion: 8.0.42
+      DBName: !Ref DBName
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true                  # encryption at rest
+      MultiAZ: !Ref DBMultiAZ
+      PubliclyAccessible: false               # never expose the DB
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DbSecurityGroup
+      MasterUsername: dbadmin
+      ManageMasterUserPassword: true          # password lives in Secrets Manager
+      BackupRetentionPeriod: 7
+      PreferredBackupWindow: 02:00-03:00
+      PreferredMaintenanceWindow: sun:04:00-sun:05:00
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+      EnableCloudwatchLogsExports: [error, general, slowquery]
+      Tags:
+        - { Key: Name, Value: !Sub '${AWS::StackName}-db' }
+
+# ------------------------------------------------------------------------------
+Outputs:
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export: { Name: !Sub '${AWS::StackName}-VpcId' }
+
+  AlbDnsName:
+    Description: Public URL of the application
+    Value: !Sub 'http://${ApplicationLoadBalancer.DNSName}'
+
+  PublicSubnets:
+    Description: Public subnet IDs
+    Value: !Join [',', [!Ref PublicSubnet1, !Ref PublicSubnet2]]
+
+  PrivateSubnets:
+    Description: Private subnet IDs
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+
+  AppInstanceIds:
+    Description: EC2 instance IDs (connect via SSM Session Manager)
+    Value: !Join [',', [!Ref AppInstance1, !Ref AppInstance2]]
+
+  DatabaseEndpoint:
+    Description: RDS endpoint address
+    Value: !GetAtt Database.Endpoint.Address
+
+  DatabaseSecretArn:
+    Description: Secrets Manager secret holding the DB master credentials
+    Value: !GetAtt Database.MasterUserSecret.SecretArn

@@ -1,0 +1,300 @@
+Description: >-
+  Cloudformation Stack for Nuon Runner ASG. Should be used in the runner_nested_template_url field in stack.toml.
+Parameters:
+  SubnetId:
+    Description: The subnet on which the app will run within the selected VPC.
+    Type: AWS::EC2::Subnet::Id
+  RunnerEgressGroupId:
+    Description: The security group for the runner instance that allows outbound traffic.
+    Type: AWS::EC2::SecurityGroup::Id
+  InstallId:
+    Type: String
+    Description: The install ID
+  RunnerId:
+    Type: String
+    Description: The runner ID
+  RunnerApiUrl:
+    Type: String
+    Description: API URL for the runner
+    Default: https://runner.nuon.co
+  RunnerInitScriptUrl:
+    Type: String
+    Description: URL for the init script that is added to the use data for the Runner ASG VM instances.
+    Default: https://raw.githubusercontent.com/nuonco/runner/refs/heads/main/scripts/aws/init.sh
+  RunnerEnvVars:
+    Type: String
+    Description: Optional newline-delimited shell export statements to inject into runner user data before init script execution. e.g. `export FOO=BAR\nexport MOO=COW`.
+    Default: ""
+  InstanceType:
+    Type: String
+    Description: EC2 instance type for the runner
+    Default: t3.medium
+  RootVolumeSize:
+    Type: Number
+    Description: Size of the root EBS volume in GB
+    Default: 100
+    MinValue: 30
+    MaxValue: 200
+
+Conditions:
+  HasRunnerEnvVars:
+    Fn::Not:
+    - Fn::Equals:
+      - Ref: RunnerEnvVars
+      - ""
+
+Resources:
+  RunnerAutoScalingGroup:
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: 1
+        MinInstancesInService: 0
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId:
+          Ref: RunnerLaunchTemplate
+        Version:
+          Fn::GetAtt:
+          - RunnerLaunchTemplate
+          - LatestVersionNumber
+      MaxSize: "1"
+      MinSize: "1"
+      Tags:
+      - Key: nuon_runner_id
+        PropagateAtLaunch: false
+        Value:
+          Ref: RunnerId
+      - Key: Name
+        PropagateAtLaunch: false
+        Value:
+          Fn::Sub: ${AWS::StackName}-runner
+      VPCZoneIdentifier:
+      - Ref: SubnetId
+    Type: AWS::AutoScaling::AutoScalingGroup
+
+  RunnerInstanceProfile:
+    Properties:
+      InstanceProfileName:
+        Fn::Sub: ${AWS::StackName}--runner-profile
+      Roles:
+      - Ref: RunnerInstanceRole
+    Type: AWS::IAM::InstanceProfile
+
+  RunnerInstanceRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service: ec2.amazonaws.com
+      Description: Instance role for the runner ec2 instance and ASG. Used to assume Provision, Deprovision, Maintenance, and custom roles as needed by the app.
+      # The SSM agent heartbeat (ssm/ssmmessages/ec2messages) is the only managed
+      # policy attached. Everything else is scoped inline below.
+      ManagedPolicyArns:
+      - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+      # The runner does all real work by assuming a scoped role, so the instance
+      # role only needs to reach the install's own roles. Every role defined in
+      # permissions/*.toml is named `{{ .nuon.install.id }}-<role>` (provision,
+      # deprovision, maintenance, and the custom roles: acm-operations,
+      # alb-operations, bucket-cleanup), so the install id prefix is the scope.
+      #
+      # A tag condition (iam:ResourceTag/install.nuon.co/id) would be equivalent
+      # in intent, but nuon does not guarantee install tags on the roles it
+      # creates for these definitions -- the name prefix is contractual, the tags
+      # are not, so scoping by name is the safer of the two.
+      - PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: AssumeInstallScopedRoles
+            Effect: Allow
+            Action:
+            - sts:AssumeRole
+            - sts:TagSession
+            Resource:
+              Fn::Sub: arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${InstallId}-*
+        PolicyName: RunnerInstanceAssumeRolePolicy
+      # The cloudwatch agent config written by the runner init script logs to
+      # `runner-$RUNNER_ID` and nothing else. Create + put only; deletes are
+      # denied outright so a compromised runner cannot destroy its own logs (an
+      # explicit Deny cannot be overridden by any later grant).
+      - PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          - Sid: WriteOwnLogGroup
+            Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - logs:DescribeLogStreams
+            Resource:
+            - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:runner-${RunnerId}
+            - Fn::Sub: arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:runner-${RunnerId}:*
+          - Sid: DenyLogDeletion
+            Effect: Deny
+            Action:
+            - logs:DeleteLogGroup
+            - logs:DeleteLogStream
+            - logs:DeleteRetentionPolicy
+            Resource: '*'
+        PolicyName: RunnerInstanceLogsPolicy
+      Tags:
+      - Key: nuon_runner_id
+        Value:
+          Ref: RunnerId
+      - Key: runner.nuon.co/id
+        Value:
+          Ref: RunnerId
+      - Key: nuon_install_id
+        Value:
+          Ref: InstallId
+      - Key: install.nuon.co/id
+        Value:
+          Ref: InstallId
+      - Key: Name
+        Value:
+          Fn::Sub: ${RunnerId}-runner-instance
+    Type: AWS::IAM::Role
+
+  # this is required to allow the runner ASG instances to access their own metadata/tags
+  # (the init script reads nuon_runner_id / nuon_runner_api_url off its own instance).
+  #
+  # ec2:DescribeTags cannot be narrowed: it supports neither resource-level ARNs
+  # nor the ec2:ResourceTag condition key, so "*" is the only valid resource. The
+  # read is scoped in practice by the --filters on the instance's own id, and the
+  # action is list-only.
+  #
+  # NOTE: the logical id here was renamed away from the original
+  # RunnerInstanceRoleCloudWatchLogPolicy, which never described what it did.
+  # CloudFormation treats a logical id rename as create-new-then-delete-old, and
+  # an AWS::IAM::Policy is identified by (PolicyName, attached role) -- so the
+  # PolicyName has to change alongside the logical id, or the new resource
+  # collides with the old one that has not been deleted yet.
+  RunnerInstanceRoleEC2InstanceMetadataPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName:
+        Fn::Sub: ${RunnerId}-runner-ec2-instance-metadata
+      Roles:
+      - Ref: RunnerInstanceRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Sid: ReadOwnInstanceTags
+          Effect: Allow
+          Action:
+          - ec2:DescribeTags
+          Resource: "*"
+
+  # Self-lifecycle: the runner rolls itself via an instance refresh on its own
+  # ASG. Kept as a separate AWS::IAM::Policy because it needs a Ref to the ASG
+  # (whose name CloudFormation generates) to build the ARN scope.
+  #
+  # The autoscaling Describe* actions do not support resource-level permissions,
+  # so they sit in their own "*" statement; the mutating action is scoped to this
+  # stack's ASG only.
+  RunnerInstanceRoleSelfLifecyclePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName:
+        Fn::Sub: ${RunnerId}-runner-self-lifecycle
+      Roles:
+      - Ref: RunnerInstanceRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - Sid: RefreshOwnAutoScalingGroup
+          Effect: Allow
+          Action:
+          - autoscaling:StartInstanceRefresh
+          - autoscaling:DescribeInstanceRefreshes
+          Resource:
+            Fn::Sub: arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${RunnerAutoScalingGroup}
+        - Sid: DescribeAutoScalingState
+          Effect: Allow
+          Action:
+          - autoscaling:DescribeAutoScalingGroups
+          - autoscaling:DescribeAutoScalingInstances
+          Resource: "*"
+  RunnerLaunchTemplate:
+    Properties:
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize:
+              Ref: RootVolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+        IamInstanceProfile:
+          Name:
+            Ref: RunnerInstanceProfile
+        ImageId:
+          Fn::Sub: '{{resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}}'
+        InstanceType:
+          Ref: InstanceType
+        NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeleteOnTermination: true
+          DeviceIndex: 0
+          Groups:
+          - Ref: RunnerEgressGroupId
+          SubnetId:
+            Ref: SubnetId
+        TagSpecifications:
+        - ResourceType: instance
+          Tags:
+          - Key: nuon_runner_id
+            Value:
+              Ref: RunnerId
+          - Key: runner.nuon.co/id
+            Value:
+              Ref: RunnerId
+          - Key: nuon_runner_api_url
+            Value:
+              Ref: RunnerApiUrl
+          - Key: nuon_runner_id
+            Value:
+              Ref: RunnerId
+          - Key: Name
+            Value:
+              Fn::Sub: ${RunnerId}-runner-instance
+        - ResourceType: network-interface
+          Tags:
+          - Key: nuon_runner_id
+            Value:
+              Ref: RunnerId
+          - Key: Name
+            Value:
+              Fn::Sub: ${RunnerId}-runner-eni
+        UserData:
+          Fn::Base64:
+            Fn::Join:
+            - "\n"
+            - - "#!/bin/bash"
+              - Fn::If:
+                - HasRunnerEnvVars
+                - Ref: RunnerEnvVars
+                - Ref: AWS::NoValue
+              - Fn::Sub: curl ${RunnerInitScriptUrl} | bash
+      LaunchTemplateName:
+        Fn::Sub: ${AWS::StackName}-runner
+    Type: AWS::EC2::LaunchTemplate
+
+Outputs:
+  ASG:
+    Description: The runner ASG.
+    Value: !Ref RunnerAutoScalingGroup
+  RunnerInstanceRole:
+    Description: The role used by the instances managed by the Runner ASG
+    Value: !Ref RunnerInstanceRole
+
+  RunnerInstanceRoleARN:
+    Description: The ARN of role used by the instances managed by the Runner ASG
+    Value: !GetAtt RunnerInstanceRole.Arn

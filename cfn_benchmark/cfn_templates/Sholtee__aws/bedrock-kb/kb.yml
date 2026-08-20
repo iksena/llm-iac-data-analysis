@@ -1,0 +1,551 @@
+#####################################################
+# kb.yml
+#
+# Author: Denes Solti
+#####################################################
+Description: Knowledge base infrastructure.
+
+Transform: AWS::LanguageExtensions
+
+Parameters:
+  app:
+    Type: String
+    Description: The application name (including prefix)
+    MaxLength: '32'
+  embeddingModel:
+    Type: String
+    Description: Embedding model name
+    Default: amazon.titan-embed-text-v2:0
+
+Resources:
+  ##########################
+  # OpenSearch
+  ##########################
+
+  OpenSearchCollection:
+    Type: AWS::OpenSearchServerless::Collection
+    DependsOn: OpenSearchEncryptionPolicy  # EncryptionPolicy must exist for the collection
+    Properties:
+      Description: OpenSearch collection
+      Name: !Sub "${app}-os-collection"
+      Type: VECTORSEARCH
+    Metadata:
+      aws:cdk:path: KB/OpenSearch/Resource
+
+  OpenSearchEncryptionPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "${app}-os-encryption-policy"
+      Policy:
+        Fn::ToJsonString:
+          Rules:
+            - Resource:
+                - !Sub "collection/${app}-os-collection"  # name of OpenSearchCollection
+              ResourceType: collection
+          AWSOwnedKey: true
+      Type: encryption
+    Metadata:
+      aws:cdk:path: KB/OpenSearch/Policy/EncryptionPolicy
+
+  OpenSearchNetworkPolicy:
+    Type: AWS::OpenSearchServerless::SecurityPolicy
+    Properties:
+      Name: !Sub "${app}-os-network-policy"
+      Policy:
+        Fn::ToJsonString:
+          - Rules:
+              - Resource:
+                  - !Sub "collection/${app}-os-collection"
+                ResourceType: collection
+            AllowFromPublic: true
+      Type: network
+    Metadata:
+      aws:cdk:path: KB/OpenSearch/Policy/NetworkPolicy
+
+  OpenSearchDataAccessPolicy:
+    Type: AWS::OpenSearchServerless::AccessPolicy
+    Properties:
+      Name: !Sub "${app}-os-data-access-policy"
+      Policy:
+        Fn::ToJsonString:
+          - Rules:
+              - Resource:
+                  - !Sub "collection/${app}-os-collection"
+                Permission:
+                  - aoss:CreateCollectionItems
+                  - aoss:DeleteCollectionItems
+                  - aoss:UpdateCollectionItems
+                  - aoss:DescribeCollectionItems
+                ResourceType: collection
+              - Resource:
+                  - !Sub "index/${app}-os-collection/*"
+                Permission:
+                  - aoss:CreateIndex
+                  - aoss:DeleteIndex
+                  - aoss:UpdateIndex
+                  - aoss:DescribeIndex
+                  - aoss:ReadDocument
+                  - aoss:WriteDocument
+                ResourceType: index
+            Principal:
+              - !GetAtt BedrockExecutionRole.Arn
+              - !GetAtt OpenSearchIndexUpdaterLambdaRole.Arn
+              - !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Description: "-"
+      Type: data
+    Metadata:
+      aws:cdk:path: KB/OpenSearch/Policy/DataAccessPolicy
+
+  OpenSearchIndex:
+    Type: AWS::CloudFormation::CustomResource
+    DependsOn:
+      - OpenSearchNetworkPolicy
+      - OpenSearchDataAccessPolicy
+    Properties:
+      IndexName: !Sub "${app}-os-index"
+      Parameters:
+        settings:
+          index.knn: "true"
+          number_of_shards: 1
+          knn.algo_param.ef_search: 512
+          number_of_replicas: 0
+        mappings:
+          properties:
+            vector_field:
+              type: knn_vector
+              dimension: 1024
+              method:
+                name: hnsw
+                engine: faiss
+                space_type: "l2"
+            text_field:
+              type: text
+              index: "true"
+            text_metadata_field:
+              type: text
+              index: "false"
+      ServiceToken: !GetAtt OpenSearchIndexUpdaterLambda.Arn
+    Metadata:
+      aws:cdk:path: KB/OpenSearch/Index/Resource
+
+  OpenSearchIndexUpdaterLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Code:
+        ZipFile: |
+          const
+            {send, SUCCESS, FAILED} = require('cfn-response'),
+            {promisify} = require('util'),
+            exec = promisify(require('child_process').exec),
+            exists = promisify(require('fs').exists),
+            mkdir = promisify(require('fs').mkdir),
+            {tmpdir} = require('os'),
+            {join} = require('path'),
+            {REGION, OS_ENDPOINT, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN} = process.env;
+
+          exports.handler = async function(event, context) {
+            try {
+              const
+                {RequestType, ResourceProperties: {IndexName, Parameters}} = event,
+                appDir = join(tmpdir(), 'index_updater');
+
+              if (!(await exists(appDir)))
+                await mkdir(appDir);
+
+              console.log('Installing OpenSearch client...');
+              await exec(
+                `npm install --loglevel=verbose --logs-dir="${tmpdir()}" --cache="${join(tmpdir(), 'npm_cache')}" --prefix="${appDir}" @opensearch-project/opensearch@2.7.0`
+              );
+
+              console.log('Creating client...');
+              const
+                {Client} = require(join(appDir, 'node_modules', '@opensearch-project', 'opensearch')),
+                {AwsSigv4Signer} = require(join(appDir, 'node_modules', '@opensearch-project', 'opensearch', 'lib', 'aws')),
+                client = new Client({
+                  ...AwsSigv4Signer({
+                    region: REGION,
+                    service: 'aoss',
+                    async getCredentials() {  // needs to be async
+                      return {
+                        accessKeyId: AWS_ACCESS_KEY_ID,
+                        secretAccessKey: AWS_SECRET_ACCESS_KEY,
+                        sessionToken: AWS_SESSION_TOKEN
+                      };
+                    }
+                  }),
+                  node: OS_ENDPOINT
+                });
+
+              switch (RequestType) {
+                case 'Create': {
+                  console.log('Creating new index...');
+                  for (let attempts = 1; ; attempts++) {
+                    try {
+                      const response = await client.indices.create({
+                        index: IndexName,
+                        body: JSON.stringify(Parameters)
+                      });
+                      console.log(response);
+                      // index creation can take up to a minute
+                      await sleep(60000);
+                      break;
+                    } catch (err) {
+                      if (err.toString().includes('authorization_exception') && attempts < 4) {
+                        console.warn(err);
+                        await sleep(20000 * attempts);
+                        continue;
+                      }
+                      throw err;
+                    }
+                  }
+                  break;
+                }
+              }
+
+              await send(event, context, SUCCESS, {
+                IndexName
+              });
+            } catch (err) {
+              console.error(err);
+              await send(event, context, FAILED, null);
+            }
+          };
+
+          function sleep(ms) {
+            return new Promise(cb => setTimeout(cb, ms));
+          }
+      FunctionName: !Sub "${app}-os-index-updater"
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Timeout: 180
+      MemorySize: 128
+      Role: !GetAtt OpenSearchIndexUpdaterLambdaRole.Arn
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          OS_ENDPOINT: !GetAtt OpenSearchCollection.CollectionEndpoint
+    Metadata:
+      aws:cdk:path: KB/OpenSearch/Index/UpdaterLambda/Resource
+
+  OpenSearchIndexUpdaterLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyName: allowOpenSearchAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: aoss:*
+                Resource: "*"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+    Metadata:
+      aws:cdk:path: KB/OpenSearch/Index/UpdaterLambda/Role
+
+  ##########################
+  # Knowledge base
+  ##########################
+
+  KnowledgeBase:
+    Type: AWS::Bedrock::KnowledgeBase
+    Properties:
+      Name: !Sub "${app}-kb"
+      RoleArn: !GetAtt BedrockExecutionRole.Arn
+      KnowledgeBaseConfiguration:
+        Type: VECTOR
+        VectorKnowledgeBaseConfiguration:
+          EmbeddingModelArn: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${embeddingModel}"
+      StorageConfiguration:
+        Type: OPENSEARCH_SERVERLESS
+        OpensearchServerlessConfiguration:
+          CollectionArn: !GetAtt OpenSearchCollection.Arn
+          VectorIndexName: !GetAtt OpenSearchIndex.IndexName
+          FieldMapping:  # field names are defined in OpenSearchIndex.Parameters
+            MetadataField: text_metadata_field
+            TextField: text_field
+            VectorField: vector_field
+    Metadata:
+      aws:cdk:path: KB/KnowledgeBase/Resource
+
+  KnowledgeBaseCommonProperties:
+    Type: AWS::DynamoDB::Table
+    Description: Table containing the common properties such as last update time
+    Properties:
+      TableName: !Sub "${app}-kb-common-properties"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+    Metadata:
+      aws:cdk:path: KB/KnowledgeBase/Properties
+
+  KnowledgeBaseDataBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: KnowledgeBaseDataBucketEventSinkLambdaPermission  # required for NotificationConfiguration
+    Properties:
+      BucketName: !Sub "${app}-kb-data-bucket"
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt KnowledgeBaseDataBucketEventSinkLambda.Arn
+          - Event: s3:ObjectRemoved:*
+            Function: !GetAtt KnowledgeBaseDataBucketEventSinkLambda.Arn
+    Metadata:
+      aws:cdk:path: KB/KnowledgeBase/Data/Resource
+
+  KnowledgeBaseDataSource:
+    Type: AWS::Bedrock::DataSource
+    Properties:
+      Name: !Sub "${app}-kb-datasource"
+      KnowledgeBaseId: !Ref KnowledgeBase
+      DataSourceConfiguration:
+        Type: S3
+        S3Configuration:
+          BucketArn: !GetAtt KnowledgeBaseDataBucket.Arn
+      VectorIngestionConfiguration:
+        ChunkingConfiguration:
+          ChunkingStrategy: FIXED_SIZE
+          FixedSizeChunkingConfiguration:
+            MaxTokens: 4000
+            OverlapPercentage: 5
+    Metadata:
+      aws:cdk:path: KB/KnowledgeBase/Data/Source
+
+  KnowledgeBaseDataBucketEventSinkLambda:
+    Type: AWS::Lambda::Function
+    Description: Lambda processing the data bucket events
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          const
+            {DynamoDBClient, PutItemCommand} = require('@aws-sdk/client-dynamodb'),
+            client = new DynamoDBClient();
+
+          exports.handler = async function(event, context) {
+            console.log(event);
+            await client.send(new PutItemCommand({
+              Item: {
+                id: {S: 'bucket-modified'},
+                timestamp: {N: new Date().getTime().toString()}
+              },
+              TableName: '${KnowledgeBaseCommonProperties}'
+            }));
+          };
+      FunctionName: !Sub "${app}-kb-data-bucket-event-sink"
+      Handler: index.handler
+      Role: !GetAtt KnowledgeBaseDataBucketEventSinkLambdaRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 30
+      MemorySize: 128
+    Metadata:
+      aws:cdk:path: KB/KnowledgeBase/Data/EventSink/Resource
+
+  KnowledgeBaseDataBucketEventSinkLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyName: allowDbAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                Resource: !GetAtt KnowledgeBaseCommonProperties.Arn
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+    Metadata:
+      aws:cdk:path: KB/KnowledgeBase/Data/EventSink/Role
+
+  KnowledgeBaseDataBucketEventSinkLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref KnowledgeBaseDataBucketEventSinkLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${app}-kb-data-bucket"  # we cannot use "!GetAtt KnowledgeBaseDataBucket.Arn" here to avoid circular reference
+      SourceAccount: !Ref AWS::AccountId
+    Metadata:
+      aws:cdk:path: KB/KnowledgeBase/Data/EventSink/Permission
+
+  KnowledgeBaseDataIngestionInitiatorLambda:
+    Type: AWS::Lambda::Function
+    Description: Scheduled lambda that initiates a new KB ingestion job if the data bucket has been changed
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          const
+            {BedrockAgentClient, StartIngestionJobCommand} = require('@aws-sdk/client-bedrock-agent'),
+            {DynamoDBClient, GetItemCommand, PutItemCommand} = require('@aws-sdk/client-dynamodb'),
+            client = new DynamoDBClient();
+
+          exports.handler = async function(event, context) {
+            console.log('Querying properties...');
+
+            const
+              ingestionRun = (
+                await client.send(
+                  new GetItemCommand({ Key: { id: {S: 'ingestion-run'} }, TableName: '${KnowledgeBaseCommonProperties}' })
+                )
+              )['Item'],
+              bucketModified = (
+                await client.send(
+                  new GetItemCommand({ Key: { id: {S: 'bucket-modified'} }, TableName: '${KnowledgeBaseCommonProperties}' })
+                )
+              )['Item'];
+
+            if (!bucketModified)
+              return;  // nothing was uploaded yet
+
+            if (!ingestionRun || (parseInt(bucketModified.timestamp.N) > parseInt(ingestionRun.timestamp.N))) {
+              console.log('Initiating new ingestion job...');
+
+              const resp = await new BedrockAgentClient().send(new StartIngestionJobCommand({
+                knowledgeBaseId: '${KnowledgeBase}',
+                dataSourceId: '${KnowledgeBaseDataSource.DataSourceId}'
+              }));
+              console.log(resp);
+
+              await client.send(new PutItemCommand({
+                Item: {
+                  id: {S: 'ingestion-run'},
+                  timestamp: {N: new Date().getTime().toString()}
+                },
+                TableName: '${KnowledgeBaseCommonProperties}'
+              }));
+            }
+          };
+      FunctionName: !Sub "${app}-kb-data-ingestion-initiator"
+      Handler: index.handler
+      Role: !GetAtt KnowledgeBaseDataIngestionInitiatorLambdaRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 30
+      MemorySize: 128
+    Metadata:
+      aws:cdk:path: KB/KnowledgeBase/Data/IngestionInitiator/Resource
+
+  KnowledgeBaseDataIngestionInitiatorLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+      Policies:
+        - PolicyName: allowBedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:StartIngestionJob
+                Resource: !GetAtt KnowledgeBase.KnowledgeBaseArn
+        - PolicyName: allowDbAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                Resource: !GetAtt KnowledgeBaseCommonProperties.Arn
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+    Metadata:
+      aws:cdk:path: KB/KnowledgeBase/Data/IngestionInitiator/Role
+
+  KnowledgeBaseDataIngestionInitiatorLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref KnowledgeBaseDataIngestionInitiatorLambda
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt KnowledgeBaseDataIngestionInitiatorLambdaSchedule.Arn
+      SourceAccount: !Ref AWS::AccountId
+    Metadata:
+      aws:cdk:path: KB/KnowledgeBase/Data/IngestionInitiator/Permission
+
+  KnowledgeBaseDataIngestionInitiatorLambdaSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(10 minutes)
+      Targets:
+        - Id: KnowledgeBaseDataIngestionInitiatorLambdaSchedule
+          Arn: !GetAtt KnowledgeBaseDataIngestionInitiatorLambda.Arn
+    Metadata:
+      aws:cdk:path: KB/KnowledgeBase/Data/IngestionInitiator/Schedule
+
+  ##########################
+  # Bedrock
+  ##########################
+
+  BedrockExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - bedrock.amazonaws.com
+      Policies:
+        - PolicyName: allowOpenSearchApiAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - aoss:APIAccessAll
+                Resource:
+                  - !GetAtt OpenSearchCollection.Arn
+        - PolicyName: allowS3ReadOnlyAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !GetAtt KnowledgeBaseDataBucket.Arn
+                  - !Sub "${KnowledgeBaseDataBucket.Arn}/*"
+        - PolicyName: allowModelInvocation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: !Sub "arn:aws:bedrock:${AWS::Region}::foundation-model/${embeddingModel}"
+    Metadata:
+      aws:cdk:path: KB/Bedrock/ExecutionRole

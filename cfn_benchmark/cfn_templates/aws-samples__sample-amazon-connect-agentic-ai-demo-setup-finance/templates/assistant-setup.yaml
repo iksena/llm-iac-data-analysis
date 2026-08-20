@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Connect Assistant Setup with Knowledge Base and S3 Integration'
+
+Parameters:
+  ConnectInstanceArn:
+    Type: String
+    Description: ARN of Amazon Connect instance
+    AllowedPattern: '^arn:aws:connect:[a-z0-9-]+:[0-9]{12}:instance/[a-zA-Z0-9-]+'
+    ConstraintDescription: Must be a valid Amazon Connect Instance ARN
+
+Resources:
+  # KMS Key for encryption
+  ConnectAssistantKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+    DeletionPolicy: Delete # Note: Stongly advise Retain for production workloads.
+    UpdateReplacePolicy: Delete # Note: Stongly advise Retain for production workloads.
+
+  # Wisdom Assistant
+  ConnectAssistant:
+    Type: AWS::Wisdom::Assistant
+    Properties:
+      Name: !Sub 'connect-assistant-${AWS::StackName}'
+      Description: Connect Assistant integrated with Amazon Connect
+      Type: AGENT
+      Tags:
+        - Key: 'AmazonConnectEnabled'
+          Value: 'true'
+
+  # CloudWatch Log Group for Connect Integration Lambda
+  ConnectIntegrationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-ConnectIntegration'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt ConnectAssistantKey.Arn
+    DeletionPolicy: Delete
+
+  # Lambda Role for Connect Integration
+  ConnectIntegrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ConnectIntegrationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - connect:CreateIntegrationAssociation
+                  - connect:DeleteIntegrationAssociation
+                  - connect:ListIntegrationAssociations
+                Resource: !sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - wisdom:GetAssistant
+                  - wisdom:TagResource
+                Resource:
+                  - !GetAtt ConnectAssistant.AssistantArn
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt IntegrationFnDLQ.Arn
+    DeletionPolicy: Delete
+
+  # SQS Dead Letter Queue for Lambda
+  IntegrationFnDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-IntegrationFn-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    DeletionPolicy: Delete
+
+  # Lambda Function for Connect Integration
+  # checkov:skip=CKV_AWS_117:Lambda functions call public APIs in demo environment
+  IntegrationFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt ConnectIntegrationRole.Arn
+      Timeout: 60
+      DeadLetterConfig:
+        TargetArn: !GetAtt IntegrationFnDLQ.Arn
+      LoggingConfig:
+        LogGroup: !Ref ConnectIntegrationLogGroup
+        LogFormat: JSON
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          connect = boto3.client('connect')
+
+          def handler(event, context):
+              response_data = {}
+              try:
+                  print(f"Received event: {json.dumps(event, default=str)}")
+
+                  instance_id = event['ResourceProperties']['InstanceId']
+                  assistant_arn = event['ResourceProperties']['AssistantArn']
+
+                  if event['RequestType'] == 'Delete':
+                      print("Delete request - removing Connect integration")
+
+                      try:
+                          # List existing integrations to find the one to delete
+                          response = connect.list_integration_associations(
+                              InstanceId=instance_id,
+                              IntegrationType='WISDOM_ASSISTANT'
+                          )
+
+                          # Find and delete the matching integration
+                          for integration in response.get('IntegrationAssociationSummaryList', []):
+                              if integration.get('IntegrationArn') == assistant_arn:
+                                  connect.delete_integration_association(
+                                      InstanceId=instance_id,
+                                      IntegrationAssociationId=integration['IntegrationAssociationId']
+                                  )
+                                  print(f"Deleted integration: {integration['IntegrationAssociationId']}")
+                                  break
+                      except Exception as e:
+                          print(f"Error during deletion (may already be deleted): {str(e)}")
+
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  # For Create and Update operations
+                  print(f"Creating Connect integration association")
+                  print(f"Parameters:")
+                  print(f"  InstanceId: {instance_id}")
+                  print(f"  IntegrationType: WISDOM_ASSISTANT")
+                  print(f"  IntegrationArn: {assistant_arn}")
+                  print(f"Equivalent AWS CLI command:")
+                  print(f"  aws connect create-integration-association \\")
+                  print(f"    --instance-id {instance_id} \\")
+                  print(f"    --integration-type WISDOM_ASSISTANT \\")
+                  print(f"    --integration-arn {assistant_arn}")
+
+                  response = connect.create_integration_association(
+                      InstanceId=instance_id,
+                      IntegrationType='WISDOM_ASSISTANT',
+                      IntegrationArn=assistant_arn
+                  )
+
+                  response_data = {
+                      'IntegrationAssociationId': response['IntegrationAssociationId'],
+                      'IntegrationAssociationArn': response['IntegrationAssociationArn']
+                  }
+
+                  print(f"Successfully created integration: {response['IntegrationAssociationId']}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  error_message = f"Error in Connect integration: {str(e)}"
+                  print(error_message)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': error_message
+                  })
+    DeletionPolicy: Delete
+
+  # Custom Resource to Create Connect Integration
+  ConnectIntegration:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt IntegrationFn.Arn
+      InstanceId: !Select [1, !Split ['/', !Ref ConnectInstanceArn]]
+      AssistantArn: !GetAtt ConnectAssistant.AssistantArn
+    DependsOn: ConnectAssistant
+
+Outputs:
+  AssistantArn:
+    Description: ARN of the Connect Assistant
+    Value: !GetAtt ConnectAssistant.AssistantArn
+    Export:
+      Name: !Sub '${AWS::StackName}-AssistantArn'
+
+  AssistantId:
+    Description: ID of the Connect Assistant
+    Value: !GetAtt ConnectAssistant.AssistantId
+    Export:
+      Name: !Sub '${AWS::StackName}-AssistantId'
+
+  ConnectIntegrationCommand:
+    Description:
+      Manual AWS CLI command to associate assistant with Connect instance
+    Value: !Sub |
+      aws connect create-integration-association \
+        --instance-id ${ConnectInstanceArn} \
+        --integration-type WISDOM_ASSISTANT \
+        --integration-arn ${ConnectAssistant.AssistantArn}
+
+  ConnectIntegrationId:
+    Description: ID of the Connect-Wisdom integration association
+    Value: !GetAtt ConnectIntegration.IntegrationAssociationId

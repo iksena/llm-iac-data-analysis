@@ -1,0 +1,548 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Production Static Website with CloudFront, S3, WAF, and Lambda@Edge'
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: Domain name for the website (e.g., www.example.com)
+    AllowedPattern: (?!-)[a-zA-Z0-9-.]{1,63}(?<!-)
+    ConstraintDescription: Must be a valid domain name
+
+  HostedZoneId:
+    Type: String
+    Description: Route 53 Hosted Zone ID (leave empty to skip DNS setup)
+    Default: ''
+
+  CertificateArn:
+    Type: String
+    Description: ACM Certificate ARN in us-east-1 for CloudFront
+    Default: ''
+
+  Environment:
+    Type: String
+    Description: Environment name
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+
+  PriceClass:
+    Type: String
+    Description: CloudFront price class
+    Default: PriceClass_100
+    AllowedValues:
+      - PriceClass_100
+      - PriceClass_200
+      - PriceClass_All
+
+Conditions:
+  HasHostedZone: !Not [!Equals [!Ref HostedZoneId, '']]
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, '']]
+  CreateCertificate: !Equals [!Ref CertificateArn, '']
+
+Resources:
+  # S3 Bucket for Static Content
+  WebsiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${DomainName}-${AWS::AccountId}'
+      # SECURITY FLAW #2: No access logging enabled
+      # AccessLoggingConfiguration:
+      #   DestinationBucketName: !Ref LogsBucket
+      #   LogFilePrefix: s3-access/
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldVersions
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 90
+      Tags:
+        - Key: Name
+          Value: !Sub '${DomainName}-website'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # S3 Bucket Policy
+  # SECURITY FLAW #5: Allowing public GetObject without CloudFront OAI restriction
+  WebsiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref WebsiteBucket
+      PolicyDocument:
+        Statement:
+          # This should only allow CloudFront OAI, not public access
+          - Sid: PublicReadGetObject
+            Effect: Allow
+            Principal: '*'
+            Action: 's3:GetObject'
+            Resource: !Sub '${WebsiteBucket.Arn}/*'
+          - Sid: AllowCloudFrontOAI
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${CloudFrontOAI}'
+            Action: 's3:GetObject'
+            Resource: !Sub '${WebsiteBucket.Arn}/*'
+
+  # CloudFront Origin Access Identity
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for ${DomainName}'
+
+  # Logs Bucket (for CloudFront and S3 access logs)
+  LogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${DomainName}-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      Tags:
+        - Key: Name
+          Value: !Sub '${DomainName}-logs'
+        - Key: Environment
+          Value: !Ref Environment
+
+  LogsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref LogsBucket
+      PolicyDocument:
+        Statement:
+          - Sid: AllowCloudFrontLogs
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: 's3:PutObject'
+            Resource: !Sub '${LogsBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref AWS::AccountId
+
+  # ACM Certificate (if not provided)
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Condition: CreateCertificate
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames:
+        - !Sub '*.${DomainName}'
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !If [HasHostedZone, !Ref HostedZoneId, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: Name
+          Value: !Sub '${DomainName}-cert'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda@Edge Function for Security Headers
+  EdgeFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+                - edgelambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Name
+          Value: !Sub '${DomainName}-edge-role'
+        - Key: Environment
+          Value: !Ref Environment
+
+  SecurityHeadersFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${DomainName}-security-headers'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt EdgeFunctionRole.Arn
+      Code:
+        ZipFile: |
+          def lambda_handler(event, context):
+              response = event['Records'][0]['cf']['response']
+              headers = response['headers']
+
+              # Add security headers
+              headers['strict-transport-security'] = [{
+                  'key': 'Strict-Transport-Security',
+                  'value': 'max-age=31536000; includeSubDomains; preload'
+              }]
+              headers['x-content-type-options'] = [{
+                  'key': 'X-Content-Type-Options',
+                  'value': 'nosniff'
+              }]
+              headers['x-frame-options'] = [{
+                  'key': 'X-Frame-Options',
+                  'value': 'DENY'
+              }]
+              headers['x-xss-protection'] = [{
+                  'key': 'X-XSS-Protection',
+                  'value': '1; mode=block'
+              }]
+              headers['referrer-policy'] = [{
+                  'key': 'Referrer-Policy',
+                  'value': 'strict-origin-when-cross-origin'
+              }]
+              headers['content-security-policy'] = [{
+                  'key': 'Content-Security-Policy',
+                  'value': "default-src 'self'; img-src 'self' data: https:; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'"
+              }]
+
+              return response
+      Timeout: 5
+      Tags:
+        - Key: Name
+          Value: !Sub '${DomainName}-headers'
+        - Key: Environment
+          Value: !Ref Environment
+
+  SecurityHeadersFunctionVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      FunctionName: !Ref SecurityHeadersFunction
+
+  # WAF WebACL
+  # SECURITY FLAW #4: Only rate limiting, missing OWASP rules
+  WebACL:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub '${DomainName}-waf'
+      Scope: CLOUDFRONT
+      DefaultAction:
+        Allow: {}
+      Rules:
+        # Only basic rate limiting, should include AWS Managed Rule Groups
+        - Name: RateLimitRule
+          Priority: 1
+          Statement:
+            RateBasedStatement:
+              Limit: 2000
+              AggregateKeyType: IP
+          Action:
+            Block: {}
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimitRule
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub '${DomainName}-waf'
+      Tags:
+        - Key: Name
+          Value: !Sub '${DomainName}-waf'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudFront Distribution
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        # SECURITY FLAW #1: Minimum TLS protocol version TLSv1 instead of TLSv1.2_2021
+        ViewerCertificate:
+          AcmCertificateArn: !If
+            - CreateCertificate
+            - !Ref Certificate
+            - !Ref CertificateArn
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1
+        Aliases: !If
+          - HasCertificate
+          - [!Ref DomainName]
+          - !Ref 'AWS::NoValue'
+        DefaultRootObject: index.html
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: !Ref PriceClass
+        # SECURITY FLAW #3: No access logging enabled
+        # Logging:
+        #   Bucket: !GetAtt LogsBucket.DomainName
+        #   Prefix: cloudfront/
+        #   IncludeCookies: false
+        WebACLId: !GetAtt WebACL.Arn
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt WebsiteBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOAI}'
+            OriginShield:
+              Enabled: true
+              OriginShieldRegion: !Ref AWS::Region
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          CachedMethods:
+            - GET
+            - HEAD
+            - OPTIONS
+          Compress: true
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # CORS-S3Origin
+          ResponseHeadersPolicyId: !Ref ResponseHeadersPolicy
+          LambdaFunctionAssociations:
+            - EventType: origin-response
+              LambdaFunctionARN: !Ref SecurityHeadersFunctionVersion
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+            ErrorCachingMinTTL: 300
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: /404.html
+            ErrorCachingMinTTL: 300
+        Comment: !Sub 'CloudFront distribution for ${DomainName}'
+      Tags:
+        - Key: Name
+          Value: !Sub '${DomainName}-cdn'
+        - Key: Environment
+          Value: !Ref Environment
+
+  # CloudFront Response Headers Policy
+  ResponseHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub '${DomainName}-headers-policy'
+        Comment: Security headers policy
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            AccessControlMaxAgeSec: 31536000
+            IncludeSubdomains: true
+            Preload: true
+            Override: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          XSSProtection:
+            ModeBlock: true
+            Protection: true
+            Override: true
+          ReferrerPolicy:
+            ReferrerPolicy: strict-origin-when-cross-origin
+            Override: true
+        CustomHeadersConfig:
+          Items:
+            - Header: X-Environment
+              Value: !Ref Environment
+              Override: false
+
+  # Route 53 DNS Record
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2  # CloudFront hosted zone ID
+        EvaluateTargetHealth: false
+
+  DNSRecordIPv6:
+    Type: AWS::Route53::RecordSet
+    Condition: HasHostedZone
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: AAAA
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2  # CloudFront hosted zone ID
+        EvaluateTargetHealth: false
+
+  # CloudWatch Alarms
+  CloudFrontErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${DomainName}-error-rate'
+      AlarmDescription: Alert when CloudFront 5xx error rate is high
+      MetricName: 5xxErrorRate
+      Namespace: AWS/CloudFront
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref CloudFrontDistribution
+      TreatMissingData: notBreaching
+
+  CloudFrontRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${DomainName}-request-spike'
+      AlarmDescription: Alert when requests spike unexpectedly
+      MetricName: Requests
+      Namespace: AWS/CloudFront
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 100000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DistributionId
+          Value: !Ref CloudFrontDistribution
+      TreatMissingData: notBreaching
+
+  # CloudWatch Dashboard
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${DomainName}-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/CloudFront", "Requests", {"stat": "Sum", "label": "Total Requests"}],
+                  [".", "BytesDownloaded", {"stat": "Sum", "label": "Bytes Downloaded"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "us-east-1",
+                "title": "CloudFront Traffic",
+                "yAxis": {"left": {"label": "Count"}},
+                "dimensions": {"DistributionId": "${CloudFrontDistribution}"}
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/CloudFront", "4xxErrorRate", {"stat": "Average", "label": "4xx Error Rate"}],
+                  [".", "5xxErrorRate", {"stat": "Average", "label": "5xx Error Rate"}]
+                ],
+                "period": 300,
+                "stat": "Average",
+                "region": "us-east-1",
+                "title": "CloudFront Error Rates",
+                "yAxis": {"left": {"label": "Percent", "min": 0, "max": 100}},
+                "dimensions": {"DistributionId": "${CloudFrontDistribution}"}
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/WAFV2", "BlockedRequests", {"stat": "Sum", "label": "Blocked Requests"}],
+                  [".", "AllowedRequests", {"stat": "Sum", "label": "Allowed Requests"}]
+                ],
+                "period": 300,
+                "stat": "Sum",
+                "region": "us-east-1",
+                "title": "WAF Activity",
+                "yAxis": {"left": {"label": "Count"}},
+                "dimensions": {"WebACL": "${DomainName}-waf", "Region": "CLOUDFRONT", "Rule": "ALL"}
+              }
+            }
+          ]
+        }
+
+Outputs:
+  WebsiteBucketName:
+    Description: Name of the S3 bucket for website content
+    Value: !Ref WebsiteBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketName'
+
+  WebsiteBucketArn:
+    Description: ARN of the S3 bucket
+    Value: !GetAtt WebsiteBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-BucketArn'
+
+  CloudFrontDistributionId:
+    Description: CloudFront Distribution ID
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionId'
+
+  CloudFrontDomainName:
+    Description: CloudFront Distribution Domain Name
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub '${AWS::StackName}-DistributionDomain'
+
+  WebsiteURL:
+    Description: URL of the website
+    Value: !If
+      - HasCertificate
+      - !Sub 'https://${DomainName}'
+      - !Sub 'https://${CloudFrontDistribution.DomainName}'
+    Export:
+      Name: !Sub '${AWS::StackName}-URL'
+
+  WebACLArn:
+    Description: ARN of the WAF WebACL
+    Value: !GetAtt WebACL.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-WebACLArn'
+
+  CertificateArn:
+    Description: ARN of the ACM Certificate
+    Value: !If
+      - CreateCertificate
+      - !Ref Certificate
+      - !Ref CertificateArn
+    Export:
+      Name: !Sub '${AWS::StackName}-CertificateArn'
+
+  LogsBucketName:
+    Description: Name of the logs bucket
+    Value: !Ref LogsBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-LogsBucket'
+
+  EdgeFunctionArn:
+    Description: ARN of the Lambda@Edge function
+    Value: !Ref SecurityHeadersFunctionVersion
+    Export:
+      Name: !Sub '${AWS::StackName}-EdgeFunction'

@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: WordPress evolution SSM Automation documents and roles.
+
+Parameters:
+  RootStackName:
+    Type: String
+    Default: unknown
+    Description: Root CloudFormation stack name used for SourceStack tags on backup resources.
+
+Resources:
+  AutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: wordpress-pre-stage-ami
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:CreateImage
+                  - ec2:CreateTags
+                  - ec2:DescribeImages
+                  - ec2:DescribeInstances
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ssm:DescribeInstanceInformation
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ssm:ListCommandInvocations
+                  - ssm:ListCommands
+                Resource: '*'
+
+  PreStageSnapshotDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: Wordpress-PreStageSnapshot
+      DocumentType: Automation
+      DocumentFormat: YAML
+      UpdateMethod: NewVersion
+      Content:
+        schemaVersion: '0.3'
+        description: Create an AMI from the current WordPress EC2 instance before a stage upgrade.
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            default: !GetAtt AutomationRole.Arn
+            description: IAM role ARN used by this automation.
+          InstanceId:
+            type: String
+            description: EC2 instance ID to image.
+          SourceStage:
+            type: String
+            default: stage
+            description: Stage whose EC2 instance is being imaged, for example stage1, stage2, or stage3.
+          SourceStackName:
+            type: String
+            default: !Ref RootStackName
+            description: Root stack name to tag on the created AMI and snapshot.
+          NoReboot:
+            type: Boolean
+            default: false
+            description: Set true for crash-consistent image without reboot.
+        mainSteps:
+          - name: createImage
+            action: aws:executeAwsApi
+            nextStep: tagImage
+            isEnd: false
+            inputs:
+              Service: ec2
+              Api: CreateImage
+              InstanceId: '{{ InstanceId }}'
+              Name: '{{ SourceStage }}-ami-{{ automation:EXECUTION_ID }}'
+              NoReboot: '{{ NoReboot }}'
+              TagSpecifications:
+                - ResourceType: image
+                  Tags:
+                    - Key: Name
+                      Value: '{{ SourceStage }}-ami'
+                    - Key: SourceStack
+                      Value: '{{ SourceStackName }}'
+                    - Key: SourceInstanceId
+                      Value: '{{ InstanceId }}'
+                - ResourceType: snapshot
+                  Tags:
+                    - Key: Name
+                      Value: '{{ SourceStage }}-snapshot'
+                    - Key: SourceStack
+                      Value: '{{ SourceStackName }}'
+                    - Key: SourceInstanceId
+                      Value: '{{ InstanceId }}'
+            outputs:
+              - Name: ImageId
+                Selector: $.ImageId
+                Type: String
+          - name: tagImage
+            action: aws:executeAwsApi
+            nextStep: waitForImageAvailable
+            isEnd: false
+            inputs:
+              Service: ec2
+              Api: CreateTags
+              Resources:
+                - '{{ createImage.ImageId }}'
+              Tags:
+                - Key: Name
+                  Value: '{{ SourceStage }}-ami'
+                - Key: SourceStack
+                  Value: '{{ SourceStackName }}'
+                - Key: SourceInstanceId
+                  Value: '{{ InstanceId }}'
+          - name: waitForImageAvailable
+            action: aws:waitForAwsResourceProperty
+            timeoutSeconds: 1800
+            isEnd: true
+            inputs:
+              Service: ec2
+              Api: DescribeImages
+              ImageIds:
+                - '{{ createImage.ImageId }}'
+              PropertySelector: $.Images[0].State
+              DesiredValues:
+                - available
+        outputs:
+          - createImage.ImageId
+
+  MigrateLocalMariaDbToRdsDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: Wordpress-MigrateLocalMariaDbToRds
+      DocumentType: Automation
+      DocumentFormat: YAML
+      UpdateMethod: NewVersion
+      Content:
+        schemaVersion: '0.3'
+        description: Dump local MariaDB on the stage 2 WordPress instance and import it into RDS.
+        assumeRole: '{{ AutomationAssumeRole }}'
+        parameters:
+          AutomationAssumeRole:
+            type: String
+            default: !GetAtt AutomationRole.Arn
+            description: IAM role ARN used by this automation.
+          SourceInstanceId:
+            type: String
+            description: Stage 2 WordPress EC2 instance ID.
+          RdsEndpoint:
+            type: String
+            description: RDS endpoint address.
+          RdsPort:
+            type: String
+            default: '3306'
+            description: RDS MySQL port.
+        mainSteps:
+          - name: migrateDatabase
+            action: aws:runCommand
+            timeoutSeconds: 900
+            isEnd: true
+            inputs:
+              DocumentName: AWS-RunShellScript
+              InstanceIds:
+                - '{{ SourceInstanceId }}'
+              Parameters:
+                commands:
+                  - |
+                    #!/bin/bash
+                    set -euo pipefail
+                    IMDS_TOKEN=$(curl -fsS -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+                    REGION=$(curl -fsS -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" http://169.254.169.254/latest/dynamic/instance-identity/document | sed -n 's/.*"region"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+                    DBName=$(aws ssm get-parameters --region "$REGION" --names /Wordpress/DBName --query Parameters[0].Value --output text)
+                    DBUser=$(aws ssm get-parameters --region "$REGION" --names /Wordpress/DBUser --query Parameters[0].Value --output text)
+                    DBPassword=$(aws ssm get-parameters --region "$REGION" --names /Wordpress/DBPassword --with-decryption --query Parameters[0].Value --output text)
+                    DUMP=/tmp/wp-stage3-migrate.sql
+                    systemctl start mariadb || true
+                    mysqldump -h127.0.0.1 -u"$DBUser" -p"$DBPassword" "$DBName" > "$DUMP"
+                    mysql -h"{{ RdsEndpoint }}" -P"{{ RdsPort }}" -u"$DBUser" -p"$DBPassword" "$DBName" < "$DUMP"
+                    rm -f "$DUMP"
+
+Outputs:
+  PreStageSnapshotDocumentName:
+    Value: !Ref PreStageSnapshotDocument
+  MigrateLocalMariaDbToRdsDocumentName:
+    Value: !Ref MigrateLocalMariaDbToRdsDocument
+  AutomationRoleArn:
+    Value: !GetAtt AutomationRole.Arn

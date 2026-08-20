@@ -1,0 +1,2025 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "AWS Resource Utilization Reporter - Discovers all account resources (EC2, Lambda, RDS, DynamoDB, SQS, SNS, S3, ECS, ElastiCache, API Gateway, Step Functions, EventBridge), collects CloudWatch metrics, scores health/utilization deterministically, then uses Bedrock LLM for narrative report via SNS"
+Parameters:
+  Region:
+    Type: String
+    Default: ap-south-1
+    AllowedValues:
+      - us-east-1
+      - us-east-2
+      - us-west-1
+      - us-west-2
+      - ap-south-1
+      - ap-southeast-1
+      - ap-southeast-2
+      - ap-northeast-1
+      - ap-northeast-2
+      - eu-west-1
+      - eu-west-2
+      - eu-west-3
+      - eu-central-1
+      - eu-north-1
+      - sa-east-1
+      - ca-central-1
+    Description: AWS Region where the stack is deployed (must support Amazon Bedrock)
+  ReportTopicArn:
+    Type: String
+    Default: arn:aws:sns:REGION:ACCOUNT_ID:TOPIC_NAME
+    Description: SNS Topic ARN for sending utilization reports. Email subscriptions must be confirmed before they receive messages.
+  ModelId:
+    Type: String
+    Default: openai.gpt-oss-120b-1:0
+    AllowedValues:
+      - openai.gpt-oss-120b-1:0
+      - openai.gpt-oss-20b-1:0
+      - zai.glm-4.7-flash
+      - amazon.nova-pro-v1:0
+      - amazon.nova-micro-v1:0
+      - amazon.nova-lite-v1:0
+      - anthropic.claude-3-haiku-20240307-v1:0
+    Description: >-
+      Bedrock LLM model for report narrative generation. All models support ap-south-1 with no marketplace subscription.
+  LookbackDays:
+    Type: Number
+    Default: 7
+    AllowedValues: [1, 3, 7, 14, 21, 30]
+    Description: >-
+      Number of days to look back for CloudWatch metrics.
+      1=Daily hot-spot, 3=Last 3 days, 7=Weekly report, 14=Bi-weekly, 21=Three weeks, 30=Monthly.
+  AccountName:
+    Type: String
+    Default: ""
+    Description: Optional friendly name for this AWS account (e.g., "Production", "Development"). Will be displayed in SNS email subject and report. Leave empty to use Account ID only. Useful when deploying across multiple accounts to clearly identify which account the report belongs to.
+  EnableQuotaAnalysis:
+    Type: String
+    Default: "true"
+    AllowedValues: ["true", "false"]
+    Description: Include AWS/Usage namespace quota-pressure metrics (CallCount, ResourceCount, ThrottleCount).
+  EnableDebug:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: Enable verbose debug logging in CloudWatch Logs. Set to true to troubleshoot metric collection issues, false for normal operation.
+  ScanScope:
+    Type: String
+    Default: RegionOnly
+    AllowedValues: ["RegionOnly", "AllRegions"]
+    Description: >-
+      RegionOnly = scan resources only in the deployed region.
+      AllRegions = scan resources across all enabled regions in the account (takes longer but gives full account view).
+  ScheduleExpr:
+    Type: String
+    Default: rate(7 days)
+    AllowedValues:
+      - rate(1 day)
+      - rate(7 days)
+      - rate(30 days)
+      - cron(0 0 1 * ? *)
+      - cron(0 0 L * ? *)
+      - cron(0 0 15 * ? *)
+      - cron(0 0 ? * MON *)
+      - cron(0 0 ? * FRI *)
+      - cron(0 0 ? * 1 *)
+      - cron(0 0 1 1 ? *)
+      - cron(0 0 1 */3 ? *)
+      - cron(0 0 1 */6 ? *)
+    Description: >-
+      Schedule for Lambda execution. Options: rate(1 day)=Daily, rate(7 days)=Weekly, rate(30 days)=Monthly,
+      cron(0 0 1 * ? *)=1st of every month, cron(0 0 L * ? *)=Last day of every month,
+      cron(0 0 15 * ? *)=15th of every month, cron(0 0 ? * MON *)=Every Monday,
+      cron(0 0 ? * FRI *)=Every Friday, cron(0 0 ? * 1 *)=Every Sunday,
+      cron(0 0 1 1 ? *)=January 1st yearly, cron(0 0 1 */3 ? *)=Quarterly (1st day),
+      cron(0 0 1 */6 ? *)=Semi-annually (1st day).
+
+###################################################################
+Resources:
+  ReporterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: StackReporter-${AWS::StackName}-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [lambda.amazonaws.com]
+            Action: [sts:AssumeRole]
+      Path: "/"
+      Policies:
+        - PolicyName:
+            Fn::Sub: StackReporter-Policy-${AWS::StackName}-${AWS::Region}
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # CloudWatch metrics collection
+              - Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:ListMetrics
+                Resource: "*"
+              # Bedrock LLM invocation
+              - Effect: Allow
+                Action: [bedrock:InvokeModel]
+                Resource:
+                  - arn:aws:bedrock:*::foundation-model/*
+                  - Fn::Sub: arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/*
+              # SNS publish
+              - Effect: Allow
+                Action: [sns:Publish]
+                Resource:
+                  Ref: ReportTopicArn
+              # CloudWatch Logs
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource:
+                  Fn::Sub: arn:aws:logs:${AWS::Region}:*:log-group:/aws/lambda/${AWS::StackName}-reporter-${AWS::Region}:*
+              - Effect: Allow
+                Action: [logs:CreateLogGroup]
+                Resource:
+                  Fn::Sub: arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*
+              # Resource listing and describe calls for discovery
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:DescribeRegions
+                  - lambda:ListFunctions
+                  - lambda:GetFunction
+                  - lambda:ListProvisionedConcurrencyConfigs
+                  - dynamodb:ListTables
+                  - dynamodb:DescribeTable
+                  - sqs:ListQueues
+                  - sqs:GetQueueAttributes
+                  - sns:ListTopics
+                  - sns:GetTopicAttributes
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketLocation
+                  - rds:DescribeDBInstances
+                  - rds:DescribeDBClusters
+                  - ecs:ListClusters
+                  - ecs:ListServices
+                  - ecs:DescribeServices
+                  - ecs:DescribeClusters
+                  - states:ListStateMachines
+                  - states:DescribeStateMachine
+                  - events:ListRules
+                  - events:DescribeRule
+                  - elasticache:DescribeCacheClusters
+                  - elasticloadbalancing:DescribeLoadBalancers
+                  - elasticloadbalancing:DescribeTargetGroups
+                  - elasticloadbalancing:DescribeTargetHealth
+                  - elasticloadbalancing:DescribeTags
+                  - wafv2:ListWebACLs
+                  - wafv2:GetWebACL
+                  - wafv2:ListTagsForResource
+                  - cloudfront:ListDistributions
+                  - cloudfront:GetDistribution
+                  - cloudfront:ListTagsForResource
+                Resource: "*"
+              # API Gateway uses path-based IAM actions (not service:Action format)
+              - Effect: Allow
+                Action:
+                  - apigateway:GET
+                Resource:
+                  - arn:aws:apigateway:*::/restapis
+                  - arn:aws:apigateway:*::/restapis/*
+                  - arn:aws:apigateway:*::/apis
+                  - arn:aws:apigateway:*::/apis/*
+              # Tag lookups for friendly resource names
+              - Effect: Allow
+                Action:
+                  - tag:GetResources
+                  - ec2:DescribeTags
+                  - rds:ListTagsForResource
+                  - lambda:ListTags
+                  - s3:GetBucketTagging
+                  - dynamodb:ListTagsOfResource
+                  - sqs:ListQueueTags
+                  - sns:ListTagsForResource
+                  - states:ListTagsForResource
+                  - elasticache:ListTagsForResource
+                  - ecs:ListTagsForResource
+                Resource: "*"
+              # Service Quotas for quota-pressure analysis
+              - Effect: Allow
+                Action:
+                  - servicequotas:GetServiceQuota
+                  - servicequotas:ListServiceQuotas
+                  - sts:GetCallerIdentity
+                Resource: "*"
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName:
+        Fn::Sub: StackReporter-Sched-${AWS::StackName}-${AWS::Region}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [scheduler.amazonaws.com]
+            Action: [sts:AssumeRole]
+      Path: "/"
+      Policies:
+        - PolicyName:
+            Fn::Sub: StackReporter-Sched-Policy-${AWS::StackName}-${AWS::Region}
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [lambda:InvokeFunction]
+                Resource:
+                  - Fn::GetAtt: ReporterFunction.Arn
+
+###################################################################
+  ReporterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName:
+        Fn::Sub: ${AWS::StackName}-reporter-${AWS::Region}
+      Description: Discovers stack resources, collects CloudWatch metrics, scores utilization, generates Bedrock narrative, publishes to SNS
+      Handler: index.lambda_handler
+      Runtime: python3.13
+      Timeout: 900
+      MemorySize: 512
+      ReservedConcurrentExecutions: 1
+      TracingConfig:
+        Mode: Active
+      Role:
+        Fn::GetAtt: ReporterRole.Arn
+      Environment:
+        Variables:
+          ReportTopicArn:
+            Ref: ReportTopicArn
+          ModelId:
+            Ref: ModelId
+          LookbackDays:
+            Ref: LookbackDays
+          AccountName:
+            Ref: AccountName
+          EnableQuotaAnalysis:
+            Ref: EnableQuotaAnalysis
+          EnableDebug:
+            Ref: EnableDebug
+          ScanScope:
+            Ref: ScanScope
+      Code:
+        ZipFile: |
+          import boto3, os, json, re, math
+          from datetime import datetime, timedelta
+          from collections import defaultdict
+
+          cfn = boto3.client('cloudformation')
+          cw  = boto3.client('cloudwatch')
+          bedrock = boto3.client('bedrock-runtime')
+          sns_client = boto3.client('sns')
+          sts_identity = None
+
+          def dbg(msg):
+              """Print only when EnableDebug=true."""
+              if os.environ.get('EnableDebug', 'false').lower() == 'true':
+                  print(f"[DEBUG] {msg}")
+
+          def get_account_id():
+              global sts_identity
+              if not sts_identity:
+                  sts_identity = boto3.client('sts').get_caller_identity()
+              return sts_identity['Account']
+
+          def env_bool(k, d='false'):
+              return os.environ.get(k, d).lower() == 'true'
+
+          # ── 0. TAG-BASED NAME RESOLUTION ───────────────────────────────
+          def resolve_resource_name(resource_type, physical_id, region):
+              """Resolve friendly name from resource tags (Key=Name). Returns tag value or physical_id."""
+              try:
+                  if resource_type == 'AWS::EC2::Instance':
+                      ec2 = boto3.client('ec2', region_name=region)
+                      resp = ec2.describe_tags(Filters=[
+                          {'Name': 'resource-id', 'Values': [physical_id]},
+                          {'Name': 'key', 'Values': ['Name']}
+                      ])
+                      for tag in resp.get('Tags', []):
+                          if tag['Key'] == 'Name' and tag['Value']:
+                              return tag['Value']
+                  elif resource_type == 'AWS::Lambda::Function':
+                      fn_name = physical_id.split(':')[-1] if ':' in physical_id else physical_id
+                      lam = boto3.client('lambda', region_name=region)
+                      resp = lam.list_tags(Resource=physical_id if ':' in physical_id else f"arn:aws:lambda:{region}:{get_account_id()}:function:{fn_name}")
+                      name = resp.get('Tags', {}).get('Name', '')
+                      if name: return name
+                  elif resource_type == 'AWS::S3::Bucket':
+                      s3 = boto3.client('s3')
+                      resp = s3.get_bucket_tagging(Bucket=physical_id)
+                      for tag in resp.get('TagSet', []):
+                          if tag['Key'] == 'Name' and tag['Value']:
+                              return tag['Value']
+                  elif resource_type == 'AWS::DynamoDB::Table':
+                      ddb = boto3.client('dynamodb', region_name=region)
+                      resp = ddb.list_tags_of_resource(ResourceArn=f"arn:aws:dynamodb:{region}:{get_account_id()}:table/{physical_id}")
+                      for tag in resp.get('Tags', []):
+                          if tag['Key'] == 'Name' and tag['Value']:
+                              return tag['Value']
+                  elif resource_type in ('AWS::RDS::DBInstance', 'AWS::RDS::DBCluster'):
+                      rds = boto3.client('rds', region_name=region)
+                      acct = get_account_id()
+                      rtype = 'db' if 'Instance' in resource_type else 'cluster'
+                      arn = f"arn:aws:rds:{region}:{acct}:{rtype}:{physical_id}"
+                      resp = rds.list_tags_for_resource(ResourceName=arn)
+                      for tag in resp.get('TagList', []):
+                          if tag['Key'] == 'Name' and tag['Value']:
+                              return tag['Value']
+                  elif resource_type == 'AWS::SQS::Queue':
+                      sqs = boto3.client('sqs', region_name=region)
+                      resp = sqs.list_queue_tags(QueueUrl=physical_id)
+                      name = resp.get('Tags', {}).get('Name', '')
+                      if name: return name
+                  elif resource_type == 'AWS::ECS::Service':
+                      ecs = boto3.client('ecs', region_name=region)
+                      resp = ecs.list_tags_for_resource(resourceArn=physical_id)
+                      for tag in resp.get('tags', []):
+                          if tag['key'] == 'Name' and tag['value']:
+                              return tag['value']
+                  elif resource_type == 'AWS::ElastiCache::CacheCluster':
+                      ec = boto3.client('elasticache', region_name=region)
+                      acct = get_account_id()
+                      arn = f"arn:aws:elasticache:{region}:{acct}:cluster:{physical_id}"
+                      resp = ec.list_tags_for_resource(ResourceName=arn)
+                      for tag in resp.get('TagList', []):
+                          if tag['Key'] == 'Name' and tag['Value']:
+                              return tag['Value']
+              except Exception:
+                  pass
+              return ''
+
+          # ── 1. RESOURCE DISCOVERY (account-wide, not stack-based) ─────
+          def discover_all_resources(regions):
+              """Scan AWS APIs directly to find all resources across given regions."""
+              resources = []
+              for rgn in regions:
+                  print(f"[Discovery] Scanning region: {rgn}")
+                  try:
+                      # EC2 instances (running + stopped)
+                      ec2 = boto3.client('ec2', region_name=rgn)
+                      paginator = ec2.get_paginator('describe_instances')
+                      for page in paginator.paginate(Filters=[{'Name': 'instance-state-name', 'Values': ['running', 'stopped']}]):
+                          for res in page['Reservations']:
+                              for inst in res['Instances']:
+                                  iid = inst['InstanceId']
+                                  name = ''
+                                  for tag in inst.get('Tags', []):
+                                      if tag['Key'] == 'Name':
+                                          name = tag['Value']
+                                          break
+                                  resources.append({'type': 'AWS::EC2::Instance', 'physical_id': iid, 'logical_id': iid, 'name': name, 'region': rgn})
+                  except Exception as e:
+                      print(f"[Discovery] EC2 error in {rgn}: {e}")
+                  try:
+                      # Lambda functions
+                      lam = boto3.client('lambda', region_name=rgn)
+                      paginator = lam.get_paginator('list_functions')
+                      for page in paginator.paginate():
+                          for fn in page['Functions']:
+                              fname = fn['FunctionName']
+                              name = resolve_resource_name('AWS::Lambda::Function', fn['FunctionArn'], rgn)
+                              resources.append({'type': 'AWS::Lambda::Function', 'physical_id': fname, 'logical_id': fname, 'name': name or fname, 'region': rgn})
+                  except Exception as e:
+                      print(f"[Discovery] Lambda error in {rgn}: {e}")
+                  try:
+                      # RDS instances
+                      rds = boto3.client('rds', region_name=rgn)
+                      paginator = rds.get_paginator('describe_db_instances')
+                      for page in paginator.paginate():
+                          for db in page['DBInstances']:
+                              dbid = db['DBInstanceIdentifier']
+                              name = ''
+                              for tag in db.get('TagList', []):
+                                  if tag['Key'] == 'Name':
+                                      name = tag['Value']
+                                      break
+                              resources.append({'type': 'AWS::RDS::DBInstance', 'physical_id': dbid, 'logical_id': dbid, 'name': name, 'region': rgn})
+                  except Exception as e:
+                      print(f"[Discovery] RDS error in {rgn}: {e}")
+                  try:
+                      # RDS clusters
+                      for page in rds.get_paginator('describe_db_clusters').paginate():
+                          for cl in page['DBClusters']:
+                              clid = cl['DBClusterIdentifier']
+                              resources.append({'type': 'AWS::RDS::DBCluster', 'physical_id': clid, 'logical_id': clid, 'name': '', 'region': rgn})
+                  except Exception as e:
+                      print(f"[Discovery] RDS cluster error in {rgn}: {e}")
+                  try:
+                      # DynamoDB tables
+                      ddb = boto3.client('dynamodb', region_name=rgn)
+                      paginator = ddb.get_paginator('list_tables')
+                      for page in paginator.paginate():
+                          for tbl in page['TableNames']:
+                              name = resolve_resource_name('AWS::DynamoDB::Table', tbl, rgn)
+                              resources.append({'type': 'AWS::DynamoDB::Table', 'physical_id': tbl, 'logical_id': tbl, 'name': name, 'region': rgn})
+                  except Exception as e:
+                      print(f"[Discovery] DynamoDB error in {rgn}: {e}")
+                  try:
+                      # SQS queues
+                      sqs = boto3.client('sqs', region_name=rgn)
+                      resp = sqs.list_queues()
+                      for url in resp.get('QueueUrls', []):
+                          qname = url.split('/')[-1]
+                          resources.append({'type': 'AWS::SQS::Queue', 'physical_id': url, 'logical_id': qname, 'name': '', 'region': rgn})
+                  except Exception as e:
+                      print(f"[Discovery] SQS error in {rgn}: {e}")
+                  try:
+                      # SNS topics
+                      sns = boto3.client('sns', region_name=rgn)
+                      paginator = sns.get_paginator('list_topics')
+                      for page in paginator.paginate():
+                          for topic in page['Topics']:
+                              arn = topic['TopicArn']
+                              tname = arn.split(':')[-1]
+                              resources.append({'type': 'AWS::SNS::Topic', 'physical_id': arn, 'logical_id': tname, 'name': '', 'region': rgn})
+                  except Exception as e:
+                      print(f"[Discovery] SNS error in {rgn}: {e}")
+                  try:
+                      # API Gateway REST APIs (v1)
+                      apigw = boto3.client('apigateway', region_name=rgn)
+                      paginator = apigw.get_paginator('get_rest_apis')
+                      for page in paginator.paginate():
+                          for api in page.get('items', []):
+                              aid = api['id']
+                              aname = api.get('name', aid)
+                              resources.append({'type': 'AWS::ApiGateway::RestApi', 'physical_id': aid, 'logical_id': aname, 'name': aname, 'region': rgn})
+                  except Exception as e:
+                      print(f"[Discovery] API GW v1 error in {rgn}: {e}")
+                  try:
+                      # API Gateway HTTP APIs (v2)
+                      apigw2 = boto3.client('apigatewayv2', region_name=rgn)
+                      paginator = apigw2.get_paginator('get_apis')
+                      for page in paginator.paginate():
+                          for api in page.get('Items', []):
+                              aid = api['ApiId']
+                              aname = api.get('Name', aid)
+                              resources.append({'type': 'AWS::ApiGatewayV2::Api', 'physical_id': aid, 'logical_id': aname, 'name': aname, 'region': rgn})
+                  except Exception as e:
+                      print(f"[Discovery] API GW v2 error in {rgn}: {e}")
+                  try:
+                      # Step Functions
+                      sfn = boto3.client('stepfunctions', region_name=rgn)
+                      paginator = sfn.get_paginator('list_state_machines')
+                      for page in paginator.paginate():
+                          for sm in page['stateMachines']:
+                              resources.append({'type': 'AWS::StepFunctions::StateMachine', 'physical_id': sm['stateMachineArn'], 'logical_id': sm['name'], 'name': sm['name'], 'region': rgn})
+                  except Exception as e:
+                      print(f"[Discovery] StepFunctions error in {rgn}: {e}")
+                  try:
+                      # ECS services
+                      ecs = boto3.client('ecs', region_name=rgn)
+                      clusters = ecs.list_clusters().get('clusterArns', [])
+                      for cluster_arn in clusters:
+                          cluster_name = cluster_arn.split('/')[-1]
+                          svc_arns = ecs.list_services(cluster=cluster_arn).get('serviceArns', [])
+                          if svc_arns:
+                              svcs = ecs.describe_services(cluster=cluster_arn, services=svc_arns[:10]).get('services', [])
+                              for svc in svcs:
+                                  svc_arn = svc['serviceArn']
+                                  svc_name = svc['serviceName']
+                                  resources.append({'type': 'AWS::ECS::Service', 'physical_id': svc_arn, 'logical_id': svc_name, 'name': svc_name, 'region': rgn})
+                  except Exception as e:
+                      print(f"[Discovery] ECS error in {rgn}: {e}")
+                  try:
+                      # ElastiCache clusters
+                      ec_client = boto3.client('elasticache', region_name=rgn)
+                      paginator = ec_client.get_paginator('describe_cache_clusters')
+                      for page in paginator.paginate():
+                          for cc in page['CacheClusters']:
+                              ccid = cc['CacheClusterId']
+                              resources.append({'type': 'AWS::ElastiCache::CacheCluster', 'physical_id': ccid, 'logical_id': ccid, 'name': '', 'region': rgn})
+                  except Exception as e:
+                      print(f"[Discovery] ElastiCache error in {rgn}: {e}")
+                  try:
+                      # Elastic Load Balancers (ALB, NLB, CLB)
+                      elb = boto3.client('elbv2', region_name=rgn)
+                      paginator = elb.get_paginator('describe_load_balancers')
+                      for page in paginator.paginate():
+                          for lb in page['LoadBalancers']:
+                              lb_arn = lb['LoadBalancerArn']
+                              lb_name = lb['LoadBalancerName']
+                              lb_type = lb['Type']  # application | network | gateway
+                              # Get Name tag
+                              tag_name = ''
+                              try:
+                                  tags_resp = elb.describe_tags(ResourceArns=[lb_arn])
+                                  for td in tags_resp.get('TagDescriptions', []):
+                                      for tag in td.get('Tags', []):
+                                          if tag['Key'] == 'Name':
+                                              tag_name = tag['Value']
+                              except Exception:
+                                  pass
+                              resources.append({
+                                  'type': 'AWS::ElasticLoadBalancingV2::LoadBalancer',
+                                  'physical_id': lb_arn,
+                                  'logical_id': lb_name,
+                                  'name': tag_name or lb_name,
+                                  'region': rgn,
+                                  'lb_type': lb_type,
+                              })
+                  except Exception as e:
+                      print(f"[Discovery] ELB error in {rgn}: {e}")
+                  try:
+                      # Classic Load Balancers (ELBv1)
+                      elb1 = boto3.client('elb', region_name=rgn)
+                      paginator = elb1.get_paginator('describe_load_balancers')
+                      for page in paginator.paginate():
+                          for lb in page['LoadBalancerDescriptions']:
+                              lb_name = lb['LoadBalancerName']
+                              resources.append({
+                                  'type': 'AWS::ElasticLoadBalancing::LoadBalancer',
+                                  'physical_id': lb_name,
+                                  'logical_id': lb_name,
+                                  'name': lb_name,
+                                  'region': rgn,
+                                  'lb_type': 'classic',
+                              })
+                  except Exception as e:
+                      print(f"[Discovery] CLB error in {rgn}: {e}")
+                  try:
+                      # WAF v2 Web ACLs - REGIONAL scope (list_web_acls is NOT paginated)
+                      waf = boto3.client('wafv2', region_name=rgn)
+                      next_marker = None
+                      while True:
+                          kwargs = {'Scope': 'REGIONAL', 'Limit': 100}
+                          if next_marker:
+                              kwargs['NextMarker'] = next_marker
+                          resp = waf.list_web_acls(**kwargs)
+                          for acl in resp.get('WebACLs', []):
+                              acl_id = acl['Id']
+                              acl_name = acl['Name']
+                              acl_arn = acl['ARN']
+                              tag_name = ''
+                              try:
+                                  tags_resp = waf.list_tags_for_resource(ResourceARN=acl_arn)
+                                  for tag in tags_resp.get('TagInfoForResource', {}).get('TagList', []):
+                                      if tag['Key'] == 'Name':
+                                          tag_name = tag['Value']
+                              except Exception:
+                                  pass
+                              resources.append({
+                                  'type': 'AWS::WAFv2::WebACL',
+                                  'physical_id': acl_id,
+                                  'logical_id': acl_name,
+                                  'name': tag_name or acl_name,
+                                  'region': rgn,
+                                  'waf_scope': 'REGIONAL',
+                              })
+                          next_marker = resp.get('NextMarker')
+                          if not next_marker:
+                              break
+                  except Exception as e:
+                      print(f"[Discovery] WAF error in {rgn}: {e}")
+                  try:
+                      # EventBridge rules
+                      eb = boto3.client('events', region_name=rgn)
+                      paginator = eb.get_paginator('list_rules')
+                      for page in paginator.paginate():
+                          for rule in page['Rules']:
+                              resources.append({'type': 'AWS::Events::Rule', 'physical_id': rule['Name'], 'logical_id': rule['Name'], 'name': rule['Name'], 'region': rgn})
+                  except Exception as e:
+                      print(f"[Discovery] EventBridge error in {rgn}: {e}")
+              # S3 is global - scan once
+              try:
+                  s3 = boto3.client('s3')
+                  buckets = s3.list_buckets().get('Buckets', [])
+                  for b in buckets:
+                      bname = b['Name']
+                      try:
+                          loc = s3.get_bucket_location(Bucket=bname).get('LocationConstraint') or 'us-east-1'
+                          if loc in regions:
+                              name = resolve_resource_name('AWS::S3::Bucket', bname, loc)
+                              resources.append({'type': 'AWS::S3::Bucket', 'physical_id': bname, 'logical_id': bname, 'name': name, 'region': loc})
+                      except Exception:
+                          pass
+              except Exception as e:
+                  print(f"[Discovery] S3 error: {e}")
+              # WAF CloudFront scope - global, must query us-east-1 (list_web_acls is NOT paginated)
+              try:
+                  waf_cf = boto3.client('wafv2', region_name='us-east-1')
+                  next_marker = None
+                  while True:
+                      kwargs = {'Scope': 'CLOUDFRONT', 'Limit': 100}
+                      if next_marker:
+                          kwargs['NextMarker'] = next_marker
+                      resp = waf_cf.list_web_acls(**kwargs)
+                      for acl in resp.get('WebACLs', []):
+                          acl_id = acl['Id']
+                          acl_name = acl['Name']
+                          acl_arn = acl['ARN']
+                          tag_name = ''
+                          try:
+                              tags_resp = waf_cf.list_tags_for_resource(ResourceARN=acl_arn)
+                              for tag in tags_resp.get('TagInfoForResource', {}).get('TagList', []):
+                                  if tag['Key'] == 'Name':
+                                      tag_name = tag['Value']
+                          except Exception:
+                              pass
+                          resources.append({
+                              'type': 'AWS::WAFv2::WebACL',
+                              'physical_id': acl_id,
+                              'logical_id': acl_name,
+                              'name': tag_name or acl_name,
+                              'region': 'us-east-1 (CloudFront)',
+                              'waf_scope': 'CLOUDFRONT',
+                          })
+                      next_marker = resp.get('NextMarker')
+                      if not next_marker:
+                          break
+              except Exception as e:
+                  print(f"[Discovery] WAF CloudFront error: {e}")
+              # CloudFront distributions - global, query us-east-1
+              try:
+                  cf_client = boto3.client('cloudfront', region_name='us-east-1')
+                  paginator = cf_client.get_paginator('list_distributions')
+                  for page in paginator.paginate():
+                      dist_list = page.get('DistributionList', {}).get('Items', [])
+                      for dist in dist_list:
+                          dist_id = dist['Id']
+                          dist_arn = dist['ARN']
+                          # Friendly name from tags or comment
+                          tag_name = ''
+                          try:
+                              tags_resp = cf_client.list_tags_for_resource(Resource=dist_arn)
+                              for tag in tags_resp.get('Tags', {}).get('Items', []):
+                                  if tag['Key'] == 'Name':
+                                      tag_name = tag['Value']
+                          except Exception:
+                              pass
+                          comment = dist.get('Comment', '')
+                          display = tag_name or comment or dist_id
+                          origins = ', '.join(o['DomainName'] for o in dist.get('Origins', {}).get('Items', [])[:2])
+                          resources.append({
+                              'type': 'AWS::CloudFront::Distribution',
+                              'physical_id': dist_id,
+                              'logical_id': dist_id,
+                              'name': display,
+                              'region': 'Global',
+                              'origins': origins,
+                          })
+              except Exception as e:
+                  print(f"[Discovery] CloudFront error: {e}")
+
+              print(f"[Discovery] Found {len(resources)} total resources across {len(regions)} region(s)")
+              by_type = defaultdict(int)
+              for r in resources:
+                  by_type[r['type'].split('::')[-1]] += 1
+              for t, c in sorted(by_type.items(), key=lambda x: x[1], reverse=True):
+                  print(f"[Discovery]   {t}: {c}")
+              return resources
+
+          # ── 2. METRIC DEFINITIONS PER RESOURCE TYPE ────────────────────
+          def _m(ns, name, dims, stat='Average', period=300):
+              return {'namespace': ns, 'metric': name, 'dimensions': dims, 'stat': stat, 'period': period}
+
+          def get_period(lookback_days):
+              """Return appropriate CloudWatch period based on lookback window."""
+              if lookback_days <= 1:
+                  return 300
+              elif lookback_days <= 7:
+                  return 3600
+              else:
+                  return 86400
+
+          # Cache for CWAgent/System-Linux dimensions per instance per region
+          _cwagent_dims_cache = {}
+
+          def discover_instance_custom_dims(instance_id, region, period):
+              """
+              Use ListMetrics to find the actual dimensions CWAgent/System-Linux
+              published for this instance. Returns list of metric descriptors.
+              CWAgent uses dims like: ImageId, InstanceId, InstanceType, instance, objectname
+              System/Linux uses dims like: InstanceId, InstanceType, MountPath, Filesystem
+              """
+              cache_key = f"{instance_id}|{region}"
+              if cache_key in _cwagent_dims_cache:
+                  return _cwagent_dims_cache[cache_key]
+
+              ms = []
+              cw_r = boto3.client('cloudwatch', region_name=region)
+
+              for namespace, metrics_to_find in [
+                  ('CWAgent', [
+                      ('mem_used_percent', 'Average'),
+                      ('mem_used_percent', 'Maximum'),
+                      ('disk_used_percent', 'Average'),
+                      ('disk_used_percent', 'Maximum'),
+                  ]),
+                  ('System/Linux', [
+                      ('MemoryUtilization', 'Average'),
+                      ('MemoryUtilization', 'Maximum'),
+                      ('DiskSpaceUtilization', 'Average'),
+                      ('DiskSpaceUtilization', 'Maximum'),
+                  ]),
+              ]:
+                  # Get all unique dimension sets for this metric+instance
+                  seen_metric_dims = {}  # metric_name -> first dims found
+                  try:
+                      paginator = cw_r.get_paginator('list_metrics')
+                      for metric_name, stat in metrics_to_find:
+                          if metric_name in seen_metric_dims:
+                              # Already found dims for this metric, reuse
+                              dims = seen_metric_dims[metric_name]
+                              ms.append(_m(namespace, metric_name, dims, stat, period))
+                              dbg(f"CWAgent reuse dims for {instance_id} {namespace}/{metric_name}: {dims}")
+                              continue
+                          for page in paginator.paginate(
+                              Namespace=namespace,
+                              MetricName=metric_name,
+                              Dimensions=[{'Name': 'InstanceId', 'Value': instance_id}]
+                          ):
+                              for m in page['Metrics']:
+                                  dims = m['Dimensions']
+                                  dbg(f"Found {namespace}/{metric_name} for {instance_id} with dims: {[d['Name']+'='+d['Value'] for d in dims]}")
+                                  seen_metric_dims[metric_name] = dims
+                                  ms.append(_m(namespace, metric_name, dims, stat, period))
+                                  break  # use first dimension set found
+                              if metric_name in seen_metric_dims:
+                                  break
+                  except Exception as e:
+                      dbg(f"ListMetrics error for {instance_id} in {namespace}: {e}")
+
+              dbg(f"discover_instance_custom_dims({instance_id}): found {len(ms)} custom metrics")
+              _cwagent_dims_cache[cache_key] = ms
+              return ms
+
+          def metrics_for_resource(r, period=3600):
+              """Return list of metric descriptors for a resource."""
+              t = r['type']
+              pid = r['physical_id']
+              rgn = r.get('region', os.environ.get('AWS_REGION', 'ap-south-1'))
+              ms = []
+              if t == 'AWS::Lambda::Function':
+                  fn = pid.split(':')[-1] if ':' in pid else pid
+                  d = [{'Name': 'FunctionName', 'Value': fn}]
+                  ms = [
+                      _m('AWS/Lambda', 'Invocations', d, 'Sum', period),
+                      _m('AWS/Lambda', 'Errors', d, 'Sum', period),
+                      _m('AWS/Lambda', 'Duration', d, 'Average', period),
+                      _m('AWS/Lambda', 'Duration', d, 'Maximum', period),
+                      _m('AWS/Lambda', 'Throttles', d, 'Sum', period),
+                      _m('AWS/Lambda', 'ConcurrentExecutions', d, 'Maximum', period),
+                  ]
+              elif t == 'AWS::ApiGateway::RestApi':
+                  d = [{'Name': 'ApiName', 'Value': pid}]
+                  ms = [
+                      _m('AWS/ApiGateway', 'Count', d, 'Sum', period),
+                      _m('AWS/ApiGateway', 'Latency', d, 'Average', period),
+                      _m('AWS/ApiGateway', 'IntegrationLatency', d, 'Average', period),
+                      _m('AWS/ApiGateway', '4XXError', d, 'Sum', period),
+                      _m('AWS/ApiGateway', '5XXError', d, 'Sum', period),
+                  ]
+              elif t == 'AWS::ApiGatewayV2::Api':
+                  d = [{'Name': 'ApiId', 'Value': pid}]
+                  ms = [
+                      _m('AWS/ApiGateway', 'Count', d, 'Sum', period),
+                      _m('AWS/ApiGateway', 'Latency', d, 'Average', period),
+                      _m('AWS/ApiGateway', 'IntegrationLatency', d, 'Average', period),
+                      _m('AWS/ApiGateway', '4xx', d, 'Sum', period),
+                      _m('AWS/ApiGateway', '5xx', d, 'Sum', period),
+                  ]
+              elif t == 'AWS::StepFunctions::StateMachine':
+                  d = [{'Name': 'StateMachineArn', 'Value': pid}]
+                  ms = [
+                      _m('AWS/States', 'ExecutionsStarted', d, 'Sum', period),
+                      _m('AWS/States', 'ExecutionsSucceeded', d, 'Sum', period),
+                      _m('AWS/States', 'ExecutionsFailed', d, 'Sum', period),
+                      _m('AWS/States', 'ExecutionsTimedOut', d, 'Sum', period),
+                      _m('AWS/States', 'ExecutionTime', d, 'Average', period),
+                  ]
+              elif t == 'AWS::Events::Rule':
+                  rule_name = pid.split('/')[-1] if '/' in pid else pid
+                  d = [{'Name': 'RuleName', 'Value': rule_name}]
+                  ms = [
+                      _m('AWS/Events', 'Invocations', d, 'Sum', period),
+                      _m('AWS/Events', 'FailedInvocations', d, 'Sum', period),
+                      _m('AWS/Events', 'ThrottledRules', d, 'Sum', period),
+                      _m('AWS/Events', 'MatchedEvents', d, 'Sum', period),
+                  ]
+              elif t == 'AWS::DynamoDB::Table':
+                  tbl = pid
+                  d = [{'Name': 'TableName', 'Value': tbl}]
+                  ms = [
+                      _m('AWS/DynamoDB', 'ConsumedReadCapacityUnits', d, 'Sum', period),
+                      _m('AWS/DynamoDB', 'ConsumedWriteCapacityUnits', d, 'Sum', period),
+                      _m('AWS/DynamoDB', 'ThrottledRequests', d, 'Sum', period),
+                      _m('AWS/DynamoDB', 'SuccessfulRequestLatency', d, 'Average', period),
+                  ]
+              elif t == 'AWS::SQS::Queue':
+                  qname = pid.split('/')[-1] if '/' in pid else pid
+                  d = [{'Name': 'QueueName', 'Value': qname}]
+                  ms = [
+                      _m('AWS/SQS', 'ApproximateNumberOfMessagesVisible', d, 'Average', period),
+                      _m('AWS/SQS', 'ApproximateAgeOfOldestMessage', d, 'Maximum', period),
+                      _m('AWS/SQS', 'NumberOfMessagesSent', d, 'Sum', period),
+                      _m('AWS/SQS', 'NumberOfMessagesReceived', d, 'Sum', period),
+                      _m('AWS/SQS', 'NumberOfMessagesDeleted', d, 'Sum', period),
+                  ]
+              elif t == 'AWS::SNS::Topic':
+                  topic_name = pid.split(':')[-1] if ':' in pid else pid
+                  d = [{'Name': 'TopicName', 'Value': topic_name}]
+                  ms = [
+                      _m('AWS/SNS', 'NumberOfMessagesPublished', d, 'Sum', period),
+                      _m('AWS/SNS', 'NumberOfNotificationsDelivered', d, 'Sum', period),
+                      _m('AWS/SNS', 'NumberOfNotificationsFailed', d, 'Sum', period),
+                  ]
+              elif t == 'AWS::S3::Bucket':
+                  d_std = [{'Name': 'BucketName', 'Value': pid}, {'Name': 'StorageType', 'Value': 'StandardStorage'}]
+                  d_all = [{'Name': 'BucketName', 'Value': pid}, {'Name': 'StorageType', 'Value': 'AllStorageTypes'}]
+                  d_filt = [{'Name': 'BucketName', 'Value': pid}, {'Name': 'FilterId', 'Value': 'EntireBucket'}]
+                  ms = [
+                      _m('AWS/S3', 'BucketSizeBytes', d_std, 'Average', 86400),
+                      _m('AWS/S3', 'NumberOfObjects', d_all, 'Average', 86400),
+                      _m('AWS/S3', '4xxErrors', d_filt, 'Sum', period),
+                      _m('AWS/S3', '5xxErrors', d_filt, 'Sum', period),
+                      _m('AWS/S3', 'BytesDownloaded', d_filt, 'Sum', period),
+                      _m('AWS/S3', 'FirstByteLatency', d_filt, 'Average', period),
+                  ]
+              elif t == 'AWS::EC2::Instance':
+                  d = [{'Name': 'InstanceId', 'Value': pid}]
+                  ms = [
+                      _m('AWS/EC2', 'CPUUtilization', d, 'Average', period),
+                      _m('AWS/EC2', 'CPUUtilization', d, 'Maximum', period),
+                      _m('AWS/EC2', 'NetworkIn', d, 'Sum', period),
+                      _m('AWS/EC2', 'NetworkOut', d, 'Sum', period),
+                      _m('AWS/EC2', 'StatusCheckFailed', d, 'Maximum', period),
+                  ]
+                  # Discover actual CWAgent/System-Linux dimensions via ListMetrics
+                  custom_ms = discover_instance_custom_dims(pid, rgn, period)
+                  ms.extend(custom_ms)
+                  dbg(f"EC2 {pid}: {len(ms)} total metrics ({len(custom_ms)} custom)")
+              elif t == 'AWS::ECS::Service':
+                  parts = pid.split('/')
+                  if len(parts) >= 3:
+                      cluster, svc = parts[-2], parts[-1]
+                  else:
+                      cluster, svc = 'default', parts[-1]
+                  d = [{'Name': 'ClusterName', 'Value': cluster}, {'Name': 'ServiceName', 'Value': svc}]
+                  ms = [
+                      _m('AWS/ECS', 'CPUUtilization', d, 'Average', period),
+                      _m('AWS/ECS', 'MemoryUtilization', d, 'Average', period),
+                  ]
+              elif t in ('AWS::RDS::DBInstance', 'AWS::RDS::DBCluster'):
+                  d = [{'Name': 'DBInstanceIdentifier' if 'Instance' in t else 'DBClusterIdentifier', 'Value': pid}]
+                  ms = [
+                      _m('AWS/RDS', 'CPUUtilization', d, 'Average', period),
+                      _m('AWS/RDS', 'FreeableMemory', d, 'Average', period),
+                      _m('AWS/RDS', 'DatabaseConnections', d, 'Average', period),
+                      _m('AWS/RDS', 'FreeStorageSpace', d, 'Average', period),
+                      _m('AWS/RDS', 'ReadLatency', d, 'Average', period),
+                      _m('AWS/RDS', 'WriteLatency', d, 'Average', period),
+                  ]
+              elif t == 'AWS::ElastiCache::CacheCluster':
+                  d = [{'Name': 'CacheClusterId', 'Value': pid}]
+                  ms = [
+                      _m('AWS/ElastiCache', 'CPUUtilization', d, 'Average', period),
+                      _m('AWS/ElastiCache', 'FreeableMemory', d, 'Average', period),
+                      _m('AWS/ElastiCache', 'CurrConnections', d, 'Average', period),
+                      _m('AWS/ElastiCache', 'Evictions', d, 'Sum', period),
+                  ]
+              elif t == 'AWS::ElasticLoadBalancingV2::LoadBalancer':
+                  # ALB: dimension is LoadBalancer (short suffix of ARN)
+                  # NLB: same dimension key
+                  lb_suffix = '/'.join(pid.split('/')[-3:]) if pid.count('/') >= 3 else pid
+                  lb_type = r.get('lb_type', 'application')
+                  if lb_type == 'application':
+                      d = [{'Name': 'LoadBalancer', 'Value': lb_suffix}]
+                      ms = [
+                          _m('AWS/ApplicationELB', 'RequestCount', d, 'Sum', period),
+                          _m('AWS/ApplicationELB', 'TargetResponseTime', d, 'Average', period),
+                          _m('AWS/ApplicationELB', 'HTTPCode_ELB_4XX_Count', d, 'Sum', period),
+                          _m('AWS/ApplicationELB', 'HTTPCode_ELB_5XX_Count', d, 'Sum', period),
+                          _m('AWS/ApplicationELB', 'HTTPCode_Target_2XX_Count', d, 'Sum', period),
+                          _m('AWS/ApplicationELB', 'ActiveConnectionCount', d, 'Average', period),
+                          _m('AWS/ApplicationELB', 'NewConnectionCount', d, 'Sum', period),
+                          _m('AWS/ApplicationELB', 'ProcessedBytes', d, 'Sum', period),
+                          _m('AWS/ApplicationELB', 'HealthyHostCount', d, 'Average', period),
+                          _m('AWS/ApplicationELB', 'UnHealthyHostCount', d, 'Average', period),
+                      ]
+                  elif lb_type == 'network':
+                      d = [{'Name': 'LoadBalancer', 'Value': lb_suffix}]
+                      ms = [
+                          _m('AWS/NetworkELB', 'ActiveFlowCount', d, 'Average', period),
+                          _m('AWS/NetworkELB', 'NewFlowCount', d, 'Sum', period),
+                          _m('AWS/NetworkELB', 'ProcessedBytes', d, 'Sum', period),
+                          _m('AWS/NetworkELB', 'HealthyHostCount', d, 'Average', period),
+                          _m('AWS/NetworkELB', 'UnHealthyHostCount', d, 'Average', period),
+                          _m('AWS/NetworkELB', 'TCP_Client_Reset_Count', d, 'Sum', period),
+                          _m('AWS/NetworkELB', 'TCP_Target_Reset_Count', d, 'Sum', period),
+                      ]
+                  else:
+                      ms = []
+              elif t == 'AWS::ElasticLoadBalancing::LoadBalancer':
+                  # Classic ELB
+                  d = [{'Name': 'LoadBalancerName', 'Value': pid}]
+                  ms = [
+                      _m('AWS/ELB', 'RequestCount', d, 'Sum', period),
+                      _m('AWS/ELB', 'Latency', d, 'Average', period),
+                      _m('AWS/ELB', 'HTTPCode_ELB_4XX', d, 'Sum', period),
+                      _m('AWS/ELB', 'HTTPCode_ELB_5XX', d, 'Sum', period),
+                      _m('AWS/ELB', 'HealthyHostCount', d, 'Average', period),
+                      _m('AWS/ELB', 'UnHealthyHostCount', d, 'Average', period),
+                  ]
+              elif t == 'AWS::WAFv2::WebACL':
+                  waf_scope = r.get('waf_scope', 'REGIONAL')
+                  # WAFv2 CloudWatch metrics use WebACL name + scope as dimensions
+                  d = [
+                      {'Name': 'WebACL', 'Value': r.get('logical_id', pid)},
+                      {'Name': 'Region', 'Value': 'CloudFront' if waf_scope == 'CLOUDFRONT' else rgn},
+                      {'Name': 'Rule', 'Value': 'ALL'},
+                  ]
+                  ms = [
+                      _m('AWS/WAFV2', 'AllowedRequests', d, 'Sum', period),
+                      _m('AWS/WAFV2', 'BlockedRequests', d, 'Sum', period),
+                      _m('AWS/WAFV2', 'CountedRequests', d, 'Sum', period),
+                      _m('AWS/WAFV2', 'PassedRequests', d, 'Sum', period),
+                  ]
+              elif t == 'AWS::CloudFront::Distribution':
+                  # CloudFront metrics always in us-east-1, Region=Global dimension
+                  d = [
+                      {'Name': 'DistributionId', 'Value': pid},
+                      {'Name': 'Region', 'Value': 'Global'},
+                  ]
+                  ms = [
+                      _m('AWS/CloudFront', 'Requests', d, 'Sum', period),
+                      _m('AWS/CloudFront', 'BytesDownloaded', d, 'Sum', period),
+                      _m('AWS/CloudFront', 'BytesUploaded', d, 'Sum', period),
+                      _m('AWS/CloudFront', 'TotalErrorRate', d, 'Average', period),
+                      _m('AWS/CloudFront', '4xxErrorRate', d, 'Average', period),
+                      _m('AWS/CloudFront', '5xxErrorRate', d, 'Average', period),
+                      _m('AWS/CloudFront', 'CacheHitRate', d, 'Average', period),
+                      _m('AWS/CloudFront', 'OriginLatency', d, 'Average', period),
+                  ]
+              return ms
+
+          # ── 3. METRIC COLLECTION via GetMetricData ─────────────────────
+          def collect_metrics(resources, lookback_days):
+              """Batch-collect all metrics using GetMetricData (up to 500 per call), per region."""
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(days=lookback_days)
+              period = get_period(lookback_days)
+              print(f"[Metrics] lookback={lookback_days}d, period={period}s ({period//60}min / {period//3600}h)")
+              # Group resources by region
+              by_region = defaultdict(list)
+              for r in resources:
+                  by_region[r.get('region', os.environ.get('AWS_REGION', 'ap-south-1'))].append(r)
+
+              results = {}
+              total_queries = 0
+              for rgn, rgn_resources in by_region.items():
+                  cw_regional = boto3.client('cloudwatch', region_name=rgn)
+                  all_queries = []
+                  for r in rgn_resources:
+                      rkey = f"{r['type']}|{r['physical_id']}"
+                      for i, m in enumerate(metrics_for_resource(r, period)):
+                          label = f"m{total_queries + len(all_queries)}"
+                          q = {
+                              'Id': label,
+                              'MetricStat': {
+                                  'Metric': {
+                                      'Namespace': m['namespace'],
+                                      'MetricName': m['metric'],
+                                      'Dimensions': m['dimensions'],
+                                  },
+                                  'Period': m['period'],
+                                  'Stat': m['stat'],
+                              },
+                              'ReturnData': True,
+                          }
+                          all_queries.append((rkey, f"{m['metric']}_{m['stat']}", q))
+
+                  # Execute in batches of 500
+                  batch_size = 500
+                  for batch_start in range(0, len(all_queries), batch_size):
+                      batch = all_queries[batch_start:batch_start + batch_size]
+                      queries = [q for _, _, q in batch]
+                      # Build label->index map for safe result matching (response order not guaranteed)
+                      label_to_idx = {q['Id']: i for i, q in enumerate(queries)}
+                      try:
+                          resp = cw_regional.get_metric_data(
+                              MetricDataQueries=queries,
+                              StartTime=start_time,
+                              EndTime=end_time,
+                              ScanBy='TimestampAscending'
+                          )
+                          for mdr in resp.get('MetricDataResults', []):
+                              result_id = mdr.get('Id', '')
+                              idx = label_to_idx.get(result_id)
+                              if idx is None:
+                                  continue
+                              rkey = batch[idx][0]
+                              mlabel = batch[idx][1]
+                              vals = mdr.get('Values', [])
+                              if rkey not in results:
+                                  results[rkey] = {}
+                              summary = {}
+                              if vals:
+                                  summary = {
+                                      'avg': round(sum(vals) / len(vals), 4),
+                                      'max': round(max(vals), 4),
+                                      'min': round(min(vals), 4),
+                                      'sum': round(sum(vals), 4),
+                                      'count': len(vals),
+                                      'last': round(vals[-1], 4),
+                                  }
+                              results[rkey][mlabel] = summary
+                      except Exception as e:
+                          print(f"[Metrics] Batch error in {rgn}: {e}")
+                  total_queries += len(all_queries)
+                  print(f"[Metrics] Region {rgn}: {len(rgn_resources)} resources, {len(all_queries)} queries")
+                  if os.environ.get('EnableDebug', 'false').lower() == 'true':
+                      for r in rgn_resources:
+                          if r['type'] == 'AWS::EC2::Instance':
+                              rkey = f"{r['type']}|{r['physical_id']}"
+                              stored = results.get(rkey, {})
+                              non_empty = {k: v for k, v in stored.items() if v}
+                              print(f"[DEBUG] EC2 {r.get('name', r['physical_id'])} [{rgn}] stored keys with data: {list(non_empty.keys())}")
+
+              print(f"[Metrics] Total: {len(results)} resources, {total_queries} metric queries across {len(by_region)} region(s)")
+              return results
+
+          # ── 4. QUOTA-PRESSURE METRICS (AWS/Usage namespace) ────────────
+          def collect_quota_metrics(lookback_days):
+              """Collect AWS/Usage namespace metrics for quota-pressure analysis."""
+              if not env_bool('EnableQuotaAnalysis', 'true'):
+                  return {}
+              end_time = datetime.utcnow()
+              start_time = end_time - timedelta(days=lookback_days)
+              quota_data = {}
+              # Discover available usage metrics
+              try:
+                  paginator = cw.get_paginator('list_metrics')
+                  usage_metrics = []
+                  for page in paginator.paginate(Namespace='AWS/Usage'):
+                      for m in page['Metrics']:
+                          usage_metrics.append(m)
+                  if not usage_metrics:
+                      print("[Quota] No AWS/Usage metrics found")
+                      return {}
+                  print(f"[Quota] Found {len(usage_metrics)} usage metrics")
+                  # Batch query up to 200 most relevant
+                  queries = []
+                  meta = []
+                  for i, um in enumerate(usage_metrics[:200]):
+                      dims = um['Dimensions']
+                      dim_dict = {d['Name']: d['Value'] for d in dims}
+                      svc = dim_dict.get('Service', 'Unknown')
+                      res_type = dim_dict.get('Type', dim_dict.get('Resource', 'Unknown'))
+                      label = f"q{i}"
+                      queries.append({
+                          'Id': label,
+                          'MetricStat': {
+                              'Metric': {
+                                  'Namespace': 'AWS/Usage',
+                                  'MetricName': um['MetricName'],
+                                  'Dimensions': dims,
+                              },
+                              'Period': 300,
+                              'Stat': 'Maximum',
+                          },
+                          'ReturnData': True,
+                      })
+                      meta.append({'service': svc, 'resource': res_type, 'metric': um['MetricName']})
+
+                  # Execute in batches
+                  for bs in range(0, len(queries), 500):
+                      batch_q = queries[bs:bs+500]
+                      batch_m = meta[bs:bs+500]
+                      try:
+                          resp = cw.get_metric_data(
+                              MetricDataQueries=batch_q,
+                              StartTime=start_time,
+                              EndTime=end_time,
+                              ScanBy='TimestampDescending'
+                          )
+                          for idx, mdr in enumerate(resp.get('MetricDataResults', [])):
+                              vals = mdr.get('Values', [])
+                              if vals:
+                                  mx = max(vals)
+                                  if mx > 0:
+                                      key = f"{batch_m[idx]['service']}/{batch_m[idx]['resource']}"
+                                      if key not in quota_data:
+                                          quota_data[key] = []
+                                      quota_data[key].append({
+                                          'metric': batch_m[idx]['metric'],
+                                          'max_value': round(mx, 2),
+                                          'avg_value': round(sum(vals)/len(vals), 2),
+                                          'datapoints': len(vals),
+                                      })
+                      except Exception as e:
+                          print(f"[Quota] Batch error: {e}")
+              except Exception as e:
+                  print(f"[Quota] Discovery error: {e}")
+              print(f"[Quota] Collected quota data for {len(quota_data)} service/resource combos")
+              return quota_data
+
+          # ── 5. DETERMINISTIC SCORING ENGINE ────────────────────────────
+          SEVERITY_IMMEDIATE = 'Immediate'
+          SEVERITY_THIS_WEEK = 'This Week'
+          SEVERITY_LATER = 'Later'
+
+          def score_resource(rtype, metrics):
+              """Score a single resource. Returns dict with category, findings, severity."""
+              findings = []
+              category = 'healthy'  # healthy | underutilized | overutilized | unhealthy
+
+              def val(key, field='avg'):
+                  v = metrics.get(key, {})
+                  return v.get(field, 0) if v else 0
+
+              def has(key):
+                  return bool(metrics.get(key, {}))
+
+              if rtype == 'AWS::Lambda::Function':
+                  invocations = val('Invocations_Sum', 'sum')
+                  errors = val('Errors_Sum', 'sum')
+                  throttles = val('Throttles_Sum', 'sum')
+                  avg_dur = val('Duration_Average', 'avg')
+                  max_dur = val('Duration_Maximum', 'max')
+                  max_conc = val('ConcurrentExecutions_Maximum', 'max')
+
+                  if invocations == 0:
+                      findings.append({'text': f'Zero invocations in lookback window - review if still needed', 'severity': SEVERITY_LATER})
+                      category = 'underutilized'
+                  else:
+                      error_rate = (errors / invocations * 100) if invocations > 0 else 0
+                      if error_rate > 5:
+                          findings.append({'text': f'High error rate: {round(error_rate,1)}% ({int(errors)}/{int(invocations)})', 'severity': SEVERITY_IMMEDIATE})
+                          category = 'unhealthy'
+                      if throttles > 0:
+                          findings.append({'text': f'Throttled {int(throttles)} times - increase reserved concurrency or review concurrency limits', 'severity': SEVERITY_IMMEDIATE})
+                          category = 'overutilized'
+                      if avg_dur > 10000:
+                          findings.append({'text': f'High avg duration: {round(avg_dur)}ms - optimize runtime or increase memory', 'severity': SEVERITY_THIS_WEEK})
+                          if category == 'healthy': category = 'overutilized'
+                      if invocations < 10 and invocations > 0:
+                          findings.append({'text': f'Very low invocations ({int(invocations)}) - review if function is still needed', 'severity': SEVERITY_LATER})
+                          if category == 'healthy': category = 'underutilized'
+
+              elif rtype in ('AWS::ApiGateway::RestApi', 'AWS::ApiGatewayV2::Api'):
+                  count = val('Count_Sum', 'sum')
+                  latency = val('Latency_Average', 'avg')
+                  err4 = val('4XXError_Sum', 'sum') + val('4xx_Sum', 'sum')
+                  err5 = val('5XXError_Sum', 'sum') + val('5xx_Sum', 'sum')
+
+                  if count == 0:
+                      findings.append({'text': 'Zero requests - API may be unused', 'severity': SEVERITY_LATER})
+                      category = 'underutilized'
+                  else:
+                      err5_rate = (err5 / count * 100) if count > 0 else 0
+                      if err5_rate > 1:
+                          findings.append({'text': f'5XX error rate: {round(err5_rate,1)}% ({int(err5)} errors)', 'severity': SEVERITY_IMMEDIATE})
+                          category = 'unhealthy'
+                      if latency > 3000:
+                          findings.append({'text': f'High avg latency: {round(latency)}ms', 'severity': SEVERITY_THIS_WEEK})
+                          if category == 'healthy': category = 'overutilized'
+                      err4_rate = (err4 / count * 100) if count > 0 else 0
+                      if err4_rate > 10:
+                          findings.append({'text': f'High 4XX rate: {round(err4_rate,1)}%', 'severity': SEVERITY_THIS_WEEK})
+
+              elif rtype == 'AWS::StepFunctions::StateMachine':
+                  started = val('ExecutionsStarted_Sum', 'sum')
+                  failed = val('ExecutionsFailed_Sum', 'sum')
+                  timed_out = val('ExecutionsTimedOut_Sum', 'sum')
+                  if started == 0:
+                      findings.append({'text': 'No executions started - review if still needed', 'severity': SEVERITY_LATER})
+                      category = 'underutilized'
+                  else:
+                      fail_rate = ((failed + timed_out) / started * 100) if started > 0 else 0
+                      if fail_rate > 5:
+                          findings.append({'text': f'Failure/timeout rate: {round(fail_rate,1)}%', 'severity': SEVERITY_IMMEDIATE})
+                          category = 'unhealthy'
+
+              elif rtype == 'AWS::DynamoDB::Table':
+                  reads = val('ConsumedReadCapacityUnits_Sum', 'sum')
+                  writes = val('ConsumedWriteCapacityUnits_Sum', 'sum')
+                  throttles = val('ThrottledRequests_Sum', 'sum')
+                  if reads == 0 and writes == 0:
+                      findings.append({'text': 'Zero consumed capacity - table may be unused', 'severity': SEVERITY_LATER})
+                      category = 'underutilized'
+                  if throttles > 0:
+                      findings.append({'text': f'{int(throttles)} throttled requests - scale capacity or redesign hot keys', 'severity': SEVERITY_IMMEDIATE})
+                      category = 'overutilized'
+
+              elif rtype == 'AWS::SQS::Queue':
+                  visible = val('ApproximateNumberOfMessagesVisible_Average', 'avg')
+                  oldest = val('ApproximateAgeOfOldestMessage_Maximum', 'max')
+                  sent = val('NumberOfMessagesSent_Sum', 'sum')
+                  if sent == 0:
+                      findings.append({'text': 'No messages sent - queue may be unused', 'severity': SEVERITY_LATER})
+                      category = 'underutilized'
+                  if visible > 1000 and oldest > 3600:
+                      findings.append({'text': f'Backlog: ~{int(visible)} msgs visible, oldest {int(oldest)}s - consumers under-scaled or failing', 'severity': SEVERITY_IMMEDIATE})
+                      category = 'overutilized'
+                  elif oldest > 7200:
+                      findings.append({'text': f'Oldest message age: {int(oldest)}s - possible consumer issue', 'severity': SEVERITY_THIS_WEEK})
+
+              elif rtype == 'AWS::EC2::Instance':
+                  cpu = val('CPUUtilization_Average', 'avg')
+                  cpu_max = val('CPUUtilization_Maximum', 'max')
+                  status_fail = val('StatusCheckFailed_Maximum', 'max')
+                  # Memory: try CWAgent first, fall back to System/Linux
+                  mem = val('mem_used_percent_Average', 'avg')
+                  mem_max = val('mem_used_percent_Maximum', 'max')
+                  if not mem:
+                      mem = val('MemoryUtilization_Average', 'avg')
+                      mem_max = val('MemoryUtilization_Maximum', 'max')
+                  has_mem = mem > 0
+                  # Disk: try CWAgent first, fall back to System/Linux
+                  disk = val('disk_used_percent_Average', 'avg')
+                  disk_max = val('disk_used_percent_Maximum', 'max')
+                  if not disk:
+                      disk = val('DiskSpaceUtilization_Average', 'avg')
+                      disk_max = val('DiskSpaceUtilization_Maximum', 'max')
+                  has_disk = disk > 0
+
+                  if status_fail > 0:
+                      findings.append({'text': 'Status check failures detected', 'severity': SEVERITY_IMMEDIATE})
+                      category = 'unhealthy'
+                  # Disk critical (>90%)
+                  if has_disk and disk_max > 90:
+                      findings.append({'text': f'CRITICAL disk usage: {round(disk,1)}% avg, {round(disk_max,1)}% peak - expand volume or clean up immediately', 'severity': SEVERITY_IMMEDIATE})
+                      if category == 'healthy': category = 'overutilized'
+                  elif has_disk and disk > 80:
+                      findings.append({'text': f'High disk usage: {round(disk,1)}% avg, {round(disk_max,1)}% peak - plan volume expansion', 'severity': SEVERITY_THIS_WEEK})
+                      if category == 'healthy': category = 'overutilized'
+                  # Memory critical (>90%)
+                  if has_mem and mem_max > 90:
+                      findings.append({'text': f'CRITICAL memory usage: {round(mem,1)}% avg, {round(mem_max,1)}% peak - scale up instance type', 'severity': SEVERITY_IMMEDIATE})
+                      if category == 'healthy': category = 'overutilized'
+                  elif has_mem and mem > 80:
+                      findings.append({'text': f'High memory usage: {round(mem,1)}% avg, {round(mem_max,1)}% peak - consider larger instance', 'severity': SEVERITY_THIS_WEEK})
+                      if category == 'healthy': category = 'overutilized'
+                  # CPU overutilized
+                  if cpu > 80:
+                      findings.append({'text': f'High CPU: {round(cpu,1)}% avg, {round(cpu_max,1)}% peak - consider scaling up/out', 'severity': SEVERITY_THIS_WEEK})
+                      if category == 'healthy': category = 'overutilized'
+                  # Underutilized: low CPU + low memory + low disk
+                  elif cpu < 5 and has('CPUUtilization_Average'):
+                      if has_mem and mem < 10 and has_disk and disk < 20:
+                          findings.append({'text': f'Very low utilization: CPU {round(cpu,1)}%, Memory {round(mem,1)}%, Disk {round(disk,1)}% - consider downsizing', 'severity': SEVERITY_LATER})
+                      elif has_mem and mem < 10:
+                          findings.append({'text': f'Very low utilization: CPU {round(cpu,1)}%, Memory {round(mem,1)}% - consider downsizing', 'severity': SEVERITY_LATER})
+                      else:
+                          findings.append({'text': f'Very low CPU: {round(cpu,1)}% avg - consider downsizing', 'severity': SEVERITY_LATER})
+                      if category == 'healthy': category = 'underutilized'
+                  # Informational: show memory/disk stats even if healthy
+                  if has_mem and not any('memory' in f['text'].lower() for f in findings):
+                      findings.append({'text': f'Memory: {round(mem,1)}% avg, {round(mem_max,1)}% peak', 'severity': SEVERITY_LATER})
+                  if has_disk and not any('disk' in f['text'].lower() for f in findings):
+                      findings.append({'text': f'Disk: {round(disk,1)}% avg, {round(disk_max,1)}% peak', 'severity': SEVERITY_LATER})
+
+              elif rtype == 'AWS::ECS::Service':
+                  cpu = val('CPUUtilization_Average', 'avg')
+                  mem = val('MemoryUtilization_Average', 'avg')
+                  if cpu > 80 or mem > 80:
+                      findings.append({'text': f'High utilization: CPU {round(cpu,1)}%, Memory {round(mem,1)}% - scale out', 'severity': SEVERITY_THIS_WEEK})
+                      category = 'overutilized'
+                  elif cpu < 5 and mem < 10 and has('CPUUtilization_Average'):
+                      findings.append({'text': f'Low utilization: CPU {round(cpu,1)}%, Memory {round(mem,1)}% - consider downsizing', 'severity': SEVERITY_LATER})
+                      category = 'underutilized'
+
+              elif rtype in ('AWS::RDS::DBInstance', 'AWS::RDS::DBCluster'):
+                  cpu = val('CPUUtilization_Average', 'avg')
+                  conns = val('DatabaseConnections_Average', 'avg')
+                  if cpu > 80:
+                      findings.append({'text': f'High CPU: {round(cpu,1)}% avg - scale up instance class', 'severity': SEVERITY_THIS_WEEK})
+                      category = 'overutilized'
+                  elif cpu < 5 and conns < 1 and has('CPUUtilization_Average'):
+                      findings.append({'text': f'Idle: CPU {round(cpu,1)}%, {round(conns,1)} avg connections - consider downsizing or stopping', 'severity': SEVERITY_LATER})
+                      category = 'underutilized'
+
+              elif rtype == 'AWS::ElastiCache::CacheCluster':
+                  cpu = val('CPUUtilization_Average', 'avg')
+                  evictions = val('Evictions_Sum', 'sum')
+                  if evictions > 100:
+                      findings.append({'text': f'{int(evictions)} evictions - increase node size or add nodes', 'severity': SEVERITY_THIS_WEEK})
+                      category = 'overutilized'
+                  elif cpu < 5 and has('CPUUtilization_Average'):
+                      findings.append({'text': f'Low CPU: {round(cpu,1)}% - consider downsizing', 'severity': SEVERITY_LATER})
+                      category = 'underutilized'
+
+              elif rtype in ('AWS::ElasticLoadBalancingV2::LoadBalancer', 'AWS::ElasticLoadBalancing::LoadBalancer'):                  # ALB/NLB metrics
+                  requests = val('RequestCount_Sum', 'sum') or val('ActiveFlowCount_Average', 'avg')
+                  err5 = val('HTTPCode_ELB_5XX_Count_Sum', 'sum') or val('HTTPCode_ELB_5XX_Sum', 'sum')
+                  unhealthy = val('UnHealthyHostCount_Average', 'avg')
+                  latency = val('TargetResponseTime_Average', 'avg') or val('Latency_Average', 'avg')
+                  if unhealthy and unhealthy > 0:
+                      findings.append({'text': f'{round(unhealthy,1)} avg unhealthy targets - check target health', 'severity': SEVERITY_IMMEDIATE})
+                      category = 'unhealthy'
+                  if err5 and requests and requests > 0:
+                      err5_rate = err5 / requests * 100
+                      if err5_rate > 1:
+                          findings.append({'text': f'5XX error rate: {round(err5_rate,1)}% ({int(err5)} errors)', 'severity': SEVERITY_IMMEDIATE})
+                          if category == 'healthy': category = 'unhealthy'
+                  if latency and latency > 3:
+                      findings.append({'text': f'High avg response time: {round(latency,3)}s', 'severity': SEVERITY_THIS_WEEK})
+                      if category == 'healthy': category = 'overutilized'
+                  if not requests or requests == 0:
+                      findings.append({'text': 'Zero requests - load balancer may be unused', 'severity': SEVERITY_LATER})
+                      if category == 'healthy': category = 'underutilized'
+
+              elif rtype == 'AWS::WAFv2::WebACL':
+                  allowed = val('AllowedRequests_Sum', 'sum')
+                  blocked = val('BlockedRequests_Sum', 'sum')
+                  total = allowed + blocked
+                  if total == 0:
+                      findings.append({'text': 'Zero requests evaluated - WAF ACL may be unused or not associated', 'severity': SEVERITY_LATER})
+                      category = 'underutilized'
+                  else:
+                      block_rate = (blocked / total * 100) if total > 0 else 0
+                      if block_rate > 20:
+                          findings.append({'text': f'High block rate: {round(block_rate,1)}% ({int(blocked):,} blocked / {int(total):,} total) - review rules for false positives', 'severity': SEVERITY_THIS_WEEK})
+                      elif blocked > 0:
+                          findings.append({'text': f'Blocking {int(blocked):,} requests ({round(block_rate,1)}% block rate)', 'severity': SEVERITY_LATER})
+
+              elif rtype == 'AWS::CloudFront::Distribution':
+                  requests = val('Requests_Sum', 'sum')
+                  err5_rate = val('5xxErrorRate_Average', 'avg')
+                  total_err = val('TotalErrorRate_Average', 'avg')
+                  cache_hit = val('CacheHitRate_Average', 'avg')
+                  origin_lat = val('OriginLatency_Average', 'avg')
+                  if requests == 0:
+                      findings.append({'text': 'Zero requests - distribution may be unused', 'severity': SEVERITY_LATER})
+                      category = 'underutilized'
+                  else:
+                      if err5_rate and err5_rate > 1:
+                          findings.append({'text': f'5XX error rate: {round(err5_rate,2)}% - check origin health', 'severity': SEVERITY_IMMEDIATE})
+                          category = 'unhealthy'
+                      if total_err and total_err > 5:
+                          findings.append({'text': f'Total error rate: {round(total_err,2)}%', 'severity': SEVERITY_THIS_WEEK})
+                          if category == 'healthy': category = 'overutilized'
+                      if cache_hit is not None and cache_hit < 50:
+                          findings.append({'text': f'Low cache hit rate: {round(cache_hit,1)}% - review cache behaviours', 'severity': SEVERITY_THIS_WEEK})
+                      if origin_lat and origin_lat > 1000:
+                          findings.append({'text': f'High origin latency: {round(origin_lat)}ms', 'severity': SEVERITY_THIS_WEEK})
+
+              # S3, SNS, Events - mostly informational
+              elif rtype == 'AWS::SNS::Topic':
+                  published = val('NumberOfMessagesPublished_Sum', 'sum')
+                  failed = val('NumberOfNotificationsFailed_Sum', 'sum')
+                  if failed > 0 and published > 0:
+                      fail_rate = failed / published * 100
+                      if fail_rate > 5:
+                          findings.append({'text': f'Delivery failure rate: {round(fail_rate,1)}%', 'severity': SEVERITY_THIS_WEEK})
+                          category = 'unhealthy'
+
+              elif rtype == 'AWS::Events::Rule':
+                  invocations = val('Invocations_Sum', 'sum')
+                  failed = val('FailedInvocations_Sum', 'sum')
+                  throttled = val('ThrottledRules_Sum', 'sum')
+                  if failed > 0:
+                      findings.append({'text': f'{int(failed)} failed invocations', 'severity': SEVERITY_THIS_WEEK})
+                      category = 'unhealthy'
+                  if throttled > 0:
+                      findings.append({'text': f'{int(throttled)} throttled rules', 'severity': SEVERITY_IMMEDIATE})
+                      category = 'overutilized'
+
+              if not findings:
+                  findings.append({'text': 'No issues detected', 'severity': SEVERITY_LATER})
+
+              return {'category': category, 'findings': findings}
+
+          # ── 6. BUILD STRUCTURED INPUT FOR BEDROCK ──────────────────────
+          def build_bedrock_prompt(scope_label, lookback_days, resources, metrics, scores, quota_data, account_name, account_id):
+              P = []
+              P.append(f"AWS RESOURCE UTILIZATION REPORT")
+              if account_name:
+                  P.append(f"Account: {account_name} ({account_id}) | Scope: {scope_label}")
+              else:
+                  P.append(f"Account: {account_id} | Scope: {scope_label}")
+              P.append(f"Report Window: {lookback_days} days ending {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+              P.append(f"Resources Analyzed: {len(resources)}")
+              P.append("")
+
+              # Classify resources
+              overutilized = []
+              underutilized = []
+              unhealthy = []
+              healthy = []
+              for r in resources:
+                  rkey = f"{r['type']}|{r['physical_id']}"
+                  sc = scores.get(rkey, {})
+                  cat = sc.get('category', 'healthy')
+                  display_name = r.get('name', '') or r['logical_id']
+                  rgn_label = r.get('region', '')
+                  entry = {
+                      'type': r['type'].split('::')[-1],
+                      'id': r['physical_id'],
+                      'logical': r['logical_id'],
+                      'display_name': display_name,
+                      'region': rgn_label,
+                      'findings': sc.get('findings', []),
+                      'metrics': metrics.get(rkey, {}),
+                  }
+                  if cat == 'overutilized': overutilized.append(entry)
+                  elif cat == 'underutilized': underutilized.append(entry)
+                  elif cat == 'unhealthy': unhealthy.append(entry)
+                  else: healthy.append(entry)
+
+              # Summary counts
+              P.append("RESOURCE HEALTH SUMMARY:")
+              P.append(f"  Unhealthy: {len(unhealthy)}")
+              P.append(f"  Overutilized: {len(overutilized)}")
+              P.append(f"  Underutilized: {len(underutilized)}")
+              P.append(f"  Healthy: {len(healthy)}")
+              P.append("")
+
+              # Deterministic findings - unhealthy first
+              if unhealthy:
+                  P.append("UNHEALTHY RESOURCES (errors, failures, status-check issues):")
+                  for e in unhealthy:
+                      label = f"{e['type']} - {e['display_name']} [{e['region']}] ({e['id']})"
+                      P.append(f"  {label}")
+                      for f in e['findings']:
+                          P.append(f"    [{f['severity']}] {f['text']}")
+                      # Include key metrics
+                      for mk, mv in e['metrics'].items():
+                          if mv:
+                              P.append(f"    metric {mk}: avg={mv.get('avg',0)}, max={mv.get('max',0)}, sum={mv.get('sum',0)}")
+                  P.append("")
+
+              if overutilized:
+                  P.append("OVERUTILIZED RESOURCES (high CPU/latency/throttling/backlog):")
+                  for e in overutilized:
+                      label = f"{e['type']} - {e['display_name']} [{e['region']}] ({e['id']})"
+                      P.append(f"  {label}")
+                      for f in e['findings']:
+                          P.append(f"    [{f['severity']}] {f['text']}")
+                      for mk, mv in e['metrics'].items():
+                          if mv:
+                              P.append(f"    metric {mk}: avg={mv.get('avg',0)}, max={mv.get('max',0)}, sum={mv.get('sum',0)}")
+                  P.append("")
+
+              if underutilized:
+                  P.append("UNDERUTILIZED / WASTE CANDIDATES (low traffic, idle resources):")
+                  for e in underutilized:
+                      label = f"{e['type']} - {e['display_name']} [{e['region']}] ({e['id']})"
+                      P.append(f"  {label}")
+                      for f in e['findings']:
+                          P.append(f"    [{f['severity']}] {f['text']}")
+                      for mk, mv in e['metrics'].items():
+                          if mv:
+                              P.append(f"    metric {mk}: avg={mv.get('avg',0)}, max={mv.get('max',0)}, sum={mv.get('sum',0)}")
+                  P.append("")
+
+              if healthy:
+                  P.append(f"HEALTHY RESOURCES ({len(healthy)} resources with no issues):")
+                  for e in healthy:
+                      label = f"{e['type']} - {e['display_name']} [{e['region']}] ({e['id']})"
+                      P.append(f"  {label}")
+                      for mk, mv in e['metrics'].items():
+                          if mv:
+                              P.append(f"    {mk}: avg={mv.get('avg',0)} max={mv.get('max',0)} min={mv.get('min',0)}")
+                  P.append("")
+
+              # Quota pressure
+              if quota_data:
+                  P.append("QUOTA-PRESSURE METRICS (AWS/Usage namespace):")
+                  for svc_key, qmetrics in sorted(quota_data.items()):
+                      P.append(f"  {svc_key}:")
+                      for qm in qmetrics:
+                          P.append(f"    {qm['metric']}: max={qm['max_value']}, avg={qm['avg_value']}")
+                  P.append("")
+
+              # ── SERVICE-GROUPED STRUCTURED DATA FOR LLM ───────────────
+              # Group all resources by service type, emit pre-formatted metrics
+              def fmt(v, decimals=2):
+                  return round(v, decimals) if v else 'N/A'
+
+              def get_m(rm, key, field='avg'):
+                  v = rm.get(key, {})
+                  return v.get(field, None) if v else None
+
+              def metric_line(rm, key, label, unit='', scale=1, decimals=2):
+                  avg = get_m(rm, key, 'avg')
+                  mx  = get_m(rm, key, 'max')
+                  mn  = get_m(rm, key, 'min')
+                  if avg is None and mx is None:
+                      return None  # caller must check and skip None
+                  def fv(x): return f"{round(x*scale, decimals)}{unit}" if x is not None else '-'
+                  return f"    {label}: avg {fv(avg)}  |  max {fv(mx)}  |  min {fv(mn)}"
+
+              def aml(P, rm, key, label, unit='', scale=1, decimals=2):
+                  """Append metric_line only if data exists."""
+                  line = metric_line(rm, key, label, unit, scale, decimals)
+                  if line: P.append(line)
+
+              # Group resources by type
+              by_type = defaultdict(list)
+              all_entries = unhealthy + overutilized + underutilized + healthy
+              for e in all_entries:
+                  by_type[e['type']].append(e)
+
+              P.append("=" * 60)
+              P.append("SERVICE-GROUPED METRICS (pre-formatted, use these exact values):")
+              P.append("")
+
+              # EC2
+              if by_type.get('Instance'):
+                  P.append(f"EC2 INSTANCES ({len(by_type['Instance'])}):")
+                  for e in by_type['Instance']:
+                      rm = e['metrics']
+                      status = e['findings'][0]['text'] if e['findings'] else 'healthy'
+                      P.append(f"  {e['display_name']} [{e['region']}] ({e['id']}) | Status: {status}")
+                      # CPU
+                      cpu_avg = get_m(rm, 'CPUUtilization_Average', 'avg')
+                      cpu_max = get_m(rm, 'CPUUtilization_Average', 'max')
+                      cpu_min = get_m(rm, 'CPUUtilization_Average', 'min')
+                      if cpu_avg is not None:
+                          P.append(f"    CPU Utilization  : avg {round(cpu_avg,2)}%  |  max {round(cpu_max,2) if cpu_max is not None else '-'}%  |  min {round(cpu_min,2) if cpu_min is not None else '-'}%")
+                      # Memory: CWAgent first, then System/Linux
+                      mem_key = 'mem_used_percent_Average' if get_m(rm, 'mem_used_percent_Average') is not None else (
+                                'MemoryUtilization_Average' if get_m(rm, 'MemoryUtilization_Average') is not None else None)
+                      if mem_key:
+                          mem_avg = get_m(rm, mem_key, 'avg')
+                          mem_max = get_m(rm, mem_key, 'max')
+                          mem_min = get_m(rm, mem_key, 'min')
+                          ns_label = 'CWAgent' if 'mem_used' in mem_key else 'System/Linux'
+                          P.append(f"    Memory ({ns_label}): avg {round(mem_avg,2)}%  |  max {round(mem_max,2) if mem_max is not None else '-'}%  |  min {round(mem_min,2) if mem_min is not None else '-'}%")
+                      # Disk: CWAgent first, then System/Linux
+                      disk_key = 'disk_used_percent_Average' if get_m(rm, 'disk_used_percent_Average') is not None else (
+                                 'DiskSpaceUtilization_Average' if get_m(rm, 'DiskSpaceUtilization_Average') is not None else None)
+                      if disk_key:
+                          disk_avg = get_m(rm, disk_key, 'avg')
+                          disk_max = get_m(rm, disk_key, 'max')
+                          disk_min = get_m(rm, disk_key, 'min')
+                          ns_label = 'CWAgent' if 'disk_used' in disk_key else 'System/Linux'
+                          P.append(f"    Disk ({ns_label})  : avg {round(disk_avg,2)}%  |  max {round(disk_max,2) if disk_max is not None else '-'}%  |  min {round(disk_min,2) if disk_min is not None else '-'}%")
+                      # Network: only show if data exists, convert bytes to GB
+                      def net_gb_line(rm, key, label):
+                          avg = get_m(rm, key, 'avg')
+                          mx  = get_m(rm, key, 'max')
+                          mn  = get_m(rm, key, 'min')
+                          if avg is None: return None
+                          gb = lambda x: f"{round(x/1024**3, 2)}GB" if x is not None else '-'
+                          return f"    {label}: avg {gb(avg)}  |  max {gb(mx)}  |  min {gb(mn)}"
+                      ni = net_gb_line(rm, 'NetworkIn_Sum', 'Network In  ')
+                      no = net_gb_line(rm, 'NetworkOut_Sum', 'Network Out ')
+                      if ni: P.append(ni)
+                      if no: P.append(no)
+                  P.append("")
+
+              # Lambda
+              if by_type.get('Function'):
+                  P.append(f"LAMBDA FUNCTIONS ({len(by_type['Function'])}):")
+                  for e in by_type['Function']:
+                      rm = e['metrics']
+                      inv = get_m(rm, 'Invocations_Sum', 'sum')
+                      err = get_m(rm, 'Errors_Sum', 'sum')
+                      dur_avg = get_m(rm, 'Duration_Average', 'avg')
+                      dur_max = get_m(rm, 'Duration_Maximum', 'max')
+                      thr = get_m(rm, 'Throttles_Sum', 'sum')
+                      err_rate = f"{round(err/inv*100,1)}%" if inv and err is not None and inv > 0 else 'N/A'
+                      P.append(f"  {e['display_name']} [{e['region']}]")
+                      P.append(f"    Invocations: {int(inv) if inv is not None else 'N/A'} | Errors: {int(err) if err is not None else 'N/A'} ({err_rate}) | Throttles: {int(thr) if thr is not None else 'N/A'}")
+                      P.append(f"    Duration: avg={round(dur_avg,1) if dur_avg is not None else 'N/A'}ms max={round(dur_max,1) if dur_max is not None else 'N/A'}ms")
+                  P.append("")
+
+              # RDS
+              if by_type.get('DBInstance') or by_type.get('DBCluster'):
+                  rds_list = by_type.get('DBInstance', []) + by_type.get('DBCluster', [])
+                  P.append(f"RDS ({len(rds_list)}):")
+                  for e in rds_list:
+                      rm = e['metrics']
+                      P.append(f"  {e['display_name']} [{e['region']}] ({e['id']})")
+                      aml(P, rm, 'CPUUtilization_Average', 'CPU', '%')
+                      aml(P, rm, 'DatabaseConnections_Average', 'Connections')
+                      free_mem = get_m(rm, 'FreeableMemory_Average')
+                      P.append(f"    FreeableMemory: {round(free_mem/1024/1024/1024,2)}GB avg" if free_mem else "    FreeableMemory: N/A")
+                      free_stor = get_m(rm, 'FreeStorageSpace_Average')
+                      P.append(f"    FreeStorage: {round(free_stor/1024/1024/1024,2)}GB avg" if free_stor else "    FreeStorage: N/A")
+                      aml(P, rm, 'ReadLatency_Average', 'ReadLatency', 'ms', 1000)
+                      aml(P, rm, 'WriteLatency_Average', 'WriteLatency', 'ms', 1000)
+                  P.append("")
+
+              # DynamoDB
+              if by_type.get('Table'):
+                  P.append(f"DYNAMODB TABLES ({len(by_type['Table'])}):")
+                  for e in by_type['Table']:
+                      rm = e['metrics']
+                      P.append(f"  {e['display_name']} [{e['region']}]")
+                      aml(P, rm, 'ConsumedReadCapacityUnits_Sum', 'ReadCU', '', 1, 1)
+                      aml(P, rm, 'ConsumedWriteCapacityUnits_Sum', 'WriteCU', '', 1, 1)
+                      aml(P, rm, 'ThrottledRequests_Sum', 'Throttles', '', 1, 0)
+                      aml(P, rm, 'SuccessfulRequestLatency_Average', 'Latency', 'ms')
+                  P.append("")
+
+              # SQS
+              if by_type.get('Queue'):
+                  P.append(f"SQS QUEUES ({len(by_type['Queue'])}):")
+                  for e in by_type['Queue']:
+                      rm = e['metrics']
+                      P.append(f"  {e['display_name']} [{e['region']}]")
+                      aml(P, rm, 'ApproximateNumberOfMessagesVisible_Average', 'VisibleMsgs')
+                      aml(P, rm, 'ApproximateAgeOfOldestMessage_Maximum', 'OldestMsgAge', 's')
+                      aml(P, rm, 'NumberOfMessagesSent_Sum', 'Sent', '', 1, 0)
+                      aml(P, rm, 'NumberOfMessagesReceived_Sum', 'Received', '', 1, 0)
+                  P.append("")
+
+              # S3 - top 20 by size, convert bytes to GB
+              if by_type.get('Bucket'):
+                  buckets_with_size = []
+                  for e in by_type['Bucket']:
+                      rm = e['metrics']
+                      # Use 'last' (most recent daily datapoint) as current size
+                      # Fall back to 'max' then 'avg' if last not available
+                      sz = get_m(rm, 'BucketSizeBytes_Average', 'last') or \
+                           get_m(rm, 'BucketSizeBytes_Average', 'max') or \
+                           get_m(rm, 'BucketSizeBytes_Average', 'avg') or 0
+                      buckets_with_size.append((sz, e))
+                  buckets_with_size.sort(key=lambda x: x[0], reverse=True)
+                  top20 = buckets_with_size[:20]
+                  P.append(f"S3 BUCKETS (top 20 by size, {len(by_type['Bucket'])} total):")
+                  for sz_bytes, e in top20:
+                      rm = e['metrics']
+                      sz_gb = round(sz_bytes / (1024**3), 2) if sz_bytes else 0
+                      obj = get_m(rm, 'NumberOfObjects_Average', 'last') or get_m(rm, 'NumberOfObjects_Average')
+                      P.append(f"  {e['display_name']} [{e['region']}]")
+                      P.append(f"    Size: {sz_gb} GB")
+                      if obj:
+                          P.append(f"    Objects: {round(obj):,}")
+                      err4 = get_m(rm, '4xxErrors_Sum', 'sum')
+                      err5 = get_m(rm, '5xxErrors_Sum', 'sum')
+                      if err4 or err5:
+                          P.append(f"    Errors: 4xx={int(err4) if err4 else 0} 5xx={int(err5) if err5 else 0}")
+                  P.append("")
+
+              # API Gateway
+              apigw_list = by_type.get('RestApi', []) + by_type.get('Api', [])
+              if apigw_list:
+                  P.append(f"API GATEWAY ({len(apigw_list)}):")
+                  for e in apigw_list:
+                      rm = e['metrics']
+                      P.append(f"  {e['display_name']} [{e['region']}]")
+                      aml(P, rm, 'Count_Sum', 'Requests', '', 1, 0)
+                      aml(P, rm, 'Latency_Average', 'Latency', 'ms')
+                      aml(P, rm, '4XXError_Sum', '4XX', '', 1, 0)
+                      aml(P, rm, '5XXError_Sum', '5XX', '', 1, 0)
+                  P.append("")
+
+              # ECS
+              if by_type.get('Service'):
+                  P.append(f"ECS SERVICES ({len(by_type['Service'])}):")
+                  for e in by_type['Service']:
+                      rm = e['metrics']
+                      P.append(f"  {e['display_name']} [{e['region']}]")
+                      aml(P, rm, 'CPUUtilization_Average', 'CPU', '%')
+                      aml(P, rm, 'MemoryUtilization_Average', 'Memory', '%')
+                  P.append("")
+
+              # ElastiCache
+              if by_type.get('CacheCluster'):
+                  P.append(f"ELASTICACHE ({len(by_type['CacheCluster'])}):")
+                  for e in by_type['CacheCluster']:
+                      rm = e['metrics']
+                      P.append(f"  {e['display_name']} [{e['region']}]")
+                      aml(P, rm, 'CPUUtilization_Average', 'CPU', '%')
+                      free_mem = get_m(rm, 'FreeableMemory_Average')
+                      P.append(f"    FreeableMemory: {round(free_mem/1024/1024,1)}MB avg" if free_mem else "    FreeableMemory: N/A")
+                      aml(P, rm, 'CurrConnections_Average', 'Connections')
+                      aml(P, rm, 'Evictions_Sum', 'Evictions', '', 1, 0)
+                  P.append("")
+
+              # ELB (ALB, NLB, CLB)
+              elb_list = by_type.get('LoadBalancer', [])
+              if elb_list:
+                  P.append(f"LOAD BALANCERS ({len(elb_list)}):")
+                  for e in elb_list:
+                      rm = e['metrics']
+                      lb_type = e.get('lb_type', 'application').upper()
+                      P.append(f"  {e['display_name']} [{e['region']}] ({lb_type})")
+                      # Show counts (sum) not avg/max/min for request/error metrics
+                      def elb_count(rm, key, label):
+                          v = get_m(rm, key, 'sum')
+                          if v is not None: P.append(f"    {label}: {int(v):,}")
+                      def elb_avg(rm, key, label, unit='', scale=1, decimals=3):
+                          v = get_m(rm, key, 'avg')
+                          if v is not None: P.append(f"    {label}: {round(v*scale, decimals)}{unit}")
+                      # ALB
+                      elb_count(rm, 'RequestCount_Sum', 'Requests (total)')
+                      elb_avg(rm, 'TargetResponseTime_Average', 'Avg Response Time', 's')
+                      elb_count(rm, 'HTTPCode_Target_2XX_Count_Sum', '2XX Responses')
+                      elb_count(rm, 'HTTPCode_ELB_4XX_Count_Sum', '4XX Errors')
+                      elb_count(rm, 'HTTPCode_ELB_5XX_Count_Sum', '5XX Errors')
+                      elb_avg(rm, 'ActiveConnectionCount_Average', 'Avg Active Connections')
+                      elb_count(rm, 'NewConnectionCount_Sum', 'New Connections (total)')
+                      # NLB
+                      elb_avg(rm, 'ActiveFlowCount_Average', 'Avg Active Flows')
+                      elb_count(rm, 'NewFlowCount_Sum', 'New Flows (total)')
+                      elb_count(rm, 'TCP_Client_Reset_Count_Sum', 'Client TCP Resets')
+                      elb_count(rm, 'TCP_Target_Reset_Count_Sum', 'Target TCP Resets')
+                      # CLB
+                      elb_avg(rm, 'Latency_Average', 'Avg Latency', 's')
+                      elb_count(rm, 'HTTPCode_ELB_5XX_Sum', '5XX Errors (CLB)')
+                      # Targets health
+                      healthy = get_m(rm, 'HealthyHostCount_Average', 'avg')
+                      unhealthy = get_m(rm, 'UnHealthyHostCount_Average', 'avg')
+                      if healthy is not None or unhealthy is not None:
+                          P.append(f"    Targets: healthy={round(healthy) if healthy is not None else '-'}  unhealthy={round(unhealthy) if unhealthy is not None else '-'}")
+                      # Processed bytes -> GB (use sum for total traffic)
+                      proc = get_m(rm, 'ProcessedBytes_Sum', 'sum')
+                      if proc:
+                          P.append(f"    Processed: {round(proc/1024**3, 2)} GB (total over window)")
+                  P.append("")
+
+              # WAF Web ACLs
+              waf_list = by_type.get('WebACL', [])
+              if waf_list:
+                  P.append(f"WAF WEB ACLs ({len(waf_list)}):")
+                  for e in waf_list:
+                      rm = e['metrics']
+                      scope = e.get('waf_scope', 'REGIONAL')
+                      allowed = get_m(rm, 'AllowedRequests_Sum', 'sum')
+                      blocked = get_m(rm, 'BlockedRequests_Sum', 'sum')
+                      counted = get_m(rm, 'CountedRequests_Sum', 'sum')
+                      total = (allowed or 0) + (blocked or 0)
+                      block_rate = round(blocked / total * 100, 1) if total > 0 and blocked else 0
+                      P.append(f"  {e['display_name']} [{e['region']}] ({scope})")
+                      if total > 0:
+                          P.append(f"    Requests: allowed={int(allowed or 0):,}  blocked={int(blocked or 0):,}  counted={int(counted or 0):,}  total={int(total):,}")
+                          P.append(f"    Block Rate: {block_rate}%")
+                      else:
+                          P.append(f"    Requests: no traffic data")
+                  P.append("")
+
+              # CloudFront distributions
+              cf_list = by_type.get('Distribution', [])
+              if cf_list:
+                  P.append(f"CLOUDFRONT DISTRIBUTIONS ({len(cf_list)}):")
+                  for e in cf_list:
+                      rm = e['metrics']
+                      origins = e.get('origins', '')
+                      P.append(f"  {e['display_name']} [{e['region']}] ({e['id']})" + (f" | Origins: {origins}" if origins else ""))
+                      req = get_m(rm, 'Requests_Sum', 'sum')
+                      if req: P.append(f"    Requests: {int(req):,} (total over window)")
+                      dl = get_m(rm, 'BytesDownloaded_Sum', 'sum')
+                      ul = get_m(rm, 'BytesUploaded_Sum', 'sum')
+                      if dl: P.append(f"    Downloaded: {round(dl/1024**3, 2)} GB (total over window)")
+                      if ul: P.append(f"    Uploaded: {round(ul/1024**3, 2)} GB (total over window)")
+                      if dl or ul:
+                          total_bytes = (dl or 0) + (ul or 0)
+                          P.append(f"    Processed: {round(total_bytes/1024**3, 2)} GB (total over window)")
+                      cache_hit = get_m(rm, 'CacheHitRate_Average', 'avg')
+                      if cache_hit is not None: P.append(f"    Cache Hit Rate: {round(cache_hit,1)}%")
+                      total_err = get_m(rm, 'TotalErrorRate_Average', 'avg')
+                      err4 = get_m(rm, '4xxErrorRate_Average', 'avg')
+                      err5 = get_m(rm, '5xxErrorRate_Average', 'avg')
+                      if total_err is not None:
+                          P.append(f"    Error Rate: total={round(total_err,2)}%  4xx={round(err4,2) if err4 is not None else '-'}%  5xx={round(err5,2) if err5 is not None else '-'}%")
+                      origin_lat = get_m(rm, 'OriginLatency_Average', 'avg')
+                      if origin_lat: P.append(f"    Origin Latency: avg {round(origin_lat)}ms")
+                  P.append("")
+
+              for svc_type, svc_label in [('Topic','SNS TOPICS'), ('Rule','EVENTBRIDGE RULES'), ('StateMachine','STEP FUNCTIONS')]:
+                  if by_type.get(svc_type):
+                      P.append(f"{svc_label} ({len(by_type[svc_type])}):")
+                      for e in by_type[svc_type]:
+                          rm = e['metrics']
+                          has_data = any(v for v in rm.values() if v)
+                          if has_data:
+                              for mk, mv in rm.items():
+                                  if mv:
+                                      P.append(f"  {e['display_name']} [{e['region']}]: {mk} avg={mv.get('avg',0)} max={mv.get('max',0)}")
+                          else:
+                              P.append(f"  {e['display_name']} [{e['region']}]: no metric data")
+                      P.append("")
+
+              # Quota pressure
+              if quota_data:
+                  P.append("QUOTA-PRESSURE METRICS (AWS/Usage namespace):")
+                  for svc_key, qmetrics in sorted(quota_data.items()):
+                      P.append(f"  {svc_key}:")
+                      for qm in qmetrics:
+                          P.append(f"    {qm['metric']}: max={qm['max_value']}, avg={qm['avg_value']}")
+                  P.append("")
+
+              # Instructions for Bedrock
+              P.append("=" * 60)
+              P.append("INSTRUCTIONS FOR REPORT GENERATION:")
+              P.append("Write a plain-text utilization report using the EXACT pre-formatted data in SERVICE-GROUPED METRICS above.")
+              P.append("USE THESE EXACT NUMBERS. DO NOT RECALCULATE OR INVENT DATA. If a metric shows N/A, write N/A.")
+              P.append("")
+              P.append("REQUIRED SECTIONS IN THIS ORDER:")
+              P.append("1. EXECUTIVE SUMMARY - Account, scope, lookback window, total resources, health counts. 5-7 lines max.")
+              P.append("2. EC2 INSTANCES - One block per instance: Name [Region] then indented lines for each metric that has data.")
+              P.append("   Format: CPU Utilization: avg X% | max Y% | min Z%")
+              P.append("   Format: Memory (System/Linux): avg X% | max Y% | min Z%")
+              P.append("   Format: Disk (CWAgent): avg X% | max Y% | min Z%")
+              P.append("   Format: Network In: avg X GB | max Y GB | min Z GB")
+              P.append("   OMIT any metric line that has no data. Do NOT write 'N/A' lines.")
+              P.append("3. LAMBDA FUNCTIONS - Active functions first, then zero-invocation group at end.")
+              P.append("   Format: Name [Region] | Invocations: N | Errors: N (X%) | Duration: avg Xms / max Yms")
+              P.append("4. RDS / DATABASES - Name [Region] | CPU avg/max | Connections avg | Free Storage | Latency")
+              P.append("5. S3 BUCKETS (top 20 by size) - Name [Region] | Size: X GB (current) | Objects: N")
+              P.append("6. OTHER SERVICES - DynamoDB, SQS, API Gateway, ECS, ElastiCache, Load Balancers, WAF, CloudFront, SNS, EventBridge each in sub-section.")
+              P.append("   For Load Balancers show: Name [Region] (ALB/NLB/CLB) | Requests | Response Time | 5XX Errors | Healthy/Unhealthy Targets | Processed GB")
+              P.append("   For WAF Web ACLs show: Name [Region] (REGIONAL/CLOUDFRONT) | Allowed | Blocked | Block Rate%")
+              P.append("   For CloudFront show: Name | Requests | Downloaded GB | Cache Hit Rate% | Error Rate% | Origin Latency")
+              P.append("7. ISSUES AND HOTSPOTS - Only resources with real problems. Immediate / This Week / Later.")
+              P.append("8. RECOMMENDED ACTIONS - Specific, metric-backed. Name the resource and exact metric value.")
+              P.append("")
+              P.append("CRITICAL RULES:")
+              P.append("- Use EXACT numbers from SERVICE-GROUPED METRICS above. Do NOT recalculate.")
+              P.append("- OMIT metric lines with no data entirely. Never write 'N/A' or 'not available'.")
+              P.append("- avg/max/min labels are already in the data - copy them as-is.")
+              P.append("- S3 sizes are already in GB.")
+              P.append("- Network values are already in GB.")
+              P.append("- Lambda invocations=0 means not called in window, not an error.")
+              P.append("- Plain text only. No markdown. No reasoning/thinking blocks.")
+
+              return "\n".join(P)
+
+          # ── 7. BEDROCK INVOCATION (same pattern as billing-insights) ───
+          def invoke_bedrock(prompt, raw_model):
+              _region = os.environ.get('AWS_REGION', 'ap-south-1')
+              if _region.startswith('us'): _prefix = 'us'
+              elif _region.startswith('eu') or _region == 'il-central-1': _prefix = 'eu'
+              elif _region.startswith('ap') or _region in ('me-central-1',): _prefix = 'apac'
+              else: _prefix = 'us'
+              if any(raw_model.startswith(p) for p in ('amazon.nova', 'anthropic.claude')):
+                  model_id = f"{_prefix}.{raw_model}"
+              else:
+                  model_id = raw_model
+              print(f"[Bedrock] Using model: {model_id}")
+
+              if raw_model.startswith("openai.") or raw_model.startswith("zai."):
+                  req = {"messages": [{"role": "user", "content": prompt}]}
+              else:
+                  req = {"messages": [{"role": "user", "content": [{"text": prompt}]}]}
+
+              br_resp = bedrock.invoke_model(modelId=model_id, body=json.dumps(req), accept="application/json")
+              body = json.loads(br_resp['body'].read().decode('utf-8'))
+              result = None
+              if 'output' in body and 'message' in body['output']:
+                  c = body['output']['message'].get('content', [])
+                  if c: result = c[0].get('text')
+              elif 'content' in body and body['content']:
+                  result = body['content'][0].get('text')
+              elif 'choices' in body and body['choices']:
+                  result = body['choices'][0].get('message', {}).get('content')
+              elif 'completion' in body:
+                  result = body['completion']
+
+              if result:
+                  result = re.sub(r'<reasoning>.*?</reasoning>', '', result, flags=re.DOTALL).strip()
+                  result = re.sub(r'<thinking>.*?</thinking>', '', result, flags=re.DOTALL).strip()
+                  result = re.sub(r'\*{1,3}', '', result)
+                  result = re.sub(r'^#{1,6}\s*', '', result, flags=re.MULTILINE)
+                  result = re.sub(r'`{1,3}', '', result)
+                  result = re.sub(r'\n{3,}', '\n\n', result).strip()
+              return result
+
+          # ── 8. BUILD EXECUTIVE SUMMARY (deterministic, no LLM) ─────────
+          def build_executive_summary(scope_label, lookback_days, resources, scores, account_name, account_id):
+              S = []
+              S.append("=" * 60)
+              S.append("AWS RESOURCE UTILIZATION REPORT")
+              S.append("=" * 60)
+              if account_name:
+                  S.append(f"Account: {account_name} ({account_id}) | Scope: {scope_label}")
+              else:
+                  S.append(f"Account: {account_id} | Scope: {scope_label}")
+              S.append(f"Report Window: {lookback_days} days ending {datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}")
+              S.append(f"Total Resources: {len(resources)}")
+              S.append("")
+
+              cats = defaultdict(int)
+              immediate_actions = []
+              week_actions = []
+              for r in resources:
+                  rkey = f"{r['type']}|{r['physical_id']}"
+                  sc = scores.get(rkey, {})
+                  cats[sc.get('category', 'healthy')] += 1
+                  for f in sc.get('findings', []):
+                      display = r.get('name', '') or r['logical_id']
+                      rname = f"{r['type'].split('::')[-1]} {display}"
+                      if f['severity'] == SEVERITY_IMMEDIATE:
+                          immediate_actions.append(f"{rname}: {f['text']}")
+                      elif f['severity'] == SEVERITY_THIS_WEEK:
+                          week_actions.append(f"{rname}: {f['text']}")
+
+              S.append(f"Health: {cats.get('healthy',0)} healthy, {cats.get('overutilized',0)} overutilized, {cats.get('underutilized',0)} underutilized, {cats.get('unhealthy',0)} unhealthy")
+              S.append("")
+
+              if immediate_actions:
+                  S.append(f"IMMEDIATE ACTIONS REQUIRED ({len(immediate_actions)}):")
+                  for a in immediate_actions[:5]:
+                      S.append(f"  - {a}")
+              elif week_actions:
+                  S.append("No immediate actions. Review this-week items below.")
+              else:
+                  S.append("STATUS: All resources healthy. No action required.")
+
+              S.append("=" * 60)
+              S.append("")
+              return "\n".join(S)
+
+          # ── 9. LAMBDA HANDLER ──────────────────────────────────────────
+          def lambda_handler(event, context):
+              try:
+                  topic_arn = os.environ['ReportTopicArn']
+                  raw_model = os.environ['ModelId']
+                  lookback_days = int(os.environ.get('LookbackDays', '7'))
+                  account_name = os.environ.get('AccountName', '').strip()
+                  scan_scope = os.environ.get('ScanScope', 'RegionOnly')
+                  region = os.environ.get('AWS_REGION', 'ap-south-1')
+                  account_id = context.invoked_function_arn.split(':')[4]
+
+                  # Determine which regions to scan
+                  if scan_scope == 'AllRegions':
+                      ec2_client = boto3.client('ec2', region_name=region)
+                      all_regions = [r['RegionName'] for r in ec2_client.describe_regions(AllRegions=False)['Regions']]
+                      scan_regions = all_regions
+                      print(f"[Start] AllRegions mode: scanning {len(scan_regions)} regions")
+                  else:
+                      scan_regions = [region]
+                      print(f"[Start] RegionOnly mode: scanning {region}")
+
+                  print(f"[Start] Account={account_id}, Lookback={lookback_days}d, Model={raw_model}, Scope={scan_scope}")
+
+                  # Step 1: Discover ALL resources across selected regions
+                  resources = discover_all_resources(scan_regions)
+                  if not resources:
+                      msg = f"No resources found in account {account_id} ({', '.join(scan_regions)})"
+                      print(f"[Warning] {msg}")
+                      subj_empty = f'AWS Resource Report - {account_name} ({account_id}) - No Resources' if account_name else f'AWS Resource Report - {account_id} - No Resources'
+                      sns_client.publish(TargetArn=topic_arn, Subject=subj_empty[:100], Message=msg)
+                      return {'statusCode': 200, 'body': json.dumps({'message': msg})}
+
+                  # Step 2: Collect CloudWatch metrics
+                  metrics = collect_metrics(resources, lookback_days)
+
+                  # Step 3: Deterministic scoring
+                  scores = {}
+                  for r in resources:
+                      rkey = f"{r['type']}|{r['physical_id']}"
+                      rm = metrics.get(rkey, {})
+                      scores[rkey] = score_resource(r['type'], rm)
+
+                  # Step 4: Quota-pressure metrics
+                  quota_data = collect_quota_metrics(lookback_days)
+
+                  # Step 5: Build Bedrock prompt and invoke
+                  scope_label = f"All Regions ({len(scan_regions)})" if scan_scope == 'AllRegions' else region
+                  prompt = build_bedrock_prompt(scope_label, lookback_days, resources, metrics, scores, quota_data, account_name, account_id)
+                  print(f"[Bedrock] Prompt length: {len(prompt)} chars")
+                  narrative = invoke_bedrock(prompt, raw_model)
+
+                  if not narrative:
+                      narrative = "LLM did not return a narrative. See executive summary above for deterministic findings."
+
+                  # Step 6: Build final report
+                  exec_summary = build_executive_summary(scope_label, lookback_days, resources, scores, account_name, account_id)
+                  full_report = exec_summary + narrative
+
+                  # Step 7: Publish to SNS
+                  report_date = datetime.utcnow().strftime('%Y-%m-%d')
+                  if account_name:
+                      subj = f'AWS Resource Report - {account_name} ({account_id}) - {report_date}'
+                  else:
+                      subj = f'AWS Resource Report - {account_id} - {report_date}'
+                  if len(subj) > 100:
+                      subj = subj[:97] + '...'
+
+                  resp = sns_client.publish(TargetArn=topic_arn, Subject=subj, Message=full_report, MessageStructure='text')
+                  print(f"[SNS] Published: {resp['MessageId']}")
+                  return {'statusCode': 200, 'body': json.dumps({'message': 'Report sent', 'msgId': resp['MessageId'], 'resources': len(resources)})}
+
+              except Exception as e:
+                  print(f"[Error] {str(e)}")
+                  import traceback
+                  traceback.print_exc()
+                  return {'statusCode': 500, 'body': json.dumps({'error': str(e)})}
+
+###################################################################
+  ReporterSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Description: Scheduled execution for stack utilization reporter
+      State: ENABLED
+      ScheduleExpression:
+        Ref: ScheduleExpr
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn:
+          Fn::GetAtt: ReporterFunction.Arn
+        RoleArn:
+          Fn::GetAtt: SchedulerRole.Arn
+
+  ReporterInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName:
+        Fn::Sub: ${AWS::StackName}-reporter-${AWS::Region}
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn:
+        Fn::GetAtt: ReporterSchedule.Arn

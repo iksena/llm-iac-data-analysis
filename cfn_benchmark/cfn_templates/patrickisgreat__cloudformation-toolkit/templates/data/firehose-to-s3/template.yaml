@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Description: >-
+  Kinesis Data Firehose delivery stream landing records in S3 with buffering,
+  compression, Hive-style time partitioning, a separate error prefix, and
+  CloudWatch error logging.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Naming
+        Parameters:
+          - NamePrefix
+          - Environment
+          - StreamSuffix
+      - Label:
+          default: Source
+        Parameters:
+          - SourceStreamArn
+      - Label:
+          default: Destination
+        Parameters:
+          - DestinationBucketArn
+          - TablePrefix
+          - CompressionFormat
+      - Label:
+          default: Buffering (latency vs file size)
+        Parameters:
+          - BufferSizeMb
+          - BufferIntervalSeconds
+      - Label:
+          default: Operations
+        Parameters:
+          - LogRetentionDays
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: Prefix for the delivery stream name.
+    AllowedPattern: "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+    ConstraintDescription: 3-32 lowercase characters, digits and hyphens.
+
+  Environment:
+    Type: String
+    Description: Environment this delivery stream belongs to.
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+
+  StreamSuffix:
+    Type: String
+    Description: What this stream delivers, e.g. "clickstream".
+    Default: events
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{0,40}$"
+
+  SourceStreamArn:
+    Type: String
+    Description: >-
+      Kinesis Data Stream ARN to read from. Leave empty for Direct PUT, where
+      producers call PutRecord on Firehose itself - simpler, but with no replay:
+      a record Firehose fails to deliver after its retries is gone, whereas a
+      Kinesis source can be re-read within its retention window.
+    Default: ""
+
+  DestinationBucketArn:
+    Type: String
+    Description: ARN of the S3 bucket records land in, from data/s3-bucket.
+
+  TablePrefix:
+    Type: String
+    Description: >-
+      Key prefix records are written under, before the time partition. Name it
+      after the table it becomes in the catalog, e.g. "raw/clickstream".
+    Default: raw/events
+    AllowedPattern: "^[A-Za-z0-9!_.*'()/-]{1,200}$"
+
+  CompressionFormat:
+    Type: String
+    Description: >-
+      GZIP is the safe default - Athena, Glue and Spark all read it, and it cuts
+      storage and scan cost several-fold. ZIP and Snappy are not splittable for
+      Athena, so a large file is read by a single reader.
+    Default: GZIP
+    AllowedValues: [GZIP, ZIP, Snappy, HADOOP_SNAPPY, UNCOMPRESSED]
+
+  BufferSizeMb:
+    Type: Number
+    Description: >-
+      Flush once this much data has accumulated. Larger buffers produce larger
+      files, and large files are what make Athena queries fast - a lake of
+      thousands of tiny objects spends most of its query time on S3 listing and
+      open calls.
+    Default: 64
+    MinValue: 1
+    MaxValue: 128
+
+  BufferIntervalSeconds:
+    Type: Number
+    Description: >-
+      Flush at least this often, whatever the buffer size. This is the freshness
+      floor: data is queryable roughly this long after it was produced.
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+
+  LogRetentionDays:
+    Type: Number
+    Description: Retention for the Firehose error log group.
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+Conditions:
+  HasKinesisSource: !Not [!Equals [!Ref SourceStreamArn, ""]]
+
+Resources:
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub "/${Environment}/${NamePrefix}/${StreamSuffix}/firehose"
+      RetentionInDays: !Ref LogRetentionDays
+
+  LogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref LogGroup
+      LogStreamName: S3Delivery
+
+  DeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: deliver-to-s3
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Ref DestinationBucketArn
+                  - !Sub "${DestinationBucketArn}/*"
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                Resource: !GetAtt LogGroup.Arn
+              - !If
+                - HasKinesisSource
+                - Effect: Allow
+                  Action:
+                    - kinesis:DescribeStream
+                    - kinesis:GetShardIterator
+                    - kinesis:GetRecords
+                    - kinesis:ListShards
+                  Resource: !Ref SourceStreamArn
+                - !Ref AWS::NoValue
+
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: !Sub "${NamePrefix}-${Environment}-${StreamSuffix}"
+      DeliveryStreamType: !If [HasKinesisSource, KinesisStreamAsSource, DirectPut]
+      KinesisStreamSourceConfiguration: !If
+        - HasKinesisSource
+        - KinesisStreamARN: !Ref SourceStreamArn
+          RoleARN: !GetAtt DeliveryRole.Arn
+        - !Ref AWS::NoValue
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Ref DestinationBucketArn
+        RoleARN: !GetAtt DeliveryRole.Arn
+        CompressionFormat: !Ref CompressionFormat
+        # Hive-style partition keys (key=value) so Glue crawlers and Athena's
+        # partition projection recognise them without a custom classifier. The
+        # default Firehose layout is bare numbers, which they do not.
+        Prefix: !Sub "${TablePrefix}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/hour=!{timestamp:HH}/"
+        # Records that fail delivery land here rather than being dropped. Keep it
+        # outside the table prefix — an error object inside the partition tree is
+        # a malformed row in every query against the table.
+        ErrorOutputPrefix: !Sub "errors/${TablePrefix}/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/"
+        BufferingHints:
+          SizeInMBs: !Ref BufferSizeMb
+          IntervalInSeconds: !Ref BufferIntervalSeconds
+        S3BackupMode: Disabled
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref LogGroup
+          LogStreamName: !Ref LogStream
+        EncryptionConfiguration:
+          # The destination bucket's own default encryption applies. Setting a
+          # KMS key here as well would double-encrypt and require the delivery
+          # role to hold key permissions it does not otherwise need.
+          NoEncryptionConfig: NoEncryption
+        # Note: there is no retry-duration knob for an S3 destination. Firehose
+        # retries internally and writes what it cannot deliver to
+        # ErrorOutputPrefix; RetryOptions exists only on the Redshift, Splunk and
+        # HTTP endpoint destinations.
+
+Outputs:
+  DeliveryStreamName:
+    Description: Delivery stream name, for producers using Direct PUT and for alarms.
+    Value: !Ref DeliveryStream
+
+  DeliveryStreamArn:
+    Description: Delivery stream ARN, for IAM policies.
+    Value: !GetAtt DeliveryStream.Arn
+
+  DeliveryRoleArn:
+    Description: Role Firehose assumes to write to S3 and read from Kinesis.
+    Value: !GetAtt DeliveryRole.Arn
+
+  TableLocation:
+    Description: >-
+      s3:// location of the delivered data, for a Glue table or an Athena
+      external table definition.
+    Value: !Sub
+      - "s3://${BucketName}/${TablePrefix}/"
+      - BucketName: !Select [5, !Split [":", !Ref DestinationBucketArn]]
+
+  LogGroupName:
+    Description: Log group holding Firehose delivery errors.
+    Value: !Ref LogGroup

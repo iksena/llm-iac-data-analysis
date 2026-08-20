@@ -1,0 +1,221 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description:
+  'Amazon Connect Instance Attributes Configuration - Must be deployed after
+  Assistant setup'
+
+# IMPORTANT: This stack must be deployed AFTER the Assistant (QiC) stack
+# Reason: Enabling BOT_MANAGEMENT attribute triggers creation of the Lex service-linked role (SLR)
+# The Lex SLR creation can conflict with the Assistant stack if both try to create it simultaneously
+# Deploy order: ConnectStack -> AssistantStack -> InstanceAttributesStack
+
+Parameters:
+  ConnectInstanceId:
+    Type: String
+    Description: The ID of the Amazon Connect instance
+
+Resources:
+  # Lambda Role for Instance Attribute Configuration
+  InstanceAttributeConfigRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ConnectAttributeAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - connect:UpdateInstanceAttribute
+                  - connect:DescribeInstanceAttribute
+                Resource:
+                  - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/${ConnectInstanceId}'
+                  - !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:instance/*'
+              - Effect: Allow
+                Action:
+                  - iam:PutRolePolicy
+                  - iam:GetRole
+                  - iam:GetRolePolicy
+                Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/aws-service-role/connect.amazonaws.com/*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt AttrConfigFnDLQ.Arn
+
+  # SQS Dead Letter Queue for Attribute Config Lambda
+  AttrConfigFnDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-AttrConfigFn-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    DeletionPolicy: Delete
+
+  # Lambda Function to Configure Instance Attributes
+  # checkov:skip=CKV_AWS_117:Lambda functions call public APIs in demo environment
+  AttrConfigFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt InstanceAttributeConfigRole.Arn
+      Timeout: 60
+      DeadLetterConfig:
+        TargetArn: !GetAtt AttrConfigFnDLQ.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              response_data = {}
+
+              try:
+                  print(f"Received event: {json.dumps(event, default=str)}")
+
+                  instance_id = event['ResourceProperties']['InstanceId']
+                  attributes_csv = event['ResourceProperties'].get('Attributes', '')
+
+                  connect = boto3.client('connect')
+
+                  if event['RequestType'] == 'Delete':
+                      print("Delete request - no action needed for attributes")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  # Parse CSV list of attributes
+                  attributes = [attr.strip() for attr in attributes_csv.split(',') if attr.strip()]
+
+                  if not attributes:
+                      print("No attributes to configure")
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  print(f"Configuring {len(attributes)} attributes for instance: {instance_id}")
+
+                  enabled_count = 0
+                  failed_attributes = []
+
+                  for attribute_type in attributes:
+                      try:
+                          print(f"Enabling attribute: {attribute_type}")
+                          connect.update_instance_attribute(
+                              InstanceId=instance_id,
+                              AttributeType=attribute_type,
+                              Value='true'
+                          )
+                          enabled_count += 1
+                          print(f"  ✓ Successfully enabled {attribute_type}")
+                      except Exception as attr_error:
+                          error_msg = str(attr_error)
+                          print(f"  ✗ Failed to enable {attribute_type}: {error_msg}")
+                          failed_attributes.append(f"{attribute_type}: {error_msg}")
+
+                  response_data = {
+                      'EnabledCount': enabled_count,
+                      'TotalAttributes': len(attributes),
+                      'EnabledAttributes': ', '.join(attributes[:enabled_count])
+                  }
+
+                  if failed_attributes:
+                      error_message = f"Failed to enable {len(failed_attributes)} attribute(s): {'; '.join(failed_attributes)}"
+                      print(f"ERROR: {error_message}")
+                      response_data['FailedAttributes'] = '; '.join(failed_attributes)
+                      cfnresponse.send(event, context, cfnresponse.FAILED, response_data)
+                      return
+
+                  print(f"Configuration complete: {enabled_count}/{len(attributes)} attributes enabled successfully")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  error_message = f"Error configuring instance attributes: {str(e)}"
+                  print(error_message)
+
+                  try:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {
+                          'Error': error_message
+                      })
+                  except Exception as send_error:
+                      print(f"Failed to send error response: {str(send_error)}")
+    DeletionPolicy: Retain
+
+  # Custom Resource to Configure Instance Attributes
+  InstanceAttributeConfig:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt AttrConfigFn.Arn
+      InstanceId: !Ref ConnectInstanceId
+      Attributes: AUTOMATED_INTERACTION_LOG,BOT_MANAGEMENT,ENABLE_BOT_ANALYTICS_AND_TRANSCRIPTS
+
+  # KMS Key for Customer Profiles encryption
+  CustomerProfilesKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for Amazon Connect Customer Profiles
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Customer Profiles Service
+            Effect: Allow
+            Principal:
+              Service: profile.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+              - kms:CreateGrant
+            Resource: '*'
+    DependsOn: InstanceAttributeConfig
+
+  # KMS Key Alias for easy identification in the console
+  CustomerProfilesKmsKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/connect-customer-profiles
+      TargetKeyId: !Ref CustomerProfilesKmsKey
+
+  # Customer Profiles Domain
+  CustomerProfilesDomain:
+    Type: AWS::CustomerProfiles::Domain
+    Properties:
+      # ConnectInstanceId is expected to be a UUID (e.g., abc12345-1234-1234-1234-123456789012)
+      # Use first segment of UUID for a short unique domain name
+      DomainName: !Sub
+        - 'connect-profiles-${ShortId}'
+        - ShortId: !Select [0, !Split ['-', !Ref ConnectInstanceId]]
+      DefaultExpirationDays: 366
+      DefaultEncryptionKey: !GetAtt CustomerProfilesKmsKey.Arn
+    DependsOn: CustomerProfilesKmsKey
+
+Outputs:
+  CustomerProfilesDomainName:
+    Description: Customer Profiles Domain Name
+    Value: !Ref CustomerProfilesDomain
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomerProfilesDomainName'
+
+  CustomerProfilesKmsKeyAlias:
+    Description:
+      KMS Key Alias for Customer Profiles (use this when setting up integration)
+    Value: alias/connect-customer-profiles
+    Export:
+      Name: !Sub '${AWS::StackName}-CustomerProfilesKmsKeyAlias'

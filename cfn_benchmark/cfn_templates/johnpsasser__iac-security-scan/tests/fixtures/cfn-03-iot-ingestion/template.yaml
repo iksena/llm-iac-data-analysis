@@ -1,0 +1,791 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'IoT Data Ingestion Platform - Production-grade architecture for ingesting, transforming, and storing IoT device data'
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: production
+    AllowedValues:
+      - development
+      - staging
+      - production
+    Description: Environment name for resource tagging
+
+  DataRetentionDays:
+    Type: Number
+    Default: 90
+    MinValue: 30
+    MaxValue: 365
+    Description: Number of days to retain device data in S3
+
+  KinesisShardCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    MaxValue: 10
+    Description: Number of shards for Kinesis Data Stream
+
+  FirehoseBufferSizeMB:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 128
+    Description: Firehose buffer size in MB
+
+  FirehoseBufferIntervalSeconds:
+    Type: Number
+    Default: 300
+    MinValue: 60
+    MaxValue: 900
+    Description: Firehose buffer interval in seconds
+
+  AlertEmail:
+    Type: String
+    Default: alerts@example.com
+    Description: Email address for CloudWatch alarms
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Environment Configuration
+        Parameters:
+          - EnvironmentName
+          - AlertEmail
+      - Label:
+          default: Data Retention
+        Parameters:
+          - DataRetentionDays
+      - Label:
+          default: Kinesis Configuration
+        Parameters:
+          - KinesisShardCount
+          - FirehoseBufferSizeMB
+          - FirehoseBufferIntervalSeconds
+
+Resources:
+  #############################################################################
+  # S3 Data Lake
+  #############################################################################
+
+  # SECURITY FLAW #3: S3 bucket without default encryption
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-iot-datalake-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+            ExpirationInDays: !Ref DataRetentionDays
+          - Id: DeleteIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: IoTDataLake
+
+  DataLakeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataLakeBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !GetAtt DataLakeBucket.Arn
+              - !Sub '${DataLakeBucket.Arn}/*'
+            Condition:
+              Bool:
+                'aws:SecureTransport': 'false'
+
+  #############################################################################
+  # DynamoDB for Device State
+  #############################################################################
+
+  DeviceStateTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${AWS::StackName}-device-state'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: deviceId
+          AttributeType: S
+        - AttributeName: timestamp
+          AttributeType: N
+        - AttributeName: deviceType
+          AttributeType: S
+      KeySchema:
+        - AttributeName: deviceId
+          KeyType: HASH
+        - AttributeName: timestamp
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: DeviceTypeIndex
+          KeySchema:
+            - AttributeName: deviceType
+              KeyType: HASH
+            - AttributeName: timestamp
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+      TimeToLiveSpecification:
+        Enabled: true
+        AttributeName: ttl
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: DeviceState
+
+  #############################################################################
+  # Kinesis Data Stream
+  #############################################################################
+
+  # SECURITY FLAW #2: Kinesis stream without server-side encryption
+  IngestionStream:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub '${AWS::StackName}-ingestion-stream'
+      ShardCount: !Ref KinesisShardCount
+      RetentionPeriodHours: 168
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: IoTIngestion
+
+  #############################################################################
+  # Lambda Transformation Function
+  #############################################################################
+
+  TransformationFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-transformation-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      # SECURITY FLAW #4: Lambda function with overly permissive IAM role
+      Policies:
+        - PolicyName: DataAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'dynamodb:*'
+                  - 's3:*'
+                  - 'kinesis:*'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  TransformationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-data-transformer'
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt TransformationFunctionRole.Arn
+      Timeout: 60
+      MemorySize: 512
+      Environment:
+        Variables:
+          DEVICE_STATE_TABLE: !Ref DeviceStateTable
+          ENVIRONMENT: !Ref EnvironmentName
+      Code:
+        ZipFile: |
+          import json
+          import base64
+          import os
+          import boto3
+          from datetime import datetime, timezone
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DEVICE_STATE_TABLE'])
+
+          def lambda_handler(event, context):
+              """
+              Transform IoT data from Kinesis Firehose.
+              Enriches data, validates, and updates device state.
+              """
+              output_records = []
+
+              for record in event['records']:
+                  try:
+                      # Decode the data
+                      payload = base64.b64decode(record['data']).decode('utf-8')
+                      data = json.loads(payload)
+
+                      # Enrich the data
+                      enriched_data = {
+                          'deviceId': data.get('deviceId'),
+                          'deviceType': data.get('deviceType', 'unknown'),
+                          'timestamp': data.get('timestamp', int(datetime.now(timezone.utc).timestamp())),
+                          'measurements': data.get('measurements', {}),
+                          'metadata': {
+                              'processingTime': datetime.now(timezone.utc).isoformat(),
+                              'version': '1.0',
+                              'source': 'iot-core'
+                          }
+                      }
+
+                      # Add calculated fields
+                      if 'temperature' in enriched_data['measurements']:
+                          temp_c = enriched_data['measurements']['temperature']
+                          enriched_data['measurements']['temperature_f'] = (temp_c * 9/5) + 32
+
+                      # Update device state in DynamoDB
+                      try:
+                          table.put_item(
+                              Item={
+                                  'deviceId': enriched_data['deviceId'],
+                                  'timestamp': enriched_data['timestamp'],
+                                  'deviceType': enriched_data['deviceType'],
+                                  'lastMeasurements': enriched_data['measurements'],
+                                  'ttl': enriched_data['timestamp'] + (90 * 86400)  # 90 days TTL
+                              }
+                          )
+                      except Exception as e:
+                          print(f"Error updating DynamoDB: {e}")
+
+                      # Prepare output for S3
+                      output_data = json.dumps(enriched_data) + '\n'
+                      output_record = {
+                          'recordId': record['recordId'],
+                          'result': 'Ok',
+                          'data': base64.b64encode(output_data.encode('utf-8')).decode('utf-8')
+                      }
+
+                  except Exception as e:
+                      print(f"Error processing record: {e}")
+                      output_record = {
+                          'recordId': record['recordId'],
+                          'result': 'ProcessingFailed',
+                          'data': record['data']
+                      }
+
+                  output_records.append(output_record)
+
+              return {'records': output_records}
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: DataTransformation
+
+  TransformationFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${TransformationFunction}'
+      RetentionInDays: 30
+
+  #############################################################################
+  # Kinesis Firehose
+  #############################################################################
+
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-firehose-delivery-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: FirehoseDeliveryPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:AbortMultipartUpload'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:PutObject'
+                Resource:
+                  - !GetAtt DataLakeBucket.Arn
+                  - !Sub '${DataLakeBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - 'kinesis:DescribeStream'
+                  - 'kinesis:GetShardIterator'
+                  - 'kinesis:GetRecords'
+                  - 'kinesis:ListShards'
+                Resource: !GetAtt IngestionStream.Arn
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                  - 'lambda:GetFunctionConfiguration'
+                Resource: !GetAtt TransformationFunction.Arn
+              - Effect: Allow
+                Action:
+                  - 'logs:PutLogEvents'
+                Resource: !GetAtt FirehoseLogGroup.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${AWS::StackName}-delivery-stream'
+      RetentionInDays: 30
+
+  FirehoseLogStream:
+    Type: AWS::Logs::LogStream
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: S3Delivery
+
+  # SECURITY FLAW #5: Firehose delivery stream without encryption in transit
+  DeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - FirehoseDeliveryRole
+    Properties:
+      DeliveryStreamName: !Sub '${AWS::StackName}-delivery-stream'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt IngestionStream.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt DataLakeBucket.Arn
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+        Prefix: 'iot-data/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        ErrorOutputPrefix: 'errors/!{firehose:error-output-type}/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+        BufferingHints:
+          SizeInMBs: !Ref FirehoseBufferSizeMB
+          IntervalInSeconds: !Ref FirehoseBufferIntervalSeconds
+        CompressionFormat: GZIP
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !GetAtt TransformationFunction.Arn
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: '3'
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: '60'
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: !Ref FirehoseLogStream
+        S3BackupMode: Enabled
+        S3BackupConfiguration:
+          BucketARN: !GetAtt DataLakeBucket.Arn
+          RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+          Prefix: 'backup/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/'
+          BufferingHints:
+            SizeInMBs: 5
+            IntervalInSeconds: 300
+          CompressionFormat: GZIP
+          CloudWatchLoggingOptions:
+            Enabled: true
+            LogGroupName: !Ref FirehoseLogGroup
+            LogStreamName: !Ref FirehoseLogStream
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+        - Key: Purpose
+          Value: DataDelivery
+
+  #############################################################################
+  # IoT Core Resources
+  #############################################################################
+
+  # IoT Thing Types
+  SensorThingType:
+    Type: AWS::IoT::ThingType
+    Properties:
+      ThingTypeName: !Sub '${AWS::StackName}-sensor'
+      ThingTypeProperties:
+        ThingTypeDescription: Generic IoT sensor devices
+        SearchableAttributes:
+          - deviceType
+          - location
+          - firmware
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  GatewayThingType:
+    Type: AWS::IoT::ThingType
+    Properties:
+      ThingTypeName: !Sub '${AWS::StackName}-gateway'
+      ThingTypeProperties:
+        ThingTypeDescription: IoT gateway devices
+        SearchableAttributes:
+          - deviceType
+          - location
+          - connectedDevices
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # SECURITY FLAW #1: IoT policy with overly permissive actions
+  DevicePolicy:
+    Type: AWS::IoT::Policy
+    Properties:
+      PolicyName: !Sub '${AWS::StackName}-device-policy'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'iot:*'
+            Resource: '*'
+
+  # IoT Topic Rule to send data to Kinesis
+  IoTTopicRule:
+    Type: AWS::IoT::TopicRule
+    Properties:
+      RuleName: !Sub '${AWS::StackName}_ingestion_rule'
+      TopicRulePayload:
+        Description: Route IoT device data to Kinesis Data Stream
+        Sql: "SELECT * FROM 'devices/+/telemetry'"
+        Actions:
+          - Kinesis:
+              StreamName: !Ref IngestionStream
+              PartitionKey: '${topic(2)}'
+              RoleArn: !GetAtt IoTRuleRole.Arn
+        AwsIotSqlVersion: '2016-03-23'
+        RuleDisabled: false
+        ErrorAction:
+          CloudwatchLogs:
+            LogGroupName: !Ref IoTRuleErrorLogGroup
+            RoleArn: !GetAtt IoTRuleRole.Arn
+
+  IoTRuleRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${AWS::StackName}-iot-rule-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: iot.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: IoTRulePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kinesis:PutRecord'
+                  - 'kinesis:PutRecords'
+                Resource: !GetAtt IngestionStream.Arn
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !GetAtt IoTRuleErrorLogGroup.Arn
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  IoTRuleErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/iot/${AWS::StackName}-rule-errors'
+      RetentionInDays: 30
+
+  #############################################################################
+  # CloudWatch Monitoring
+  #############################################################################
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-alerts'
+      DisplayName: IoT Platform Alerts
+      Subscription:
+        - Endpoint: !Ref AlertEmail
+          Protocol: email
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Kinesis Stream Iterator Age Alarm
+  StreamIteratorAgeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-stream-iterator-age'
+      AlarmDescription: Alert when Kinesis stream iterator age is high
+      MetricName: GetRecords.IteratorAgeMilliseconds
+      Namespace: AWS/Kinesis
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 60000
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: StreamName
+          Value: !Ref IngestionStream
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  # Lambda Error Rate Alarm
+  LambdaErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-lambda-errors'
+      AlarmDescription: Alert when Lambda transformation errors occur
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref TransformationFunction
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  # Firehose Delivery to S3 Success Alarm
+  FirehoseDeliveryFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-firehose-delivery-failures'
+      AlarmDescription: Alert when Firehose fails to deliver data to S3
+      MetricName: DeliveryToS3.Success
+      Namespace: AWS/Firehose
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 0.95
+      ComparisonOperator: LessThanThreshold
+      Dimensions:
+        - Name: DeliveryStreamName
+          Value: !Ref DeliveryStream
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  # DynamoDB Throttle Alarm
+  DynamoDBThrottleAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${AWS::StackName}-dynamodb-throttles'
+      AlarmDescription: Alert when DynamoDB throttles requests
+      MetricName: UserErrors
+      Namespace: AWS/DynamoDB
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: TableName
+          Value: !Ref DeviceStateTable
+      AlarmActions:
+        - !Ref AlertTopic
+      TreatMissingData: notBreaching
+
+  #############################################################################
+  # CloudWatch Dashboard
+  #############################################################################
+
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-monitoring'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Kinesis", "IncomingRecords", {"stat": "Sum", "label": "Incoming Records"}],
+                  [".", "IncomingBytes", {"stat": "Sum", "label": "Incoming Bytes"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Kinesis Ingestion Rate",
+                "period": 300,
+                "dimensions": {
+                  "StreamName": "${IngestionStream}"
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Lambda", "Invocations", {"stat": "Sum"}],
+                  [".", "Errors", {"stat": "Sum"}],
+                  [".", "Duration", {"stat": "Average"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Lambda Transformation Metrics",
+                "period": 300,
+                "dimensions": {
+                  "FunctionName": "${TransformationFunction}"
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/Firehose", "DeliveryToS3.Success", {"stat": "Average"}],
+                  [".", "DeliveryToS3.Records", {"stat": "Sum"}],
+                  [".", "DeliveryToS3.DataFreshness", {"stat": "Average"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Firehose Delivery Metrics",
+                "period": 300,
+                "dimensions": {
+                  "DeliveryStreamName": "${DeliveryStream}"
+                }
+              }
+            },
+            {
+              "type": "metric",
+              "properties": {
+                "metrics": [
+                  ["AWS/DynamoDB", "ConsumedReadCapacityUnits", {"stat": "Sum"}],
+                  [".", "ConsumedWriteCapacityUnits", {"stat": "Sum"}],
+                  [".", "UserErrors", {"stat": "Sum"}]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "DynamoDB Metrics",
+                "period": 300,
+                "dimensions": {
+                  "TableName": "${DeviceStateTable}"
+                }
+              }
+            }
+          ]
+        }
+
+Outputs:
+  DataLakeBucketName:
+    Description: S3 bucket for IoT data lake
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-DataLakeBucket'
+
+  DeviceStateTableName:
+    Description: DynamoDB table for device state
+    Value: !Ref DeviceStateTable
+    Export:
+      Name: !Sub '${AWS::StackName}-DeviceStateTable'
+
+  IngestionStreamName:
+    Description: Kinesis Data Stream for ingestion
+    Value: !Ref IngestionStream
+    Export:
+      Name: !Sub '${AWS::StackName}-IngestionStream'
+
+  DeliveryStreamName:
+    Description: Kinesis Firehose delivery stream
+    Value: !Ref DeliveryStream
+    Export:
+      Name: !Sub '${AWS::StackName}-DeliveryStream'
+
+  TransformationFunctionArn:
+    Description: ARN of Lambda transformation function
+    Value: !GetAtt TransformationFunction.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TransformationFunction'
+
+  DevicePolicyName:
+    Description: IoT policy for devices
+    Value: !Ref DevicePolicy
+    Export:
+      Name: !Sub '${AWS::StackName}-DevicePolicy'
+
+  SensorThingTypeName:
+    Description: Thing type for sensors
+    Value: !Ref SensorThingType
+    Export:
+      Name: !Sub '${AWS::StackName}-SensorThingType'
+
+  GatewayThingTypeName:
+    Description: Thing type for gateways
+    Value: !Ref GatewayThingType
+    Export:
+      Name: !Sub '${AWS::StackName}-GatewayThingType'
+
+  IoTTopicRuleName:
+    Description: IoT topic rule name
+    Value: !Ref IoTTopicRule
+    Export:
+      Name: !Sub '${AWS::StackName}-IoTTopicRule'
+
+  AlertTopicArn:
+    Description: SNS topic for alerts
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub '${AWS::StackName}-AlertTopic'
+
+  DashboardURL:
+    Description: CloudWatch Dashboard URL
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${MonitoringDashboard}'
+
+  IoTEndpoint:
+    Description: IoT endpoint for device connections
+    Value: !Sub 'https://${AWS::AccountId}.iot.${AWS::Region}.amazonaws.com'

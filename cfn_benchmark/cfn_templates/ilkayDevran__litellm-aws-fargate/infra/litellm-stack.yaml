@@ -1,0 +1,779 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  LiteLLM proxy on AWS Fargate with HTTPS, RDS PostgreSQL backend, Secrets Manager,
+  Bedrock IAM access, and Route 53 + ACM custom domain. Single-stack deployment.
+
+Parameters:
+  DomainName:
+    Type: String
+    Description: FQDN for the proxy (e.g. litellm.sirket.com). ACM cert + Route 53 A record use this.
+
+  HostedZoneId:
+    Type: AWS::Route53::HostedZone::Id
+    Description: Route 53 hosted zone ID for the parent domain (used for ACM DNS validation and A record).
+
+  ImageUri:
+    Type: String
+    Default: ghcr.io/berriai/litellm-database:main-stable
+    Description: Docker image URI. Stock image works for first deploy; swap for ECR custom image later.
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to deploy into. Pass the default VPC ID to reuse it (deploy.sh auto-discovers).
+
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: >
+      2+ public subnets in different AZs (used for ALB, Fargate task, and RDS subnet group).
+      For default VPC just pass all of its subnet IDs. Must have route to an Internet Gateway.
+
+  DBPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 16
+    Description: RDS master password (16+ chars, no '/' '@' '"' or spaces).
+    AllowedPattern: '[a-zA-Z0-9!#$%&()*+,\-.:;<=>?\[\]^_`{|}~]+'
+
+  MasterKey:
+    Type: String
+    NoEcho: true
+    MinLength: 20
+    Description: LiteLLM master key (e.g. sk-...). Use a long random string.
+    AllowedPattern: 'sk-[a-zA-Z0-9_-]+'
+
+  UIUsername:
+    Type: String
+    Default: admin
+    Description: Username for LiteLLM Admin UI login.
+
+  UIPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: Password for LiteLLM Admin UI login.
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t4g.small
+    AllowedValues:
+      - db.t4g.micro
+      - db.t4g.small
+      - db.t4g.medium
+      - db.t4g.large
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+
+  TaskCpu:
+    Type: String
+    Default: "512"
+    AllowedValues: ["256", "512", "1024", "2048", "4096"]
+
+  TaskMemory:
+    Type: String
+    Default: "2048"
+    AllowedValues: ["512", "1024", "2048", "3072", "4096", "8192"]
+
+  DesiredCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+
+  AlertEmail:
+    Type: String
+    Description: Email address to receive CloudWatch alarm notifications. Recipient must confirm the SNS subscription via email link before alerts are delivered.
+    AllowedPattern: '[^@]+@[^@]+\.[^@]+'
+
+  MinTaskCount:
+    Type: Number
+    Default: 1
+    MinValue: 1
+    Description: Minimum number of ECS tasks Application Auto Scaling may scale down to (idle floor).
+
+  MaxTaskCount:
+    Type: Number
+    Default: 2
+    MinValue: 1
+    Description: Maximum number of ECS tasks Application Auto Scaling may scale up to (peak ceiling).
+
+  ScalingTargetRequestsPerTaskPerMinute:
+    Type: Number
+    Default: 1000
+    MinValue: 100
+    Description: ALB requests-per-task-per-minute target for auto-scaling. Each task should average this many requests/min; scale out when exceeded.
+
+  EnableWAF:
+    Type: String
+    Default: "false"
+    AllowedValues: ["true", "false"]
+    Description: >
+      Attach an AWS WAF Web ACL to the ALB. Filters bot/brute-force traffic by
+      (1) AWS managed IP reputation list and (2) requiring a well-formed
+      "Bearer sk-..." Authorization header on inference paths. No IP allowlist
+      and no rate limiting — legitimate Lambda/Batch/for-loop traffic with valid
+      keys is never throttled regardless of source IP or request volume.
+
+Conditions:
+  WAFEnabled: !Equals [!Ref EnableWAF, "true"]
+
+Resources:
+  # ============================ Security Groups ============================
+  # (Networking — VPC, subnets, IGW — reused from existing VPC passed as parameter.
+  #  By default deploy.sh auto-discovers the default VPC.)
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public ingress for ALB (HTTPS + HTTP redirect)
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS from anywhere (LiteLLM key auth at app layer)
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP for 301 redirect to HTTPS
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-alb-sg"
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate task ingress from ALB only
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-task-sg"
+
+  TaskIngressFromALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref TaskSecurityGroup
+      IpProtocol: tcp
+      FromPort: 4000
+      ToPort: 4000
+      SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Description: LiteLLM proxy port from ALB
+
+  DBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS ingress from Fargate tasks only
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-db-sg"
+
+  DBIngressFromTask:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DBSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      SourceSecurityGroupId: !Ref TaskSecurityGroup
+      Description: PostgreSQL from Fargate tasks
+
+  # ============================ TLS / DNS ============================
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref DomainName
+          HostedZoneId: !Ref HostedZoneId
+
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref DomainName
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt LoadBalancer.DNSName
+        HostedZoneId: !GetAtt LoadBalancer.CanonicalHostedZoneID
+        EvaluateTargetHealth: false
+
+  # ============================ Secrets ============================
+  DBPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/db-password"
+      Description: RDS master password for LiteLLM proxy database
+      SecretString: !Ref DBPassword
+
+  MasterKeySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/master-key"
+      Description: LiteLLM master key (admin auth)
+      SecretString: !Ref MasterKey
+
+  UIPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}/ui-password"
+      Description: LiteLLM Admin UI password
+      SecretString: !Ref UIPassword
+
+  # GCP Service Account JSON secrets are NOT created here — they already exist in
+  # Secrets Manager (per-project). They are injected into the task as env vars below.
+
+  # ============================ RDS ============================
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${AWS::StackName} LiteLLM RDS subnet group"
+      SubnetIds: !Ref SubnetIds
+
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-db"
+      Engine: postgres
+      EngineVersion: "16.10"
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      MasterUsername: litellm
+      MasterUserPassword: !Ref DBPassword
+      DBName: litellm
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref DBSecurityGroup
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      StorageEncrypted: true
+      EnablePerformanceInsights: false
+
+  # ============================ IAM ============================
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref DBPasswordSecret
+                  - !Ref MasterKeySecret
+                  - !Ref UIPasswordSecret
+                  # To wire pre-existing Secrets Manager entries (e.g. GCP service-account JSONs
+                  # stored out-of-band) into the task, add their ARN patterns here AND add a
+                  # matching entry to TaskDefinition.Secrets below. Then reference them in
+                  # LiteLLM model definitions as os.environ/<ENV_VAR_NAME>.
+                  # Example:
+                  #   - !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:gcp/proj-a/backend-*"
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: BedrockInvoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                  - bedrock:Converse
+                  - bedrock:ConverseStream
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - bedrock:ListFoundationModels
+                  - bedrock:GetFoundationModel
+                Resource: "*"
+
+  # ============================ ECS ============================
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "${AWS::StackName}-cluster"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/ecs/${AWS::StackName}"
+      RetentionInDays: !Ref LogRetentionDays
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "${AWS::StackName}-task"
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        OperatingSystemFamily: LINUX
+        CpuArchitecture: X86_64
+      ContainerDefinitions:
+        - Name: litellm
+          Image: !Ref ImageUri
+          Essential: true
+          PortMappings:
+            - ContainerPort: 4000
+              Protocol: tcp
+          Environment:
+            - Name: DB_HOST
+              Value: !GetAtt Database.Endpoint.Address
+            - Name: DB_PORT
+              Value: !GetAtt Database.Endpoint.Port
+            - Name: DB_NAME
+              Value: litellm
+            - Name: DB_USER
+              Value: litellm
+            - Name: STORE_MODEL_IN_DB
+              Value: "True"
+            - Name: UI_USERNAME
+              Value: !Ref UIUsername
+            - Name: AWS_DEFAULT_REGION
+              Value: !Ref AWS::Region
+          Secrets:
+            - Name: DB_PASSWORD
+              ValueFrom: !Ref DBPasswordSecret
+            - Name: LITELLM_MASTER_KEY
+              ValueFrom: !Ref MasterKeySecret
+            - Name: UI_PASSWORD
+              ValueFrom: !Ref UIPasswordSecret
+            # Optional: inject pre-existing Secrets Manager entries as task env vars.
+            # Pair each entry with a matching ARN in TaskExecutionRole.SecretsAccess above,
+            # then reference them in LiteLLM models via vertex_credentials: os.environ/<NAME>.
+            # Example for a GCP service-account JSON kept out-of-band:
+            #   - Name: GCP_SA_PROJ_A
+            #     ValueFrom: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:gcp/proj-a/backend"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: litellm
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - HTTPSListener
+      - Database
+    Properties:
+      ServiceName: !Sub "${AWS::StackName}-service"
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 200
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+      LoadBalancers:
+        - ContainerName: litellm
+          ContainerPort: 4000
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: 120
+
+  # ============================ Load Balancer ============================
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "${AWS::StackName}-alb"
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      SecurityGroups:
+        - !Ref ALBSecurityGroup
+      Subnets: !Ref SubnetIds
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "${AWS::StackName}-tg"
+      Port: 4000
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !Ref VpcId
+      HealthCheckProtocol: HTTP
+      HealthCheckPath: /health/liveliness
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+
+  HTTPSListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref Certificate
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  HTTPListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: redirect
+          RedirectConfig:
+            Protocol: HTTPS
+            Port: "443"
+            Host: "#{host}"
+            Path: "/#{path}"
+            Query: "#{query}"
+            StatusCode: HTTP_301
+
+  # ============================ Auto Scaling ============================
+  ScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    DependsOn: ECSService
+    Properties:
+      MinCapacity: !Ref MinTaskCount
+      MaxCapacity: !Ref MaxTaskCount
+      ResourceId: !Sub "service/${ECSCluster}/${ECSService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+
+  ScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-request-target-tracking"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub "${LoadBalancer.LoadBalancerFullName}/${TargetGroup.TargetGroupFullName}"
+        TargetValue: !Ref ScalingTargetRequestsPerTaskPerMinute
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 300
+
+  # ============================ Alerts (SNS + CloudWatch alarms) ============================
+  AlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alerts"
+      DisplayName: LiteLLM Proxy Alerts
+
+  AlertsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref AlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  AlarmHealthyHostCount:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-alb-no-healthy-tasks"
+      AlarmDescription: ALB has no healthy targets — service is down (task crashed, OOM, image pull failed, or health check failing)
+      Namespace: AWS/ApplicationELB
+      MetricName: HealthyHostCount
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt LoadBalancer.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt TargetGroup.TargetGroupFullName
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  AlarmTarget5XX:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-alb-5xx-spike"
+      AlarmDescription: ALB is receiving 5XX responses from container — application errors (Bedrock/Vertex auth, DB connection, code crash, etc.)
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt LoadBalancer.LoadBalancerFullName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  AlarmTaskMemoryHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ecs-memory-high"
+      AlarmDescription: ECS task memory utilization > 85% — OOM approaching, consider bumping TaskMemory or DesiredCount
+      Namespace: AWS/ECS
+      MetricName: MemoryUtilization
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 10
+      Threshold: 85
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  AlarmDBCPUHigh:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-rds-cpu-high"
+      AlarmDescription: RDS CPU > 80% sustained — DB getting hot, consider upgrading DBInstanceClass or adding cache
+      Namespace: AWS/RDS
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref Database
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 15
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  AlarmAtMaxCapacity:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-autoscaling-at-max"
+      AlarmDescription: ECS service running at MaxTaskCount — auto-scaling ceiling hit. If sustained, bump MaxTaskCount or upgrade task class.
+      Namespace: ECS/ContainerInsights
+      MetricName: RunningTaskCount
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref ECSCluster
+        - Name: ServiceName
+          Value: !GetAtt ECSService.Name
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: !Ref MaxTaskCount
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+      OKActions:
+        - !Ref AlertsTopic
+
+  AlarmDBStorageLow:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-rds-storage-low"
+      AlarmDescription: RDS free storage < 4 GB — disk filling up, enable storage auto-scaling or bump DBAllocatedStorage
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Ref Database
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 30
+      Threshold: 4000000000   # 4 GB in bytes
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertsTopic
+
+  # ============================ WAF (optional, Condition: WAFEnabled) ============================
+  # Strategy: NO IP allowlist, NO rate limiting (dynamic Lambda/Batch IPs + heavy
+  # for-loop bursts must pass freely). Instead:
+  #   Rule 0  AWS managed IP reputation list (rate-independent, blocks known-bad IPs)
+  #   Rule 1  On inference paths, require Authorization: "Bearer sk-..." format.
+  #           Dictionary brute-force (Bearer 1234 / admin / ...) is blocked at the
+  #           edge. Valid sk- keys pass regardless of IP / volume. LiteLLM's own
+  #           per-key RPM/TPM/budget remains the control for valid-key abuse.
+  WAFWebACL:
+    Type: AWS::WAFv2::WebACL
+    Condition: WAFEnabled
+    Properties:
+      Name: !Sub "${AWS::StackName}-waf"
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub "${AWS::StackName}-waf"
+      Rules:
+        - Name: AmazonIpReputationList
+          Priority: 0
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesAmazonIpReputationList
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${AWS::StackName}-waf-ipreputation"
+        - Name: KnownBadInputs
+          Priority: 2
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${AWS::StackName}-waf-knownbadinputs"
+        - Name: RequireBearerSkOnInferencePaths
+          Priority: 1
+          Action:
+            Block: {}
+          Statement:
+            AndStatement:
+              Statements:
+                - OrStatement:
+                    Statements:
+                      - ByteMatchStatement:
+                          FieldToMatch: { UriPath: {} }
+                          PositionalConstraint: STARTS_WITH
+                          SearchString: "/v1/"
+                          TextTransformations:
+                            - Priority: 0
+                              Type: NONE
+                      - ByteMatchStatement:
+                          FieldToMatch: { UriPath: {} }
+                          PositionalConstraint: STARTS_WITH
+                          SearchString: "/chat/"
+                          TextTransformations:
+                            - Priority: 0
+                              Type: NONE
+                      - ByteMatchStatement:
+                          FieldToMatch: { UriPath: {} }
+                          PositionalConstraint: STARTS_WITH
+                          SearchString: "/completions"
+                          TextTransformations:
+                            - Priority: 0
+                              Type: NONE
+                      - ByteMatchStatement:
+                          FieldToMatch: { UriPath: {} }
+                          PositionalConstraint: STARTS_WITH
+                          SearchString: "/embeddings"
+                          TextTransformations:
+                            - Priority: 0
+                              Type: NONE
+                - NotStatement:
+                    Statement:
+                      RegexMatchStatement:
+                        FieldToMatch:
+                          SingleHeader: { Name: authorization }
+                        RegexString: '(?i)^bearer\s+sk-[a-z0-9._-]{16,}'
+                        TextTransformations:
+                          - Priority: 0
+                            Type: NONE
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: !Sub "${AWS::StackName}-waf-badauth"
+
+  WAFAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    Condition: WAFEnabled
+    Properties:
+      ResourceArn: !Ref LoadBalancer
+      WebACLArn: !GetAtt WAFWebACL.Arn
+
+Outputs:
+  ProxyURL:
+    Description: HTTPS URL for the LiteLLM proxy (use as base_url in your clients)
+    Value: !Sub "https://${DomainName}"
+
+  LoadBalancerDNS:
+    Description: ALB DNS name (raw, no custom domain)
+    Value: !GetAtt LoadBalancer.DNSName
+
+  DatabaseEndpoint:
+    Description: RDS PostgreSQL endpoint
+    Value: !GetAtt Database.Endpoint.Address
+
+  MasterKeySecretArn:
+    Description: Secrets Manager ARN for the LiteLLM master key
+    Value: !Ref MasterKeySecret
+
+  ECSClusterName:
+    Description: ECS cluster name (for force-new-deployment commands)
+    Value: !Ref ECSCluster
+
+  ECSServiceName:
+    Description: ECS service name (for force-new-deployment commands)
+    Value: !GetAtt ECSService.Name
+
+  AlertsTopicArn:
+    Description: SNS topic where alarms publish (subscribe more emails / Slack webhook here)
+    Value: !Ref AlertsTopic

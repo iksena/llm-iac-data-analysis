@@ -1,0 +1,655 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Connect Assistant Knowledge Base with Industry FAQ Documents'
+
+Parameters:
+  KnowledgeBaseZipUrl:
+    Type: String
+    Description: >-
+      URL to fetch knowledge base documents ZIP file from. The ZIP should contain
+      demo/ with .txt files.
+    Default: ''
+  AssistantArn:
+    Type: String
+    Description:
+      'ARN of the Connect Assistant to associate with this knowledge base'
+  ConnectInstanceId:
+    Type: String
+    Description: 'ID of the Amazon Connect instance'
+  WorkshopStackName:
+    Type: String
+    Description: 'Name of the parent workshop stack for resource naming'
+    Default: 'workshop-stack'
+
+Conditions:
+  HasKnowledgeBaseZipUrl: !Not [!Equals [!Ref KnowledgeBaseZipUrl, '']]
+
+Resources:
+  # checkov:skip=CKV_AWS_18:This is a logging bucket that receives access logs from other buckets
+  # cfn-lint:disable=W35:This is a logging bucket that receives access logs from other buckets
+  KnowledgeBaseBucketLoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    DeletionPolicy: Retain
+
+  # S3 Bucket Policy for Logging Bucket to allow S3 logging service
+  KnowledgeBaseBucketLoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref KnowledgeBaseBucketLoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3LoggingService
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action:
+              - s3:PutObject
+            Resource: !Sub '${KnowledgeBaseBucketLoggingBucket.Arn}/*'
+
+  # S3 Bucket for Knowledge Base Documents
+  KnowledgeBaseBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref KnowledgeBaseBucketLoggingBucket
+        LogFilePrefix: 'kb-access-logs/'
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    DeletionPolicy: Retain
+
+  # S3 Bucket Policy for App Integrations
+  KnowledgeBaseBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref KnowledgeBaseBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowAppIntegrationsDataIntegrations
+            Effect: Allow
+            Principal:
+              Service: app-integrations.amazonaws.com
+            Action:
+              - s3:ListBucket
+              - s3:GetObject
+              - s3:GetBucketLocation
+            Resource:
+              - !GetAtt KnowledgeBaseBucket.Arn
+              - !Sub '${KnowledgeBaseBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+              ArnEquals:
+                'aws:SourceArn': !Sub 'arn:aws:app-integrations:${AWS::Region}:${AWS::AccountId}:data-integration/*'
+
+  # Lambda Role for Knowledge Base Upload
+  KBUploadRole:
+    Type: AWS::IAM::Role
+    Condition: HasKnowledgeBaseZipUrl
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3KnowledgeBaseAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Permission to write to the KB bucket
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:ListBucket
+                  - s3:ListBucketVersions
+                Resource:
+                  - !Sub '${KnowledgeBaseBucket.Arn}'
+                  - !Sub '${KnowledgeBaseBucket.Arn}/*'
+              # Permission to read from ANY S3 bucket (for downloading ZIP)
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: 'arn:aws:s3:::*/*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt KBUploadFnDLQ.Arn
+    DeletionPolicy: Delete
+
+  # SQS Dead Letter Queue for KB Upload Lambda
+  KBUploadFnDLQ:
+    Type: AWS::SQS::Queue
+    Condition: HasKnowledgeBaseZipUrl
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-KBUploadFn-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    DeletionPolicy: Delete
+
+  # Lambda Function to Upload Knowledge Base Documents
+  # checkov:skip=CKV_AWS_117:Lambda functions call public APIs in demo environment
+  KBUploadFn:
+    Type: AWS::Lambda::Function
+    Condition: HasKnowledgeBaseZipUrl
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt KBUploadRole.Arn
+      Timeout: 900
+      MemorySize: 512
+      DeadLetterConfig:
+        TargetArn: !GetAtt KBUploadFnDLQ.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          import zipfile
+          import io
+          import re
+
+          def parse_s3_url(url):
+              """Parse S3 URL to extract bucket and key. Supports multiple formats."""
+              # Format: https://bucket.s3.region.amazonaws.com/key
+              match = re.match(r'https://([^.]+)\.s3\.([^.]+)\.amazonaws\.com/(.+)', url)
+              if match:
+                  return match.group(1), match.group(3)
+              # Format: https://bucket.s3.amazonaws.com/key
+              match = re.match(r'https://([^.]+)\.s3\.amazonaws\.com/(.+)', url)
+              if match:
+                  return match.group(1), match.group(2)
+              # Format: s3://bucket/key
+              match = re.match(r's3://([^/]+)/(.+)', url)
+              if match:
+                  return match.group(1), match.group(2)
+              return None, None
+
+          def handler(event, context):
+              response_data = {}
+              try:
+                  print(f"Received event: {json.dumps(event, default=str)}")
+
+                  bucket_name = event['ResourceProperties']['BucketName']
+                  zip_url = event['ResourceProperties'].get('KnowledgeBaseZipUrl', '')
+
+                  s3 = boto3.client('s3')
+
+                  if event['RequestType'] == 'Delete':
+                      print("Delete request - cleaning up ALL S3 objects and versions in bucket")
+
+                      try:
+                          total_deleted = 0
+
+                          # Delete all object versions and delete markers
+                          paginator = s3.get_paginator('list_object_versions')
+                          pages = paginator.paginate(Bucket=bucket_name)
+
+                          for page in pages:
+                              if 'Versions' in page:
+                                  versions = [{'Key': v['Key'], 'VersionId': v['VersionId']} for v in page['Versions']]
+                                  if versions:
+                                      s3.delete_objects(Bucket=bucket_name, Delete={'Objects': versions})
+                                      total_deleted += len(versions)
+                                      print(f"Deleted batch of {len(versions)} object versions")
+
+                              if 'DeleteMarkers' in page:
+                                  markers = [{'Key': m['Key'], 'VersionId': m['VersionId']} for m in page['DeleteMarkers']]
+                                  if markers:
+                                      s3.delete_objects(Bucket=bucket_name, Delete={'Objects': markers})
+                                      total_deleted += len(markers)
+                                      print(f"Deleted batch of {len(markers)} delete markers")
+
+                          print(f"Total deleted: {total_deleted} objects/versions/markers")
+                      except Exception as e:
+                          print(f"Error during cleanup: {str(e)}")
+
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  # For Create and Update operations
+                  print(f"Processing {event['RequestType']} request")
+
+                  if not zip_url:
+                      raise ValueError("KnowledgeBaseZipUrl parameter is required")
+
+                  # Parse S3 URL and download using boto3 (with IAM credentials)
+                  print(f"Downloading knowledge base zip from: {zip_url}")
+                  source_bucket, source_key = parse_s3_url(zip_url)
+
+                  if not source_bucket or not source_key:
+                      raise ValueError(f"Could not parse S3 URL: {zip_url}")
+
+                  print(f"Parsed S3 URL - Bucket: {source_bucket}, Key: {source_key}")
+
+                  response = s3.get_object(Bucket=source_bucket, Key=source_key)
+                  zip_data = response['Body'].read()
+
+                  print(f"Downloaded {len(zip_data)} bytes")
+
+                  # Extract and upload files preserving structure
+                  # ZIP structure: {industry}/{filename}.txt or just {filename}.txt
+                  # S3 structure: {industry}/{filename}.txt or {filename}.txt (root of bucket)
+                  uploaded_count = 0
+                  industries_found = set()
+
+                  with zipfile.ZipFile(io.BytesIO(zip_data)) as zip_ref:
+                      file_list = zip_ref.namelist()
+                      print(f"Found {len(file_list)} entries in zip")
+
+                      for file_name in file_list:
+                          # Skip directories
+                          if file_name.endswith('/'):
+                              continue
+
+                          # Skip non-text files
+                          if not file_name.endswith('.txt'):
+                              print(f"Skipping non-txt file: {file_name}")
+                              continue
+
+                          # Read file content
+                          file_content = zip_ref.read(file_name)
+
+                          # Preserve directory structure at bucket root
+                          # e.g., hotel/faq.txt -> hotel/faq.txt
+                          # e.g., faq.txt -> faq.txt
+                          s3_key = file_name
+
+                          # Track industries found
+                          parts = file_name.split('/')
+                          if len(parts) > 1:
+                              industries_found.add(parts[0])
+
+                          s3.put_object(
+                              Bucket=bucket_name,
+                              Key=s3_key,
+                              Body=file_content,
+                              ContentType='text/plain'
+                          )
+
+                          uploaded_count += 1
+
+                          if uploaded_count % 50 == 0:
+                              print(f"Uploaded {uploaded_count} files...")
+
+                  print(f"Successfully uploaded {uploaded_count} knowledge base files")
+                  print(f"Industries found: {list(industries_found)}")
+
+                  response_data = {
+                      'BucketName': bucket_name,
+                      'UploadedFiles': str(uploaded_count),
+                      'S3Prefix': '',
+                      'Industries': ','.join(sorted(industries_found)) if industries_found else 'none'
+                  }
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  error_message = f"Error in knowledge base upload: {str(e)}"
+                  print(error_message)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': error_message})
+    DeletionPolicy: Delete
+
+  # Custom Resource to trigger KB document upload from ZIP
+  # This invokes the Lambda function to download and extract the ZIP
+  KBUpload:
+    Type: Custom::KBUpload
+    Condition: HasKnowledgeBaseZipUrl
+    DependsOn:
+      - KnowledgeBaseBucket
+    Properties:
+      ServiceToken: !GetAtt KBUploadFn.Arn
+      BucketName: !Ref KnowledgeBaseBucket
+      KnowledgeBaseZipUrl: !Ref KnowledgeBaseZipUrl
+
+  # IAM Role for Knowledge Base to access S3
+  KnowledgeBaseS3AccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: wisdom.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub '${KnowledgeBaseBucket.Arn}'
+                  - !Sub '${KnowledgeBaseBucket.Arn}/*'
+    DeletionPolicy: Delete
+
+  # Connect Assistant Knowledge Base
+  IndustryKnowledgeBase:
+    Type: AWS::Wisdom::KnowledgeBase
+    Properties:
+      Name: !Sub 'industry-kb-${WorkshopStackName}'
+      Description: 'Industry FAQ knowledge base for Connect Assistant'
+      KnowledgeBaseType: EXTERNAL
+      SourceConfiguration:
+        AppIntegrations:
+          AppIntegrationArn: !GetAtt S3DataSource.DataIntegrationArn
+      ServerSideEncryptionConfiguration:
+        KmsKeyId: !GetAtt DataIntegrationKey.Arn
+      Tags:
+        - Key: 'AmazonConnectEnabled'
+          Value: 'True'
+        - Key: 'AmazonConnectInstanceId'
+          Value: !Ref ConnectInstanceId
+
+  # KMS Key for Data Integration
+  DataIntegrationKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for Connect Assistant data integration'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Wisdom service to use the key
+            Effect: Allow
+            Principal:
+              Service: wisdom.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs
+            Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*'
+    DeletionPolicy: Delete
+
+  # S3 Data Source Integration
+  S3DataSource:
+    Type: AWS::AppIntegrations::DataIntegration
+    Properties:
+      Name: !Sub 'industry-kb-${WorkshopStackName}'
+      Description: 'S3 data source for industry knowledge base FAQs'
+      KmsKey: !GetAtt DataIntegrationKey.Arn
+      SourceURI: !Sub 's3://${KnowledgeBaseBucket}'
+
+  # Associate Knowledge Base with Assistant
+  KnowledgeBaseAssociation:
+    Type: AWS::Wisdom::AssistantAssociation
+    Properties:
+      AssistantId:
+        !Select [1, !Split ['/', !Select [5, !Split [':', !Ref AssistantArn]]]]
+      Association:
+        KnowledgeBaseId: !Ref IndustryKnowledgeBase
+      AssociationType: KNOWLEDGE_BASE
+    DependsOn: IndustryKnowledgeBase
+
+  # CloudWatch Log Group for Connect KB Integration Lambda
+  ConnectKBIntegrationLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-ConnectKBIntegration'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt DataIntegrationKey.Arn
+    DeletionPolicy: Delete
+
+  # Lambda Role for Connect Knowledge Base Integration
+  ConnectKBIntegrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ConnectKBIntegrationAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - connect:CreateIntegrationAssociation
+                  - connect:DeleteIntegrationAssociation
+                  - connect:ListIntegrationAssociations
+                Resource: !Sub 'arn:aws:connect:${AWS::Region}:${AWS::AccountId}:*'
+              - Effect: Allow
+                Action:
+                  - wisdom:GetKnowledgeBase
+                  - wisdom:TagResource
+                Resource:
+                  - !GetAtt IndustryKnowledgeBase.KnowledgeBaseArn
+              # KMS permissions required for Connect to create integration with encrypted KB
+              - Effect: Allow
+                Action:
+                  - kms:CreateGrant
+                  - kms:DescribeKey
+                Resource:
+                  - !GetAtt DataIntegrationKey.Arn
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt ConnectKBIntegrationFnDLQ.Arn
+    DeletionPolicy: Delete
+
+  # SQS Dead Letter Queue for Connect KB Integration Lambda
+  ConnectKBIntegrationFnDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-ConnectKBIntegrationFn-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    DeletionPolicy: Delete
+
+  # Lambda Function for Connect Knowledge Base Integration
+  # checkov:skip=CKV_AWS_117:Lambda functions call public APIs in demo environment
+  ConnectKBIntegrationFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt ConnectKBIntegrationRole.Arn
+      Timeout: 60
+      DeadLetterConfig:
+        TargetArn: !GetAtt ConnectKBIntegrationFnDLQ.Arn
+      LoggingConfig:
+        LogGroup: !Ref ConnectKBIntegrationLogGroup
+        LogFormat: JSON
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          connect = boto3.client('connect')
+
+          def handler(event, context):
+              response_data = {}
+              try:
+                  print(f"Received event: {json.dumps(event, default=str)}")
+
+                  instance_id = event['ResourceProperties']['InstanceId']
+                  knowledge_base_arn = event['ResourceProperties']['KnowledgeBaseArn']
+
+                  if event['RequestType'] == 'Delete':
+                      print("Delete request - removing Connect KB integration")
+
+                      try:
+                          # List existing integrations to find the one to delete
+                          response = connect.list_integration_associations(
+                              InstanceId=instance_id,
+                              IntegrationType='WISDOM_KNOWLEDGE_BASE'
+                          )
+
+                          # Find and delete the matching integration
+                          for integration in response.get('IntegrationAssociationSummaryList', []):
+                              if integration.get('IntegrationArn') == knowledge_base_arn:
+                                  connect.delete_integration_association(
+                                      InstanceId=instance_id,
+                                      IntegrationAssociationId=integration['IntegrationAssociationId']
+                                  )
+                                  print(f"Deleted KB integration: {integration['IntegrationAssociationId']}")
+                                  break
+                      except Exception as e:
+                          print(f"Error during deletion (may already be deleted): {str(e)}")
+
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  # For Create and Update operations
+                  print(f"Creating Connect Knowledge Base integration association")
+                  print(f"Parameters:")
+                  print(f"  InstanceId: {instance_id}")
+                  print(f"  IntegrationType: WISDOM_KNOWLEDGE_BASE")
+                  print(f"  IntegrationArn: {knowledge_base_arn}")
+                  print(f"Equivalent AWS CLI command:")
+                  print(f"  aws connect create-integration-association \\")
+                  print(f"    --instance-id {instance_id} \\")
+                  print(f"    --integration-type WISDOM_KNOWLEDGE_BASE \\")
+                  print(f"    --integration-arn {knowledge_base_arn}")
+
+                  response = connect.create_integration_association(
+                      InstanceId=instance_id,
+                      IntegrationType='WISDOM_KNOWLEDGE_BASE',
+                      IntegrationArn=knowledge_base_arn
+                  )
+
+                  response_data = {
+                      'IntegrationAssociationId': response['IntegrationAssociationId'],
+                      'IntegrationAssociationArn': response['IntegrationAssociationArn']
+                  }
+
+                  print(f"Successfully created KB integration: {response['IntegrationAssociationId']}")
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+
+              except Exception as e:
+                  error_message = f"Error in Connect KB integration: {str(e)}"
+                  print(error_message)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {
+                      'Error': error_message
+                  })
+    DeletionPolicy: Delete
+
+  # Custom Resource to Create Connect Knowledge Base Integration
+  ConnectKBIntegration:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt ConnectKBIntegrationFn.Arn
+      InstanceId: !Ref ConnectInstanceId
+      KnowledgeBaseArn: !GetAtt IndustryKnowledgeBase.KnowledgeBaseArn
+    DependsOn:
+      - IndustryKnowledgeBase
+      - KnowledgeBaseAssociation
+
+Outputs:
+  KnowledgeBaseBucketName:
+    Description: S3 Bucket containing knowledge base documents
+    Value: !Ref KnowledgeBaseBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-KnowledgeBaseBucket'
+
+  KnowledgeBaseBucketArn:
+    Description: ARN of the knowledge base S3 bucket
+    Value: !GetAtt KnowledgeBaseBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-KnowledgeBaseBucketArn'
+
+  KnowledgeBaseS3Prefix:
+    Description: S3 prefix for knowledge base documents (empty = bucket root)
+    Value: ''
+
+  UploadedFileCount:
+    Condition: HasKnowledgeBaseZipUrl
+    Description: Number of knowledge base files uploaded from ZIP
+    Value: !GetAtt KBUpload.UploadedFiles
+
+  IndustriesLoaded:
+    Condition: HasKnowledgeBaseZipUrl
+    Description: Industries found in the uploaded ZIP file
+    Value: !GetAtt KBUpload.Industries
+
+  KnowledgeBaseId:
+    Description: ID of the Connect Assistant Knowledge Base
+    Value: !Ref IndustryKnowledgeBase
+    Export:
+      Name: !Sub '${AWS::StackName}-KnowledgeBaseId'
+
+  KnowledgeBaseArn:
+    Description: ARN of the Connect Assistant Knowledge Base
+    Value: !GetAtt IndustryKnowledgeBase.KnowledgeBaseArn
+    Export:
+      Name: !Sub '${AWS::StackName}-KnowledgeBaseArn'
+
+  AssistantAssociationId:
+    Description: ID of the Knowledge Base association with the Assistant (needed for AI Agents Retrieve tool)
+    # !Ref returns "assistantAssociationId|assistantId" format, we need just the first part
+    Value: !Select [0, !Split ['|', !Ref KnowledgeBaseAssociation]]
+    Export:
+      Name: !Sub '${AWS::StackName}-AssistantAssociationId'
+
+  ConnectKBIntegrationId:
+    Description: ID of the Connect-Knowledge Base integration association
+    Value: !GetAtt ConnectKBIntegration.IntegrationAssociationId
+
+  ConnectKBIntegrationCommand:
+    Description: Manual AWS CLI command to associate knowledge base with Connect instance
+    Value: !Sub |
+      aws connect create-integration-association \
+        --instance-id ${ConnectInstanceId} \
+        --integration-type WISDOM_KNOWLEDGE_BASE \
+        --integration-arn ${IndustryKnowledgeBase.KnowledgeBaseArn}

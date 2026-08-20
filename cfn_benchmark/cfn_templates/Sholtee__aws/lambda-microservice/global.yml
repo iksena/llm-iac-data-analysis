@@ -1,0 +1,203 @@
+#####################################################
+# global.yml
+#
+# Author: Denes Solti
+#####################################################
+Description: Global infrastructure. Needs to be deployed to "us-east-1" region
+
+Parameters:
+  app:
+    Type: String
+    Description: The application name (including prefix)
+    MaxLength: '32'
+  exposeErrorInfo:
+    Type: String
+    AllowedValues:
+      - true
+      - false
+    Description: Expose exception information
+    Default: true
+
+Conditions:
+  ExposeErrorInfo: !Equals
+    - !Ref exposeErrorInfo
+    - true
+
+Resources:
+  RequestSignerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Lambda that signs the incoming requests. Required for IAM validation
+      Code:
+        ZipFile: !Sub
+          - |
+            'use strict';
+            const
+              {SignatureV4} = require('@aws-sdk/signature-v4'),
+              {createHash, createHmac} = require('crypto'),
+              {parse} = require('querystring'),
+
+              {AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN} = process.env,
+
+              sigV4 = new SignatureV4({
+                service: 'lambda',
+                region: '${AWS::Region}',
+                credentials: async () => ({  // must be async
+                  accessKeyId: AWS_ACCESS_KEY_ID,
+                  secretAccessKey: AWS_SECRET_ACCESS_KEY,
+                  sessionToken: AWS_SESSION_TOKEN
+                }),
+                sha256: function(secret) {  // must be a ctor -> function
+                  return secret ? createHmac('sha256', secret) : createHash('sha256');
+                }
+              }),
+              excludedHeaders = getExcludedHeaders();
+
+            exports.handler = async function(event, context, callback) {
+              try {
+                console.log('Lambda context: ' + JSON.stringify(context));
+                console.log('Request available: ' + JSON.stringify(event));
+
+                const
+                  request = event.Records[0].cf.request,
+                  eh = await excludedHeaders,
+                  signed = await sigV4.sign(
+                    {
+                      hostname: request.headers.host[0].value,
+                      method: request.method,
+                      protocol: 'https:',
+                      path: request.uri,
+                      query: request.querystring
+                        ? parse(request.querystring)
+                        : null,
+                      headers: Object
+                        .entries(request.headers)
+                        .filter(([key]) => !eh.has(key))
+                        .map(([, header]) => ({[header[0].key]: header[0].value}))
+                        .reduce((accu, curr) => ({...accu, ...curr}), {}),
+                      body: request.body?.data && request.body.encoding === 'base64'
+                        ? Buffer.from(request.body.data, request.body.encoding)
+                        : request.body?.data
+                    },
+                    {
+                      signingRegion: /(?<urlid>\w+)\.lambda-url\.(?<region>[\w-]+)\.on\.aws/i
+                        .exec(request.headers.host[0].value)
+                        .groups
+                        .region
+                    }
+                  );
+
+                request.headers = Object
+                  .entries(signed.headers)
+                  .map(([key, value]) => ({[key.toLowerCase()]: [{key: key, value}]}))
+                  .reduce((accu, curr) => ({...accu, ...curr}), {});
+
+                console.log('Request signed successfully: ' + JSON.stringify(request));
+
+                return callback(null, request);
+              } catch (err) {
+                console.error(err);
+                return callback(null, {
+                  status: '500',
+                  statusDescription: 'Internal server error',
+                  headers: {
+                    'content-type': [{
+                      key: 'Content-Type',
+                      value: 'application/json'
+                    }]
+                  },
+                  body: JSON.stringify({
+                    error: ${ErrorResp}
+                  })
+                });
+              }
+            };
+
+            async function getExcludedHeaders() {
+              const
+                {SSMClient, GetParameterCommand} = require('@aws-sdk/client-ssm'),
+                ssmClient = new SSMClient({region: '${AWS::Region}'}),
+                ret = await ssmClient.send(
+                  new GetParameterCommand({Name: '${RequestSignerExcludedHeaders}'})
+                );
+
+              return new Set(ret.Parameter.Value.split(','));
+            }
+          - ErrorResp: !If
+              - ExposeErrorInfo
+              - 'err.toString()'
+              - '"Internal server error"'
+      FunctionName: !Sub "${app}-request-signer"
+      Handler: index.handler
+      Role: !GetAtt RequestSignerLambdaRole.Arn
+      Runtime: nodejs18.x
+      Timeout: 5
+      MemorySize: 128
+
+  RequestSignerLambdaVersion:
+    Type: AWS::Lambda::Version
+    Properties:
+      Description: Lambda version. Lambda@Edge requires exact version
+      FunctionName: !Ref RequestSignerLambda
+
+  RequestSignerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+            - edgelambda.amazonaws.com
+            - replicator.lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Policies:
+        - PolicyName: allowLambdaLogging
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:*"
+                Resource: "*"
+        - PolicyName: allowSSMAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter*
+                Resource: '*'
+        - PolicyName: allowCloudFrontReplication
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+                - lambda:GetFunction
+                - lambda:EnableReplication*
+                - lambda:InvokeFunction
+                - iam:CreateServiceLinkedRole
+                - cloudfront:UpdateDistribution
+              Resource: '*'
+
+  RequestSignerExcludedHeaders:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Description: Headers to be excluded when signing the request. Must be store as a parameter as Lambda@Edge cannot have environment variables defined
+      Name: !Sub "${app}-request-signer-excluded-headers"
+      Value: x-forwarded-for,te
+      Type: String
+
+Outputs:
+  RequestSignerLambdaArn:  # export among regions not supported
+    Value: !Ref RequestSignerLambdaVersion
+    Export:
+      Name: !Sub "${app}-request-signer-lambda-arn"
+  RequestSignerLambdaRoleArn:
+    Value: !GetAtt RequestSignerLambdaRole.Arn
+    Export:
+      Name: !Sub "${app}-request-signer-lambda-role-arn"

@@ -1,0 +1,251 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Set the Security alternate contact across all AWS Organization accounts,
+  auto-apply to new accounts, and (optionally) schedule a sweep.
+
+Parameters:
+  SecurityEmail:
+    Type: String
+    Description: Email for the Security alternate contact (distribution list recommended)
+  SecurityPhone:
+    Type: String
+    Description: Phone number for the Security alternate contact (E.164 format, e.g., +15555555555)
+  SecurityContactName:
+    Type: String
+    Default: Cloud Security Team
+    Description: Display name for the Security alternate contact
+  SecurityContactTitle:
+    Type: String
+    Default: AWS Security Contact
+    Description: Title for the Security alternate contact
+  CreateDailySweep:
+    Type: String
+    AllowedValues: ['true','false']
+    Default: 'true'
+    Description: Create a daily sweep to (re)apply contact to all accounts
+  DailySweepSchedule:
+    Type: String
+    Default: rate(1 day)
+    Description: EventBridge schedule expression for the sweep (e.g., rate(12 hours) or cron(...))
+  EnableControlTowerRule:
+    Type: String
+    AllowedValues: ['true','false']
+    Default: 'true'
+    Description: Listen for Control Tower CreateManagedAccount events
+  EnableOrganizationsRule:
+    Type: String
+    AllowedValues: ['true','false']
+    Default: 'true'
+    Description: Listen for Organizations CreateAccountResult events
+
+Conditions:
+  DoDailySweep: !Equals [!Ref CreateDailySweep, 'true']
+  DoCTRule:     !Equals [!Ref EnableControlTowerRule, 'true']
+  DoOrgRule:    !Equals [!Ref EnableOrganizationsRule, 'true']
+
+Resources:
+
+  AltContactRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub security-alt-contact-manager-${AWS::StackName}
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ManageAlternateContacts
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # List accounts in the org
+              - Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                  - organizations:DescribeOrganization
+                Resource: "*"
+              # Put/Get alternate contact on org member accounts (resource-scoped)
+              - Effect: Allow
+                Action:
+                  - account:PutAlternateContact
+                  - account:GetAlternateContact
+                Resource: !Sub arn:aws:organizations::${AWS::AccountId}:account/o-*/*
+              # Also allow standalone (management account itself)
+              - Effect: Allow
+                Action:
+                  - account:PutAlternateContact
+                  - account:GetAlternateContact
+                Resource: "*"
+
+  AltContactFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub security-alt-contact-apply-${AWS::StackName}
+      Description: Applies Security alternate contact org-wide and on new accounts
+      Runtime: python3.12
+      Timeout: 300
+      MemorySize: 256
+      Role: !GetAtt AltContactRole.Arn
+      Environment:
+        Variables:
+          SECURITY_EMAIL: !Ref SecurityEmail
+          SECURITY_PHONE: !Ref SecurityPhone
+          SECURITY_CONTACT_NAME: !Ref SecurityContactName
+          SECURITY_CONTACT_TITLE: !Ref SecurityContactTitle
+      Handler: index.handler
+      Code:
+        ZipFile: |
+          import os, json, logging, boto3, botocore
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          org = boto3.client("organizations")
+          acct = boto3.client("account")
+          sts = boto3.client("sts")
+          MGMT_ID = sts.get_caller_identity()["Account"]
+
+          def put_security_contact(target_account_id=None):
+              params = dict(
+                  AlternateContactType='SECURITY',
+                  EmailAddress=os.environ["SECURITY_EMAIL"],
+                  PhoneNumber=os.environ["SECURITY_PHONE"],
+                  Name=os.environ.get("SECURITY_CONTACT_NAME","Cloud Security Team"),
+                  Title=os.environ.get("SECURITY_CONTACT_TITLE","AWS Security Contact"),
+              )
+              # Management account can't specify AccountId on this API
+              # (must call without AccountId). Others must specify it.
+              if target_account_id and target_account_id != MGMT_ID:
+                  params["AccountId"] = target_account_id
+              try:
+                  acct.put_alternate_contact(**params)
+                  logger.info(f"Set SECURITY contact for account {target_account_id or MGMT_ID}")
+              except botocore.exceptions.ClientError as e:
+                  logger.error(f"Failed for {target_account_id}: {e}")
+                  raise
+
+          def sweep_all_accounts():
+              # iterate all ACTIVE accounts; set contact for each + mgmt account
+              paginator = org.get_paginator("list_accounts")
+              for page in paginator.paginate():
+                  for a in page.get("Accounts", []):
+                      if a.get("Status") == "ACTIVE":
+                          put_security_contact(a["Id"])
+              # Ensure management account itself is updated (call w/o AccountId)
+              put_security_contact(None)
+
+          def handler(event, context):
+              logger.info("Event: %s", json.dumps(event))
+              src = event.get("source")
+              # New account via Organizations
+              if src == "aws.organizations":
+                  detail = event.get("detail", {})
+                  try:
+                      state = detail["serviceEventDetails"]["createAccountStatus"]["state"]
+                      if state == "SUCCEEDED":
+                          new_id = detail["serviceEventDetails"]["createAccountStatus"]["accountId"]
+                          put_security_contact(new_id)
+                          return {"statusCode":200,"body":"Updated new org account"}
+                  except Exception as e:
+                      logger.warning(f"Could not parse organizations event: {e}")
+              # New account via Control Tower (Account Factory)
+              if src == "aws.controltower":
+                  detail = event.get("detail", {})
+                  try:
+                      state = detail["serviceEventDetails"]["createManagedAccountStatus"]["state"]
+                      if state == "SUCCEEDED":
+                          new_id = detail["serviceEventDetails"]["createManagedAccountStatus"]["account"]["accountId"]
+                          put_security_contact(new_id)
+                          return {"statusCode":200,"body":"Updated new CT account"}
+                  except Exception as e:
+                      logger.warning(f"Could not parse controltower event: {e}")
+              # Fallback: run a full sweep (e.g., scheduled or manual test)
+              sweep_all_accounts()
+              return {"statusCode":200,"body":"Sweep completed"}
+
+  # ── EventBridge rules ─────────────────────────────────────────────────────────
+
+  DailySweepRule:
+    Type: AWS::Events::Rule
+    Condition: DoDailySweep
+    Properties:
+      Name: !Sub security-alt-contact-schedule-${AWS::StackName}
+      Description: Periodic sweep to set Security alternate contact on all accounts
+      ScheduleExpression: !Ref DailySweepSchedule
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AltContactFn.Arn
+          Id: LambdaTarget
+
+  DailySweepInvokePerm:
+    Type: AWS::Lambda::Permission
+    Condition: DoDailySweep
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AltContactFn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailySweepRule.Arn
+
+  OrganizationsCreateAccountRule:
+    Type: AWS::Events::Rule
+    Condition: DoOrgRule
+    Properties:
+      Name: !Sub security-alt-contact-org-rule-${AWS::StackName}
+      Description: Trigger on successful Organizations account creation (CreateAccountResult)
+      EventPattern:
+        detail-type: ["AWS Service Event via CloudTrail"]
+        source: ["aws.organizations"]
+        detail:
+          eventName: ["CreateAccountResult"]
+          serviceEventDetails:
+            createAccountStatus:
+              state: ["SUCCEEDED"]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AltContactFn.Arn
+          Id: LambdaTarget
+
+  OrganizationsInvokePerm:
+    Type: AWS::Lambda::Permission
+    Condition: DoOrgRule
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AltContactFn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt OrganizationsCreateAccountRule.Arn
+
+  ControlTowerCreateManagedAccountRule:
+    Type: AWS::Events::Rule
+    Condition: DoCTRule
+    Properties:
+      Name: !Sub security-alt-contact-ct-rule-${AWS::StackName}
+      Description: Trigger on successful Control Tower Account Factory account creation
+      EventPattern:
+        detail-type: ["AWS Service Event via CloudTrail"]
+        source: ["aws.controltower"]
+        detail:
+          eventName: ["CreateManagedAccount"]
+          serviceEventDetails:
+            createManagedAccountStatus:
+              state: ["SUCCEEDED"]
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt AltContactFn.Arn
+          Id: LambdaTarget
+
+  ControlTowerInvokePerm:
+    Type: AWS::Lambda::Permission
+    Condition: DoCTRule
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AltContactFn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ControlTowerCreateManagedAccountRule.Arn
+
+Outputs:
+  FunctionName:
+    Description: Lambda function that applies the Security alternate contact
+    Value: !Ref AltContactFn

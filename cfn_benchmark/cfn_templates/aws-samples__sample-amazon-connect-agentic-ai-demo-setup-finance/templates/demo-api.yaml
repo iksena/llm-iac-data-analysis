@@ -1,0 +1,1704 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Banking System API v2'
+
+# =============================================================================
+# LESSONS LEARNED FROM PREVIOUS BILLING API ISSUES:
+# 1. Lambda code must be inline (not placeholder) - no separate deployment step
+# 2. IAM permissions must include dynamodb:Query explicitly
+# 3. Environment variables use !Ref which returns physical table names correctly
+# 4. API key header must be X-API-Key (matching OpenAPI spec)
+# 5. OpenAPI spec uploaded to S3 for AgentCore Gateway registration
+# 6. Custom resource for API key value retrieval (for outputs)
+# =============================================================================
+
+Parameters:
+  SeedDataUrl:
+    Type: String
+    Description: 'URL to fetch banking seed data from (JSON format)'
+    Default: ''
+  OpenApiSpecUrl:
+    Type: String
+    Description: 'URL to fetch OpenAPI specification from (YAML format)'
+    Default: ''
+  SharedApiKeyId:
+    Type: String
+    Description: '(Optional) ID of a shared API key to use instead of creating a new one. When provided, this stack will use the shared key for its usage plan.'
+    Default: ''
+  ProfileId:
+    Type: String
+    Default: ''
+
+Conditions:
+  UseSharedApiKey: !Not [!Equals [!Ref SharedApiKeyId, '']]
+  CreateOwnApiKey: !Equals [!Ref SharedApiKeyId, '']
+
+Resources:
+  # ============================================================================
+  # CLOUDWATCH LOG GROUPS
+  # ============================================================================
+
+  # KMS Key for CloudWatch Logs encryption
+  LogsEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Effect: Allow
+            Principal:
+              Service: !Sub 'logs.${AWS::Region}.amazonaws.com'
+            Action:
+              - 'kms:Encrypt'
+              - 'kms:Decrypt'
+              - 'kms:ReEncrypt*'
+              - 'kms:GenerateDataKey*'
+              - 'kms:CreateGrant'
+              - 'kms:DescribeKey'
+            Resource: '*'
+            Condition:
+              ArnLike:
+                'kms:EncryptionContext:aws:logs:arn': !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:*'
+      KeySpec: SYMMETRIC_DEFAULT
+      KeyUsage: ENCRYPT_DECRYPT
+    DeletionPolicy: Delete
+
+  ApiLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/apigateway/${AWS::StackName}'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt LogsEncryptionKey.Arn
+    DeletionPolicy: Delete
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-banking-api'
+      RetentionInDays: 7
+      KmsKeyId: !GetAtt LogsEncryptionKey.Arn
+    DeletionPolicy: Delete
+
+  # ============================================================================
+  # IAM ROLES
+  # ============================================================================
+
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+    DeletionPolicy: Delete
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  # Lambda Execution Role - CRITICAL: Must include dynamodb:Query permission
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub '${LambdaLogGroup.Arn}:*'
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource:
+                  - !GetAtt TransactionsTable.Arn
+                  - !Sub '${TransactionsTable.Arn}/index/*'
+                  - !GetAtt DisputesTable.Arn
+                  - !Sub '${DisputesTable.Arn}/index/*'
+                  - !GetAtt AccountTable.Arn
+                  - !Sub '${AccountTable.Arn}/index/*'
+        - PolicyName: XRayAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - xray:PutTraceSegments
+                  - xray:PutTelemetryRecords
+                Resource: !Sub 'arn:aws:xray:${AWS::Region}:${AWS::AccountId}:*'
+        - PolicyName: SQSDLQAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt GetTxnFnDLQ.Arn
+                  - !GetAtt GetAcctFnDLQ.Arn
+                  - !GetAtt VerifyPINFnDLQ.Arn
+                  - !GetAtt PutBCardFnDLQ.Arn
+                  - !GetAtt DisputeFnDLQ.Arn
+        - PolicyName: KMSDecryptAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                  - 'kms:DescribeKey'
+                Resource:
+                  - !GetAtt DynamoDBEncryptionKey.Arn
+    DeletionPolicy: Delete
+
+  # API Key Retrieval Role
+  ApiKeyRetrievalRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ApiGatewayAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - apigateway:GET
+                Resource: !Sub 'arn:aws:apigateway:${AWS::Region}::/apikeys/*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt ApiKeyFnDLQ.Arn
+    DeletionPolicy: Delete
+
+  # Data Seeding Role
+  DataSeedingRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBSeedingAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:BatchWriteItem
+                Resource:
+                  - !GetAtt TransactionsTable.Arn
+                  - !GetAtt DisputesTable.Arn
+                  - !GetAtt AccountTable.Arn
+        - PolicyName: S3ReadAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: 'arn:aws:s3:::*/*'
+        - PolicyName: SQSDLQAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt SeedDataFnDLQ.Arn
+        - PolicyName: KMSDecryptAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'kms:Decrypt'
+                  - 'kms:GenerateDataKey'
+                  - 'kms:DescribeKey'
+                Resource:
+                  - !GetAtt DynamoDBEncryptionKey.Arn
+    DeletionPolicy: Delete
+
+  # S3 Upload Role
+  S3UploadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:GetObject
+                Resource:
+                  - !Sub '${OpenApiBucket.Arn}'
+                  - !Sub '${OpenApiBucket.Arn}/*'
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: 'arn:aws:s3:::*/*'
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource:
+                  - !GetAtt S3UploadFnDLQ.Arn
+    DeletionPolicy: Delete
+
+  # ============================================================================
+  # KMS KEY FOR LAMBDA ENVIRONMENT VARIABLE ENCRYPTION
+  # ============================================================================
+
+  LambdaEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for Lambda environment variable encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow Lambda service to use the key
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:DescribeKey'
+            Resource: '*'
+    DeletionPolicy: Delete
+
+  LambdaEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-lambda-env'
+      TargetKeyId: !Ref LambdaEncryptionKey
+
+  # ============================================================================
+  # KMS KEY FOR DYNAMODB ENCRYPTION
+  # ============================================================================
+
+  DynamoDBEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: 'KMS key for DynamoDB table encryption'
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: Allow DynamoDB to use the key
+            Effect: Allow
+            Principal:
+              Service: dynamodb.amazonaws.com
+            Action:
+              - 'kms:Decrypt'
+              - 'kms:GenerateDataKey'
+              - 'kms:DescribeKey'
+            Resource: '*'
+    DeletionPolicy: Delete
+
+  DynamoDBEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub 'alias/${AWS::StackName}-dynamodb'
+      TargetKeyId: !Ref DynamoDBEncryptionKey
+
+  # ============================================================================
+  # DYNAMODB TABLES
+  # ============================================================================
+
+  TransactionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: transactionId
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: transactionId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerIdIndex
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !GetAtt DynamoDBEncryptionKey.Arn
+    DeletionPolicy: Delete
+  AccountTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: customerId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: customerId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !GetAtt DynamoDBEncryptionKey.Arn
+    DeletionPolicy: Delete
+  DisputesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: disputeId
+          AttributeType: S
+        - AttributeName: customerId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: disputeId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: CustomerIdIndex
+          KeySchema:
+            - AttributeName: customerId
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !GetAtt DynamoDBEncryptionKey.Arn
+    DeletionPolicy: Delete
+
+  # ============================================================================
+  # S3 BUCKET FOR OPENAPI SPEC
+  # ============================================================================
+
+  # checkov:skip=CKV_AWS_18:This is a logging bucket that receives access logs from other buckets
+  # cfn-lint:disable=W35:This is a logging bucket that receives access logs from other buckets
+  OpenApiBucketLoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    DeletionPolicy: Retain
+
+  # S3 Bucket Policy for Logging Bucket to allow S3 logging service
+  OpenApiBucketLoggingBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OpenApiBucketLoggingBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowS3LoggingService
+            Effect: Allow
+            Principal:
+              Service: logging.s3.amazonaws.com
+            Action:
+              - s3:PutObject
+            Resource: !Sub '${OpenApiBucketLoggingBucket.Arn}/*'
+
+  OpenApiBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      VersioningConfiguration:
+        Status: Enabled
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LoggingConfiguration:
+        DestinationBucketName: !Ref OpenApiBucketLoggingBucket
+        LogFilePrefix: 'openapi-access-logs/'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+    DeletionPolicy: Retain
+
+  # S3 Bucket Policy for OpenAPI Bucket
+  OpenApiBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref OpenApiBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowApiGatewayAccess
+            Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action:
+              - s3:GetObject
+            Resource: !Sub '${OpenApiBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                'aws:SourceAccount': !Ref 'AWS::AccountId'
+
+  # ============================================================================
+  # SQS DEAD LETTER QUEUES FOR LAMBDA FUNCTIONS
+  # ============================================================================
+
+  SeedDataFnDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-SeedDataFn-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    DeletionPolicy: Delete
+
+  ApiKeyFnDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-ApiKeyFn-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    DeletionPolicy: Delete
+
+  S3UploadFnDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-S3UploadFn-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    DeletionPolicy: Delete
+
+  GetTxnFnDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-GetTxnFn-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    DeletionPolicy: Delete
+
+  GetAcctFnDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-GetAcctFn-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    DeletionPolicy: Delete
+
+  VerifyPINFnDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-VerifyPINFn-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    DeletionPolicy: Delete
+
+  PutBCardFnDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-PutBCardFn-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    DeletionPolicy: Delete
+
+  DisputeFnDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${AWS::StackName}-DisputeFn-DLQ'
+      MessageRetentionPeriod: 1209600  # 14 days
+      KmsMasterKeyId: alias/aws/sqs
+    DeletionPolicy: Delete
+
+  # ============================================================================
+  # CUSTOM RESOURCE: DATA SEEDING
+  # ============================================================================
+
+  # checkov:skip=CKV_AWS_117:Lambda functions call public APIs in demo environment
+  # cfn-lint:disable=W89:Lambda functions in demo environment call public APIs and don't require VPC
+  SeedDataFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: nodejs22.x
+      Handler: index.handler
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt DataSeedingRole.Arn
+      Timeout: 300
+      MemorySize: 256
+      DeadLetterConfig:
+        TargetArn: !GetAtt SeedDataFnDLQ.Arn
+      Code:
+        ZipFile: |
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, BatchWriteCommand } = require('@aws-sdk/lib-dynamodb');
+          const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
+          const https = require('https');
+          const http = require('http');
+
+          const client = new DynamoDBClient({});
+          const docClient = DynamoDBDocumentClient.from(client);
+          const s3Client = new S3Client({});
+
+          // Fetch data from S3 URI (s3://bucket/key) or HTTPS URL
+          async function fetchData(url, profileId) {
+            // Handle S3 URI format: s3://bucket-name/path/to/file.json
+            if (url.startsWith('s3://')) {
+              const parts = url.slice(5).split('/');
+              const bucket = parts[0];
+              const key = parts.slice(1).join('/');
+              console.log(`Fetching from S3: bucket=${bucket}, key=${key}`);
+
+              const response = await s3Client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+              var body = await response.Body.transformToString();
+              body = body.replaceAll('<profile-id>', profileId);
+              return JSON.parse(body);
+            }
+
+            // Handle HTTPS/HTTP URLs (for public URLs)
+            return new Promise((resolve, reject) => {
+              const protocol = url.startsWith('https:') ? https : http;
+              protocol.get(url, (res) => {
+                let data = '';
+                res.on('data', chunk => data += chunk);
+                res.on('end', () => {
+                  try { resolve(JSON.parse(data)); }
+                  catch (e) { reject(new Error('Failed to parse JSON: ' + e.message)); }
+                });
+              }).on('error', reject);
+            });
+          }
+
+          async function batchWrite(tableName, items) {
+            for (let i = 0; i < items.length; i += 25) {
+              const batch = items.slice(i, i + 25);
+              await docClient.send(new BatchWriteCommand({
+                RequestItems: { [tableName]: batch.map(item => ({ PutRequest: { Item: item } })) }
+              }));
+              console.log(`Wrote batch to ${tableName}`);
+            }
+          }
+
+          async function sendResponse(event, context, status, data = {}) {
+            const body = JSON.stringify({
+              Status: status,
+              Reason: data.Reason || 'See CloudWatch Log Stream: ' + context.logStreamName,
+              PhysicalResourceId: context.logStreamName,
+              StackId: event.StackId,
+              RequestId: event.RequestId,
+              LogicalResourceId: event.LogicalResourceId,
+              Data: data
+            });
+
+            const url = new URL(event.ResponseURL);
+            return new Promise((resolve, reject) => {
+              const req = https.request({
+                hostname: url.hostname,
+                port: 443,
+                path: url.pathname + url.search,
+                method: 'PUT',
+                headers: { 'Content-Type': '', 'Content-Length': body.length }
+              }, res => { console.log('Response sent:', res.statusCode); resolve(); });
+              req.on('error', reject);
+              req.write(body);
+              req.end();
+            });
+          }
+
+          // Default seed data if no URL provided - ALIGNED WITH DEMO SCRIPT
+          function getDefaultData() {
+            return {
+              transactions: [
+                { transactionId: 'TXN-2024-001234', customerId: 'CUST-12345', amount: 149.99, currency: 'USD', transactionDate: '2024-01-15T10:30:00Z', status: 'Completed', type: 'Charge', description: 'Monthly subscription - Premium Plan', vendorName: 'AnyCompany Services', paymentMethodType: 'CreditCard', paymentMethodLast4: '4242' },
+                { transactionId: 'TXN-2024-001235', customerId: 'CUST-12345', amount: 149.99, currency: 'USD', transactionDate: '2024-01-15T10:31:00Z', status: 'Completed', type: 'Charge', description: 'Monthly subscription - Premium Plan', vendorName: 'AnyCompany Services', paymentMethodType: 'CreditCard', paymentMethodLast4: '4242', notes: 'DUPLICATE CHARGE - Same service charged twice within 1 minute' },
+                { transactionId: 'TXN-2024-001236', customerId: 'CUST-12345', amount: 49.99, currency: 'USD', transactionDate: '2024-01-20T14:15:00Z', status: 'Completed', type: 'Charge', description: 'Additional user license', vendorName: 'AnyCompany Services', paymentMethodType: 'CreditCard', paymentMethodLast4: '4242' },
+                { transactionId: 'TXN-2024-001237', customerId: 'CUST-67890', amount: 199.99, currency: 'USD', transactionDate: '2024-01-10T09:00:00Z', status: 'Completed', type: 'Charge', description: 'Annual subscription - Business Plan', vendorName: 'CloudTech Solutions', paymentMethodType: 'CreditCard', paymentMethodLast4: '5555' },
+                { transactionId: 'TXN-2024-001238', customerId: 'CUST-67890', amount: 299.99, currency: 'USD', transactionDate: '2024-01-12T11:30:00Z', status: 'Completed', type: 'Charge', description: 'Professional services - Consulting', vendorName: 'Expert Consultants Inc', paymentMethodType: 'CreditCard', paymentMethodLast4: '5555', notes: 'VENDOR ERROR - Customer was charged for 3 hours instead of 2 hours at $99.99/hour' }
+              ],
+              disputes: [
+                { disputeId: 'DISP-2024-001', customerId: 'CUST-67890', transactionId: 'TXN-2024-001238', amount: 99.99, currency: 'USD', reason: 'Overcharged for consulting services - billed for 3 hours instead of 2', status: 'UnderReview', createdAt: '2024-01-18T09:15:00Z', updatedAt: '2024-01-19T14:20:00Z' }
+              ],
+              accounts: [
+                { customerId: 'CUST-12345', savings: '3000', current: '5000', investments: '8000' }
+              ]
+            };
+          }
+
+          exports.handler = async (event, context) => {
+            console.log('Event:', JSON.stringify(event, null, 2));
+
+            try {
+              if (event.RequestType === 'Delete') {
+                await sendResponse(event, context, 'SUCCESS');
+                return;
+              }
+
+              const props = event.ResourceProperties;
+              let data = props.SeedDataUrl ? await fetchData(props.SeedDataUrl,props.ProfileId) : getDefaultData();
+
+              if (data.transactions?.length) await batchWrite(props.TransactionsTableName, data.transactions);
+              if (data.disputes?.length) await batchWrite(props.DisputesTableName, data.disputes);
+              if (data.accounts?.length) await batchWrite(props.AccountTableName, data.accounts);
+
+              await sendResponse(event, context, 'SUCCESS', {
+                TransactionCount: data.transactions?.length || 0
+              });
+            } catch (error) {
+              console.error('Error:', error);
+              await sendResponse(event, context, 'FAILED', { Reason: error.message });
+            }
+          };
+    DeletionPolicy: Delete
+
+  BankingDataSeeding:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt SeedDataFn.Arn
+      TransactionsTableName: !Ref TransactionsTable
+      DisputesTableName: !Ref DisputesTable
+      AccountTableName: !Ref AccountTable
+      SeedDataUrl: !Ref SeedDataUrl
+      ProfileId: !Ref ProfileId
+    DependsOn:
+      - TransactionsTable
+      - DisputesTable
+      - AccountTable
+
+  # ============================================================================
+  # CUSTOM RESOURCE: API KEY VALUE RETRIEVAL
+  # ============================================================================
+
+  # checkov:skip=CKV_AWS_117:Lambda functions call public APIs in demo environment
+  # cfn-lint:disable=W89:Lambda functions in demo environment call public APIs and don't require VPC
+  ApiKeyFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt ApiKeyRetrievalRole.Arn
+      Timeout: 30
+      DeadLetterConfig:
+        TargetArn: !GetAtt ApiKeyFnDLQ.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  print(f"Event: {json.dumps(event)}")
+
+                  if event['RequestType'] == 'Delete':
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  api_key_id = event['ResourceProperties']['ApiKeyId']
+                  client = boto3.client('apigateway')
+                  response = client.get_api_key(apiKey=api_key_id, includeValue=True)
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'ApiKeyValue': response['value']
+                  })
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+    DeletionPolicy: Delete
+
+  # Custom Resource to Get API Key Value (only when creating own key)
+  ApiKeyValueRetrieval:
+    Type: AWS::CloudFormation::CustomResource
+    Condition: CreateOwnApiKey
+    Properties:
+      ServiceToken: !GetAtt ApiKeyFn.Arn
+      ApiKeyId: !Ref BankingApiKey
+    DependsOn: BankingApiKey
+
+  # ============================================================================
+  # CUSTOM RESOURCE: OPENAPI SPEC UPLOAD TO S3
+  # ============================================================================
+
+  # checkov:skip=CKV_AWS_117:Lambda functions call public APIs in demo environment
+  # cfn-lint:disable=W89:Lambda functions in demo environment call public APIs and don't require VPC
+  S3UploadFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.handler
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt S3UploadRole.Arn
+      Timeout: 60
+      DeadLetterConfig:
+        TargetArn: !GetAtt S3UploadFnDLQ.Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  print(f"Event: {json.dumps(event)}")
+
+                  bucket = event['ResourceProperties']['BucketName']
+                  s3 = boto3.client('s3')
+
+                  if event['RequestType'] == 'Delete':
+                      try:
+                          s3.delete_object(Bucket=bucket, Key='openapi.yaml')
+                      except:
+                          pass
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+
+                  url = event['ResourceProperties'].get('OpenApiSpecUrl', '')
+                  api_url = event['ResourceProperties']['ApiGatewayUrl']
+
+                  if url:
+                      # Handle S3 URLs (s3://bucket/key)
+                      if url.startswith('s3://'):
+                          parts = url[5:].split('/', 1)
+                          source_bucket = parts[0]
+                          source_key = parts[1] if len(parts) > 1 else ''
+                          response = s3.get_object(Bucket=source_bucket, Key=source_key)
+                          content = response['Body'].read().decode('utf-8')
+                      else:
+                          # Handle HTTP/HTTPS URLs
+                          import urllib.request
+                          with urllib.request.urlopen(url) as response:
+                              content = response.read().decode('utf-8')
+                  else:
+                      # Default minimal OpenAPI spec
+                      content = '''openapi: 3.0.1
+          info:
+            title: Banking System API
+            version: 1.0.0
+          servers:
+            - url: ${API_GATEWAY_URL}
+          paths: {}
+          components:
+            securitySchemes:
+              ApiKeyAuth:
+                type: apiKey
+                in: header
+                name: X-API-Key
+          security:
+            - ApiKeyAuth: []
+          '''
+
+                  content = content.replace('${API_GATEWAY_URL}', api_url)
+
+                  s3.put_object(
+                      Bucket=bucket,
+                      Key='openapi.yaml',
+                      Body=content,
+                      ContentType='application/x-yaml'
+                  )
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'S3Location': f's3://{bucket}/openapi.yaml',
+                      'BucketName': bucket,
+                      'ObjectKey': 'openapi.yaml'
+                  })
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+    DeletionPolicy: Delete
+
+  OpenApiUpload:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt S3UploadFn.Arn
+      BucketName: !Ref OpenApiBucket
+      OpenApiSpecUrl: !Ref OpenApiSpecUrl
+      ApiGatewayUrl: !Sub 'https://${BankingApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+    DependsOn: OpenApiBucket
+
+  # ============================================================================
+  # LAMBDA FUNCTIONS - ACTUAL IMPLEMENTATION (NOT PLACEHOLDERS!)
+  # ============================================================================
+
+  # checkov:skip=CKV_AWS_117:Lambda functions call public APIs in demo environment
+  # cfn-lint:disable=W89:Lambda functions in demo environment call public APIs and don't require VPC
+  GetTxnFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      KmsKeyArn: !GetAtt LambdaEncryptionKey.Arn
+      Environment:
+        Variables:
+          TRANSACTIONS_TABLE: !Ref TransactionsTable
+          CUSTOMER_ID_INDEX: CustomerIdIndex
+      DeadLetterConfig:
+        TargetArn: !GetAtt GetTxnFnDLQ.Arn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['TRANSACTIONS_TABLE'])
+          INDEX_NAME = os.environ['CUSTOMER_ID_INDEX']
+
+          def lambda_handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+
+              try:
+                  params = event.get('queryStringParameters') or {}
+                  customer_id = params.get('customerId')
+
+                  if not customer_id:
+                      return response(400, {'error': 'Missing required parameter', 'code': 'MISSING_CUSTOMER_ID', 'details': 'customerId is required'})
+
+                  result = table.query(
+                      IndexName=INDEX_NAME,
+                      KeyConditionExpression=Key('customerId').eq(customer_id)
+                  )
+
+                  transactions = result.get('Items', [])
+
+                  # Apply optional filters
+                  start_date = params.get('startDate')
+                  end_date = params.get('endDate')
+                  txn_type = params.get('type')
+
+                  if start_date:
+                      transactions = [t for t in transactions if t.get('transactionDate', '') >= start_date]
+                  if end_date:
+                      transactions = [t for t in transactions if t.get('transactionDate', '') <= end_date + 'T23:59:59Z']
+                  if txn_type:
+                      transactions = [t for t in transactions if t.get('type') == txn_type]
+
+                  return response(200, {
+                      'transactions': transactions,
+                      'count': len(transactions),
+                      'customerId': customer_id
+                  })
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return response(500, {'error': 'Internal server error', 'details': str(e)})
+
+          def response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+    DeletionPolicy: Delete
+
+  # checkov:skip=CKV_AWS_117:Lambda functions call public APIs in demo environment
+  # cfn-lint:disable=W89:Lambda functions in demo environment call public APIs and don't require VPC
+  GetAcctFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      KmsKeyArn: !GetAtt LambdaEncryptionKey.Arn
+      Environment:
+        Variables:
+          ACCOUNT_TABLE: !Ref AccountTable
+      DeadLetterConfig:
+        TargetArn: !GetAtt GetAcctFnDLQ.Arn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['ACCOUNT_TABLE'])
+
+          def lambda_handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+
+              try:
+                  params = event.get('queryStringParameters') or {}
+                  customer_id = params.get('customerId')
+
+                  if not customer_id:
+                      return response(400, {'error': 'Missing required parameter', 'code': 'MISSING_CUSTOMER_ID', 'details': 'customerId is required'})
+
+                  result = table.query(
+                      KeyConditionExpression=Key('customerId').eq(customer_id)
+                  )
+
+                  accounts = result.get('Items', [])
+                  if len(accounts) > 0 :
+                    accounts[0]['PIN'] = '******'
+                  # Parse lineItems JSON string back to array
+                  for acct in accounts:
+                      if isinstance(acct.get('lineItems'), str):
+                          try:
+                              acct['lineItems'] = json.loads(acct['lineItems'])
+                          except:
+                              acct['lineItems'] = []
+
+                  return response(200, {
+                      'accounts': accounts,
+                      'count': len(accounts),
+                      'customerId': customer_id
+                  })
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return response(500, {'error': 'Internal server error', 'details': str(e)})
+
+          def response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+    DeletionPolicy: Delete
+
+  # checkov:skip=CKV_AWS_117:Lambda functions call public APIs in demo environment
+  # cfn-lint:disable=W89:Lambda functions in demo environment call public APIs and don't require VPC
+  verifyPINFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      KmsKeyArn: !GetAtt LambdaEncryptionKey.Arn
+      Environment:
+        Variables:
+          ACCOUNT_TABLE: !Ref AccountTable
+      DeadLetterConfig:
+        TargetArn: !GetAtt VerifyPINFnDLQ.Arn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['ACCOUNT_TABLE'])
+
+          def lambda_handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+
+              try:
+                  params = event.get('queryStringParameters') or {}
+                  customer_id = params.get('customerId')
+                  cpin = params.get('PIN')
+
+                  if not customer_id:
+                      return response(400, {'error': 'Missing required parameter', 'code': 'MISSING_CUSTOMER_ID', 'details': 'customerId is required'})
+
+                  result = table.query(
+                      KeyConditionExpression=Key('customerId').eq(customer_id)
+                  )
+
+                  accounts = result.get('Items', [])
+                  if accounts and accounts[0].get('PIN') == cpin:
+                      return response(200, {'customerId': customer_id, 'status': 'VALID_PIN', 'details': 'The provided PIN is correct'})
+                  else:
+                      return response(401, {'customerId': customer_id, 'status': 'INVALID_PIN', 'details': 'The provided PIN is incorrect'})
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return response(500, {'error': 'Internal server error', 'details': str(e)})
+
+          def response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+    DeletionPolicy: Delete
+  # checkov:skip=CKV_AWS_117:Lambda functions call public APIs in demo environment
+  # cfn-lint:disable=W89:Lambda functions in demo environment call public APIs and don't require VPC
+  PutBCardFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      DeadLetterConfig:
+        TargetArn: !GetAtt PutBCardFnDLQ.Arn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          def lambda_handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+
+              try:
+
+                  return response(200, {
+                      'status': 200,
+                      'StatusMessage': 'Card blocked successfully',
+                  })
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return response(500, {'error': 'Internal server error', 'details': str(e)})
+
+          def response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+    DeletionPolicy: Delete
+
+  # checkov:skip=CKV_AWS_117:Lambda functions call public APIs in demo environment
+  # cfn-lint:disable=W89:Lambda functions in demo environment call public APIs and don't require VPC
+  DisputeFn:
+    Type: AWS::Lambda::Function
+    Properties:
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      TracingConfig:
+        Mode: Active
+      LoggingConfig:
+        LogGroup: !Ref LambdaLogGroup
+      KmsKeyArn: !GetAtt LambdaEncryptionKey.Arn
+      Environment:
+        Variables:
+          DISPUTES_TABLE: !Ref DisputesTable
+          CUSTOMER_ID_INDEX: CustomerIdIndex
+      DeadLetterConfig:
+        TargetArn: !GetAtt DisputeFnDLQ.Arn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from boto3.dynamodb.conditions import Key
+
+          dynamodb = boto3.resource('dynamodb')
+          table = dynamodb.Table(os.environ['DISPUTES_TABLE'])
+          INDEX_NAME = os.environ['CUSTOMER_ID_INDEX']
+
+          def lambda_handler(event, context):
+              print(f"Event: {json.dumps(event)}")
+
+              try:
+                  params = event.get('queryStringParameters') or {}
+                  customer_id = params.get('customerId')
+                  transaction_id = params.get('transactionId')
+
+                  if not customer_id:
+                      return response(400, {'error': 'Missing required parameter', 'code': 'MISSING_CUSTOMER_ID', 'details': 'customerId is required'})
+
+                  result = table.query(
+                      IndexName=INDEX_NAME,
+                      KeyConditionExpression=Key('customerId').eq(customer_id)
+                  )
+
+                  disputes = result.get('Items', [])
+
+                  # Filter by transaction ID if provided
+                  if transaction_id:
+                      disputes = [d for d in disputes if d.get('transactionId') == transaction_id]
+
+                  return response(200, {
+                      'disputes': disputes,
+                      'count': len(disputes),
+                      'customerId': customer_id
+                  })
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return response(500, {'error': 'Internal server error', 'details': str(e)})
+
+          def response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps(body, default=str)
+              }
+    DeletionPolicy: Delete
+
+  # ============================================================================
+  # LAMBDA PERMISSIONS FOR API GATEWAY
+  # ============================================================================
+
+  GetTransactionsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetTxnFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BankingApi}/*'
+  GetAccountsPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GetAcctFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BankingApi}/*'
+  PutBlockCardPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PutBCardFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BankingApi}/*'
+  verifyPINPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref verifyPINFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BankingApi}/*'
+  GetDisputesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DisputeFn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BankingApi}/*'
+
+  # ============================================================================
+  # API GATEWAY REST API
+  # ============================================================================
+
+  BankingApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${AWS::StackName}-BankingAPI'
+      Description: 'Banking System API v2 for dispute resolution'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+    DeletionPolicy: Delete
+
+  # ============================================================================
+  # API RESOURCES
+  # ============================================================================
+
+  TransactionsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref BankingApi
+      ParentId: !GetAtt BankingApi.RootResourceId
+      PathPart: transactions
+
+  AccountsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref BankingApi
+      ParentId: !GetAtt BankingApi.RootResourceId
+      PathPart: accounts
+
+  verifyPINResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref BankingApi
+      ParentId: !GetAtt BankingApi.RootResourceId
+      PathPart: verifyPIN
+
+  PutBlockCardResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref BankingApi
+      ParentId: !GetAtt BankingApi.RootResourceId
+      PathPart: blockCard
+
+  DisputesResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref BankingApi
+      ParentId: !GetAtt BankingApi.RootResourceId
+      PathPart: disputes
+
+  # ============================================================================
+  # API METHODS - GET /transactions
+  # ============================================================================
+
+  # cfn-lint:disable=W59:Using API Key authentication instead of IAM
+  TransactionsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BankingApi
+      ResourceId: !Ref TransactionsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.querystring.customerId: true
+        method.request.querystring.startDate: false
+        method.request.querystring.endDate: false
+        method.request.querystring.type: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetTxnFn.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+  TransactionsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BankingApi
+      ResourceId: !Ref TransactionsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+  # ============================================================================
+  # API METHODS - Put /blockCard
+  # cfn-lint:disable=W59:Using API Key authentication instead of IAM
+  PutBlockCardMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BankingApi
+      ResourceId: !Ref PutBlockCardResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.querystring.customerId: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${PutBCardFn.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+  PutBlockCardOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BankingApi
+      ResourceId: !Ref PutBlockCardResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'PUT,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+  # ============================================================================
+  # API METHODS - GET /accounts
+  # ============================================================================
+  # cfn-lint:disable=W59:Using API Key authentication instead of IAM
+  AccountsGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BankingApi
+      ResourceId: !Ref AccountsResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.querystring.customerId: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetAcctFn.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  AccountsOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BankingApi
+      ResourceId: !Ref AccountsResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+  # ============================================================================
+  # API METHODS - GET /accounts
+  # ============================================================================
+  # cfn-lint:disable=W59:Using API Key authentication instead of IAM
+  verifyPINMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BankingApi
+      ResourceId: !Ref verifyPINResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.querystring.customerId: true
+        method.request.querystring.PIN: true
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${verifyPINFn.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  verifyPINOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BankingApi
+      ResourceId: !Ref verifyPINResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ============================================================================
+  # API METHODS - GET /disputes
+  # ============================================================================
+  # cfn-lint:disable=W59:Using API Key authentication instead of IAM
+  DisputesGetMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BankingApi
+      ResourceId: !Ref DisputesResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      ApiKeyRequired: true
+      RequestParameters:
+        method.request.querystring.customerId: true
+        method.request.querystring.transactionId: false
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${DisputeFn.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+
+  DisputesOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref BankingApi
+      ResourceId: !Ref DisputesResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+
+  # ============================================================================
+  # API GATEWAY DEPLOYMENT AND STAGE
+  # ============================================================================
+
+  # cfn-lint:disable=W68:Deployment is associated with UsagePlan through ApiStages property
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment  # cfn-lint:disable=W68
+    DependsOn:
+      - TransactionsGetMethod
+      - TransactionsOptionsMethod
+      - DisputesGetMethod
+      - DisputesOptionsMethod
+      - AccountsGetMethod
+      - AccountsOptionsMethod
+      - PutBlockCardMethod
+      - PutBlockCardOptionsMethod
+    Properties:
+      RestApiId: !Ref BankingApi
+
+  # cfn-lint:disable=W64:Stage is associated with UsagePlan through ApiStages property
+  ApiStage:
+    Type: AWS::ApiGateway::Stage  # cfn-lint:disable=W64
+    Properties:
+      RestApiId: !Ref BankingApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+      TracingEnabled: true
+      CacheClusterEnabled: true
+      CacheClusterSize: '0.5'
+      MethodSettings:
+        - ResourcePath: '/*'
+          HttpMethod: '*'
+          LoggingLevel: INFO
+          DataTraceEnabled: true
+          MetricsEnabled: true
+          CachingEnabled: true
+          CacheTtlInSeconds: 300
+      AccessLogSetting:
+        DestinationArn: !GetAtt ApiLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength","integrationError":"$context.integrationErrorMessage"}'
+
+  # ============================================================================
+  # API KEY AND USAGE PLAN
+  # ============================================================================
+
+  # API Key (only created when not using shared key)
+  BankingApiKey:
+    Type: AWS::ApiGateway::ApiKey
+    Condition: CreateOwnApiKey
+    DependsOn: ApiStage
+    Properties:
+      Description: 'API Key for Banking System API v2'
+      Enabled: true
+      GenerateDistinctId: true
+
+  BankingUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiStage
+    Properties:
+      UsagePlanName: !Sub '${AWS::StackName}-usage-plan'
+      Description: 'Usage plan for Banking System API v2'
+      ApiStages:
+        - ApiId: !Ref BankingApi
+          Stage: prod
+      Throttle:
+        BurstLimit: 100
+        RateLimit: 50
+
+  # Usage Plan Key - associates the effective API key with the usage plan
+  BankingUsagePlanKey:
+    Type: AWS::ApiGateway::UsagePlanKey
+    Properties:
+      KeyId: !If [UseSharedApiKey, !Ref SharedApiKeyId, !Ref BankingApiKey]
+      KeyType: API_KEY
+      UsagePlanId: !Ref BankingUsagePlan
+
+# =============================================================================
+# OUTPUTS - Consistent interface matching hotel-api.yaml pattern
+# Required outputs: ApiUrl, ApiKey, OpenApiSpecS3Location
+# =============================================================================
+
+Outputs:
+  # Required output: API endpoint URL
+  ApiUrl:
+    Description: 'URL of the Banking API'
+    Value: !Sub 'https://${BankingApi}.execute-api.${AWS::Region}.amazonaws.com/prod'
+
+  # Required output: API key value for authentication (own key when not using shared)
+  ApiKey:
+    Condition: CreateOwnApiKey
+    Description: 'Value of the API Key for authentication'
+    Value: !GetAtt ApiKeyValueRetrieval.ApiKeyValue
+
+  # Required output: S3 location of OpenAPI spec
+  OpenApiSpecS3Location:
+    Description: 'S3 location of the uploaded OpenAPI specification'
+    Value: !GetAtt OpenApiUpload.S3Location
+
+  # Additional outputs for reference
+  ApiKeyId:
+    Description: 'ID of the effective API key (shared or own)'
+    Value: !If [UseSharedApiKey, !Ref SharedApiKeyId, !Ref BankingApiKey]
+
+  OpenApiBucketName:
+    Description: 'S3 bucket containing OpenAPI specification'
+    Value: !Ref OpenApiBucket
+
+  TransactionsTableName:
+    Description: 'DynamoDB Transactions table name'
+    Value: !Ref TransactionsTable
+
+  DisputesTableName:
+    Description: 'DynamoDB Disputes table name'
+    Value: !Ref DisputesTable

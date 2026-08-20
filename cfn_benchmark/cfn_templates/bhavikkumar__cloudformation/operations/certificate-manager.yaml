@@ -1,0 +1,590 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Lets Encrypt certificate manager, which runs automatically to generate and renew certificates.'
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+    - Label:
+        default: 'Parent Stacks'
+      Parameters:
+      - ParentVPCStack
+      - ParentPublicZoneStack
+      - ParentAlertStack
+      - LogAggregatorDNS
+    - Label:
+        default: 'Cert Bot Settings'
+      Parameters:
+      - BucketName
+      - LEEnvironment
+      - EmailAddress
+
+Parameters:
+  ParentVPCStack:
+    Description: 'Stack name of parent VPC stack based on vpc/vpc-*azs.yaml template.'
+    Type: String
+  ParentPublicZoneStack:
+    Description: 'Stack name of parent Hosted Zone stack based on dns/*-hosted-zone.yaml template.'
+    Type: String
+  ParentAlertStack:
+    Description: 'Optional but recommended stack name of parent alert stack based on operations/alert.yaml template.'
+    Type: String
+  LogAggregatorDNS:
+    Description: 'The log aggregator dns address as we deploy operations/fluentd-aggregator.yaml template afterwards'
+    Type: String
+  BucketName:
+    Description: 'Optional name of the bucket.'
+    Type: String
+    Default: ''
+  LEEnvironment:
+    Description: The lets encrypt environment which we will be running against
+    Type: String
+    Default: staging
+    AllowedValues:
+    - staging
+    - production
+  EmailAddress:
+    Description: The email address which lets encrypt will email when certificates are about to expire
+    Type: String
+
+Conditions:
+  CreateProdCertificates: !Equals [!Ref LEEnvironment, 'production']
+  HasBucketName: !Not [!Equals [!Ref BucketName, '']]
+
+Resources:
+  CertificateManagerAsgNotification:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: 'Certificate Manager ASG Notifications'
+      TopicName: 'CertificateManagerNotifications'
+
+  CertificateManagerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        -
+          Effect: "Allow"
+          Principal:
+            Service:
+            - "ec2.amazonaws.com"
+          Action:
+          - "sts:AssumeRole"
+      Path: /
+
+  CertificateBotPolicy:
+    DependsOn:
+    - CertificateManagerRole
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: "certbot-route53-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        -
+          Effect: "Allow"
+          Action:
+          - "route53:ListHostedZones"
+          - "route53:GetChange"
+          Resource: "*"
+        -
+          Effect: "Allow"
+          Action:
+          - "route53:ChangeResourceRecordSets"
+          Resource: !Join ['', ['arn:aws:route53:::hostedzone/', 'Fn::ImportValue': !Sub '${ParentPublicZoneStack}-HostedZoneId']]
+      Roles:
+      - !Ref CertificateManagerRole
+
+  CertificateBucketPolicy:
+    DependsOn:
+    - CertificateManagerRole
+    - CertificateBucket
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: "certificate-bucket-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        -
+          Effect: "Allow"
+          Action:
+          - "s3:ListBucket"
+          Resource:
+          - !Join ["", ["arn:aws:s3:::", !Ref CertificateBucket]]
+        -
+          Effect: "Allow"
+          Action:
+          - s3:ListObjects
+          - s3:ListBucket
+          - s3:GetObject
+          - s3:PutObject
+          Resource:
+          - !Join ["", ["arn:aws:s3:::", !Ref CertificateBucket, "/*"]]
+      Roles:
+      - !Ref CertificateManagerRole
+
+  CertificateManagerInstanceProfile:
+    DependsOn:
+    - CertificateBucketPolicy
+    - CertificateBotPolicy
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+      - !Ref CertificateManagerRole
+
+  CertificateBucket:
+    Type: "AWS::S3::Bucket"
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !If [HasBucketName, !Ref BucketName, !Ref 'AWS::NoValue']
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+        - ServerSideEncryptionByDefault:
+            SSEAlgorithm: AES256
+
+  ACMCertificate:
+    Type: "AWS::CertificateManager::Certificate"
+    Properties:
+      DomainName:
+        'Fn::ImportValue': !Sub '${ParentPublicZoneStack}-DomainName'
+      SubjectAlternativeNames:
+      - !Join ['.', ['*', 'Fn::ImportValue': !Sub '${ParentPublicZoneStack}-DomainName']]
+
+  CertBotLaunchConfiguration:
+    Metadata:
+      Comment: Update, Install Docker and create/renew a wildcard certificate
+      AWS::CloudFormation::Init:
+        configSets:
+          full_install:
+          - install_cfn
+          - install_docker
+          - setup_logging
+          - create_renew_certificates
+          update_install:
+          - install_cfn
+          - create_renew_certificates
+        install_cfn:
+          files:
+            /etc/cfn/cfn-hup.conf:
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+              mode: '000400'
+              owner: root
+              group: root
+            /etc/cfn/hooks.d/cfn-auto-reloader.conf:
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.CertBotLaunchConfiguration.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource CertBotLaunchConfiguration -c update_install --region ${AWS::Region}
+                runas=root
+          services:
+            sysvinit:
+              cfn-hup:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files: [/etc/cfn/cfn-hup.conf, /etc/cfn/hooks.d/cfn-auto-reloader.conf]
+        install_docker:
+          packages:
+            yum:
+              docker: []
+          services:
+            sysvinit:
+              docker:
+                enabled: 'true'
+                ensureRunning: 'true'
+        setup_logging:
+          services:
+            sysvinit:
+              rsyslog:
+                enabled: 'true'
+                ensureRunning: 'true'
+                files:
+                - "/etc/rsyslog.d/10-ship-syslog.conf"
+          files:
+            /etc/rsyslog.d/10-ship-syslog.conf:
+              content: |
+                # ### begin forwarding rule ###
+                # The statement between the begin ... end define a SINGLE forwarding
+                # rule. They belong together, do NOT split them. If you create multiple
+                # forwarding rules, duplicate the whole block!
+                # Remote Logging (we use TCP for reliable delivery)
+                #
+                # An on-disk queue is created for this action. If the remote host is
+                # down, messages are spooled to disk and sent when it is up again.
+                $WorkDirectory /var/lib/rsyslog # where to place spool files
+                $ActionQueueFileName fluentdq # unique name prefix for spool files
+                $ActionQueueMaxDiskSpace 1g   # 1gb space limit (use as much as possible)
+                $ActionQueueSaveOnShutdown on # save messages to disk on shutdown
+                $ActionQueueType LinkedList   # run asynchronously
+                $ActionResumeRetryCount -1    # infinite retries if host is down
+                # remote host is: name/ip:port, e.g. 192.168.0.1:514, port optional
+                *.* @@localhost:5140
+                # ### end of the forwarding rule ###
+            /etc/fluentd.conf:
+              content: !Sub |
+                <system>
+                  log_level warn
+                </system>
+                <source>
+                  @type  forward
+                  @id    local_general_input
+                  port  24224
+                </source>
+                <source>
+                  @type syslog
+                  @id local_syslog_input
+                  port 5140
+                  protocol_type tcp
+                  tag rsyslog
+                  <parse>
+                    message_format auto
+                  </parse>
+                </source>
+                <filter **>
+                  @type record_transformer
+                  <record>
+                    host "#{Socket.gethostname}"
+                  </record>
+                </filter>
+                <match **>
+                  @type forward
+                  # Ths is required as the certificate manager is deployed first
+                  ignore_network_errors_at_startup true
+                  transport tls
+                  send_timeout 60s
+                  recover_wait 10s
+                  hard_timeout 60s
+                  <server>
+                    host ${LogAggregatorDNS}
+                    port 24224
+                  </server>
+                  <buffer>
+                    @type file
+                    path /fluentd/log/forward.buffer
+                    flush_interval 10s
+                    retry_wait 20s
+                  </buffer>
+                </match>
+          commands:
+            run_fluentd:
+              command: "docker run -d -h `hostname` -p 24224:24224 -p 5140:5140 --restart=always -e FLUENTD_CONF=fluentd.conf -v /data:/fluentd/log -v /etc/fluentd.conf:/fluentd/etc/fluentd.conf bhavikk/fluentd-sumologic:latest"
+              cwd: "~"
+        create_renew_certificates:
+          commands:
+            run_certbot:
+              command: "sudo docker run --log-driver=fluentd --name certbot -v /etc/letsencrypt:/etc/letsencrypt certbot/dns-route53 certonly $LE_ENV --keep-until-expiring -n --agree-tos --rsa-key-size 4096 --email $EMAIL_ADDRESS --dns-route53 -d $CERT_DOMAIN -d *.$CERT_DOMAIN"
+              env:
+                LE_ENV: {"Fn::If": ["CreateProdCertificates", "--server https://acme-v02.api.letsencrypt.org/directory", "--test-cert"]}
+                CERT_DOMAIN: {"Fn::ImportValue": {"Fn::Sub": "${ParentPublicZoneStack}-DomainName"}}
+                EMAIL_ADDRESS: {"Ref": "EmailAddress"}
+              cwd: "~"
+    DependsOn:
+    - CertificateManagerInstanceProfile
+    - CertificateBucket
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      AssociatePublicIpAddress: true
+      BlockDeviceMappings:
+      - DeviceName: "/dev/xvda"
+        Ebs:
+          VolumeSize: "8"
+          VolumeType: "gp2"
+      ImageId: !FindInMap [AWSRegionArch2AMI, !Ref 'AWS::Region', !FindInMap [AWSInstanceType2Arch, 't2.nano', Arch]]
+      InstanceType: "t2.nano"
+      IamInstanceProfile: !Ref CertificateManagerInstanceProfile
+      UserData:
+        Fn::Base64:
+          !Sub
+          - |
+            #!/bin/bash -xe
+            yum update -y
+            # Check if the lets encrypt tarball exists, then we download and extract it.
+            mkdir -p /etc/letsencrypt
+            EXISTS=$(aws s3 ls s3://${CertificateBucket}/letsencrypt.tar.gz) || true
+            if [ ! -z "$EXISTS" ]; then
+              aws s3 cp s3://${CertificateBucket}/letsencrypt.tar.gz /tmp/letsencrypt.tar.gz
+              tar -zxf /tmp/letsencrypt.tar.gz -C /etc/letsencrypt/
+            fi
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource CertBotLaunchConfiguration --configsets full_install --region ${AWS::Region}
+            # If the files were updated then we push the new certificates to the S3 bucket.
+            MODIFY_COUNT=$(find /etc/letsencrypt/ -type f -mmin -15 | wc -l)
+            if [ $MODIFY_COUNT -gt "0" ]; then
+              bash -c 'cat /etc/letsencrypt/live/${DOMAIN}/fullchain.pem /etc/letsencrypt/live/${DOMAIN}/privkey.pem > /etc/letsencrypt/live/${DOMAIN}/haproxy.pem'
+              tar -zcf /tmp/letsencrypt.tar.gz -C /etc/letsencrypt .
+              aws s3 cp /tmp/letsencrypt.tar.gz s3://${CertificateBucket}/ --sse
+            fi
+            /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource CertBotAutoScaleGroup --region ${AWS::Region}
+          - DOMAIN:
+              'Fn::ImportValue': !Sub '${ParentPublicZoneStack}-DomainName'
+
+  CertBotAutoScaleGroup:
+    DependsOn:
+    - CertBotLaunchConfiguration
+    Type: AWS::AutoScaling::AutoScalingGroup
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT5M
+        Count: 1
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: 1
+        MinInstancesInService: 1
+        PauseTime: PT5M
+        WaitOnResourceSignals: true
+    Properties:
+      MinSize: 0
+      MaxSize: 1
+      DesiredCapacity: 1
+      HealthCheckType: EC2
+      HealthCheckGracePeriod: 300
+      LaunchConfigurationName: !Ref CertBotLaunchConfiguration
+      MetricsCollection:
+      - Granularity: 1Minute
+      VPCZoneIdentifier:
+      - !Select [0, !Split [",", "Fn::ImportValue": !Sub "${ParentVPCStack}-SubnetsPublic"]]
+      - !Select [1, !Split [",", "Fn::ImportValue": !Sub "${ParentVPCStack}-SubnetsPublic"]]
+      - !Select [2, !Split [",", "Fn::ImportValue": !Sub "${ParentVPCStack}-SubnetsPublic"]]
+      NotificationConfigurations:
+      - TopicARN:
+          !Ref CertificateManagerAsgNotification
+        NotificationTypes:
+        - autoscaling:EC2_INSTANCE_LAUNCH
+        - autoscaling:EC2_INSTANCE_LAUNCH_ERROR
+        - autoscaling:EC2_INSTANCE_TERMINATE
+        - autoscaling:EC2_INSTANCE_TERMINATE_ERROR
+      Tags:
+      -
+        Key: node-type
+        PropagateAtLaunch: true
+        Value: certificate-manager
+
+  CertBotDailyRunSchedule:
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName:
+        Ref: CertBotAutoScaleGroup
+      DesiredCapacity: 1
+      Recurrence: "30 5 * * *"
+
+  CertBotDailyStopSchedule:
+    Type: AWS::AutoScaling::ScheduledAction
+    Properties:
+      AutoScalingGroupName:
+        Ref: CertBotAutoScaleGroup
+      DesiredCapacity: 0
+      Recurrence: "45 5 * * *"
+
+Outputs:
+  CertificateBucket:
+    Description: The bucket which contains the certificates
+    Value: !Ref CertificateBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-CertificateBucket'
+  CertificateBucketArn:
+    Description: The bucket arn which contains the certificates
+    Value: !GetAtt CertificateBucket.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-CertificateBucketArn'
+  ACMCertificate:
+    Description: The ARN of the certificate created in ACM.
+    Value: !Ref ACMCertificate
+    Export:
+      Name: !Sub '${AWS::StackName}-CertificateArn'
+  CertificateManagerAsgNotificationTopic:
+    Description: The ASG notification topic of managers being started or terminated.
+    Value: !Ref CertificateManagerAsgNotification
+  NotificationEmailAddress:
+    Description: The email address where lets encrypt will send notifications
+    Value: !Ref EmailAddress
+
+Mappings:
+  # This list comes from https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/instance-types.html#AvailableInstanceTypes
+  AWSInstanceType2Arch:
+    t2.nano:
+      Arch: HVM64
+    t2.micro:
+      Arch: HVM64
+    t2.small:
+      Arch: HVM64
+    t2.medium:
+      Arch: HVM64
+    t2.large:
+      Arch: HVM64
+    t2.xlarge:
+      Arch: HVM64
+    t2.2xlarge:
+      Arch: HVM64
+    m4.large:
+      Arch: HVM64
+    m4.xlarge:
+      Arch: HVM64
+    m4.2xlarge:
+      Arch: HVM64
+    m4.4xlarge:
+      Arch: HVM64
+    m4.10xlarge:
+      Arch: HVM64
+    m5.large:
+      Arch: HVM64
+    m5.xlarge:
+      Arch: HVM64
+    m5.2xlarge:
+      Arch: HVM64
+    m5.4xlarge:
+      Arch: HVM64
+    m5.12xlarge:
+      Arch: HVM64
+    m5.24xlarge:
+      Arch: HVM64
+    c4.large:
+      Arch: HVM64
+    c4.xlarge:
+      Arch: HVM64
+    c4.2xlarge:
+      Arch: HVM64
+    c4.4xlarge:
+      Arch: HVM64
+    c4.8xlarge:
+      Arch: HVM64
+    c5.large:
+      Arch: HVM64
+    c5.xlarge:
+      Arch: HVM64
+    c5.2xlarge:
+      Arch: HVM64
+    c5.4xlarge:
+      Arch: HVM64
+    c5.9xlarge:
+      Arch: HVM64
+    c5.18xlarge:
+      Arch: HVM64
+    r4.large:
+      Arch: HVM64
+    r4.xlarge:
+      Arch: HVM64
+    r4.2xlarge:
+      Arch: HVM64
+    r4.4xlarge:
+      Arch: HVM64
+    r4.8xlarge:
+      Arch: HVM64
+    r4.16xlarge:
+      Arch: HVM64
+    x1.16xlarge:
+      Arch: HVM64
+    x1.32xlarge:
+      Arch: HVM64
+    x1e.xlarge:
+      Arch: HVM64
+    x1e.2xlarge:
+      Arch: HVM64
+    x1e.4xlarge:
+      Arch: HVM64
+    x1e.8xlarge:
+      Arch: HVM64
+    x1e.16xlarge:
+      Arch: HVM64
+    x1e.32xlarge:
+      Arch: HVM64
+    d2.xlarge:
+      Arch: HVM64
+    d2.2xlarge:
+      Arch: HVM64
+    d2.4xlarge:
+      Arch: HVM64
+    d2.8xlarge:
+      Arch: HVM64
+    h1.2xlarge:
+      Arch: HVM64
+    h1.4xlarge:
+      Arch: HVM64
+    h1.8xlarge:
+      Arch: HVM64
+    h1.16xlarge:
+      Arch: HVM64
+    i3.large:
+      Arch: HVM64
+    i3.xlarge:
+      Arch: HVM64
+    i3.2xlarge:
+      Arch: HVM64
+    i3.4xlarge:
+      Arch: HVM64
+    i3.8xlarge:
+      Arch: HVM64
+    i3.16xlarge:
+      Arch: HVM64
+    f1.2xlarge:
+      Arch: HVM64
+    f1.16xlarge:
+      Arch: HVM64
+    g3.4xlarge:
+      Arch: HVM64
+    g3.8xlarge:
+      Arch: HVM64
+    g3.16xlarge:
+      Arch: HVM64
+    p2.xlarge:
+      Arch: HVM64
+    p2.8xlarge:
+      Arch: HVM64
+    p2.16xlarge:
+      Arch: HVM64
+    p3.2xlarge:
+      Arch: HVM64
+    p3.8xlarge:
+      Arch: HVM64
+    p3.16xlarge:
+      Arch: HVM64
+  # This list comes from https://aws.amazon.com/amazon-linux-ami/
+  AWSRegionArch2AMI:
+    us-east-1:
+      HVM64: ami-97785bed
+      HVMG2: ami-0a6e3770
+    us-east-2:
+      HVM64: ami-f63b1193
+      HVMG2: NOT_SUPPORTED
+    us-west-2:
+      HVM64: ami-f2d3638a
+      HVMG2: ami-ee15a196
+    us-west-1:
+      HVM64: ami-824c4ee2
+      HVMG2: ami-0da4a46d
+    ca-central-1:
+      HVM64: ami-a954d1cd
+      HVMG2: NOT_SUPPORTED
+    eu-west-1:
+      HVM64: ami-d834aba1
+      HVMG2: ami-af8013d6
+    eu-west-2:
+      HVM64: ami-403e2524
+      HVMG2: NOT_SUPPORTED
+    eu-west-3:
+      HVM64: ami-8ee056f3
+      HVMG2: NOT_SUPPORTED
+    eu-central-1:
+      HVM64: ami-5652ce39
+      HVMG2: ami-1d58ca72
+    ap-southeast-1:
+      HVM64: ami-68097514
+      HVMG2: ami-c06013bc
+    ap-northeast-2:
+      HVM64: ami-863090e8
+      HVMG2: NOT_SUPPORTED
+    ap-northeast-1:
+      HVM64: ami-ceafcba8
+      HVMG2: ami-edfd658b
+    ap-southeast-2:
+      HVM64: ami-942dd1f6
+      HVMG2: ami-85ef12e7
+    ap-south-1:
+      HVM64: ami-531a4c3c
+      HVMG2: ami-411e492e
+    sa-east-1:
+      HVM64: ami-84175ae8
+      HVMG2: NOT_SUPPORTED

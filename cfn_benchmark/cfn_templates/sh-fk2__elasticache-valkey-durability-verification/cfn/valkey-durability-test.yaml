@@ -1,0 +1,561 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  ElastiCache for Valkey durability verification environment.
+  VPC + EC2 benchmark client (SSM access) + durable Valkey cluster (CME/TLS)
+  + optional non-durable cluster for comparison + FIS AZ power interruption template.
+  NOTE: Durability can only be enabled at cluster creation. Updating
+  Durability between disabled and sync/async on an existing cluster is
+  rejected by the ElastiCache API (stack update will roll back).
+  Only sync <-> async transitions are valid updates.
+
+# cfn-lint (<= v1.45) does not yet know the June 2026 Durability property /
+# EffectiveDurability attribute on AWS::ElastiCache::ReplicationGroup, so
+# E3002 / E6101 are suppressed. Both are documented in the CFn reference.
+Metadata:
+  cfn-lint:
+    config:
+      ignore_checks:
+        - E3002
+        - E6101
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: valkey-dur-test
+    AllowedPattern: '^[a-z][a-z0-9-]{1,24}$'
+    Description: Prefix for resource names (lowercase, used in ReplicationGroupId).
+
+  CacheNodeType:
+    Type: String
+    Default: cache.r7g.large
+    AllowedValues:
+      - cache.r7g.large
+      - cache.r7g.xlarge
+      - cache.m7g.large
+      - cache.m7g.xlarge
+      - cache.m6g.large
+      - cache.m6g.xlarge
+      - cache.r6g.large
+    Description: >-
+      Node type for both clusters. Durability supports R7g/R6g/M7g/M6g/C7gn
+      families only. Default r7g.large matches the MemoryDB comparison stack
+      (db.r7g.large) so latency numbers are apples-to-apples.
+
+  EngineVersion:
+    Type: String
+    Default: '9.1'
+    Description: >-
+      Valkey engine version. Durability requires 9.0 or later; 9.1 (available
+      since late June 2026) is the latest and default here.
+      default.valkey9.cluster.on parameter group covers the whole 9.x family.
+
+  DurabilityMode:
+    Type: String
+    Default: sync
+    AllowedValues: [sync, async]
+    Description: >-
+      Durability mode for the durable cluster. Can be switched between
+      sync and async via stack update (about 50s, no downtime).
+
+  CreateNonDurableCluster:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Create a second cluster without durability for benchmark comparison.
+      Set to 'false' to halve ElastiCache cost when only testing FIS.
+
+  CreateDurableCluster:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: >-
+      Set both this and CreateNonDurableCluster to 'false' to park the stack
+      between multi-day verification sessions: CloudFormation deletes both
+      ElastiCache clusters (which is ~90% of the hourly cost and cannot be
+      stopped, only deleted) while the VPC, the EC2 client and the FIS template
+      survive. Stop the EC2 instance too and the parked stack costs cents.
+      Flipping both back to 'true' rebuilds the clusters in 15-20 minutes with
+      the scripts already on the instance. Deleting the clusters outside
+      CloudFormation instead would leave the stack drifted and unable to
+      recreate them.
+
+  ClientInstanceType:
+    Type: String
+    Default: m7g.large
+    AllowedValues: [m7g.large, m7g.xlarge, c7g.xlarge, t4g.medium]
+    Description: >-
+      Benchmark client instance type (Graviton). t4g.medium is cheap but
+      too weak to saturate the cluster; use it only for functional tests.
+
+  ClientAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64
+    Description: Amazon Linux 2023 arm64 AMI (resolved via SSM public parameter).
+
+  FisActionDuration:
+    Type: String
+    Default: PT2M
+    AllowedPattern: '^PT[0-9]+M$'
+    Description: Duration (ISO 8601) of the AZ power interruption action.
+
+Conditions:
+  ShouldCreateNonDurable: !Equals [!Ref CreateNonDurableCluster, 'true']
+  ShouldCreateDurable: !Equals [!Ref CreateDurableCluster, 'true']
+
+Resources:
+  # ---------------------------------------------------------------- network
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-vpc'
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-igw'
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  # Benchmark client subnet. Public IP + IMDSv2 + no inbound rules; access
+  # is via SSM Session Manager only (saves a NAT gateway for this test env).
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.0.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-a'
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-a'
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-private-b'
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-public-rt'
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------------------------------------------------------- security group
+  ClientSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Benchmark client. No inbound; SSM Session Manager only.
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: 0.0.0.0/0
+          Description: Outbound for SSM, package install, and cache access
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-client-sg'
+
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ElastiCache Valkey. Inbound 6379 from client SG only.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref ClientSecurityGroup
+          Description: Valkey TLS from benchmark client
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-cache-sg'
+
+  # -------------------------------------------------------------- elasticache
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub '${ProjectName}-subnets'
+      Description: Private subnets across two AZs (durability requires Multi-AZ)
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  # Durable cluster.
+  # - default.valkey9.cluster.on pins Cluster Mode Enabled (durability
+  #   requires CME).
+  # - NodeGroupConfiguration pins the primary to AZ1 so the FIS experiment
+  #   below deterministically hits the primary.
+  # - AtRestEncryptionEnabled is set explicitly because durability
+  #   auto-enables it; omitting it would cause template/stack drift.
+  DurableReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Condition: ShouldCreateDurable
+    Properties:
+      ReplicationGroupId: !Sub '${ProjectName}-durable'
+      ReplicationGroupDescription: Valkey 9.0 with durability (verification target)
+      Engine: valkey
+      EngineVersion: !Ref EngineVersion
+      CacheNodeType: !Ref CacheNodeType
+      CacheParameterGroupName: default.valkey9.cluster.on
+      ClusterMode: enabled
+      NumNodeGroups: 1
+      NodeGroupConfiguration:
+        - NodeGroupId: '0001'
+          ReplicaCount: 1
+          PrimaryAvailabilityZone: !Select [0, !GetAZs '']
+          ReplicaAvailabilityZones:
+            - !Select [1, !GetAZs '']
+      MultiAZEnabled: true
+      AutomaticFailoverEnabled: true
+      TransitEncryptionEnabled: true
+      AtRestEncryptionEnabled: true
+      Durability: !Ref DurabilityMode
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds:
+        - !Ref CacheSecurityGroup
+      SnapshotRetentionLimit: 1
+      # UTC. 18:00-19:00Z = JST 03:00-04:00 (深夜帯). Left unset originally, so
+      # ElastiCache assigned a random window that landed on UTC 13:30-14:30
+      # (JST 22:30-23:30) -- squarely inside this project's evening test hours.
+      # It made the replication group flip to "snapshotting" mid-run, which
+      # rejects test-failover and can make FIS itself fail with
+      # "not in an available state" (hit on 2026-07-27, sync-heavy-3).
+      SnapshotWindow: '18:00-19:00'
+      Tags:
+        # How the FIS experiment template below finds this cluster (tag targeting
+        # is the only option for aws:elasticache:replicationgroup). Must stay
+        # unique to this cluster -- see the comment on the FIS target.
+        - Key: FisAzPowerTarget
+          Value: !Sub '${ProjectName}-durable'
+        - Key: Name
+          Value: !Sub '${ProjectName}-durable'
+
+  # Comparison cluster without durability. Same node type / CME / TLS so the
+  # benchmark isolates the durability variable only.
+  NonDurableReplicationGroup:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Condition: ShouldCreateNonDurable
+    Properties:
+      ReplicationGroupId: !Sub '${ProjectName}-nodur'
+      ReplicationGroupDescription: Valkey 9.0 without durability (benchmark baseline)
+      Engine: valkey
+      EngineVersion: !Ref EngineVersion
+      CacheNodeType: !Ref CacheNodeType
+      CacheParameterGroupName: default.valkey9.cluster.on
+      ClusterMode: enabled
+      NumNodeGroups: 1
+      NodeGroupConfiguration:
+        - NodeGroupId: '0001'
+          ReplicaCount: 1
+          PrimaryAvailabilityZone: !Select [0, !GetAZs '']
+          ReplicaAvailabilityZones:
+            - !Select [1, !GetAZs '']
+      MultiAZEnabled: true
+      AutomaticFailoverEnabled: true
+      TransitEncryptionEnabled: true
+      Durability: disabled
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds:
+        - !Ref CacheSecurityGroup
+      SnapshotRetentionLimit: 0
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-nodur'
+
+  # ------------------------------------------------------------------ client
+  ClientRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-client-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore'
+      Policies:
+        # Deliberately NOT read-only: the client needs to start the FIS
+        # experiment and trigger failovers itself. Splitting "generate load
+        # here, inject the fault from your laptop" across two terminals is how
+        # you end up injecting a fault minutes after the load already finished,
+        # which silently produces a meaningless "zero loss" result. Keeping
+        # every step in one SSM session removes that race.
+        - PolicyName: verification
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: WatchDurabilityMetrics
+                Effect: Allow
+                Action:
+                  - cloudwatch:GetMetricData
+                  - cloudwatch:GetMetricStatistics
+                  - cloudwatch:ListMetrics
+                Resource: '*'
+              - Sid: RunFisExperiment
+                Effect: Allow
+                Action:
+                  - fis:StartExperiment
+                  - fis:GetExperiment
+                  - fis:ListExperiments
+                  - fis:GetExperimentTemplate
+                  - fis:ListExperimentTemplates
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:fis:${AWS::Region}:${AWS::AccountId}:experiment-template/*'
+                  - !Sub 'arn:${AWS::Partition}:fis:${AWS::Region}:${AWS::AccountId}:experiment/*'
+              # StartExperiment is documented as needing only fis:StartExperiment,
+              # but FIS assumes the experiment role at run time. Scoped to that
+              # single role so a PassRole check cannot fail mid-experiment.
+              - Sid: PassFisExperimentRole
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt FisExperimentRole.Arn
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: fis.amazonaws.com
+              # Needed to fail the primary back to AZ-1 between FIS runs: the
+              # experiment template targets a fixed AZ, so a primary left in the
+              # other AZ makes the next injection hit a replica and do nothing.
+              - Sid: FailoverForVerification
+                Effect: Allow
+                Action: elasticache:TestFailover
+                Resource: !Sub 'arn:${AWS::Partition}:elasticache:${AWS::Region}:${AWS::AccountId}:replicationgroup:${ProjectName}-durable'
+              - Sid: DescribeClusters
+                Effect: Allow
+                Action:
+                  - elasticache:DescribeReplicationGroups
+                  - elasticache:DescribeCacheClusters
+                  - elasticache:DescribeEvents
+                Resource: '*'
+              # MemoryDB比較スタック（別スタック、ImportValueで疎通のみ共有）の
+              # フェイルオーバー計測用。FISと同じ理由でEC2上で完結させたい
+              - Sid: MemoryDBFailoverForVerification
+                Effect: Allow
+                Action: memorydb:FailoverShard
+                Resource: !Sub 'arn:${AWS::Partition}:memorydb:${AWS::Region}:${AWS::AccountId}:cluster/${ProjectName}-mdb'
+              - Sid: MemoryDBDescribe
+                Effect: Allow
+                Action:
+                  - memorydb:DescribeClusters
+                  - memorydb:DescribeEvents
+                Resource: '*'
+
+  ClientInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref ClientRole
+
+  ClientInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref ClientAmiId
+      InstanceType: !Ref ClientInstanceType
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref ClientSecurityGroup
+      IamInstanceProfile: !Ref ClientInstanceProfile
+      MetadataOptions:
+        HttpTokens: required
+        HttpEndpoint: enabled
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 16
+            VolumeType: gp3
+            Encrypted: true
+            DeleteOnTermination: true
+      UserData:
+        # No "-e": a memtier build failure must not leave the instance
+        # unprovisioned (SSM access and valkey-py still work without it).
+        # AL2023 ships pcre2; legacy pcre-devel may be absent, hence
+        # --skip-broken with both listed.
+        Fn::Base64: |
+          #!/bin/bash -x
+          dnf install -y --skip-broken git autoconf automake make gcc gcc-c++ \
+            pcre-devel pcre2-devel zlib-devel openssl-devel libevent-devel python3-pip
+          pip3 install valkey boto3
+          git clone https://github.com/RedisLabs/memtier_benchmark.git /opt/memtier_benchmark
+          cd /opt/memtier_benchmark
+          if autoreconf -ivf && ./configure && make -j"$(nproc)" && make install; then
+            echo "memtier build OK: $(memtier_benchmark --version 2>&1 | head -1)" \
+              > /var/log/memtier-install.log
+          else
+            echo "memtier build FAILED - check /var/log/cloud-init-output.log" \
+              > /var/log/memtier-install.log
+          fi
+      Tags:
+        - Key: Name
+          Value: !Sub '${ProjectName}-client'
+
+  # --------------------------------------------------------------------- fis
+  FisExperimentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-fis-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: fis.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: elasticache-az-power
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InterruptTargetCluster
+                Effect: Allow
+                Action:
+                  - elasticache:InterruptClusterAzPower
+                Resource: !Sub 'arn:${AWS::Partition}:elasticache:${AWS::Region}:${AWS::AccountId}:replicationgroup:${ProjectName}-durable'
+              # Matches the permissions the FIS actions reference lists for
+              # this action. tag:GetResources is listed unconditionally there
+              # (no carve-out for ARN-based targeting), so it is included even
+              # though this template targets by ARN.
+              - Sid: DescribeForTargeting
+                Effect: Allow
+                Action:
+                  - elasticache:DescribeReplicationGroups
+                  - tag:GetResources
+                Resource: '*'
+
+  # Interrupts power in AZ1 (= the AZ the primary is pinned to via
+  # NodeGroupConfiguration), forcing a failover to the AZ2 replica.
+  AzPowerInterruptionExperiment:
+    Type: AWS::FIS::ExperimentTemplate
+    Properties:
+      Description: !Sub 'AZ power interruption for ${ProjectName}-durable primary AZ'
+      RoleArn: !GetAtt FisExperimentRole.Arn
+      StopConditions:
+        - Source: none
+      # Two placement rules, both learned the hard way from CreateExperimentTemplate 400s:
+      #
+      # 1. availabilityZoneIdentifier belongs to the TARGET, not the action. For
+      #    aws:elasticache:replicationgroup it is a Required target parameter,
+      #    while the action itself only accepts duration.
+      # 2. This resource type does NOT support ResourceArns -- targeting is
+      #    tag-only ("TargetResourceType aws:elasticache:replicationgroup does
+      #    not support resourceArns"). Hence FisAzPowerTarget below.
+      #
+      # FisAzPowerTarget is carried ONLY by the durable cluster. Tag targeting
+      # selects every match, and the non-durable comparison cluster also pins its
+      # primary to AZ-1, so availabilityZoneIdentifier would NOT exclude it if the
+      # tag ever matched. The only things keeping this scoped are the uniqueness of
+      # this tag key and the ARN scope on InterruptClusterAzPower in the role above.
+      # Do not add this tag to any other cluster.
+      Targets:
+        DurableCluster:
+          ResourceType: aws:elasticache:replicationgroup
+          ResourceTags:
+            FisAzPowerTarget: !Sub '${ProjectName}-durable'
+          SelectionMode: ALL
+          Parameters:
+            availabilityZoneIdentifier: !Select [0, !GetAZs '']
+      Actions:
+        InterruptPrimaryAzPower:
+          ActionId: aws:elasticache:replicationgroup-interrupt-az-power
+          Description: Interrupt power in the primary AZ
+          Parameters:
+            duration: !Ref FisActionDuration
+          Targets:
+            ReplicationGroups: DurableCluster
+      Tags:
+        Name: !Sub '${ProjectName}-az-power'
+
+Outputs:
+  DurableConfigurationEndpoint:
+    Condition: ShouldCreateDurable
+    Description: Configuration endpoint of the durable cluster (TLS required)
+    Value: !GetAtt DurableReplicationGroup.ConfigurationEndPoint.Address
+
+  DurableEffectiveDurability:
+    Condition: ShouldCreateDurable
+    Description: Effective durability mode actually in effect
+    Value: !GetAtt DurableReplicationGroup.EffectiveDurability
+
+  NonDurableConfigurationEndpoint:
+    Condition: ShouldCreateNonDurable
+    Description: Configuration endpoint of the non-durable baseline cluster
+    Value: !GetAtt NonDurableReplicationGroup.ConfigurationEndPoint.Address
+
+  ClientInstanceId:
+    Description: Connect with "aws ssm start-session --target <this id>"
+    Value: !Ref ClientInstance
+
+  FisExperimentTemplateId:
+    Description: Start with "aws fis start-experiment --experiment-template-id <this id>"
+    Value: !Ref AzPowerInterruptionExperiment
+
+  PrimaryAvailabilityZone:
+    Description: AZ the primary is pinned to (= AZ interrupted by FIS)
+    Value: !Select [0, !GetAZs '']
+
+  DurableReplicationGroupArn:
+    Description: Exported for the optional Aurora stack combined FIS template
+    Value: !Sub 'arn:${AWS::Partition}:elasticache:${AWS::Region}:${AWS::AccountId}:replicationgroup:${ProjectName}-durable'
+    Export:
+      Name: !Sub '${AWS::StackName}-DurableRgArn'
+
+  VpcId:
+    Value: !Ref Vpc
+    Export:
+      Name: !Sub '${AWS::StackName}-VpcId'
+
+  PrivateSubnetIds:
+    Value: !Join [',', [!Ref PrivateSubnet1, !Ref PrivateSubnet2]]
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnetIds'
+
+  ClientSecurityGroupId:
+    Value: !Ref ClientSecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-ClientSgId'

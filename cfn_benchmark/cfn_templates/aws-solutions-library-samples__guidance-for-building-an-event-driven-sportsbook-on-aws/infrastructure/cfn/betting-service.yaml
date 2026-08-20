@@ -1,0 +1,375 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+
+Globals:
+
+  Function:
+    Runtime: python3.12
+    Tracing: Active
+    Layers:
+      - !Sub arn:aws:lambda:${AWS::Region}:017000801446:layer:AWSLambdaPowertoolsPythonV3-python312-x86_64:10
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: betting
+
+Parameters:
+
+  AppSyncApiId:
+    Type: String
+
+  AppSyncApiUrl:
+    Type: String
+
+  EventBus:
+    Type: String
+
+  AppSyncLambdaLayer:
+    Type: String
+
+  LambdaEnvKmsKeyArn:
+    Type: String
+    Default: ""
+    Description: ARN of the KMS key for Lambda environment variable encryption
+
+Resources:
+
+  SQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        maxReceiveCount: 2
+        deadLetterTargetArn: !GetAtt DLQ.Arn
+
+  DLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      SqsManagedSseEnabled: true
+
+  EventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "Listener for all system events"
+      EventBusName: !Ref EventBus
+      EventPattern:
+        source:
+          - "com.trading"
+          - "com.betting"
+          - "com.livemarket"
+      Targets:
+        - Arn: !GetAtt SQSQueue.Arn
+          Id: SQSqueue
+
+  EventBridgeToToSqsPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: events.amazonaws.com
+          Action: sqs:SendMessage
+          Resource:  !GetAtt SQSQueue.Arn
+          Condition:
+            StringEqualsIfExists:
+              aws:SourceAccount: !Ref AWS::AccountId
+            Bool:
+              aws:SecureTransport: "true"
+      Queues:
+        - Ref: SQSQueue
+
+  BettingDataStore:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: betId
+          AttributeType: S
+        - AttributeName: eventId
+          AttributeType: S
+        - AttributeName: betStatus
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: betId
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      GlobalSecondaryIndexes:
+        -
+          IndexName: eventId-userId-index
+          KeySchema:
+            - AttributeName: eventId
+              KeyType: HASH
+            - AttributeName: userId
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        -
+          IndexName: eventId-betStatus-index
+          KeySchema:
+            - AttributeName: eventId
+              KeyType: HASH
+            - AttributeName: betStatus
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: ExpirationTime
+        Enabled: true
+
+  BettingBatchFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.lambda_handler
+      CodeUri: ../lambda/betting/receiver/
+      Description: Lambda for receiving events for this service
+      Timeout: 10
+      MemorySize: 256
+      KmsKeyArn: !Ref LambdaEnvKmsKeyArn
+      Layers:
+        - !Ref AppSyncLambdaLayer
+      DeadLetterQueue:
+        Type: SQS  # Can be SQS or SNS
+        TargetArn: !GetAtt DLQ.Arn
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt SQSQueue.Arn
+            BatchSize: 10
+            FunctionResponseTypes:
+              - ReportBatchItemFailures
+      Policies:
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBus
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BettingDataStore
+        - Statement:
+            - Effect: Allow
+              Action:
+                - states:StartExecution
+              Resource:
+                - !GetAtt BettingSettlementStateMachine.Arn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - appsync:GraphQL
+              Resource:
+                - !Sub arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncApiId}/types/Mutation/fields/lockBetsForEvent
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:DescribeKey
+              Resource: !Ref LambdaEnvKmsKeyArn
+      Environment:
+        Variables:
+          DB_TABLE: !Ref BettingDataStore
+          ACCOUNT_ID: !Ref AWS::AccountId
+          APPSYNC_API_ID: !Ref AppSyncApiId
+          APPSYNC_URL: !Ref AppSyncApiUrl
+          REGION: !Ref AWS::Region
+          EVENT_BUS: !Ref EventBus
+          STEP_FUNCTION_ARN: !GetAtt BettingSettlementStateMachine.Arn
+
+  BettingSettlementFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.lambda_handler
+      CodeUri: ../lambda/betting/settlement/stepfunctions/
+      Description: Lambda for Step function for settlement resolvers
+      Timeout: 10
+      MemorySize: 256
+      KmsKeyArn: !Ref LambdaEnvKmsKeyArn
+      Layers:
+        - !Ref AppSyncLambdaLayer
+      DeadLetterQueue:
+        Type: SQS  # Can be SQS or SNS
+        TargetArn: !GetAtt DLQ.Arn
+      Policies:
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBus
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BettingDataStore
+        - Statement:
+            - Effect: Allow
+              Action:
+                - appsync:GraphQL
+              Resource:
+                - !Sub arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncApiId}/types/Query/fields/getEvent
+                - !Sub arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncApiId}/types/Mutation/fields/withdrawFunds
+                - !Sub arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncApiId}/types/Mutation/fields/depositFunds
+                - !Sub arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncApiId}/types/Mutation/fields/deductFunds
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:DescribeKey
+              Resource: !Ref LambdaEnvKmsKeyArn
+      Environment:
+        Variables:
+          DB_TABLE: !Ref BettingDataStore
+          ACCOUNT_ID: !Ref AWS::AccountId
+          APPSYNC_API_ID: !Ref AppSyncApiId
+          APPSYNC_URL: !Ref AppSyncApiUrl
+          REGION: !Ref AWS::Region
+          EVENT_BUS: !Ref EventBus
+
+  StatesExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: !GetAtt BettingSettlementFunction.Arn
+        - PolicyName: XRayTracingPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "xray:PutTraceSegments"
+                  - "xray:PutTelemetryRecords"
+                  - "xray:GetSamplingRules"
+                  - "xray:GetSamplingTargets"
+                Resource: "*"
+
+  BettingSettlementStateMachine:
+    Type: "AWS::StepFunctions::StateMachine"
+    Properties:
+      DefinitionString:
+        !Sub
+          - |-
+            {
+              "Comment": "BetSettlement function with only one step for now",
+              "StartAt": "SettleAndPay",
+              "States": {
+                "SettleAndPay": {
+                  "Type": "Task",
+                  "Resource": "${lambdaArn}",
+                  "End": true
+                }
+              }
+            }
+          - {lambdaArn: !GetAtt [ BettingSettlementFunction, Arn ]}
+      RoleArn: !GetAtt [ StatesExecutionRole, Arn ]
+      TracingConfiguration:
+        Enabled: true
+
+  BettingResolverFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: app.lambda_handler
+      CodeUri: ../lambda/betting/resolvers/
+      Description: Lambda for AppSync resolvers
+      Timeout: 10
+      MemorySize: 256
+      KmsKeyArn: !Ref LambdaEnvKmsKeyArn
+      Layers:
+        - !Ref AppSyncLambdaLayer
+      Policies:
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref EventBus
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BettingDataStore
+        - Statement:
+            - Effect: Allow
+              Action:
+                - appsync:GraphQL
+              Resource:
+                - !Sub arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncApiId}/types/Query/fields/getEvent
+                - !Sub arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncApiId}/types/Mutation/fields/withdrawFunds
+                - !Sub arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncApiId}/types/Mutation/fields/depositFunds
+                - !Sub arn:aws:appsync:${AWS::Region}:${AWS::AccountId}:apis/${AppSyncApiId}/types/Mutation/fields/deductFunds
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:Decrypt
+                - kms:DescribeKey
+              Resource: !Ref LambdaEnvKmsKeyArn
+      Environment:
+        Variables:
+          DB_TABLE: !Ref BettingDataStore
+          ACCOUNT_ID: !Ref AWS::AccountId
+          APPSYNC_API_ID: !Ref AppSyncApiId
+          APPSYNC_URL: !Ref AppSyncApiUrl
+          REGION: !Ref AWS::Region
+          EVENT_BUS: !Ref EventBus
+
+  BettingAppSyncRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - appsync.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Policies:
+        - PolicyName: !Sub ${AWS::StackName}-AppSyncRole
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt BettingResolverFunction.Arn
+
+  BettingLambdaDataSource:
+    Type: AWS::AppSync::DataSource
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      Name: Betting_Lambda_Source
+      Description: Betting Lambda AppSync Data Source
+      Type: AWS_LAMBDA
+      ServiceRoleArn: !GetAtt BettingAppSyncRole.Arn
+      LambdaConfig:
+        LambdaFunctionArn: !GetAtt BettingResolverFunction.Arn
+
+  GetBetsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      TypeName: Query
+      FieldName: getBets
+      DataSourceName: !GetAtt BettingLambdaDataSource.Name
+
+  CreateBetsResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      TypeName: Mutation
+      FieldName: createBets
+      DataSourceName: !GetAtt BettingLambdaDataSource.Name
+
+  LockBetsForEventResolver:
+    Type: AWS::AppSync::Resolver
+    Properties:
+      ApiId: !Ref AppSyncApiId
+      TypeName: Mutation
+      FieldName: lockBetsForEvent
+      DataSourceName: !GetAtt BettingLambdaDataSource.Name

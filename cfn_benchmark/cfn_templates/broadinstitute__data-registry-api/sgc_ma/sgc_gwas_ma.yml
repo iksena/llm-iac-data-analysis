@@ -1,0 +1,122 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Batch job definition for SGC bottom-line meta-analysis (reuses the QC compute env / queue)
+
+# This stack adds only an ECR repo + a Batch job definition + its job role.
+# It deliberately does NOT create a compute environment or queue: MA jobs are
+# submitted onto the existing QC queue (sgc-gwas-qc-plots-queue) by
+# submit_ma_batch.py. The job definition is env-agnostic; the submitter injects
+# DATA_REGISTRY_DB_NAME per job via containerOverrides (QA vs prod).
+
+Resources:
+  MaEcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: sgc-gwas-ma-repo
+
+  MaJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ['ecs-tasks.amazonaws.com']
+            Action: ['sts:AssumeRole']
+      Path: '/'
+      Policies:
+        - PolicyName: 'RegistryS3Access'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['s3:GetObject', 's3:PutObject']
+                Resource:
+                  - 'arn:aws:s3:::dig-data-registry'
+                  - 'arn:aws:s3:::dig-data-registry/*'
+                  - 'arn:aws:s3:::dig-data-registry-qa'
+                  - 'arn:aws:s3:::dig-data-registry-qa/*'
+        # Secrets Manager appends a 6-char random suffix to every secret ARN,
+        # so the trailing wildcard is required to address the named secret.
+        - PolicyName: 'SecretsRead'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ['secretsmanager:GetSecretValue']
+                Resource: !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:data-registry*'
+        - PolicyName: 'ECRAndLogs'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ecr:GetAuthorizationToken'
+                  - 'ecr:BatchCheckLayerAvailability'
+                  - 'ecr:GetDownloadUrlForLayer'
+                  - 'ecr:BatchGetImage'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: '*'
+
+  MaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/batch/sgc-gwas-ma
+      RetentionInDays: 30
+
+  MaJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      Type: 'container'
+      JobDefinitionName: 'sgc-gwas-ma-job'
+      PlatformCapabilities: ['FARGATE']
+      Timeout:
+        AttemptDurationSeconds: 7200
+      # MA jobs run on FARGATE_SPOT (see the QC-plots queue they share), so a
+      # reclaimed job would otherwise land as FAILED with no retry and need
+      # resubmitting by hand. Retry any failure rather than filtering on the Spot
+      # status reason: a pattern that failed to match would silently disable
+      # retries altogether, and re-running a genuinely broken MA costs ~25 min
+      # and a few cents. The worker writes to a deterministic run_id prefix, so
+      # a second attempt overwrites the first attempt's artifacts.
+      RetryStrategy:
+        Attempts: 2
+      ContainerProperties:
+        Image: !Sub '${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/sgc-gwas-ma-repo'
+        # Image ENTRYPOINT is ["python", "-m", "sgc_ma.run_ma"];
+        # the values below are appended as CLI args by the submitter. The MA
+        # worker looks the run up by id and reads phenotype/ancestry/selection/
+        # thresholds off the run row itself, so it needs only run-id + bucket.
+        Command:
+          - '--run-id'
+          - 'Ref::run-id'
+          - '--bucket'
+          - 'Ref::bucket'
+        JobRoleArn: !GetAtt MaJobRole.Arn
+        ExecutionRoleArn: !GetAtt MaJobRole.Arn
+        ResourceRequirements:
+          - Type: 'VCPU'
+            Value: '2'
+          - Type: 'MEMORY'
+            Value: '16384'
+        # The worker disk-sorts ~80M rows: the 8 per-cohort sorted files
+        # (~5-8 GB total) plus GNU sort's own temp coexist in TMPDIR, so the
+        # 20 GiB Fargate default is too tight. Verified peak RSS ~2.2 GB.
+        EphemeralStorage:
+          SizeInGiB: 50
+        NetworkConfiguration:
+          AssignPublicIp: 'ENABLED'
+        FargatePlatformConfiguration:
+          PlatformVersion: 'LATEST'
+        LogConfiguration:
+          LogDriver: awslogs
+          Options:
+            awslogs-group: /aws/batch/sgc-gwas-ma
+            awslogs-region: !Ref AWS::Region
+            awslogs-stream-prefix: ma
+        Environment:
+          - Name: AWS_DEFAULT_REGION
+            Value: us-east-1
+          # DATA_REGISTRY_DB_NAME is injected per-job by submit_ma_batch.py
+          # via containerOverrides.environment (QA vs prod).

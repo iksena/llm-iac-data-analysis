@@ -1,0 +1,789 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  NordicCart free-tier reference architecture. Provisions VPC, ALB, ASG, DynamoDB,
+  Lambda, API Gateway, S3, CloudFront, Bedrock IAM, and cost governance.
+
+  This stack does NOT enable Bedrock model access; that must be done manually
+  in the Bedrock console before the Lambda will work. See docs/DESIGN-DECISIONS.md.
+
+# ============================================================================
+# Parameters
+# ============================================================================
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: NordicCart
+    Description: Project tag value applied to all resources.
+
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment tag value.
+
+  Owner:
+    Type: String
+    Default: Cosmos
+    Description: Owner tag value.
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Existing EC2 key pair for the ASG instances.
+
+  AlertEmail:
+    Type: String
+    Description: Email address for cost alerts (must be confirmed via SNS after deploy).
+    AllowedPattern: ^[^\s@]+@[^\s@]+\.[^\s@]+$
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI (resolved from SSM).
+
+  BedrockModelId:
+    Type: String
+    Default: anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: Bedrock model ID for the assistant.
+
+  BedrockInferenceProfileId:
+    Type: String
+    Default: eu.anthropic.claude-haiku-4-5-20251001-v1:0
+    Description: EU cross-region inference profile ID for the model.
+
+  BudgetLimit:
+    Type: Number
+    Default: 5
+    Description: Monthly budget limit in USD.
+
+# ============================================================================
+# Metadata (helps the console render parameter groups nicely)
+# ============================================================================
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Project identity
+        Parameters:
+          - ProjectName
+          - Environment
+          - Owner
+      - Label:
+          default: Access and alerting
+        Parameters:
+          - KeyPairName
+          - AlertEmail
+      - Label:
+          default: Infrastructure
+        Parameters:
+          - LatestAmiId
+          - BedrockModelId
+          - BedrockInferenceProfileId
+          - BudgetLimit
+
+# ============================================================================
+# Resources
+# ============================================================================
+
+Resources:
+
+  # ---------- Networking (Day 1) ----------
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - {Key: Name, Value: nordiccart-dev-vpc}
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: networking}
+        - {Key: Owner, Value: !Ref Owner}
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - {Key: Name, Value: nordiccart-dev-igw}
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: networking}
+        - {Key: Owner, Value: !Ref Owner}
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: nordiccart-dev-public-a}
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: networking}
+        - {Key: Owner, Value: !Ref Owner}
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - {Key: Name, Value: nordiccart-dev-public-b}
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: networking}
+        - {Key: Owner, Value: !Ref Owner}
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - {Key: Name, Value: nordiccart-dev-public-rt}
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: networking}
+        - {Key: Owner, Value: !Ref Owner}
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  SubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  DynamoDBEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref VPC
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.dynamodb
+      VpcEndpointType: Gateway
+      RouteTableIds:
+        - !Ref PublicRouteTable
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: nordiccart-dev-alb-sg
+      GroupDescription: ALB inbound from internet
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - {Key: Name, Value: nordiccart-dev-alb-sg}
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: networking}
+        - {Key: Owner, Value: !Ref Owner}
+
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: nordiccart-dev-ec2-sg
+      GroupDescription: EC2 inbound from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      Tags:
+        - {Key: Name, Value: nordiccart-dev-ec2-sg}
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: networking}
+        - {Key: Owner, Value: !Ref Owner}
+
+  # ---------- Data (Days 3 & 4) ----------
+
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: nordiccart-dev-orders
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      Tags:
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: data}
+        - {Key: Owner, Value: !Ref Owner}
+
+  SupportSessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: nordiccart-dev-support-sessions
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      Tags:
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: data}
+        - {Key: Owner, Value: !Ref Owner}
+
+  # ---------- Compute IAM (Day 2) ----------
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: nordiccart-dev-ec2-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ec2.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: nordiccart-dev-ec2-ddb-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:Query
+                Resource: !GetAtt OrdersTable.Arn
+      Tags:
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: compute}
+        - {Key: Owner, Value: !Ref Owner}
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: nordiccart-dev-ec2-profile
+      Roles:
+        - !Ref EC2Role
+
+  # ---------- Compute (Day 2) ----------
+
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: nordiccart-dev-lt
+      LaunchTemplateData:
+        ImageId: !Ref LatestAmiId
+        InstanceType: t3.micro
+        KeyName: !Ref KeyPairName
+        SecurityGroupIds:
+          - !Ref EC2SecurityGroup
+        IamInstanceProfile:
+          Name: !Ref EC2InstanceProfile
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -e
+            dnf update -y
+            dnf install -y python3-pip
+            pip3 install flask boto3
+            mkdir -p /opt/nordiccart
+            cat > /opt/nordiccart/app.py << 'PYEOF'
+            from flask import Flask, jsonify
+            import boto3, socket, urllib.request
+            app = Flask(__name__)
+            dynamodb = boto3.resource('dynamodb', region_name='${AWS::Region}')
+            table = dynamodb.Table('nordiccart-dev-orders')
+            def get_az():
+                try:
+                    token = urllib.request.urlopen(urllib.request.Request(
+                        'http://169.254.169.254/latest/api/token',
+                        method='PUT', headers={'X-aws-ec2-metadata-token-ttl-seconds': '21600'})).read()
+                    req = urllib.request.Request('http://169.254.169.254/latest/meta-data/placement/availability-zone',
+                        headers={'X-aws-ec2-metadata-token': token})
+                    return urllib.request.urlopen(req).read().decode()
+                except Exception:
+                    return 'unknown'
+            @app.route('/health')
+            def health(): return jsonify(status='ok'), 200
+            @app.route('/')
+            def index():
+                return jsonify(message='NordicCart storefront',
+                    served_by=socket.gethostname(), availability_zone=get_az())
+            @app.route('/orders/test')
+            def test_order():
+                table.put_item(Item={'orderId': 'demo-001', 'status': 'created'})
+                item = table.get_item(Key={'orderId': 'demo-001'}).get('Item')
+                return jsonify(order=item)
+            if __name__ == '__main__':
+                app.run(host='0.0.0.0', port=8080)
+            PYEOF
+            cat > /etc/systemd/system/nordiccart.service << 'SVCEOF'
+            [Unit]
+            Description=NordicCart storefront app
+            After=network.target
+            [Service]
+            ExecStart=/usr/bin/python3 /opt/nordiccart/app.py
+            Restart=always
+            User=ec2-user
+            [Install]
+            WantedBy=multi-user.target
+            SVCEOF
+            systemctl daemon-reload
+            systemctl enable nordiccart
+            systemctl start nordiccart
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - {Key: Name, Value: nordiccart-dev-app}
+              - {Key: Project, Value: !Ref ProjectName}
+              - {Key: Environment, Value: !Ref Environment}
+              - {Key: Component, Value: compute}
+              - {Key: Owner, Value: !Ref Owner}
+          - ResourceType: volume
+            Tags:
+              - {Key: Project, Value: !Ref ProjectName}
+              - {Key: Environment, Value: !Ref Environment}
+              - {Key: Component, Value: compute}
+              - {Key: Owner, Value: !Ref Owner}
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - {Key: Project, Value: !Ref ProjectName}
+            - {Key: Environment, Value: !Ref Environment}
+            - {Key: Component, Value: compute}
+            - {Key: Owner, Value: !Ref Owner}
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: nordiccart-dev-tg
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !Ref VPC
+      HealthCheckPath: /health
+      TargetType: instance
+      Tags:
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: compute}
+        - {Key: Owner, Value: !Ref Owner}
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: nordiccart-dev-alb
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref ALBSecurityGroup]
+      Scheme: internet-facing
+      Type: application
+      Tags:
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: compute}
+        - {Key: Owner, Value: !Ref Owner}
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: nordiccart-dev-asg
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 2
+      DesiredCapacity: 1
+      VPCZoneIdentifier: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      TargetGroupARNs: [!Ref TargetGroup]
+      Tags:
+        - {Key: Name, Value: nordiccart-dev-app, PropagateAtLaunch: true}
+        - {Key: Project, Value: !Ref ProjectName, PropagateAtLaunch: true}
+        - {Key: Environment, Value: !Ref Environment, PropagateAtLaunch: true}
+        - {Key: Component, Value: compute, PropagateAtLaunch: true}
+        - {Key: Owner, Value: !Ref Owner, PropagateAtLaunch: true}
+
+  ScalingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60.0
+
+  # ---------- Serverless AI (Day 5) ----------
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: nordiccart-dev-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: {Service: lambda.amazonaws.com}
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: nordiccart-dev-lambda-policy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeBedrockClaudeHaikuViaEUInferenceProfile
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/${BedrockInferenceProfileId}
+                  - !Sub arn:aws:bedrock:eu-central-1::foundation-model/${BedrockModelId}
+                  - !Sub arn:aws:bedrock:eu-west-1::foundation-model/${BedrockModelId}
+                  - !Sub arn:aws:bedrock:eu-west-3::foundation-model/${BedrockModelId}
+                  - !Sub arn:aws:bedrock:eu-north-1::foundation-model/${BedrockModelId}
+                  - !Sub arn:aws:bedrock:eu-south-1::foundation-model/${BedrockModelId}
+                  - !Sub arn:aws:bedrock:eu-south-2::foundation-model/${BedrockModelId}
+              - Sid: ReadWriteSupportSessions
+                Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt SupportSessionsTable.Arn
+              - Sid: WriteFunctionLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/nordiccart-dev-assistant-fn:*
+      Tags:
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: ai}
+        - {Key: Owner, Value: !Ref Owner}
+
+  AssistantFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: nordiccart-dev-assistant-fn
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          MODEL_ID: !Ref BedrockInferenceProfileId
+          TABLE_NAME: !Ref SupportSessionsTable
+          REGION: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          import json, uuid, time, os, boto3
+          REGION = os.environ.get('REGION', 'eu-central-1')
+          TABLE_NAME = os.environ['TABLE_NAME']
+          MODEL_ID = os.environ['MODEL_ID']
+          bedrock = boto3.client('bedrock-runtime', region_name=REGION)
+          dynamodb = boto3.resource('dynamodb', region_name=REGION)
+          table = dynamodb.Table(TABLE_NAME)
+          CORS = {
+              'Content-Type': 'application/json',
+              'Access-Control-Allow-Origin': '*',
+              'Access-Control-Allow-Methods': 'POST, OPTIONS',
+              'Access-Control-Allow-Headers': 'Content-Type'
+          }
+          SYSTEM = ('You are the customer support assistant for NordicCart. '
+                    'Answer questions about order status, shipping, and returns '
+                    'in two or three sentences. If unsure, suggest human support.')
+          def resp(code, payload):
+              return {'statusCode': code, 'headers': CORS, 'body': json.dumps(payload)}
+          def get_history(session_id, limit=4):
+              try:
+                  r = table.get_item(Key={'sessionId': session_id})
+              except Exception:
+                  return []
+              return (r.get('Item') or {}).get('turns', [])[-limit:]
+          def save_turn(session_id, q, a):
+              try:
+                  table.update_item(
+                      Key={'sessionId': session_id},
+                      UpdateExpression='SET turns = list_append(if_not_exists(turns, :e), :n), lastUpdated = :t',
+                      ExpressionAttributeValues={
+                          ':e': [], ':n': [{'question': q, 'answer': a}],
+                          ':t': int(time.time())
+                      })
+              except Exception as e:
+                  print(f'DDB write failed: {e}')
+          def ask_bedrock(question, history):
+              messages = []
+              for turn in history:
+                  messages.append({'role': 'user', 'content': turn['question']})
+                  messages.append({'role': 'assistant', 'content': turn['answer']})
+              messages.append({'role': 'user', 'content': question})
+              body = {'anthropic_version': 'bedrock-2023-05-31', 'max_tokens': 300,
+                      'system': SYSTEM, 'messages': messages}
+              r = bedrock.invoke_model(modelId=MODEL_ID, body=json.dumps(body))
+              return json.loads(r['body'].read())['content'][0]['text']
+          def handler(event, context):
+              if event.get('requestContext', {}).get('http', {}).get('method') == 'OPTIONS':
+                  return {'statusCode': 204, 'headers': CORS, 'body': ''}
+              try:
+                  body = json.loads(event.get('body') or '{}')
+              except json.JSONDecodeError:
+                  return resp(400, {'error': 'Body must be valid JSON'})
+              question = (body.get('question') or '').strip()
+              if not question:
+                  return resp(400, {'error': "Missing 'question'"})
+              session_id = body.get('sessionId') or str(uuid.uuid4())
+              history = get_history(session_id)
+              try:
+                  answer = ask_bedrock(question, history)
+              except Exception as e:
+                  print(f'Bedrock failed: {e}')
+                  return resp(502, {'error': 'Assistant temporarily unavailable'})
+              save_turn(session_id, question, answer)
+              return resp(200, {'sessionId': session_id, 'question': question, 'answer': answer})
+      Tags:
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: ai}
+        - {Key: Owner, Value: !Ref Owner}
+
+  HttpApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: nordiccart-dev-api
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowMethods: [POST, OPTIONS]
+        AllowHeaders: [Content-Type]
+        AllowOrigins: ['*']
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+        Component: ai
+        Owner: !Ref Owner
+
+  HttpApiIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt AssistantFunction.Arn
+      IntegrationMethod: POST
+      PayloadFormatVersion: '2.0'
+
+  HttpApiRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpApi
+      RouteKey: POST /assistant
+      Target: !Sub integrations/${HttpApiIntegration}
+
+  HttpApiStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpApi
+      StageName: $default
+      AutoDeploy: true
+
+  ApiInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AssistantFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpApi}/*/*/assistant
+
+  # ---------- Frontend and CDN (Day 6) ----------
+
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub nordiccart-dev-frontend-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: cdn}
+        - {Key: Owner, Value: !Ref Owner}
+
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: nordiccart-dev-oac
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: NordicCart CDN
+        DefaultRootObject: index.html
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: s3-origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+          - Id: api-origin
+            DomainName: !Sub ${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+            CustomOriginConfig:
+              HTTPSPort: 443
+              OriginProtocolPolicy: https-only
+              OriginSSLProtocols: [TLSv1.2]
+        DefaultCacheBehavior:
+          TargetOriginId: s3-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # Managed-CachingOptimized
+          Compress: true
+        CacheBehaviors:
+          - PathPattern: /assistant*
+            TargetOriginId: api-origin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+            CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # Managed-CachingDisabled
+            OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac  # Managed-AllViewerExceptHostHeader
+            Compress: true
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponsePagePath: /error.html
+            ResponseCode: 404
+            ErrorCachingMinTTL: 10
+      Tags:
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: cdn}
+        - {Key: Owner, Value: !Ref Owner}
+
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${FrontendBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+  # ---------- Cost Governance (Day 7) ----------
+
+  CostAlertsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: nordiccart-dev-cost-alerts
+      DisplayName: NordicCart cost alerts
+      Tags:
+        - {Key: Project, Value: !Ref ProjectName}
+        - {Key: Environment, Value: !Ref Environment}
+        - {Key: Component, Value: cost}
+        - {Key: Owner, Value: !Ref Owner}
+
+  CostAlertsSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref CostAlertsTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  MonthlyBudget:
+    Type: AWS::Budgets::Budget
+    Properties:
+      Budget:
+        BudgetName: nordiccart-dev-budget
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit:
+          Amount: !Ref BudgetLimit
+          Unit: USD
+      NotificationsWithSubscribers:
+        - Notification:
+            NotificationType: ACTUAL
+            ComparisonOperator: GREATER_THAN
+            Threshold: 80
+            ThresholdType: PERCENTAGE
+          Subscribers:
+            - SubscriptionType: SNS
+              Address: !Ref CostAlertsTopic
+
+# ============================================================================
+# Outputs
+# ============================================================================
+
+Outputs:
+  ALBDNSName:
+    Description: Application Load Balancer DNS name (legacy storefront)
+    Value: !GetAtt LoadBalancer.DNSName
+
+  ApiEndpoint:
+    Description: API Gateway endpoint for the assistant
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+
+  CloudFrontDomain:
+    Description: CloudFront distribution domain (customer-facing entry point)
+    Value: !GetAtt CloudFrontDistribution.DomainName
+
+  FrontendBucketName:
+    Description: S3 bucket for frontend assets (upload index.html and error.html here)
+    Value: !Ref FrontendBucket
+
+  BedrockAccessReminder:
+    Description: You must manually enable Bedrock model access before the assistant will work.
+    Value: !Sub Visit https://${AWS::Region}.console.aws.amazon.com/bedrock/home?region=${AWS::Region}#/modelaccess

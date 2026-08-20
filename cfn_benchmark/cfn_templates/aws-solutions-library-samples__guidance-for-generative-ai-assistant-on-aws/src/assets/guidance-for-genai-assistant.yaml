@@ -1,0 +1,639 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy GenAI-Assistant solution on AWS(SO9026).
+
+Parameters:
+  TokenGithubOauth:
+    Type: String
+    NoEcho: true
+    Description: GitHub OAuth token for Amplify to access the repository (Required
+      if HostingOption is Amplify)
+
+  HostingOption:
+    Type: String
+    AllowedValues:
+      - local
+      - Amplify
+    Default: Amplify
+    Description: Choose 'local' for local development or 'Amplify' for Amplify hosting
+
+  RepositoryUrlGithub:
+    Type: String
+    Description: 'GitHub repository URL (Required if HostingOption is Amplify).
+      Format: https://github.com/username/repository-name'
+    Default: https://github.com/username/repository
+
+Conditions:
+  DeployAmplify: !Equals
+    - !Ref HostingOption
+    - Amplify
+
+Resources:
+  # DynamoDB Table
+  GenAITable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub GenAI-Table-${AWS::StackName}
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "GenAI-Lambda-ExecutionRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: !Sub "RestrictedDynamoDBAccess-${AWS::StackName}"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Query
+                  - dynamodb:Scan
+                Resource: !GetAtt GenAITable.Arn
+        - PolicyName: !Sub "BedrockAccess-${AWS::StackName}"
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:InvokeModelWithResponseStream
+                Resource:
+                  - !Sub "arn:aws:bedrock:*::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0"
+                  - !Sub "arn:aws:bedrock:*::foundation-model/amazon.nova-micro-v1:0"
+                  - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/us.anthropic.claude-3-5-sonnet-20241022-v2:0"
+                  - !Sub "arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/us.amazon.nova-micro-v1:0"
+
+  # Lambda Function
+  GenAILambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "GenAI-Assistant-${AWS::StackName}"
+      Runtime: python3.9
+      Handler: index.lambda_handler
+      Timeout: 60
+      Code:
+        ZipFile: |
+            import json
+            import os
+            import boto3
+            from langchain_community.chat_message_histories import DynamoDBChatMessageHistory
+            from langchain_aws import ChatBedrockConverse
+            from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+            from langchain_core.runnables.history import RunnableWithMessageHistory
+            from langchain_core.output_parsers import StrOutputParser
+            import time
+            import requests
+            import re
+            from bs4 import BeautifulSoup
+            from youtube_transcript_api import YouTubeTranscriptApi
+            from urllib.parse import urlparse, parse_qs
+
+            def get_bedrock_model(user_model):
+                # Dictionary mapping user-friendly names to model IDs
+                model_mapping = {
+                    "claude-sonnet-35": "us.anthropic.claude-3-5-sonnet-20241022-v2:0",
+                    "nova-micro": "us.amazon.nova-micro-v1:0"
+                }
+                # Default to Claude if no model specified or invalid model name
+                return model_mapping.get(user_model.lower(), "us.amazon.nova-micro-v1:0")
+
+            def extract_youtube_video_id(url):
+                """
+                Extracts YouTube video ID from various forms of YouTube URLs
+                """
+                parsed_url = urlparse(url)
+
+                # Handle youtube.com URLs
+                if 'youtube.com' in parsed_url.netloc:
+                    if 'watch' in parsed_url.path:
+                        return parse_qs(parsed_url.query).get('v', [None])[0]
+                    elif 'embed' in parsed_url.path:
+                        return parsed_url.path.split('/')[-1]
+                # Handle youtu.be URLs
+                elif 'youtu.be' in parsed_url.netloc:
+                    return parsed_url.path[1:]
+
+                return ''
+
+            def get_youtube_transcript(url):
+                video_id = extract_youtube_video_id(url)
+                if video_id:
+                    transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+                    full_transcript = ""
+                    for entry in transcript_list:
+                        full_transcript += f"{entry['text']} "
+
+                    transcript= full_transcript.strip()
+                    return transcript
+
+            def extract_and_fetch_url_content(user_msg):
+                """
+                Scans message for URLs and returns webpage content if found
+                """
+                # URL pattern matching
+                url_pattern = r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
+                urls = re.findall(url_pattern, user_msg)
+
+                if not urls:
+                    return ''
+
+                # Process the first URL found
+                url = urls[0]
+                try:
+
+                    #if it is a youtube video URL, fetch transcript using youtube APIs
+                    url_domain=urlparse(url).netloc
+                    if url_domain == 'www.youtube.com':
+                        return get_youtube_transcript(url)
+
+                    # Add headers to mimic a browser request
+                    headers = {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                    }
+
+                    response = requests.get(url, headers=headers, timeout=10)
+                    response.raise_for_status()
+
+                    # Parse HTML content
+                    soup = BeautifulSoup(response.text, 'html.parser')
+
+                    # Remove script and style elements
+                    for script in soup(["script", "style"]):
+                        script.decompose()
+
+                    # Extract text content
+                    text = soup.get_text()
+
+                    # Clean up text
+                    lines = (line.strip() for line in text.splitlines())
+                    chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+                    text = ' '.join(chunk for chunk in chunks if chunk)
+
+                    # Truncate if too long
+                    #max_length = 5000
+                    #if len(text) > max_length:
+                    #    text = text[:max_length] + "..."
+
+                    return text
+
+                except Exception as e:
+                    print(f"Error fetching URL content: {str(e)}")
+                    return f"Error fetching content from URL: {str(e)}"
+
+            def lambda_handler(event, context):
+                try:
+                    tablename=os.getenv('table_name')
+                    sessionid=lambda: int(time.time())
+                    print("Received event:", json.dumps(event, indent=2))
+                    if isinstance(event.get('body'), str):
+                        body = json.loads(event['body'])
+                        #print("get_sessions=",body.get('get_sessions'))
+
+                        #Check if request is made for list of user sessions. This piece of code build chat history for user.
+                        if isinstance(body.get('get_sessions'), str) and isinstance(body.get('user_id'), str):
+                            print("inside history")
+                            ddb_client=boto3.client('dynamodb')
+                            response = ddb_client.query(TableName=tablename,KeyConditionExpression='PK= :userid', ExpressionAttributeValues={':userid':{'S':body.get('user_id')}},ProjectionExpression="SK")
+                            user_sessions = [item["SK"]["S"] for item in response.get("Items", [])]
+                            #print(response)
+                            return {
+                            'statusCode': 200,
+                            'headers': {
+                                'Content-Type': 'application/json',
+                                'Access-Control-Allow-Origin': '*'
+                            },
+                            'body': json.dumps({
+                                'response': user_sessions
+                            })
+                        }
+                        else:
+                            #Check if request is made for a session history details. This piece of code is called when user selects a chat and chat history is fetched.
+                            if isinstance(body.get('user_id'), str) and isinstance(body.get('chat_id'), str) and isinstance(body.get('get_session_history'), str) :
+                                print("get_session_history=true")
+                                response = DynamoDBChatMessageHistory(table_name=tablename, session_id=sessionid, key= {"PK": body.get('user_id'),"SK": body.get('chat_id')})
+                                print(response.messages)
+                                #history = [item["SK"]["S"] for item in response.get("Items", [])]
+                                history = [
+                                        {"type": type(msg).__name__, "content": msg.content}
+                                        for msg in response.messages
+                                    ]
+                                return {
+                                'statusCode': 200,
+                                'headers': {
+                                    'Content-Type': 'application/json',
+                                    'Access-Control-Allow-Origin': '*'
+                                },
+                                'body': json.dumps({
+                                    'response': history
+                                })
+                            }
+
+                            #Check if request is made for deleting a specific chat from history table.
+                            if isinstance(body.get('delete_chat'), str) and isinstance(body.get('user_id'), str) and isinstance(body.get('chat_id'), str):
+                                ddb_client=boto3.client('dynamodb')
+                                response = ddb_client.delete_item(TableName=tablename,Key= {"PK":{'S':body.get('user_id')},"SK":{'S':body.get('chat_id')}})
+                                #user_sessions = [item["SK"]["S"] for item in response.get("Items", [])]
+                                print(response)
+                                return {
+                                'statusCode': 200,
+                                'headers': {
+                                    'Content-Type': 'application/json',
+                                    'Access-Control-Allow-Origin': '*'
+                                },
+                                'body': json.dumps({
+                                    'response': response
+                                })
+                            }
+
+                            #Check if request is made for adding new message in the chat. This is typical piece of code which adds each user message in history table.
+
+                            if isinstance(body.get('user_id'), str) and isinstance(body.get('chat_id'), str) and isinstance(body.get('user_msg'), str) :
+                                user_id =body.get('user_id')
+                                chat_id =body.get('chat_id')
+                                user_msg =body.get('user_msg')
+                                user_msg = user_msg + " " + str(extract_and_fetch_url_content(user_msg))
+                                user_model = body.get('user_model', 'claude-sonnet-35')
+                                #print("user_msg=", user_msg)
+                            else:
+                                return("Input message is missing key field(s).")
+                    else:
+                        return("There is No message body in the event.")
+
+                    try:
+                        model_id = get_bedrock_model(user_model)
+                        print("model_id=", model_id);
+                        model = ChatBedrockConverse(
+                        model=model_id,
+                        max_tokens=4096,
+                        temperature=0.0,
+                        top_p=1,
+                        stop_sequences=["\n\nHuman"],
+                        verbose=True
+                        )
+
+                        prompt = ChatPromptTemplate.from_messages(
+                        [
+                            ("system", """You are an intelligent chatbot helping users on their query. You can also parse input
+                            web URL and summarize them. Always format your response using HTML elements without HTML body tags.
+                            when generating comparisions, prepare output in HTML table format.
+                            For any technical guidance, draft your response in sections like Pre-requisites, solution overview, detailed steps, conclusion etc.
+                            Add reference web documents but make sure they are accessible over internet.
+                            When a webpage URL or long text is given by user, summarize that in your response and conclusion or suggested next steps.
+                            """),
+                            MessagesPlaceholder(variable_name="history"),
+                            ("human", "{question}"),
+                        ]
+                        )
+
+                        output_parser = StrOutputParser()
+
+                        chain = prompt | model | output_parser
+                        my_key = {
+                            "PK": user_id,
+                            "SK": chat_id,
+                        }
+
+                        chain_with_history = RunnableWithMessageHistory(
+                        chain,
+                        lambda session_id: DynamoDBChatMessageHistory(
+                            table_name=tablename, session_id=sessionid,key=my_key
+                        ),
+                        input_messages_key="question",
+                        history_messages_key="history",
+                        )
+
+                        config = {"configurable": {"session_id": sessionid}}
+
+                        response_text = chain_with_history.invoke({"question": user_msg}, config=config)
+                        #print(response_text)
+
+                        return {
+                            'statusCode': 200,
+                            'headers': {
+                                'Content-Type': 'application/json',
+                                'Access-Control-Allow-Origin': '*'
+                            },
+                            'body': json.dumps({
+                                'response': response_text
+                            })
+                        }
+                    except Exception as e:
+                        print(f"Unexpected error: {str(e)}")
+                        return {
+                            'statusCode': 500,
+                            'headers': {
+                                'Content-Type': 'application/json',
+                                'Access-Control-Allow-Origin': '*',
+                                'Access-Control-Allow-Methods': 'OPTIONS,POST',
+                                'Access-Control-Allow-Headers': 'Content-Type'
+                            },
+                            'body': json.dumps({
+                                'error': f'Error occur in Lambda function during LLM response generation: {str(e)}'
+                            })
+                        }
+
+                except Exception as e:
+                        print(f"Response parsing error: {str(e)}")
+                        return {
+                            'statusCode': 500,
+                            'headers': {
+                                'Content-Type': 'application/json',
+                                'Access-Control-Allow-Origin': '*',
+                                'Access-Control-Allow-Methods': 'OPTIONS,POST',
+                                'Access-Control-Allow-Headers': 'Content-Type'
+                            },
+                            'body': json.dumps({
+                                'error': 'Error parsing input event json in Lambda function.'
+                            })
+                        }
+
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Architectures:
+        - x86_64
+      Environment:
+        Variables:
+          table_name: !Ref GenAITable
+
+  # API Gateway REST API
+  GenAIApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub GenAI-API-${AWS::StackName}
+
+  # API Gateway Resource
+  GenAIResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt GenAIApi.RootResourceId
+      PathPart: genai
+      RestApiId: !Ref GenAIApi
+
+  # API Gateway OPTIONS Method (CORS)
+  GenAIOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: OPTIONS
+      ResourceId: !Ref GenAIResource
+      RestApiId: !Ref GenAIApi
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: '200'
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: '''*'''
+              method.response.header.Access-Control-Allow-Methods: '''OPTIONS,POST'''
+              method.response.header.Access-Control-Allow-Headers: '''*'''
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{ "statusCode": 200 }'
+      MethodResponses:
+        - StatusCode: '200'
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Origin: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Headers: true
+
+  # API Gateway POST Method
+  GenAIPostMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      AuthorizationType: NONE
+      HttpMethod: POST
+      ResourceId: !Ref GenAIResource
+      RestApiId: !Ref GenAIApi
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GenAILambdaFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: '200'
+  # Add new IAM Role for API Gateway logging
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  # Add API Gateway Account settings to enable CloudWatch logging
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+  # Deploy API Gateway Stage
+  GenAIDeployment:
+    Type: AWS::ApiGateway::Deployment
+    Properties:
+      RestApiId: !Ref GenAIApi
+      StageName: dev
+      StageDescription:
+        AccessLogSetting:
+          DestinationArn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/apigateway/GenAI-API
+          Format: '{ "requestId":"$context.requestId", "ip": "$context.identity.sourceIp", "caller":"$context.identity.caller", "user":"$context.identity.user", "requestTime":"$context.requestTime", "httpMethod":"$context.httpMethod", "resourcePath":"$context.resourcePath", "status":"$context.status", "protocol":"$context.protocol", "responseLength":"$context.responseLength" }'
+    DependsOn:
+      - GenAIPostMethod
+      - GenAIOptionsMethod
+
+  # Add CloudWatch Log Group
+  ApiGatewayLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/GenAI-API-${AWS::StackName}
+      RetentionInDays: 7
+
+  # Lambda Permission for API Gateway
+  LambdaApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GenAILambdaFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${GenAIApi}/*/POST/genai
+
+  # Cognito User Pool
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub GenAIUserPool-${AWS::StackName}
+      AutoVerifiedAttributes:
+        - email
+      AliasAttributes:
+        - email
+      UsernameConfiguration:
+        CaseSensitive: false
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 6
+      VerificationMessageTemplate:
+        DefaultEmailOption: CONFIRM_WITH_CODE
+
+  # Cognito User Pool Client
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: GenAIUserPoolClient
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+
+  AmplifyServiceRole:
+    Type: AWS::IAM::Role
+    Condition: DeployAmplify
+    Properties:
+      RoleName: !Sub "AmplifySSRServiceRole-${AWS::StackName}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - amplify.amazonaws.com
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: !Sub "AmplifySSRPolicy-${AWS::StackName}"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "amplify:GetApp"
+                  - "amplify:GetBranch"
+                  - "amplify:UpdateApp"
+                  - "amplify:UpdateBranch"
+                Resource: !Sub "arn:aws:amplify:${AWS::Region}:${AWS::AccountId}:apps/*"
+              - Effect: Allow
+                Action:
+                  - "s3:PutObject"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                Resource:
+                  - !Sub "arn:aws:s3:::amplify-*-${AWS::Region}-*"
+                  - !Sub "arn:aws:s3:::amplify-*-${AWS::Region}-*/*"
+              - Effect: Allow
+                Action:
+                  - "cloudfront:CreateInvalidation"
+                Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/*"
+              - Effect: Allow
+                Action: "lambda:InvokeFunction"
+                Resource: !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${GenAILambdaFunction}"
+
+  # Amplify App with Service Role
+  AmplifyApp:
+    Type: "AWS::Amplify::App"
+    Condition: DeployAmplify
+    Properties:
+      Name: !Sub GenAI-Assistant-Frontend-${AWS::StackName}
+      Repository: !Ref RepositoryUrlGithub
+      OauthToken: !Ref TokenGithubOauth
+      IAMServiceRole: !GetAtt AmplifyServiceRole.Arn
+      EnableBranchAutoDeletion: true
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - npm ci
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: dist
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - node_modules/**/*
+      EnvironmentVariables:
+        - Name: VITE_API_GATEWAY_ENDPOINT
+          Value: !Sub "https://${GenAIApi}.execute-api.${AWS::Region}.amazonaws.com/dev/genai"
+        - Name: VITE_AWS_REGION
+          Value: !Ref "AWS::Region"
+        - Name: VITE_USER_POOL_CLIENT_ID
+          Value: !Ref CognitoUserPoolClient
+        - Name: VITE_USER_POOL_ID
+          Value: !Ref CognitoUserPool
+      CustomRules:
+        - Source: "</^[^.]+$|\\.(?!(css|gif|ico|jpg|js|png|txt|svg|woff|woff2|ttf|map|json)$)([^.]+$)/>"
+          Target: "/index.html"
+          Status: "200"
+
+  # Amplify Branch with Auto Build
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Condition: DeployAmplify
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: main
+      EnableAutoBuild: true
+
+Outputs:
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+
+  CognitoUserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient
+
+  ApiInvokeURL:
+    Description: Invoke URL for the GenAI API Gateway
+    Value: !Sub https://${GenAIApi}.execute-api.${AWS::Region}.amazonaws.com/dev/genai
+
+  DynamoDBTableName:
+    Description: DynamoDB Table Name
+    Value: !Ref GenAITable
+
+  LambdaFunction:
+    Description: Lambda function name
+    Value: !Ref GenAILambdaFunction
+
+  AmplifyAppURL:
+    Condition: DeployAmplify
+    Description: Amplify App URL
+    Value: !Sub https://${AmplifyBranch.BranchName}.${AmplifyApp.DefaultDomain}
+
+  MainBranchURL:
+    Condition: DeployAmplify
+    Description: Main Branch URL
+    Value: !Sub https://main.${AmplifyApp.DefaultDomain}

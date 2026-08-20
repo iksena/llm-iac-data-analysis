@@ -1,0 +1,520 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Continous Delivery of a Node App to a Serverless Hosting Stack
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Source"
+        Parameters:
+          - GitRepositoryName
+          - GitBranchName
+      - Label:
+          default: "External"
+        Parameters:
+          - HostingStack
+          - APIStack
+    ParameterLabels:
+      GitRepositoryName:
+        default: "CodeCommit Name"
+      GitBranchName:
+        default: "Branch"
+      HostingStack:
+        default: "Deploy to"
+      APIStack:
+        default: "Data Source"
+
+Parameters:
+  Description:
+    Description: Description to be recorded against some resources
+    Type: String
+  GitRepositoryName:
+    Description: The CodeCommit repository name.
+    Type: String
+  GitBranchName:
+    Description: The name of the git branch to use
+    Type: String
+    Default: "master"
+  HostingStack:
+    Description: The hosting stack to deploy the source to
+    Type: String
+  APIStack:
+    Description: The API stack to get data from
+    Type: String
+
+Resources:
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Ref AWS::StackName
+      GenerateSecret: False
+      UserPoolId:
+        Fn::ImportValue:
+          Fn::Sub:
+            - ${APIStack}-UserPoolLogicalID
+            - APIStack: !Ref APIStack
+
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    DependsOn:
+      - UserPoolClient
+    Properties:
+      AllowUnauthenticatedIdentities: False
+      DeveloperProviderName:
+        Fn::ImportValue:
+          Fn::Sub:
+            - ${HostingStack}-FullDomain
+            - HostingStack: !Ref HostingStack
+      CognitoIdentityProviders:
+        - ServerSideTokenCheck: False # TODO: check effect of this option
+          ClientId:
+            !Ref UserPoolClient
+          ProviderName:
+            Fn::ImportValue:
+              Fn::Sub:
+                - ${APIStack}-UserPoolLogicalProviderName
+                - APIStack: !Ref APIStack
+
+  CognitoUnAuthorizedRole:
+    Type: AWS::IAM::Role
+    DependsOn:
+      - IdentityPool
+    Properties:
+      RoleName: !Sub 'Cognito-${AWS::StackName}-noauth'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Federated: cognito-identity.amazonaws.com
+            Action:
+              - sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": unauthenticated
+      Policies:
+        - PolicyName: !Sub 'Cognito-${AWS::StackName}-noauth'
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "mobileanalytics:PutEvents"
+                  - "cognito-sync:*"
+                Resource: "*"
+
+  CognitoAuthorizedRole:
+      Type: AWS::IAM::Role
+      DependsOn:
+        - IdentityPool
+      Properties:
+        RoleName: !Sub 'Cognito-${AWS::StackName}-auth'
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: "Allow"
+              Principal:
+                Federated: "cognito-identity.amazonaws.com"
+              Action:
+                - "sts:AssumeRoleWithWebIdentity"
+              Condition:
+                StringEquals:
+                  "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+                "ForAnyValue:StringLike":
+                  "cognito-identity.amazonaws.com:amr": authenticated
+        Policies:
+          - PolicyName: !Sub 'Cognito-${AWS::StackName}-auth'
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: "Allow"
+                  Action:
+                    - "mobileanalytics:PutEvents"
+                    - "cognito-sync:*"
+                    - "cognito-identity:*"
+                  Resource: "*"
+                - Effect: "Allow"
+                  Action:
+                    - "lambda:InvokeFunction"
+                  Resource: "*" # TODO: restrict significantly
+
+  IdentityPoolRoleMapping:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    DependsOn:
+      - IdentityPool
+      - CognitoAuthorizedRole
+      - CognitoUnAuthorizedRole
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthorizedRole.Arn
+        unauthenticated: !GetAtt CognitoUnAuthorizedRole.Arn
+
+  InvalidateWebsiteCloudFront:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Invalidates a CloudFront distribution
+      Handler: index.handler
+      Role: !GetAtt InvalidateWebsiteCloudFrontExecutionRole.Arn
+      Environment:
+        Variables:
+          DISTRIBUTION_ID:
+            Fn::ImportValue:
+              Fn::Sub:
+                - ${HostingStack}-CloudfrontARN
+                - HostingStack: !Ref HostingStack
+
+      Runtime: nodejs6.10
+      Code:
+        ZipFile: !Sub |
+          var AWS = require('aws-sdk');
+          var cloudfront = new AWS.CloudFront();
+          var ALL_OBJECTS = "/*"
+
+          exports.handler = (event, context) => {
+
+              var jobId = event["CodePipeline.job"].id;
+
+              var codepipeline = new AWS.CodePipeline();
+
+              // Notify AWS CodePipeline of a successful job
+              var invalidateSuccess = function(message) {
+                  var params = {
+                      jobId: jobId
+                  };
+                  codepipeline.putJobSuccessResult(params, function(err, data) {
+                      if(err) {
+                          context.fail(err);
+                      } else {
+                          context.succeed(message);
+                      }
+                  });
+              };
+
+              // Notify AWS CodePipeline of a failed job
+              var invalidateFail = function(message) {
+                  var params = {
+                      jobId: jobId,
+                      failureDetails: {
+                          message: JSON.stringify(message),
+                          type: 'JobFailed',
+                          externalExecutionId: context.invokeid
+                      }
+                  };
+                  codepipeline.putJobFailureResult(params, function(err, data) {
+                      context.fail(message);
+                  });
+              };
+
+              var params = {
+                DistributionId: process.env.DISTRIBUTION_ID,
+                InvalidationBatch: {
+                  CallerReference: jobId,
+                  Paths: {
+                    Quantity: 1,
+                    Items: [
+                      ALL_OBJECTS,
+                    ]
+                  }
+                }
+              };
+
+              cloudfront.createInvalidation(params, function(err, data) {
+                  if(err){
+                      invalidateFail(err)
+                  }else{
+                      invalidateSuccess(data)
+                  }
+              });
+
+          };
+
+  InvalidateWebsiteCloudFrontExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'lambda-${AWS::StackName}-invalidation-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+            - sts:AssumeRole
+      Path: "/"
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AbilityToLog
+                Effect: Allow
+                Action:
+                  - logs:*
+                Resource: arn:aws:logs:*:*:*
+              - Sid: ReturnToCodePipeline
+                Effect: Allow
+                Action:
+                  - codepipeline:PutJobSuccessResult
+                  - codepipeline:PutJobFailureResult
+                Resource:
+                  - '*'
+              - Sid: InvalidateCloudFront
+                Effect: Allow
+                Action:
+                  - cloudfront:CreateInvalidation
+                Resource:
+                  - '*'
+
+  BuildArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'code-build-${AWS::StackName}-artifacts'
+
+  WebsiteCodeBuild:
+    Type: "AWS::CodeBuild::Project"
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Description: !Ref Description
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/nodejs:6.3.1
+        Type: LINUX_CONTAINER
+        EnvironmentVariables:
+          - Name: S3_DESTINATION
+            Value:
+              Fn::ImportValue:
+                Fn::Sub:
+                  - ${HostingStack}-BucketName
+                  - HostingStack: !Ref HostingStack
+          - Name: REACT_APP_IDENTITY_POOL_ID
+            Value: !Ref IdentityPool
+          - Name: REACT_APP_REGION
+            Value: !Ref AWS::Region
+          - Name: REACT_APP_USER_POOL_ID
+            Value:
+              Fn::ImportValue:
+                Fn::Sub:
+                  - ${APIStack}-UserPoolLogicalID
+                  - APIStack: !Ref APIStack
+          - Name: REACT_APP_USER_POOL_WEB_CLIENT_ID
+            Value: !Ref UserPoolClient
+#          - Name: REACT_APP_MAIN_API
+#            Value:
+#              Fn::ImportValue:
+#                Fn::Sub:
+#                  - ${APIStack}-PrettyEndpoint
+#                  - APIStack: !Ref APIStack TODO: Create PrettyEndpoint output
+      Name: !Ref "AWS::StackName"
+      ServiceRole: !GetAtt WebsiteCodeBuildServiceRole.Arn
+      Source:
+        Type: CODEPIPELINE
+
+  WebsiteCodeBuildServiceRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub 'code-build-${AWS::StackName}-service-role'
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - codebuild.amazonaws.com
+        Version: "2012-10-17"
+      Path: /
+      Policies:
+        - PolicyName: !Sub 'code-build-${AWS::StackName}-policy'
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CloudWatchLogsPolicy
+                Effect: Allow
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource:
+                  - '*'
+              - Sid: ArtifactBucketPolicy
+                Effect: Allow
+                Resource:
+                  - Fn::Sub:
+                      - '${Bucket}*'
+                      - Bucket: !GetAtt BuildArtifactBucket.Arn
+                Action:
+                  - s3:GetObject
+                  - s3:GetObjectVersion
+                  - s3:PutObject
+              - Sid: TargetBucketPolicy
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                  - s3:GetObject
+                  - s3:GetObjectAcl
+                  - s3:DeleteObject
+                  - s3:PutObjectAcl
+                Resource:
+                  - Fn::Sub:
+                      - ${Bucket}*
+                      - Bucket:
+                          Fn::ImportValue:
+                            Fn::Sub:
+                              - ${HostingStack}-BucketARN
+                              - HostingStack: !Ref HostingStack
+
+  DeployPipeline:
+    DependsOn:
+      - WebsiteCodeBuild
+      - InvalidateWebsiteCloudFront
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      ArtifactStore:
+        Location: !Ref BuildArtifactBucket
+        Type: S3
+      Name: !Sub "${AWS::StackName}-pipeline"
+      RoleArn: !GetAtt PipelineExecutionRole.Arn
+      Stages:
+        # Gets the source from CodeCommit
+        - Name: Source
+          Actions:
+            - Name: WebsiteSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: 1
+              OutputArtifacts:
+                - Name: website-repository
+              RunOrder: 1
+              Configuration:
+                RepositoryName: !Ref GitRepositoryName
+                BranchName: !Ref GitBranchName
+        # Runs CodeBuild to build the source with npm run build
+        - Name: Build
+          Actions:
+            - Name: NodeBuild
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: 1
+              InputArtifacts:
+                - Name: website-repository
+              OutputArtifacts:
+                - Name: website-build
+              RunOrder: 2
+              Configuration:
+                ProjectName: !Ref WebsiteCodeBuild
+        # Invalidates CloudFront to let new files show
+        - Name: CleanUp
+          Actions:
+            - Name: InvalidateCloudfront
+              ActionTypeId:
+                Category: Invoke
+                Owner: AWS
+                Provider: Lambda
+                Version: 1
+              RunOrder: 3
+              Configuration:
+                FunctionName: !Ref InvalidateWebsiteCloudFront
+
+  PipelineExecutionRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      RoleName: !Sub 'codepipeline-${AWS::StackName}-service-role'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - "sts:AssumeRole"
+            Effect: Allow
+            Principal:
+              Service:
+                - codepipeline.amazonaws.com
+      Path: /
+      Policies:
+        - PolicyName: !Sub 'code-build-${AWS::StackName}-policy'
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Action:
+                - s3:GetObject
+                - s3:GetObjectVersion
+                - s3:GetBucketVersioning
+                Resource: "*" # TODO: restrict access to scope
+                Effect: Allow
+
+              - Action:
+                - s3:PutObject
+                Resource:
+                - arn:aws:s3:::codepipeline*
+                - arn:aws:s3:::elasticbeanstalk*
+                Effect: Allow
+
+              - Action:
+                - codecommit:CancelUploadArchive
+                - codecommit:GetBranch
+                - codecommit:GetCommit
+                - codecommit:GetUploadArchiveStatus
+                - codecommit:UploadArchive
+                Resource: "*" # TODO: restrict access to scope
+                Effect: Allow
+
+              - Action:
+                - codedeploy:CreateDeployment
+                - codedeploy:GetApplicationRevision
+                - codedeploy:GetDeployment
+                - codedeploy:GetDeploymentConfig
+                - codedeploy:RegisterApplicationRevision
+                Resource: "*" # TODO: restrict access to scope
+                Effect: Allow
+
+              - Action:
+                - elasticbeanstalk:*
+                - ec2:*
+                - elasticloadbalancing:*
+                - autoscaling:*
+                - cloudwatch:*
+                - s3:*
+                - sns:*
+                - cloudformation:*
+                - rds:*
+                - sqs:*
+                - ecs:*
+                - iam:PassRole
+                Resource: "*" # TODO: restrict
+                Effect: Allow
+
+              - Action:
+                - lambda:InvokeFunction
+                - lambda:ListFunctions
+                Resource: "*" # TODO: restrict
+                Effect: Allow
+
+              - Action:
+                - codebuild:BatchGetBuilds
+                - codebuild:StartBuild
+                Resource: "*" # TODO: restrict
+                Effect: Allow
+
+Outputs:
+  CognitoIdentityPool:
+    Description: The ID of the cognito Identity Pool
+    Value: !Ref IdentityPool
+    Export:
+      Name: !Sub "${AWS::StackName}-IdentityPool"
+  CognitoUserPoolClient:
+    Description: The ID of the Cogntio UserPoolClient
+    Value: !Ref UserPoolClient
+    Export:
+      Name: !Sub "${AWS::StackName}-UserPoolClient"

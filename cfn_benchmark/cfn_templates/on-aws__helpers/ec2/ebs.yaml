@@ -1,0 +1,232 @@
+Description: >
+  This template is to manage persistamce storage for our cluster.
+  Inspired by Rexray/EBS and Portwox.
+  We can get rid of this template as soon as AWS provides native support for managing (creating, mounting, deleting and moving between AZs) persistent EBS volumes.
+
+Parameters:
+  Tag:
+    Description: We tag all AWS resources for your convenience.
+    Type: String
+    MinLength: 3
+
+  ClusterSize:
+    Description: How many EC2 instances
+    Type: Number
+
+Resources:
+  Queue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60 # Should be greater or equal than AutoScalingLifecycleLambda timeout
+      Tags:
+        - Key: Name
+          Value: !Ref Tag
+
+  QueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              AWS: !Ref AWS::AccountId
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sqs:SendMessage
+            Resource: '*'
+      Queues:
+        - !Ref Queue
+
+  Rule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Monitor EC2 events
+      EventPattern:
+        source:
+          - aws.ec2
+        detail-type:
+          - EC2 Spot Instance Request Fulfillment
+      State: ENABLED
+      Targets:
+        -
+          Arn: !GetAtt Queue.Arn
+          Id: !Ref AWS::StackName
+
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaSQSQueueExecutionRole
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaRole
+      Policies:
+        - PolicyName: !Ref AWS::StackName
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - ec2:CreateTags
+                  - ec2:CreateVolume
+                  - ec2:DeleteVolume
+                  - ec2:AttachVolume
+                  - ec2:CreateSnapshot
+                  - cloudwatch:PutMetricData
+                Resource: '*'
+
+  Lambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaRole.Arn
+      Runtime: nodejs12.x
+      ReservedConcurrentExecutions: 1 # we don't need concurrent execution of this function while processing SQS messages
+      Timeout: 60 # Should be smaller or equal than LifecycleQueue timeout
+      Code:
+        ZipFile: !Sub |
+          'use strict';
+          const AWS = require('aws-sdk');
+          const ec2 = new AWS.EC2();
+          const cloudwatch = new AWS.CloudWatch();
+          exports.handler = async (event) => {
+            console.log(JSON.stringify(event));
+            const msg = JSON.parse(event.Records[0].body);
+            const { SpotInstanceRequests } = await ec2.describeSpotInstanceRequests({ SpotInstanceRequestIds: [msg.detail['spot-instance-request-id']] }).promise();
+            const LaunchedAZ = SpotInstanceRequests[0].LaunchedAvailabilityZone;
+            console.log({ LaunchedAZ });
+            const { Volumes } = await getVolumes();
+            console.log({ Volumes });
+            if(isFreshStart(Volumes)) {
+              console.log('Fresh Start');
+              Volumes.unshift( await createVolume(getNextAvaialbleName(Volumes), LaunchedAZ) );
+            }
+            const VolumesInTheSameZone = getAvailableVolumesByAz(Volumes, LaunchedAZ);
+            if(VolumesInTheSameZone.length > 0) {
+              return attachVolume(msg.detail['instance-id'], VolumesInTheSameZone[0]);
+            } else {
+              const allAvailableVolumes = getAvailableVolumes(Volumes);
+              if(allAvailableVolumes.length > 0) {
+                const avaialbleVolume = allAvailableVolumes[0];
+                const newVolume = await copyVolume(avaialbleVolume, LaunchedAZ);
+                await deleteVolume(avaialbleVolume);
+                return attachVolume(msg.detail['instance-id'], newVolume);
+              } else { throw new Error('Volumes are not available'); }
+            }
+          };
+
+          function getVolumes() {
+            const Values = [...Array(${ClusterSize}).keys()].map(x => '${Tag}'+'-'+(x+1));
+            console.log('getVolumes', JSON.stringify(Values));
+            return ec2.describeVolumes({
+              Filters: [{Name:'tag:Name',Values}]
+            }).promise();
+          }
+
+          function isFreshStart(Volumes) {
+            return Volumes.length < ${ClusterSize};
+          }
+
+          function getNextAvaialbleName(Volumes) {
+            return '${Tag}-' + (Volumes.length + 1);
+          }
+
+          function getVolumeName(Volume) {
+            return Volume.Tags.find(t => t.Key === 'Name').Value;
+          }
+
+          function getAvailableVolumesByAz(Volumes, AZ) {
+            return Volumes.filter( v => ['available', 'creating'].includes(v.State) && v.AvailabilityZone === AZ);
+          }
+
+          function getAvailableVolumes(Volumes) {
+            return Volumes.filter( v => ['available', 'creating'].includes(v.State));
+          }
+
+          function publishMetric(MetricName, VolumeName) {
+            return cloudwatch.putMetricData({
+              Namespace: 'ON-AWS', MetricData: [{MetricName,Unit:'Count',Value:1,Dimensions:[{Name:'VolumeName',Value:VolumeName}]}]
+            }).promise();
+          }
+
+          async function createVolume(Name, AvailabilityZone, SnapshotId) {
+            const params = {
+              AvailabilityZone,
+              VolumeType: 'gp2',
+              TagSpecifications: [{
+                ResourceType: 'volume',
+                Tags: [{
+                  Key: 'Name',
+                  Value: Name
+                }]
+              }]
+            };
+            if(SnapshotId) {
+              params.SnapshotId = SnapshotId;
+              await publishMetric('VolumeCopy', Name);
+            } else {
+              await publishMetric('VolumeCreate', Name);
+              params.Size = 10;
+            }
+            return ec2.createVolume(params).promise();
+          }
+
+          async function copyVolume(Volume, TargetAvailabilityZone) {
+            const { SnapshotId } =  await ec2.createSnapshot({
+              Description: 'moving to ' + TargetAvailabilityZone,
+              VolumeId: Volume.VolumeId,
+              TagSpecifications: [{
+                ResourceType: 'snapshot',
+                Tags: [{
+                  Key: 'Name',
+                  Value: getVolumeName(Volume)
+                }]
+              }]
+            }).promise();
+            do { var { Snapshots }  = await ec2.describeSnapshots({ SnapshotIds: [ SnapshotId ] }).promise(); } while (Snapshots[0].State !== 'completed');
+            return createVolume(getVolumeName(Volume), TargetAvailabilityZone, SnapshotId);
+          }
+
+          async function attachVolume(InstanceId, Volume) {
+            do { var { Reservations }  = await ec2.describeInstances({ InstanceIds: [ InstanceId ] }).promise(); } while (Reservations[0].Instances[0].State.Name === 'pending');
+            do { var { Volumes }  = await ec2.describeVolumes({ VolumeIds: [ Volume.VolumeId ] }).promise(); } while (Volumes[0].State === 'creating');
+            return ec2.attachVolume({Device: '/dev/sdf',InstanceId,VolumeId:Volume.VolumeId}).promise();
+          }
+
+          async function deleteVolume(Volume) {
+            await ec2.deleteVolume({VolumeId: Volume.VolumeId}).promise();
+            return publishMetric('VolumeDelete', getVolumeName(Volume));
+          }
+
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Lambda}
+      RetentionInDays: 7
+
+  SqsInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt Lambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: sqs.amazonaws.com
+
+  SubscribeToQueue:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      BatchSize: 1
+      EventSourceArn: !GetAtt Queue.Arn
+      FunctionName: !GetAtt Lambda.Arn
+      Enabled: true

@@ -1,0 +1,285 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  LambdaStore — Data Layer Stack
+  DVA-C02 Stage S4: DynamoDB, S3, ElastiCache
+
+# DVA S4 Questions mapped to this stack:
+#   Q031 — x-amz-server-side-encryption: SSE-S3 header for presigned URL
+#   Q092 — ElastiCache for session state (vs DynamoDB)
+#   DynamoDB GSI design, conditional writes, TTL, Streams
+#   S3 CORS, lifecycle, event notifications
+#   S3 presigned URL generation (SSE-KMS in Build 19)
+
+Parameters:
+  Stage:
+    Type: String
+  ProjectName:
+    Type: String
+    Default: lambdastore
+  EnableElastiCache:
+    Type: String
+    Default: 'false'
+    AllowedValues: ['true', 'false']
+    Description: Enable ElastiCache Redis (COST ALERT — $0.017/hr, teardown after lab)
+
+Conditions:
+  ElastiCacheEnabled: !Equals [!Ref EnableElastiCache, 'true']
+
+Resources:
+
+  # ── DynamoDB: Products Table ─────────────────────────────────────────────────
+  # DVA S4: Partition key = productId (UUID, high cardinality)
+  # DVA S4: GSI — category-price-index for search queries
+  # DVA S4: TTL — promo items expire automatically
+  # DVA S4: Streams — feed analytics pipeline (Build Stage 16)
+  ProductsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-${Stage}-products
+      BillingMode: PAY_PER_REQUEST   # DVA S4: on-demand — no capacity planning for exam
+      TableClass: STANDARD
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES   # DVA S5: Streams for change capture
+      TimeToLiveSpecification:
+        AttributeName: expiresAt            # DVA S4: TTL — auto-delete expired items
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: productId
+          AttributeType: S
+        - AttributeName: category
+          AttributeType: S
+        - AttributeName: price
+          AttributeType: N
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: productId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        # DVA S4: GSI for search — KeyCondition: category=X AND price<=Y
+        - IndexName: category-price-index
+          KeySchema:
+            - AttributeName: category
+              KeyType: HASH
+            - AttributeName: price
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        # DVA S4: GSI for sorting by creation date (newest first)
+        - IndexName: category-created-index
+          KeySchema:
+            - AttributeName: category
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: INCLUDE
+            NonKeyAttributes: [productId, name, price, imageUrl]
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: !Ref Stage
+
+  # ── DynamoDB: Cart Table ─────────────────────────────────────────────────────
+  # DVA S4: Cart is user-scoped; userId as PK, itemId as SK
+  # DVA S4: TTL — abandoned carts auto-deleted after 7 days
+  CartTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-${Stage}-cart
+      BillingMode: PAY_PER_REQUEST
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+      AttributeDefinitions:
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: itemId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: userId
+          KeyType: HASH
+        - AttributeName: itemId
+          KeyType: RANGE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── DynamoDB: Orders Table ───────────────────────────────────────────────────
+  # DVA S4: orderId PK, userId GSI for "orders by user" queries
+  # DVA S5: DynamoDB Streams → Lambda trigger for order status changes
+  OrdersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${ProjectName}-${Stage}-orders
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      AttributeDefinitions:
+        - AttributeName: orderId
+          AttributeType: S
+        - AttributeName: userId
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: orderId
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        # DVA S4: Query orders by userId (NOT Scan — avoid full table read)
+        - IndexName: userId-createdAt-index
+          KeySchema:
+            - AttributeName: userId
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+
+  # ── S3: Product Uploads Bucket ────────────────────────────────────────────────
+  # DVA S4: Q031 — x-amz-server-side-encryption header for presigned URL
+  # DVA S3: Q012 — Cognito Identity Pool + S3 for user photo upload
+  # DVA S3: Q028 — CORS configuration for browser direct upload
+  UploadsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${ProjectName}-${Stage}-uploads-${AWS::AccountId}
+      # DVA S4: SSE-S3 default encryption (Build 19: switch to SSE-KMS)
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256   # DVA S4: Q031 — SSE-S3 = AES256
+              # DVA Build 19 — SSE-KMS: change to aws:kms + KMSMasterKeyID
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # DVA S3: Q028 — CORS for browser direct upload (Build Stage 10)
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET, PUT, POST, DELETE, HEAD]
+            AllowedOrigins: ['*']   # PROD: restrict to your domain
+            ExposedHeaders: [ETag]
+            MaxAge: 3600
+      LifecycleConfiguration:
+        Rules:
+          - Id: CleanupIncompleteMultipartUploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 1   # DVA S4: clean up stale multipart uploads
+          - Id: MoveToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA  # cheaper after 30 days
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 7
+                StorageClass: GLACIER
+      NotificationConfiguration:
+        # DVA S4: S3 event notification → SQS/Lambda/SNS on object upload
+        # LambdaConfigurations:
+        #   - Event: s3:ObjectCreated:*
+        #     Filter:
+        #       S3Key:
+        #         Rules:
+        #           - Name: suffix
+        #             Value: .jpg
+        #     Function: !GetAtt ImageProcessorFunction.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Stage
+          Value: !Ref Stage
+
+  UploadsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UploadsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: DenyNonSSL
+            Effect: Deny
+            Principal: '*'
+            Action: s3:*
+            Resource:
+              - !GetAtt UploadsBucket.Arn
+              - !Sub ${UploadsBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  # ── ElastiCache Redis (COST ALERT) ────────────────────────────────────────────
+  # DVA S4: Q092 — ElastiCache for session state (correct over DynamoDB for sessions)
+  # COST: ~$0.017/hr (cache.t3.micro) — DELETE AFTER LAB
+  ElastiCacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Condition: ElastiCacheEnabled
+    Properties:
+      CacheSubnetGroupName: !Sub ${ProjectName}-${Stage}-redis
+      Description: Redis subnet group for LambdaStore cart sessions
+      SubnetIds:
+        # TODO Build Stage 13: Replace with actual VPC subnet IDs
+        - subnet-placeholder-1
+        - subnet-placeholder-2
+
+  RedisCluster:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Condition: ElastiCacheEnabled
+    Properties:
+      ReplicationGroupDescription: !Sub ${ProjectName}-${Stage} cart sessions
+      ReplicationGroupId: !Sub ${ProjectName}-${Stage}
+      AutomaticFailoverEnabled: false   # single node for dev (save cost)
+      CacheNodeType: cache.t3.micro     # DVA Cost: ~$0.017/hr
+      Engine: redis
+      EngineVersion: '7.1'
+      NumCacheClusters: 1
+      CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
+      AtRestEncryptionEnabled: true
+      TransitEncryptionEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: TeardownAfterLab
+          Value: 'true'   # reminder to delete
+
+Outputs:
+  ProductsTableName:
+    Value: !Ref ProductsTable
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-ProductsTableName
+
+  ProductsTableArn:
+    Value: !GetAtt ProductsTable.Arn
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-ProductsTableArn
+
+  ProductsTableStreamArn:
+    Value: !GetAtt ProductsTable.StreamArn
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-ProductsTableStreamArn
+
+  OrdersTableName:
+    Value: !Ref OrdersTable
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-OrdersTableName
+
+  UploadsBucketName:
+    Value: !Ref UploadsBucket
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-UploadsBucketName
+
+  RedisEndpoint:
+    Condition: ElastiCacheEnabled
+    Value: !GetAtt RedisCluster.PrimaryEndPoint.Address
+    Export:
+      Name: !Sub ${ProjectName}-${Stage}-RedisEndpoint

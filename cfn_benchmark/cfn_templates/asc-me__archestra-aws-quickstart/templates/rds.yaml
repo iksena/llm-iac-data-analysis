@@ -1,0 +1,295 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Archestra RDS PostgreSQL — Multi-AZ, encrypted, pgvector enabled.
+  Credentials stored in Secrets Manager with optional auto-rotation.
+
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: archestra
+
+  DeploymentSize:
+    Type: String
+    AllowedValues: [XSmall, Small, Medium, Large]
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  IsolatedSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Comma-separated isolated subnet IDs for DB subnet group
+
+  RdsSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+
+  EksNodeSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: EKS node SG (for Lambda pgvector installer)
+
+  DatabaseName:
+    Type: String
+    Default: archestra
+
+  MasterUsername:
+    Type: String
+    Default: archestra_admin
+
+Mappings:
+  SizeConfig:
+    XSmall:
+      InstanceClass: db.r6g.medium
+      AllocatedStorage: 50
+      MaxAllocatedStorage: 100
+      MultiAZ: false
+    Small:
+      InstanceClass: db.r6g.large
+      AllocatedStorage: 100
+      MaxAllocatedStorage: 200
+      MultiAZ: true
+    Medium:
+      InstanceClass: db.r6g.xlarge
+      AllocatedStorage: 250
+      MaxAllocatedStorage: 500
+      MultiAZ: true
+    Large:
+      InstanceClass: db.r6g.2xlarge
+      AllocatedStorage: 500
+      MaxAllocatedStorage: 1000
+      MultiAZ: true
+
+Resources:
+  # ---------- Master Credentials ----------
+  RdsMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${EnvironmentName}/rds/master-credentials"
+      Description: RDS master user credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${MasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true
+
+  # ---------- DB Subnet Group ----------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Sub "${EnvironmentName} isolated subnets for RDS"
+      SubnetIds: !Ref IsolatedSubnetIds
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-db-subnet-group"
+
+  # ---------- Parameter Group ----------
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Family: postgres16
+      Description: !Sub "${EnvironmentName} PostgreSQL 16 parameters"
+      Parameters:
+        shared_preload_libraries: "vector"
+        max_connections: "200"
+        work_mem: "16384"
+        maintenance_work_mem: "524288"
+        effective_cache_size: "3145728"
+
+  # ---------- RDS Instance ----------
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub "${EnvironmentName}-postgres"
+      Engine: postgres
+      EngineVersion: "16.4"
+      DBInstanceClass: !FindInMap [SizeConfig, !Ref DeploymentSize, InstanceClass]
+      AllocatedStorage: !FindInMap [SizeConfig, !Ref DeploymentSize, AllocatedStorage]
+      MaxAllocatedStorage: !FindInMap [SizeConfig, !Ref DeploymentSize, MaxAllocatedStorage]
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: !FindInMap [SizeConfig, !Ref DeploymentSize, MultiAZ]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !Ref RdsSecurityGroupId
+      DBName: !Ref DatabaseName
+      MasterUsername: !Sub "{{resolve:secretsmanager:${RdsMasterSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${RdsMasterSecret}:SecretString:password}}"
+      DBParameterGroupName: !Ref DBParameterGroup
+      BackupRetentionPeriod: 14
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "sun:04:30-sun:05:30"
+      CopyTagsToSnapshot: true
+      DeletionProtection: true
+      EnablePerformanceInsights: true
+      PerformanceInsightsRetentionPeriod: 7
+      MonitoringInterval: 60
+      MonitoringRoleArn: !GetAtt RdsMonitoringRole.Arn
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName}-postgres"
+
+  # ---------- Enhanced Monitoring Role ----------
+  RdsMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-rds-monitoring"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+  # ---------- Secret Attachment (links secret to RDS) ----------
+  RdsSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref RdsMasterSecret
+      TargetId: !Ref DBInstance
+      TargetType: AWS::RDS::DBInstance
+
+  # ---------- pgvector Extension Installer ----------
+  PgvectorInstallerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-pgvector-installer"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: SecretsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref RdsMasterSecret
+
+  PgvectorInstallerFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: RdsSecretAttachment
+    Properties:
+      FunctionName: !Sub "${EnvironmentName}-pgvector-installer"
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt PgvectorInstallerRole.Arn
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref EksNodeSecurityGroupId
+        SubnetIds: !Ref IsolatedSubnetIds
+      Environment:
+        Variables:
+          DB_SECRET_ARN: !Ref RdsMasterSecret
+          DB_NAME: !Ref DatabaseName
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib.request
+          import boto3
+          import psycopg2
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  send_response(event, context, 'SUCCESS', {})
+                  return
+
+              try:
+                  client = boto3.client('secretsmanager')
+                  secret = json.loads(
+                      client.get_secret_value(SecretId=os.environ['DB_SECRET_ARN'])['SecretString']
+                  )
+                  conn = psycopg2.connect(
+                      host=secret['host'],
+                      port=secret['port'],
+                      dbname=os.environ['DB_NAME'],
+                      user=secret['username'],
+                      password=secret['password'],
+                      sslmode='require',
+                  )
+                  conn.autocommit = True
+                  with conn.cursor() as cur:
+                      cur.execute('CREATE EXTENSION IF NOT EXISTS vector')
+                  conn.close()
+                  send_response(event, context, 'SUCCESS', {'Message': 'pgvector enabled'})
+              except Exception as e:
+                  print(f'Error: {e}')
+                  send_response(event, context, 'FAILED', {'Message': str(e)})
+
+          def send_response(event, context, status, data):
+              body = json.dumps({
+                  'Status': status,
+                  'Reason': data.get('Message', ''),
+                  'PhysicalResourceId': context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'Data': data,
+              })
+              req = urllib.request.Request(
+                  event['ResponseURL'],
+                  data=body.encode(),
+                  headers={'Content-Type': 'application/json'},
+                  method='PUT',
+              )
+              urllib.request.urlopen(req)
+      Layers:
+        - !Sub "arn:aws:lambda:${AWS::Region}:898466741470:layer:psycopg2-py312:3"
+
+  PgvectorInstaller:
+    Type: Custom::PgvectorInstaller
+    DependsOn: DBInstance
+    Properties:
+      ServiceToken: !GetAtt PgvectorInstallerFunction.Arn
+
+  # ---------- Connection String Secret ----------
+  DatabaseUrlSecret:
+    Type: AWS::SecretsManager::Secret
+    DependsOn: RdsSecretAttachment
+    Properties:
+      Name: !Sub "${EnvironmentName}/rds/database-url"
+      Description: Full PostgreSQL connection string for Archestra
+      SecretString: !Sub
+        - "postgresql://${Username}:${Password}@${Host}:${Port}/${DBName}?sslmode=require"
+        - Username: !Sub "{{resolve:secretsmanager:${RdsMasterSecret}:SecretString:username}}"
+          Password: !Sub "{{resolve:secretsmanager:${RdsMasterSecret}:SecretString:password}}"
+          Host: !GetAtt DBInstance.Endpoint.Address
+          Port: !GetAtt DBInstance.Endpoint.Port
+          DBName: !Ref DatabaseName
+
+Outputs:
+  RdsEndpoint:
+    Value: !GetAtt DBInstance.Endpoint.Address
+    Export:
+      Name: !Sub "${EnvironmentName}-RdsEndpoint"
+
+  RdsPort:
+    Value: !GetAtt DBInstance.Endpoint.Port
+    Export:
+      Name: !Sub "${EnvironmentName}-RdsPort"
+
+  DatabaseName:
+    Value: !Ref DatabaseName
+    Export:
+      Name: !Sub "${EnvironmentName}-DatabaseName"
+
+  RdsMasterSecretArn:
+    Value: !Ref RdsMasterSecret
+    Export:
+      Name: !Sub "${EnvironmentName}-RdsMasterSecretArn"
+
+  DatabaseUrlSecretArn:
+    Value: !Ref DatabaseUrlSecret
+    Export:
+      Name: !Sub "${EnvironmentName}-DatabaseUrlSecretArn"

@@ -1,0 +1,172 @@
+AWSTemplateFormatVersion: 2010-09-09
+Parameters:
+  AllowedEmailDomain:
+    Type: String
+  AllowSelfRegistration:
+    Type: String
+    Default: "true"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Allow users to self-register (true) or require admin to create users (false)
+  LambdaKMSKeyArn:
+    Type: String
+    Description: ARN of the KMS key for Lambda environment variable encryption
+  CloudWatchLogsKMSKeyArn:
+    Type: String
+    Description: ARN of the KMS key for CloudWatch Logs encryption
+
+Conditions:
+  DisableSelfRegistration: !Equals [!Ref AllowSelfRegistration, "false"]
+
+Resources:
+  PreSignUpLambdaDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${AWS::StackName}-presignup-dlq
+      KmsMasterKeyId: !Ref LambdaKMSKeyArn
+      MessageRetentionPeriod: 1209600  # 14 days
+
+  PreSignUpLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-PreSignUp
+      RetentionInDays: 14
+      KmsKeyId: !Ref CloudWatchLogsKMSKeyArn
+
+  PreSignUpRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DLQPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt PreSignUpLambdaDeadLetterQueue.Arn
+
+  PreSignUpLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      ReservedConcurrentExecutions: 1
+      Environment:
+        Variables:
+          AllowedDomain: !Ref AllowedEmailDomain
+      Handler: index.lambda_handler
+      Role: !GetAtt PreSignUpRole.Arn
+      Runtime: python3.13
+      Timeout: 60
+      KmsKeyArn: !Ref LambdaKMSKeyArn
+      DeadLetterConfig:
+        TargetArn: !GetAtt PreSignUpLambdaDeadLetterQueue.Arn
+      Code:
+        ZipFile: |
+          import os
+          def lambda_handler(event, context):
+            try:
+              # It sets the user pool autoConfirmUser flag after validating the email domain
+              event['response']['autoConfirmUser'] = False
+
+              # Log only non-PII metadata. The pre-signup event carries the
+              # registrant's email address and other user attributes, so the
+              # full payload is never written to CloudWatch Logs.
+              print(f"PreSignUp triggered: triggerSource={event.get('triggerSource')}")
+
+              # Validate event structure
+              if 'request' not in event or 'userAttributes' not in event['request']:
+                raise Exception("Invalid event structure: missing request or userAttributes")
+
+              # Get email with validation
+              email = event['request']['userAttributes'].get('email')
+              if not email:
+                raise Exception("Email attribute is missing")
+
+              # Validate email format and split
+              if '@' not in email:
+                raise Exception("Invalid email format: missing @ symbol")
+
+              address = email.split('@')
+              if len(address) != 2 or not address[1]:
+                raise Exception("Invalid email format: malformed domain")
+
+              # Log the domain only. The local part identifies the individual
+              # and is the PII-bearing half of the address.
+              print(f"Validating sign-up for domain: {address[1]}")
+
+              # Validate domain (skip if AllowedDomain is * or empty)
+              allowed_domain = os.environ.get("AllowedDomain", "*")
+              if allowed_domain and allowed_domain != "*":
+                if address[1].lower() != allowed_domain.lower():
+                  raise Exception("Not an allowed email domain.")
+
+              return event
+
+            except Exception as e:
+              print(f"Error in PreSignUp Lambda: {str(e)}")
+              raise e
+
+  CognitoInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref PreSignUpLambda
+      Principal: cognito-idp.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt CognitoUserPool.Arn
+
+  CognitoUserPool:
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Type: AWS::Cognito::UserPool
+    Properties:
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: !If [DisableSelfRegistration, true, false]
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      EmailVerificationMessage: "Your verification code is {####}. This code expires in 24 hours."
+      EmailVerificationSubject: "Sample Mass Email System - Verify your email"
+      LambdaConfig:
+        PreSignUp: !GetAtt PreSignUpLambda.Arn
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${AWS::StackName}-appclient"
+      UserPoolId: !Ref CognitoUserPool
+      SupportedIdentityProviders:
+        - COGNITO
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+        - ALLOW_USER_PASSWORD_AUTH
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      AccessTokenValidity: 60
+      IdTokenValidity: 60
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: minutes
+        IdToken: minutes
+        RefreshToken: days
+
+Outputs:
+  CognitoUserPoolId:
+    Value: !Ref CognitoUserPool
+  CognitoUserPoolClientId:
+    Value: !Ref CognitoUserPoolClient

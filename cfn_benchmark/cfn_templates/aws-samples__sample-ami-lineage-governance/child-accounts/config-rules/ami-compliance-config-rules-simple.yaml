@@ -1,0 +1,313 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Simplified AWS Config rules for AMI compliance monitoring'
+
+Parameters:
+  SecurityToolingAccountId:
+    Type: String
+    Description: Account ID where the compliance evaluator Lambda function is deployed
+    AllowedPattern: '[0-9]{12}'
+
+  ConfigDeliveryChannelName:
+    Type: String
+    Description: Name of the Config delivery channel
+    Default: ami-lineage-config-channel
+
+  ConfigBucketName:
+    Type: String
+    Description: S3 bucket name prefix for Config delivery channel
+    Default: 'ami-lineage-config'
+
+  ObjectLockRetentionDays:
+    Type: Number
+    Description: Number of days to retain objects with Object Lock (7 years = 2555 days)
+    Default: 2555
+    MinValue: 1
+    MaxValue: 36500
+
+  ObjectLockMode:
+    Type: String
+    Description: Object Lock retention mode (GOVERNANCE allows privileged users to override, COMPLIANCE cannot be overridden)
+    Default: COMPLIANCE
+    AllowedValues:
+      - GOVERNANCE
+      - COMPLIANCE
+
+Resources:
+  # Configuration Recorder
+  ConfigurationRecorder:
+    Type: AWS::Config::ConfigurationRecorder
+    Properties:
+      Name: ami-lineage-config-recorder
+      RoleARN: !GetAtt ConfigRole.Arn
+      RecordingGroup:
+        AllSupported: false
+        IncludeGlobalResourceTypes: false
+        ResourceTypes:
+          - AWS::EC2::Instance
+          - AWS::EC2::SecurityGroup
+          - AWS::EC2::Volume
+
+  # Delivery Channel
+  DeliveryChannel:
+    Type: AWS::Config::DeliveryChannel
+    Properties:
+      Name: !Ref ConfigDeliveryChannelName
+      S3BucketName: !Ref ConfigBucket
+      ConfigSnapshotDeliveryProperties:
+        DeliveryFrequency: TwentyFour_Hours
+
+  # S3 Bucket for Config
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: "S3 access logging is not required for Config delivery bucket as CloudTrail provides sufficient audit trail for governance purposes"
+      checkov:
+        skip:
+          - id: CKV_AWS_18
+            comment: "S3 access logging is not required for Config delivery bucket as CloudTrail provides sufficient audit trail for governance purposes"
+    Properties:
+      BucketName: !Sub '${ConfigBucketName}-${AWS::AccountId}-${AWS::Region}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: !Ref ObjectLockMode
+            Days: !Ref ObjectLockRetentionDays
+      LifecycleConfiguration:
+        Rules:
+          - Id: TransitionToInfrequentAccess
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 90
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 180
+                StorageClass: GLACIER
+              - TransitionInDays: 365
+                StorageClass: DEEP_ARCHIVE
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+              - TransitionInDays: 90
+                StorageClass: GLACIER
+      Tags:
+        - Key: Purpose
+          Value: AMI-Lineage-Compliance-Audit-Trail
+        - Key: DataClassification
+          Value: Confidential
+        - Key: RetentionPolicy
+          Value: 7-Years
+        - Key: ObjectLockEnabled
+          Value: 'true'
+
+  # S3 Bucket Policy for Config
+  ConfigBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AWSConfigBucketPermissionsCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: AWSConfigBucketExistenceCheck
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:ListBucket
+            Resource: !GetAtt ConfigBucket.Arn
+            Condition:
+              StringEquals:
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+          - Sid: AWSConfigBucketDelivery
+            Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub '${ConfigBucket.Arn}/*'
+            Condition:
+              StringEquals:
+                's3:x-amz-acl': bucket-owner-full-control
+                'AWS:SourceAccount': !Ref 'AWS::AccountId'
+
+  # IAM Role for Config
+  ConfigRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W28
+            reason: "Explicit RoleName is required for organizational governance and cross-stack references"
+    Properties:
+      RoleName: !Sub 'AMI-Lineage-Config-Role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: config.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWS_ConfigRole
+      Policies:
+        - PolicyName: ConfigBucketAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketAcl
+                  - s3:ListBucket
+                Resource: !GetAtt ConfigBucket.Arn
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub '${ConfigBucket.Arn}/*'
+
+  # Config Rule: EC2 Instance Required Tags
+  InstanceRequiredTagsRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigurationRecorder
+    Properties:
+      ConfigRuleName: ec2-instance-required-tags
+      Description: Checks if EC2 instances have all required tags
+      Source:
+        Owner: AWS
+        SourceIdentifier: REQUIRED_TAGS
+      InputParameters: |
+        {
+          "tag1Key": "Environment",
+          "tag2Key": "Owner",
+          "tag3Key": "Project"
+        }
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+
+  # Config Rule: EC2 Instance Detailed Monitoring (as example of managed rule)
+  InstanceMonitoringRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigurationRecorder
+    Properties:
+      ConfigRuleName: ec2-instance-detailed-monitoring-enabled
+      Description: Checks if detailed monitoring is enabled for EC2 instances
+      Source:
+        Owner: AWS
+        SourceIdentifier: EC2_INSTANCE_DETAILED_MONITORING_ENABLED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::EC2::Instance
+
+  # Config Rule: S3 Bucket Versioning Enabled
+  S3BucketVersioningRule:
+    Type: AWS::Config::ConfigRule
+    DependsOn: ConfigurationRecorder
+    Properties:
+      ConfigRuleName: s3-bucket-versioning-enabled
+      Description: Checks if S3 buckets have versioning enabled (required for Object Lock and audit trail preservation)
+      Source:
+        Owner: AWS
+        SourceIdentifier: S3_BUCKET_VERSIONING_ENABLED
+      Scope:
+        ComplianceResourceTypes:
+          - AWS::S3::Bucket
+
+  # CloudWatch Dashboard for Config Compliance
+  ConfigComplianceDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub '${AWS::StackName}-AMI-Compliance-Dashboard'
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Config", "ComplianceByConfigRule", "ConfigRuleName", "${InstanceRequiredTagsRule}" ],
+                  [ ".", ".", ".", "${InstanceMonitoringRule}" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "AMI Compliance Rules",
+                "period": 300
+              }
+            },
+            {
+              "type": "metric",
+              "x": 12,
+              "y": 0,
+              "width": 12,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  [ "AWS/Config", "ComplianceByResourceType", "ResourceType", "AWS::EC2::Instance" ],
+                  [ ".", ".", ".", "AWS::EC2::SecurityGroup" ]
+                ],
+                "view": "timeSeries",
+                "stacked": false,
+                "region": "${AWS::Region}",
+                "title": "Compliance by Resource Type",
+                "period": 300
+              }
+            }
+          ]
+        }
+
+Outputs:
+  ConfigurationRecorderName:
+    Description: Name of the Config configuration recorder
+    Value: !Ref ConfigurationRecorder
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigRecorderName'
+
+  DeliveryChannelName:
+    Description: Name of the Config delivery channel
+    Value: !Ref DeliveryChannel
+    Export:
+      Name: !Sub '${AWS::StackName}-DeliveryChannelName'
+
+  ConfigBucketName:
+    Description: Name of the Config S3 bucket
+    Value: !Ref ConfigBucket
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigBucketName'
+
+  ConfigRoleArn:
+    Description: ARN of the Config service role
+    Value: !GetAtt ConfigRole.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-ConfigRoleArn'
+
+  DashboardURL:
+    Description: URL of the CloudWatch dashboard
+    Value: !Sub 'https://console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=${ConfigComplianceDashboard}'
+    Export:
+      Name: !Sub '${AWS::StackName}-DashboardURL'
