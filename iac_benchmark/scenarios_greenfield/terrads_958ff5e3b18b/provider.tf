@@ -1,0 +1,18 @@
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5"
+    }
+  }
+}
+
+provider "aws" {
+  region  = var.default-region
+  default_tags {
+    tags = {
+      CustodianRule    = "ecc-aws-362-mwaa_encrypted_with_kms_cmk"
+      ComplianceStatus = "Green"
+    }
+  }
+}

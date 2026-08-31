@@ -24,7 +24,10 @@ load_dotenv()  # Load environment variables from .env file if present
 BASE_DIR = Path('./cfn_benchmark')
 DATASET_DIR = BASE_DIR / 'dataset'
 
-PROMPTS_CSV = DATASET_DIR / 'final_benchmark_with_prompts.csv'
+# Override via CFN_PROMPTS_CSV to point this script at a different frozen
+# benchmark file (e.g. final_benchmark_real_aws_with_prompts.csv) without
+# touching the LocalStack one -- default unchanged for backward compatibility.
+PROMPTS_CSV = Path(os.environ.get('CFN_PROMPTS_CSV', str(DATASET_DIR / 'final_benchmark_with_prompts.csv')))
 
 # OpenRouter Configuration
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")

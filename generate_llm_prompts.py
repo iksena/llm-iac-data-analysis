@@ -21,8 +21,12 @@ load_dotenv()  # Load environment variables from .env file if present
 
 # ── 1. Configuration ──────────────────────────────────────────────────────────
 DATASET_DIR = Path('./iac_benchmark/dataset')
-PROMPTS_CSV = DATASET_DIR / 'final_benchmark_with_prompts.csv'
-CUSTOM_FALLBACK_CSV = DATASET_DIR / 'final_benchmark_custom.csv'
+# TF_PROMPTS_CSV lets this script be pointed at a different frozen benchmark file
+# (e.g. final_benchmark_real_aws_with_prompts.csv for the real-AWS track) without
+# touching the LocalStack track's own file -- mirrors generate_cfn_prompts.py's
+# existing CFN_PROMPTS_CSV override.
+PROMPTS_CSV = Path(os.environ.get('TF_PROMPTS_CSV', str(DATASET_DIR / 'final_benchmark_with_prompts.csv')))
+CUSTOM_FALLBACK_CSV = Path(str(PROMPTS_CSV).replace('_with_prompts.csv', '_custom.csv'))
 
 # OpenRouter Configuration
 OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY", "")
