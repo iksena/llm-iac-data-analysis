@@ -29,7 +29,7 @@ resource "aws_db_instance" "weasel_crm_rds" {
   allocated_storage    = 10
   storage_type         = "gp2"
   engine               = "mysql"
-  engine_version       = "8.0.34"
+  engine_version       = "8.0.46"
   instance_class       = "db.t2.micro"
   db_name              = "weasel_crm_db"
   username             = jsondecode(aws_secretsmanager_secret_version.current.secret_string)["username"]

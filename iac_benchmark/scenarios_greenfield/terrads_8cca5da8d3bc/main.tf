@@ -211,7 +211,7 @@ resource "aws_db_instance" "tfe_db" {
   identifier             = var.db_identifier
   db_name                = var.db_name
   engine                 = "postgres"
-  engine_version         = "14.9"
+  engine_version         = "14.24"
   instance_class         = "db.m5.xlarge"
   username               = var.db_username
   password               = var.db_password

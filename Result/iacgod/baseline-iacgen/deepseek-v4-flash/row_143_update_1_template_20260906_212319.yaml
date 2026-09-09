@@ -1,0 +1,194 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Stripe webhook handler for Squarespace to Slack via SNS"
+
+Parameters:
+  SquarespaceApiToken:
+    Type: String
+    NoEcho: true
+    Description: API token for Squarespace Commerce API
+  StripeWebhookSigningSecret:
+    Type: String
+    NoEcho: true
+    Description: Stripe webhook signing secret for verifying events
+
+Resources:
+  WebhookLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: WebhookPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/webhook-function:*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SnsTopic
+
+  SnsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: slack-notifications
+      DisplayName: SlackNotifs
+
+  WebhookLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/webhook-function
+      RetentionInDays: 7
+
+  WebhookLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: webhook-function
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt WebhookLambdaExecutionRole.Arn
+      Timeout: 30
+      Environment:
+        Variables:
+          SQUARESPACE_TOKEN: !Ref SquarespaceApiToken
+          STRIPE_SECRET: !Ref StripeWebhookSigningSecret
+          SNS_TOPIC_ARN: !Ref SnsTopic
+      Code:
+        ZipFile: |
+          import json, os, hmac, hashlib, urllib.request, urllib.error, boto3
+
+          SQUARESPACE_TOKEN = os.environ["SQUARESPACE_TOKEN"]
+          STRIPE_SECRET = os.environ["STRIPE_SECRET"]
+          SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+
+          def lambda_handler(event, context):
+              sig_header = event["headers"].get("Stripe-Signature")
+              payload = event["body"]
+              if not verify_stripe_signature(payload, sig_header):
+                  return {"statusCode": 400, "body": "Invalid signature"}
+
+              data = json.loads(payload)
+              if data["type"] == "checkout.session.completed":
+                  session = data["data"]["object"]
+                  order_id = session.get("metadata", {}).get("squarespace_order_id")
+                  if order_id:
+                      order = fetch_squarespace_order(order_id)
+                      if order:
+                          message = format_slack_message(order)
+                          publish_sns(message)
+              return {"statusCode": 200, "body": "OK"}
+
+          def verify_stripe_signature(payload, sig_header):
+              if not sig_header:
+                  return False
+              parts = sig_header.split(",")
+              timestamp = None
+              signatures = []
+              for part in parts:
+                  k, v = part.split("=", 1)
+                  if k == "t":
+                      timestamp = v
+                  elif k == "v1":
+                      signatures.append(v)
+              if not timestamp or not signatures:
+                  return False
+              signed_payload = f"{timestamp}.{payload}"
+              expected = hmac.new(STRIPE_SECRET.encode(), signed_payload.encode(), hashlib.sha256).hexdigest()
+              return hmac.compare_digest(signatures[0], expected)
+
+          def fetch_squarespace_order(order_id):
+              url = f"https://api.squarespace.com/1.0/commerce/orders/{order_id}"
+              req = urllib.request.Request(url, headers={"Authorization": f"Bearer {SQUARESPACE_TOKEN}"})
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      return json.loads(resp.read())
+              except urllib.error.HTTPError as e:
+                  print(f"Error fetching order {order_id}: {e}")
+                  return None
+
+          def format_slack_message(order):
+              items = "\n".join([f"{i['quantity']}x {i['productName']}" for i in order.get("lineItems", [])])
+              return json.dumps({
+                  "text": f"New Squarespace order {order['id']}\nCustomer: {order.get('customerEmail', 'N/A')}\nItems:\n{items}\nTotal: ${order.get('total', 0):.2f}"
+              })
+
+          def publish_sns(message):
+              sns = boto3.client("sns")
+              sns.publish(TopicArn=SNS_TOPIC_ARN, Message=message)
+
+  ApiGatewayRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: StripeWebhookApi
+      Description: API for Stripe webhook to process Squarespace orders
+
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ParentId: !GetAtt ApiGatewayRestApi.RootResourceId
+      PathPart: webhooks
+
+  ApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      ResourceId: !Ref ApiGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub "arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebhookLambda.Arn}/invocations"
+      MethodResponses: []
+
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayMethod
+    Properties:
+      RestApiId: !Ref ApiGatewayRestApi
+      StageName: prod
+      Description: Production deployment
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebhookLambda
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ApiGatewayRestApi}/*/POST/webhooks"
+
+  WebhookErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: WebhookLambdaErrors
+      AlarmDescription: Alarm if Lambda function encounters any errors
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref WebhookLambda
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+
+Outputs:
+  ApiEndpoint:
+    Description: URL of the API Gateway prod stage webhook endpoint
+    Value: !Sub "https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/prod/webhooks"
+  SnsTopicArn:
+    Description: ARN of the SNS topic for Slack notifications
+    Value: !Ref SnsTopic

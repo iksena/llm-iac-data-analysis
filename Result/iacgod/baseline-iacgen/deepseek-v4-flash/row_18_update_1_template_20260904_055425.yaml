@@ -1,0 +1,210 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Creates a CodeBuild project to automatically publish CloudFormation templates to S3 buckets in every AWS region, with SNS and EventBridge for build status notifications.'
+Parameters:
+  ProjectName:
+    Type: String
+    Default: TemplatePublisher
+    Description: Name of the CodeBuild project
+  SourceS3Bucket:
+    Type: String
+    Default: ''
+    Description: S3 bucket containing the source templates (leave empty to create a new bucket)
+  SourceS3Key:
+    Type: String
+    Default: templates.zip
+    Description: S3 key of the source archive containing templates
+  TemplateBucketPrefix:
+    Type: String
+    Default: cf-templates-published
+    Description: Prefix for region-specific S3 buckets (e.g., cf-templates-published-us-east-1)
+  NotificationEmail:
+    Type: String
+    Default: ''
+    Description: Optional email address for SNS build notifications
+Conditions:
+  HasEmail: !Not [!Equals [!Ref NotificationEmail, '']]
+  HasSourceBucket: !Not [!Equals [!Ref SourceS3Bucket, '']]
+  CreateSourceBucket: !Equals [!Ref SourceS3Bucket, '']
+Resources:
+  SourceS3BucketResource:
+    Condition: CreateSourceBucket
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-source-${AWS::AccountId}'
+      VersioningConfiguration:
+        Status: Enabled
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CodeBuildPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - codecommit:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeRegions
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - sts:AssumeRole
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:BatchGetImage
+                  - ecr:GetDownloadUrlForLayer
+                Resource: '*'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchLogsFullAccess
+  CodeBuildProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Ref ProjectName
+      Description: Builds and publishes CloudFormation templates to all regions
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:5.0
+        Type: LINUX_CONTAINER
+        PrivilegedMode: false
+        EnvironmentVariables:
+          - Name: TEMPLATE_BUCKET_PREFIX
+            Value: !Ref TemplateBucketPrefix
+          - Name: SOURCE_BUCKET
+            Value: !If [HasSourceBucket, !Ref SourceS3Bucket, !Ref SourceS3BucketResource]
+          - Name: SOURCE_KEY
+            Value: !Ref SourceS3Key
+      Source:
+        Type: S3
+        Location: !If [HasSourceBucket, !Sub '${SourceS3Bucket}/${SourceS3Key}', !Sub '${SourceS3BucketResource}/${SourceS3Key}']
+      BuildSpec: |
+        version: 0.2
+        phases:
+          install:
+            commands:
+              - echo "Installing dependencies..."
+              - aws --version
+          pre_build:
+            commands:
+              - echo "Fetching template source..."
+              - aws s3 cp s3://${SOURCE_BUCKET}/${SOURCE_KEY} . --recursive || echo "No source archive found, using local files"
+              - unzip -o ${SOURCE_KEY} -d templates/ || echo "No zip file, assuming directory structure"
+              - cd templates/ || mkdir -p templates && cd templates/
+          build:
+            commands:
+              - echo "Retrieving all AWS regions..."
+              - regions=$(aws ec2 describe-regions --query "Regions[].RegionName" --output text)
+              - for region in $regions; do
+                  bucket_name="${TEMPLATE_BUCKET_PREFIX}-${region}";
+                  echo "Processing region: $region, bucket: $bucket_name";
+                  aws s3api create-bucket --bucket $bucket_name --region $region --create-bucket-configuration LocationConstraint=$region 2>/dev/null || echo "Bucket $bucket_name already exists or cannot be created";
+                  echo "Uploading templates to $bucket_name...";
+                  for template in *.yaml *.yml; do
+                    [ -f "$template" ] && aws s3 cp "$template" "s3://$bucket_name/templates/$template" || true;
+                  done;
+                  echo "Generating index page for $bucket_name...";
+                  echo "<html><body><h1>CloudFormation Templates</h1><ul>" > index.html;
+                  for template in *.yaml *.yml; do
+                    [ -f "$template" ] && echo "<li><a href='templates/$template'>$template</a></li>" >> index.html || true;
+                  done;
+                  echo "</ul></body></html>" >> index.html;
+                  aws s3 cp index.html "s3://$bucket_name/index.html" --content-type text/html;
+                  echo "Finished region: $region";
+                done
+          post_build:
+            commands:
+              - echo "Build completed successfully for all regions"
+      TimeoutInMinutes: 60
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref CloudWatchLogsGroup
+      BadgeEnabled: true
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-Notifications'
+      Subscription:
+        - !If
+          - HasEmail
+          - Protocol: email
+            Endpoint: !Ref NotificationEmail
+          - !Ref AWS::NoValue
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    DependsOn: SNSTopic
+    Properties:
+      Topics:
+        - !Ref SNSTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SNSTopic
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref SNSTopic
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    DependsOn: CodeBuildProject
+    Properties:
+      Name: !Sub '${ProjectName}-BuildEventRule'
+      Description: Captures CodeBuild state changes and sends to SNS
+      EventPattern:
+        source:
+          - aws.codebuild
+        detail-type:
+          - CodeBuild Build State Change
+        resources:
+          - !GetAtt CodeBuildProject.Arn
+      Targets:
+        - Arn: !Ref SNSTopic
+          Id: SNSTopic
+  CloudWatchLogsGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/codebuild/${ProjectName}'
+      RetentionInDays: 30
+Outputs:
+  ProjectName:
+    Description: CodeBuild project name
+    Value: !Ref ProjectName
+  SNSTopicArn:
+    Description: SNS topic ARN for build notifications
+    Value: !Ref SNSTopic
+  LogGroupName:
+    Description: CloudWatch Logs group name
+    Value: !Ref CloudWatchLogsGroup
+  SourceBucketName:
+    Description: Source S3 bucket name (upload templates.zip here)
+    Value: !If [HasSourceBucket, !Ref SourceS3Bucket, !Ref SourceS3BucketResource]

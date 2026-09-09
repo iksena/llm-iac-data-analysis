@@ -22,6 +22,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import tempfile
 import time
 import traceback
@@ -32,6 +33,19 @@ import yaml
 
 from checkov.cloudformation.runner import Runner
 from checkov.runner_filter import RunnerFilter
+
+# Some result CSVs accumulate a very large `final_template`/error cell (many
+# repair iterations concatenated) that can push a single field past Python's
+# default 131072-byte csv limit -- raise it rather than crash. sys.maxsize can
+# exceed the platform C long used internally, so fall back to halving until
+# the platform accepts it.
+_field_size_limit = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(_field_size_limit)
+        break
+    except OverflowError:
+        _field_size_limit //= 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -49,6 +49,19 @@ try:
 except ImportError:
     sys.exit("[ERROR] pandas not installed. Run: pip install pandas")
 
+# Some result CSVs accumulate a very large `all_cfn_lint_errors`/`all_yaml_errors`
+# cell (a model stuck repeating the same lint failures across many iterations can
+# push a single field past Python's default 131072-byte csv limit) -- raise it
+# rather than crash. sys.maxsize can exceed the platform C long used internally,
+# so fall back to halving until the platform accepts it.
+_field_size_limit = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(_field_size_limit)
+        break
+    except OverflowError:
+        _field_size_limit //= 2
+
 
 # ---------------------------------------------------------------------------
 # CloudFormation-aware YAML loader (mirrors IaCGen helper)
@@ -284,6 +297,28 @@ def intent_coverage(
     }
 
 
+def normalize_row_number(value) -> str:
+    """Normalize a row_number for join purposes.
+
+    Some benchmark CSVs (e.g. cfn_eval_benchmark_real_aws*.csv) store
+    row_number as a float-formatted string ("70.0") because the column
+    passed through pandas with NaNs at some point upstream, while result
+    CSVs store it as a plain int string ("70"). A raw string comparison
+    between the two never matches, silently dropping every row to
+    NO BENCHMARK MATCH. Collapse both to the same plain-int form.
+    """
+    s = str(value).strip()
+    if not s:
+        return s
+    try:
+        f = float(s)
+        if f.is_integer():
+            return str(int(f))
+    except (ValueError, TypeError):
+        pass
+    return s
+
+
 # ---------------------------------------------------------------------------
 # Aggregate helpers
 # ---------------------------------------------------------------------------
@@ -379,10 +414,10 @@ def main() -> None:
         sys.exit(f"[ERROR] Benchmark file not found: {bench_path}")
 
     bench_df = pd.read_csv(bench_path, dtype=str)
-    bench_df["row_number"] = bench_df["row_number"].astype(str).str.strip()
+    bench_df["row_number"] = bench_df["row_number"].apply(normalize_row_number)
 
     benchmark: dict[str, dict] = {
-        str(row["row_number"]): row.to_dict()
+        row["row_number"]: row.to_dict()
         for _, row in bench_df.iterrows()
     }
 
@@ -417,7 +452,7 @@ def main() -> None:
         if args.limit is not None and i >= args.limit:
             break
 
-        row_num   = str(row.get("row_number", "")).strip()
+        row_num   = normalize_row_number(row.get("row_number", ""))
         template  = (row.get("final_template") or "").strip()
 
         result: dict = {

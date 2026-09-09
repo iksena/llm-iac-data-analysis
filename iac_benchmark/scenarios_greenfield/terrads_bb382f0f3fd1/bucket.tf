@@ -6,8 +6,10 @@ resource "aws_kms_key" "tfstate_backends" {
   tags = local.tags
 }
 
+data "aws_caller_identity" "tfstate_backends_owner" {}
+
 resource "aws_s3_bucket" "tfstate_backends" {
-  bucket        = "tfstate-s3-backends"
+  bucket        = "tfstate-s3-backends-${data.aws_caller_identity.tfstate_backends_owner.account_id}"
   acl           = "private"
   force_destroy = var.s3_bucket_force_destroy
 

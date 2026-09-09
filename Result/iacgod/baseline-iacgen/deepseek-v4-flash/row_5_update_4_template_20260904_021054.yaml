@@ -1,0 +1,272 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for Aurora Global Database failover automation using SSM, Lambda, and Route 53 ARC'
+Parameters:
+  GlobalClusterIdentifier:
+    Type: String
+    Description: Identifier of the Aurora global database cluster
+    Default: my-global-cluster
+  PrimaryRegion:
+    Type: String
+    Description: Primary region for the global database
+    Default: us-east-1
+  SecondaryRegion:
+    Type: String
+    Description: Secondary region for the global database
+    Default: us-west-2
+  RoutingControlARN:
+    Type: String
+    Description: ARN of the Route 53 ARC routing control (must be provided)
+    Default: ''
+  SecretARN:
+    Type: String
+    Description: ARN of the Secrets Manager secret to update (must be provided)
+    Default: ''
+  LambdaRoleName:
+    Type: String
+    Description: Name for the Lambda execution role
+    Default: LambdaSSMExecutionRole
+  SSMRoleName:
+    Type: String
+    Description: Name for the SSM automation execution role
+    Default: SSMAutomationRole
+Resources:
+  SSMAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref SSMRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonRDSFullAccess
+        - arn:aws:iam::aws:policy/AmazonRoute53RecoveryControlConfigFullAccess
+        - arn:aws:iam::aws:policy/SecretsManagerReadWrite
+        - arn:aws:iam::aws:policy/AmazonSSMAutomationRole
+      Policies:
+        - PolicyName: SSMAutomationAdditionalPermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:StartAutomationExecution
+                  - ssm:DescribeAutomationExecutions
+                  - ssm:GetAutomationExecution
+                Resource: '*'
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref LambdaRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaSSMStartAutomation
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:StartAutomationExecution
+                  - ssm:DescribeAutomationExecutions
+                  - ssm:GetAutomationExecution
+                Resource: '*'
+  AuroraGlobalDatabaseFailoverSSMDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      Name: AuroraGlobalDatabaseFailoverSSMDocument
+      DocumentType: Automation
+      Content:
+        schemaVersion: '0.3'
+        description: 'Automation document to failover an Aurora global database and update ARC routing control and Secrets Manager'
+        parameters:
+          PrimaryRegion:
+            type: String
+            description: Primary region of the global database
+            default: us-east-1
+          SecondaryRegion:
+            type: String
+            description: Secondary region of the global database
+          GlobalClusterIdentifier:
+            type: String
+            description: Identifier of the Aurora global database cluster
+          RoutingControlARN:
+            type: String
+            description: ARN of the Route 53 ARC routing control (must be provided)
+            default: ''
+          SecretARN:
+            type: String
+            description: ARN of the Secrets Manager secret to update (must be provided)
+            default: ''
+        mainSteps:
+          - name: DetermineActiveRegion
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.13
+              Handler: handler
+              InputPayload:
+                RoutingControlARN: '{{ RoutingControlARN }}'
+              Script: |-
+                import boto3
+                def handler(event, context):
+                    client = boto3.client('route53-recovery-control-config')
+                    routing_control_arn = event['RoutingControlARN']
+                    if not routing_control_arn:
+                        raise ValueError('RoutingControlARN is required')
+                    response = client.get_routing_control_state(RoutingControlArn=routing_control_arn)
+                    state = response['RoutingControlState']
+                    if state == 'On':
+                        active_region = '{{ PrimaryRegion }}'
+                    else:
+                        active_region = '{{ SecondaryRegion }}'
+                    return {'ActiveRegion': active_region}
+              Outputs:
+                - Name: ActiveRegion
+                  Selector: $.Payload.ActiveRegion
+                  Type: String
+            outputs:
+              - Name: ActiveRegion
+                Selector: $.Payload.ActiveRegion
+                Type: String
+          - name: PerformGlobalClusterFailover
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.13
+              Handler: handler
+              InputPayload:
+                GlobalClusterIdentifier: '{{ GlobalClusterIdentifier }}'
+                TargetRegion: '{{ SecondaryRegion }}'
+              Script: |-
+                import boto3
+                def handler(event, context):
+                    client = boto3.client('rds')
+                    response = client.failover_global_cluster(
+                        GlobalClusterIdentifier=event['GlobalClusterIdentifier'],
+                        TargetRegion=event['TargetRegion']
+                    )
+                    return {'FailoverStatus': 'Initiated'}
+              Outputs:
+                - Name: FailoverStatus
+                  Selector: $.Payload.FailoverStatus
+                  Type: String
+            outputs:
+              - Name: FailoverStatus
+                Selector: $.Payload.FailoverStatus
+                Type: String
+          - name: UpdateRoutingControlAndSecret
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.13
+              Handler: handler
+              InputPayload:
+                RoutingControlARN: '{{ RoutingControlARN }}'
+                SecretARN: '{{ SecretARN }}'
+                NewActiveRegion: '{{ SecondaryRegion }}'
+                GlobalClusterIdentifier: '{{ GlobalClusterIdentifier }}'
+              Script: |-
+                import boto3
+                import json
+                def handler(event, context):
+                    routing_control_arn = event['RoutingControlARN']
+                    secret_arn = event['SecretARN']
+                    if not routing_control_arn or not secret_arn:
+                        raise ValueError('RoutingControlARN and SecretARN are required')
+                    arc_client = boto3.client('route53-recovery-control-config')
+                    arc_client.update_routing_control_state(
+                        RoutingControlArn=routing_control_arn,
+                        RoutingControlState='On'
+                    )
+                    rds_client = boto3.client('rds')
+                    response = rds_client.describe_global_clusters(
+                        GlobalClusterIdentifier=event['GlobalClusterIdentifier']
+                    )
+                    global_cluster = response['GlobalClusters'][0]
+                    writer_endpoint = None
+                    for member in global_cluster['GlobalClusterMembers']:
+                        if member['IsWriter'] and member['Region'] == event['NewActiveRegion']:
+                            writer_endpoint = member['DBClusterArn']
+                            break
+                    secrets_client = boto3.client('secretsmanager')
+                    secrets_client.put_secret_value(
+                        SecretId=secret_arn,
+                        SecretString=json.dumps({'writerEndpoint': writer_endpoint})
+                    )
+                    return {'UpdateStatus': 'Completed'}
+              Outputs:
+                - Name: UpdateStatus
+                  Selector: $.Payload.UpdateStatus
+                  Type: String
+            outputs:
+              - Name: UpdateStatus
+                Selector: $.Payload.UpdateStatus
+                Type: String
+  TriggerFailoverFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TriggerFailover
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          SSM_DOCUMENT_NAME: !Ref AuroraGlobalDatabaseFailoverSSMDocument
+          GLOBAL_CLUSTER_ID: !Ref GlobalClusterIdentifier
+          PRIMARY_REGION: !Ref PrimaryRegion
+          SECONDARY_REGION: !Ref SecondaryRegion
+          ROUTING_CONTROL_ARN: !Ref RoutingControlARN
+          SECRET_ARN: !Ref SecretARN
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+          def handler(event, context):
+              required_vars = ['SSM_DOCUMENT_NAME', 'GLOBAL_CLUSTER_ID', 'PRIMARY_REGION', 'SECONDARY_REGION', 'ROUTING_CONTROL_ARN', 'SECRET_ARN']
+              missing = [v for v in required_vars if not os.environ.get(v)]
+              if missing:
+                  return {
+                      'statusCode': 400,
+                      'body': json.dumps({'error': f'Missing required environment variables: {missing}'})
+                  }
+              ssm = boto3.client('ssm')
+              doc_name = os.environ['SSM_DOCUMENT_NAME']
+              params = {
+                  'PrimaryRegion': [os.environ['PRIMARY_REGION']],
+                  'SecondaryRegion': [os.environ['SECONDARY_REGION']],
+                  'GlobalClusterIdentifier': [os.environ['GLOBAL_CLUSTER_ID']],
+                  'RoutingControlARN': [os.environ['ROUTING_CONTROL_ARN']],
+                  'SecretARN': [os.environ['SECRET_ARN']]
+              }
+              response = ssm.start_automation_execution(
+                  DocumentName=doc_name,
+                  Parameters=params
+              )
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps({
+                      'AutomationExecutionId': response['AutomationExecutionId']
+                  })
+              }
+Outputs:
+  SSMAutomationDocumentName:
+    Description: Name of the SSM Automation document
+    Value: !Ref AuroraGlobalDatabaseFailoverSSMDocument
+  LambdaFunctionARN:
+    Description: ARN of the TriggerFailover Lambda function
+    Value: !GetAtt TriggerFailoverFunction.Arn
+  SSMAutomationRoleARN:
+    Description: ARN of the SSM automation execution role
+    Value: !GetAtt SSMAutomationRole.Arn
+  LambdaExecutionRoleARN:
+    Description: ARN of the Lambda execution role
+    Value: !GetAtt LambdaExecutionRole.Arn

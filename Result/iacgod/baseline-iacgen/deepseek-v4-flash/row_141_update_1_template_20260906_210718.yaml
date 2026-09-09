@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: WebSocket API for grant-processing job status updates with encrypted Lambda environment variables and encrypted CloudWatch logs
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    Description: The name of the API Gateway stage
+  RelatedFunctionRoleArns:
+    Type: CommaDelimitedList
+    Description: List of IAM role ARNs for related Lambda functions that can decrypt the KMS key used for Lambda environment variables
+    Default: ''
+
+Resources:
+  # KMS Key 1: For Lambda environment variable encryption
+  LambdaEnvKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for encrypting Lambda function environment variables
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow Lambda Execution Role to Decrypt
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt LambdaExecutionRole.Arn
+            Action:
+              - kms:Decrypt
+              - kms:Encrypt
+              - kms:GenerateDataKey
+              - kms:ReEncrypt*
+              - kms:DescribeKey
+            Resource: '*'
+          - Sid: Allow Related Functions to Decrypt
+            Effect: Allow
+            Principal:
+              AWS: !If [HasRelatedRoles, !Ref RelatedFunctionRoleArns, !Ref AWS::NoValue]
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+            Resource: '*'
+            Condition:
+              StringEquals:
+                kms:CallerAccount: !Ref AWS::AccountId
+      Tags:
+        - Key: Name
+          Value: LambdaEnvKmsKey
+
+  LambdaEnvKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/lambda-env-kms-key
+      TargetKeyId: !Ref LambdaEnvKmsKey
+
+  # KMS Key 2: For CloudWatch Logs encryption
+  CloudWatchLogsKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for encrypting CloudWatch Logs log group used by API Gateway
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow CloudWatch Logs to Use Key
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+            Condition:
+              ArnLike:
+                kms:EncryptionContext:aws:logs:arn: !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:${ApiGatewayAccessLogGroup}
+      Tags:
+        - Key: Name
+          Value: CloudWatchLogsKmsKey
+
+  CloudWatchLogsKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/cloudwatch-logs-kms-key
+      TargetKeyId: !Ref CloudWatchLogsKmsKey
+
+  # DynamoDB Table for connection tracking
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: WebSocketConnections
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+      Tags:
+        - Key: Name
+          Value: WebSocketConnections
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt ConnectionsTable.Arn
+        - PolicyName: KMSDecrypt
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt LambdaEnvKmsKey.Arn
+        - PolicyName: ApiGatewayManageConnections
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*
+
+  # Lambda Function
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: WebSocketHandler
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ConnectionsTable
+          API_ENDPOINT: !Sub wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+        KmsKeyArn: !GetAtt LambdaEnvKmsKey.Arn
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+          table_name = os.environ['TABLE_NAME']
+          table = dynamodb.Table(table_name)
+
+          def lambda_handler(event, context):
+              route_key = event.get('requestContext', {}).get('routeKey')
+              connection_id = event.get('requestContext', {}).get('connectionId')
+              domain_name = event.get('requestContext', {}).get('domainName')
+              stage = event.get('requestContext', {}).get('stage')
+
+              if route_key == '$connect':
+                  try:
+                      table.put_item(Item={'connectionId': connection_id})
+                  except ClientError as e:
+                      print(f"Error storing connection {connection_id}: {e}")
+                      return {'statusCode': 500}
+                  return {'statusCode': 200}
+
+              elif route_key == '$disconnect':
+                  try:
+                      table.delete_item(Key={'connectionId': connection_id})
+                  except ClientError as e:
+                      print(f"Error removing connection {connection_id}: {e}")
+                  return {'statusCode': 200}
+
+              elif route_key == 'sendmessage':
+                  try:
+                      body = json.loads(event.get('body', '{}'))
+                      message = body.get('message', '')
+                      # Broadcast to all connected clients
+                      api_client = boto3.client('apigatewaymanagementapi', endpoint_url=f"https://{domain_name}/{stage}")
+                      response = table.scan(ProjectionExpression='connectionId')
+                      for item in response.get('Items', []):
+                          try:
+                              api_client.post_to_connection(
+                                  ConnectionId=item['connectionId'],
+                                  Data=

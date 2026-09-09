@@ -1,0 +1,164 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Creates an IAM user and group for SES SMTP, generates SMTP credentials, and stores them in SSM Parameter Store."
+Parameters:
+  IAMUserName:
+    Type: String
+    Default: SMTPUser
+    Description: "The desired IAM username for the SES SMTP user."
+  AccessKeyRotationVersion:
+    Type: String
+    Default: "1"
+    Description: "Version number to force rotation of the access key and SMTP password."
+  LambdaLogRetentionDays:
+    Type: Number
+    Default: 30
+    Description: "The number of days to retain logs for the Lambda function."
+  KmsKeyArn:
+    Type: String
+    Default: ""
+    Description: "Optional ARN of a customer-managed KMS key to encrypt the SSM parameters. Leave empty to use the default AWS managed key."
+Conditions:
+  UseCustomKmsKey: !Not [!Equals [!Ref KmsKeyArn, ""]]
+Resources:
+  SESGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: !Sub "${IAMUserName}Group"
+  SESPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${IAMUserName}SESSendPolicy"
+      Groups:
+        - !Ref SESGroup
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - ses:SendEmail
+              - ses:SendRawEmail
+            Resource: "*"
+  SESUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Ref IAMUserName
+  SESUserGroupAttachment:
+    Type: AWS::IAM::UserToGroupAddition
+    Properties:
+      GroupName: !Ref SESGroup
+      Users:
+        - !Ref SESUser
+  SESAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref SESUser
+    DependsOn: SESUserGroupAttachment
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SSMWrite
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:PutParameter
+                  - ssm:DeleteParameter
+                  - ssm:GetParameter
+                Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/ses-smtp/${IAMUserName}/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/SmtpCredentialGenerator-${IAMUserName}"
+      RetentionInDays: !Ref LambdaLogRetentionDays
+  SmtpCredentialGenerator:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaLogGroup
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.11
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3, hmac, hashlib, base64, json, os, logging
+          import cfnresponse
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          ssm = boto3.client('ssm')
+          def handler(event, context):
+            logger.info("Received event: %s", json.dumps(event))
+            response_data = {}
+            try:
+              request_type = event['RequestType']
+              props = event['ResourceProperties']
+              username = props['IAMUserName']
+              access_key_id = props['AccessKeyId']
+              secret_access_key = props['SecretAccessKey']
+              kms_key_arn = props.get('KmsKeyArn', '')
+              param_prefix = '/ses-smtp/' + username
+              username_param = param_prefix + '/username'
+              password_param = param_prefix + '/password'
+              if request_type in ['Create', 'Update']:
+                smtp_password = base64.b64encode(
+                  hmac.new(secret_access_key.encode('utf-8'), b'SendRawEmail', hashlib.sha256).digest()
+                ).decode('utf-8')
+                # Store username
+                put_kwargs = {
+                  'Name': username_param,
+                  'Value': access_key_id,
+                  'Type': 'SecureString',
+                  'Overwrite': True
+                }
+                if kms_key_arn:
+                  put_kwargs['KeyId'] = kms_key_arn
+                ssm.put_parameter(**put_kwargs)
+                # Store password
+                put_kwargs['Name'] = password_param
+                put_kwargs['Value'] = smtp_password
+                ssm.put_parameter(**put_kwargs)
+                response_data['UsernameParameter'] = username_param
+                response_data['PasswordParameter'] = password_param
+              elif request_type == 'Delete':
+                try:
+                  ssm.delete_parameter(Name=username_param)
+                except ssm.exceptions.ParameterNotFound:
+                  pass
+                try:
+                  ssm.delete_parameter(Name=password_param)
+                except ssm.exceptions.ParameterNotFound:
+                  pass
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, response_data)
+            except Exception as e:
+              logger.error("Error: %s", str(e))
+              cfnresponse.send(event, context, cfnresponse.FAILED, response_data, reason=str(e))
+  SmtpCredentials:
+    Type: Custom::SmtpCredentialGenerator
+    Properties:
+      ServiceToken: !GetAtt SmtpCredentialGenerator.Arn
+      IAMUserName: !Ref IAMUserName
+      AccessKeyId: !Ref SESAccessKey
+      SecretAccessKey: !GetAtt SESAccessKey.SecretAccessKey
+      KmsKeyArn: !If [UseCustomKmsKey, !Ref KmsKeyArn, ""]
+      RotationVersion: !Ref AccessKeyRotationVersion
+Outputs:
+  SMTPUsernameParameter:
+    Description: "SSM Parameter name for the SMTP username (IAM Access Key ID)"
+    Value: !Sub "/ses-smtp/${IOMUserName}/username"
+  SMTPPasswordParameter:
+    Description: "SSM Parameter name for the SMTP password"
+    Value: !Sub "/ses-smtp/${IOMUserName}/password"

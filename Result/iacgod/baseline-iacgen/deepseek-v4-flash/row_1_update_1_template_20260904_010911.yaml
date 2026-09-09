@@ -1,0 +1,361 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Creates an IAM role and custom SSM Automation documents for PCI compliance remediations with AWS Config Conformance Packs"
+Resources:
+  PCIAutomationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "pciautomationassumerole-${AWS::Region}"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ssm.amazonaws.com
+                - ec2.amazonaws.com
+                - events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: pciautomation-policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:ReleaseAddress
+                  - ec2:DescribeAddresses
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DeleteSecurityGroup
+                  - ec2:RevokeSecurityGroupIngress
+                  - ec2:RevokeSecurityGroupEgress
+                  - ec2:DescribeVpcs
+                  - ec2:DescribeNetworkInterfaces
+                  - autoscaling:DescribeAutoScalingGroups
+                  - autoscaling:UpdateAutoScalingGroup
+                Resource: "*"
+  RestrictDefaultSecurityGroupDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Content:
+        schemaVersion: "0.3"
+        description: "Restrict VPC default security group by revoking all ingress and egress rules"
+        assumeRole: "{{AutomationAssumeRole}}"
+        parameters:
+          VpcId:
+            type: String
+            description: "The VPC ID (optional). If not provided, the default VPC will be discovered."
+            default: ""
+          AutomationAssumeRole:
+            type: String
+            description: "The ARN of the role that allows Automation to perform the actions on your behalf."
+            default: ""
+        mainSteps:
+          - name: getDefaultVpcOrUseProvided
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.8
+              Handler: handler
+              Script: |
+                import boto3
+                ec2 = boto3.client('ec2')
+                def handler(events, context):
+                    vpc_id = events.get('VpcId', '')
+                    if vpc_id:
+                        return {'VpcId': vpc_id}
+                    response = ec2.describe_vpcs(Filters=[{'Name': 'isDefault', 'Values': ['true']}])
+                    if response['Vpcs']:
+                        return {'VpcId': response['Vpcs'][0]['VpcId']}
+                    raise Exception('No default VPC found and no VpcId provided.')
+            outputs:
+              - Name: VpcId
+                Selector: "$.Payload.VpcId"
+                Type: String
+            nextStep: findDefaultSecurityGroup
+          - name: findDefaultSecurityGroup
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.8
+              Handler: handler
+              Script: |
+                import boto3
+                ec2 = boto3.client('ec2')
+                def handler(events, context):
+                    vpc_id = events['VpcId']
+                    response = ec2.describe_security_groups(
+                        Filters=[
+                            {'Name': 'vpc-id', 'Values': [vpc_id]},
+                            {'Name': 'group-name', 'Values': ['default']}
+                        ]
+                    )
+                    if response['SecurityGroups']:
+                        return {'SecurityGroupId': response['SecurityGroups'][0]['GroupId']}
+                    raise Exception(f'Default security group not found in VPC {vpc_id}')
+            outputs:
+              - Name: SecurityGroupId
+                Selector: "$.Payload.SecurityGroupId"
+                Type: String
+            nextStep: revokeAllRules
+          - name: revokeAllRules
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.8
+              Handler: handler
+              Script: |
+                import boto3
+                ec2 = boto3.client('ec2')
+                def handler(events, context):
+                    sg_id = events['SecurityGroupId']
+                    response = ec2.describe_security_groups(GroupIds=[sg_id])
+                    sg = response['SecurityGroups'][0]
+                    if sg.get('IpPermissions'):
+                        ec2.revoke_security_group_ingress(
+                            GroupId=sg_id,
+                            IpPermissions=sg['IpPermissions']
+                        )
+                    if sg.get('IpPermissionsEgress'):
+                        ec2.revoke_security_group_egress(
+                            GroupId=sg_id,
+                            IpPermissions=sg['IpPermissionsEgress']
+                        )
+                    return {'Success': True, 'SecurityGroupId': sg_id}
+            outputs:
+              - Name: Result
+                Selector: "$.Payload"
+                Type: StringMap
+      Name: !Sub "PCI-RestrictDefaultSecurityGroup-${AWS::Region}"
+  DeleteUnusedSecurityGroupsDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Content:
+        schemaVersion: "0.3"
+        description: "Delete security groups that are not associated with any network interface"
+        assumeRole: "{{AutomationAssumeRole}}"
+        parameters:
+          SecurityGroupIds:
+            type: StringList
+            description: "List of security group IDs to evaluate. If empty, all security groups in the account will be evaluated."
+            default: []
+          AutomationAssumeRole:
+            type: String
+            description: "The ARN of the role that allows Automation to perform the actions on your behalf."
+            default: ""
+        mainSteps:
+          - name: getSecurityGroupsToEvaluate
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.8
+              Handler: handler
+              Script: |
+                import boto3
+                ec2 = boto3.client('ec2')
+                def handler(events, context):
+                    sg_ids = events.get('SecurityGroupIds', [])
+                    if sg_ids:
+                        return {'SecurityGroupIds': sg_ids}
+                    all_sgs = []
+                    paginator = ec2.get_paginator('describe_security_groups')
+                    for page in paginator.paginate():
+                        for sg in page['SecurityGroups']:
+                            all_sgs.append(sg['GroupId'])
+                    return {'SecurityGroupIds': all_sgs}
+            outputs:
+              - Name: SecurityGroupIds
+                Selector: "$.Payload.SecurityGroupIds"
+                Type: StringList
+            nextStep: filterUnusedSecurityGroups
+          - name: filterUnusedSecurityGroups
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.8
+              Handler: handler
+              Script: |
+                import boto3
+                ec2 = boto3.client('ec2')
+                def handler(events, context):
+                    sg_ids = events['SecurityGroupIds']
+                    # Get all network interfaces
+                    eni_sgs = set()
+                    paginator = ec2.get_paginator('describe_network_interfaces')
+                    for page in paginator.paginate():
+                        for eni in page['NetworkInterfaces']:
+                            for group in eni.get('Groups', []):
+                                eni_sgs.add(group['GroupId'])
+                    # Also check for default security groups (cannot be deleted)
+                    default_sgs = set()
+                    vpc_response = ec2.describe_vpcs(Filters=[{'Name': 'isDefault', 'Values': ['true']}])
+                    default_vpc_ids = [v['VpcId'] for v in vpc_response['Vpcs']]
+                    if default_vpc_ids:
+                        sg_response = ec2.describe_security_groups(Filters=[{'Name': 'group-name', 'Values': ['default']}])
+                        for sg in sg_response['SecurityGroups']:
+                            default_sgs.add(sg['GroupId'])
+                    unused = [sg for sg in sg_ids if sg not in eni_sgs and sg not in default_sgs]
+                    return {'UnusedSecurityGroupIds': unused}
+            outputs:
+              - Name: UnusedSecurityGroupIds
+                Selector: "$.Payload.UnusedSecurityGroupIds"
+                Type: StringList
+            nextStep: deleteUnusedSecurityGroups
+          - name: deleteUnusedSecurityGroups
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.8
+              Handler: handler
+              Script: |
+                import boto3
+                ec2 = boto3.client('ec2')
+                def handler(events, context):
+                    unused_ids = events['UnusedSecurityGroupIds']
+                    results = []
+                    for sg_id in unused_ids:
+                        try:
+                            ec2.delete_security_group(GroupId=sg_id)
+                            results.append({'SecurityGroupId': sg_id, 'Status': 'Deleted'})
+                        except Exception as e:
+                            results.append({'SecurityGroupId': sg_id, 'Status': 'Failed', 'Error': str(e)})
+                    return {'Results': results}
+            outputs:
+              - Name: Results
+                Selector: "$.Payload"
+                Type: StringMap
+      Name: !Sub "PCI-DeleteUnusedSecurityGroups-${AWS::Region}"
+  ReleaseUnassociatedEIPsDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Content:
+        schemaVersion: "0.3"
+        description: "Release unassociated Elastic IP addresses using their allocation IDs"
+        assumeRole: "{{AutomationAssumeRole}}"
+        parameters:
+          AllocationIds:
+            type: StringList
+            description: "List of allocation IDs to evaluate. If empty, all addresses in the account will be evaluated."
+            default: []
+          AutomationAssumeRole:
+            type: String
+            description: "The ARN of the role that allows Automation to perform the actions on your behalf."
+            default: ""
+        mainSteps:
+          - name: getAddressesToEvaluate
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.8
+              Handler: handler
+              Script: |
+                import boto3
+                ec2 = boto3.client('ec2')
+                def handler(events, context):
+                    alloc_ids = events.get('AllocationIds', [])
+                    if alloc_ids:
+                        return {'AllocationIds': alloc_ids}
+                    all_alloc_ids = []
+                    paginator = ec2.get_paginator('describe_addresses')
+                    for page in paginator.paginate():
+                        for addr in page['Addresses']:
+                            all_alloc_ids.append(addr['AllocationId'])
+                    return {'AllocationIds': all_alloc_ids}
+            outputs:
+              - Name: AllocationIds
+                Selector: "$.Payload.AllocationIds"
+                Type: StringList
+            nextStep: filterUnassociatedEIPs
+          - name: filterUnassociatedEIPs
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.8
+              Handler: handler
+              Script: |
+                import boto3
+                ec2 = boto3.client('ec2')
+                def handler(events, context):
+                    alloc_ids = events['AllocationIds']
+                    response = ec2.describe_addresses(AllocationIds=alloc_ids)
+                    unassociated = []
+                    for addr in response['Addresses']:
+                        if 'AssociationId' not in addr and 'InstanceId' not in addr:
+                            unassociated.append(addr['AllocationId'])
+                    return {'UnassociatedAllocationIds': unassociated}
+            outputs:
+              - Name: UnassociatedAllocationIds
+                Selector: "$.Payload.UnassociatedAllocationIds"
+                Type: StringList
+            nextStep: releaseEIPs
+          - name: releaseEIPs
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.8
+              Handler: handler
+              Script: |
+                import boto3
+                ec2 = boto3.client('ec2')
+                def handler(events, context):
+                    unassociated_ids = events['UnassociatedAllocationIds']
+                    results = []
+                    for alloc_id in unassociated_ids:
+                        try:
+                            ec2.release_address(AllocationId=alloc_id)
+                            results.append({'AllocationId': alloc_id, 'Status': 'Released'})
+                        except Exception as e:
+                            results.append({'AllocationId': alloc_id, 'Status': 'Failed', 'Error': str(e)})
+                    return {'Results': results}
+            outputs:
+              - Name: Results
+                Selector: "$.Payload"
+                Type: StringMap
+      Name: !Sub "PCI-ReleaseUnassociatedEIPs-${AWS::Region}"
+  UpdateASGHealthCheckDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Content:
+        schemaVersion: "0.3"
+        description: "Update an Auto Scaling group's health check type to ELB with a grace period of 300 seconds"
+        assumeRole: "{{AutomationAssumeRole}}"
+        parameters:
+          AutoScalingGroupName:
+            type: String
+            description: "The name of the Auto Scaling group to update."
+          AutomationAssumeRole:
+            type: String
+            description: "The ARN of the role that allows Automation to perform the actions on your behalf."
+            default: ""
+        mainSteps:
+          - name: updateHealthCheckType
+            action: aws:executeScript
+            inputs:
+              Runtime: python3.8
+              Handler: handler
+              Script: |
+                import boto3
+                asg = boto3.client('autoscaling')
+                def handler(events, context):
+                    asg_name = events['AutoScalingGroupName']
+                    asg.update_auto_scaling_group(
+                        AutoScalingGroupName=asg_name,
+                        HealthCheckType='ELB',
+                        HealthCheckGracePeriod=300
+                    )
+                    return {'AutoScalingGroupName': asg_name, 'HealthCheckType': 'ELB', 'HealthCheckGracePeriod': 300}
+            outputs:
+              - Name: Result
+                Selector: "$.Payload"
+                Type: StringMap
+      Name: !Sub "PCI-UpdateASGHealthCheck-${AWS::Region}"
+Outputs:
+  PCIAutomationRoleArn:
+    Description: "ARN of the IAM role created for PCI automation"
+    Value: !GetAtt PCIAutomationRole.Arn
+  RestrictDefaultSecurityGroupDocumentName:
+    Description: "Name of the SSM Automation document to restrict default security group"
+    Value: !Ref RestrictDefaultSecurityGroupDocument
+  DeleteUnusedSecurityGroupsDocumentName:
+    Description: "Name of the SSM Automation document to delete unused security groups"
+    Value: !Ref DeleteUnusedSecurityGroupsDocument
+  ReleaseUnassociatedEIPsDocumentName:
+    Description: "Name of the SSM Automation document to release unassociated EIPs"
+    Value: !Ref ReleaseUnassociatedEIPsDocument
+  UpdateASGHealthCheckDocumentName:
+    Description: "Name of the SSM Automation document to update ASG health check"
+    Value: !Ref UpdateASGHealthCheckDocument

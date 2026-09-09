@@ -1,0 +1,255 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Parameters:
+  PhoneNumber:
+    Type: String
+    Default: "+14070000000"
+    Description: Phone number for SMS notifications when a human is detected
+Resources:
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: PhotoAnalysisNotifications
+  SNSSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: sms
+      Endpoint: !Ref PhoneNumber
+      TopicArn: !Ref SNSTopic
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - rekognition:DetectLabels
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SNSTopic
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: "*"
+  TriggerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          sfn_client = boto3.client('stepfunctions')
+          def lambda_handler(event, context):
+              bucket = event['Records'][0]['s3']['bucket']['name']
+              key = event['Records'][0]['s3']['object']['key']
+              state_machine_arn = os.environ['STATE_MACHINE_ARN']
+              input_payload = json.dumps({'bucket': bucket, 'key': key})
+              response = sfn_client.start_execution(stateMachineArn=state_machine_arn, input=input_payload)
+              return {'statusCode': 200, 'body': json.dumps('Execution started: ' + response['executionArn'])}
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref StepFunctionsStateMachine
+  RekognitionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          rekognition = boto3.client('rekognition')
+          def lambda_handler(event, context):
+              bucket = event['bucket']
+              key = event['key']
+              response = rekognition.detect_labels(Image={'S3Object': {'Bucket': bucket, 'Name': key}}, MaxLabels=10, MinConfidence=70)
+              has_human = any(label['Name'] == 'Person' for label in response['Labels'])
+              return {'bucket': bucket, 'key': key, 'hasHuman': has_human, 'labels': [label['Name'] for label in response['Labels']]}
+  NotifyLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import os
+          sns = boto3.client('sns')
+          def lambda_handler(event, context):
+              bucket = event['bucket']
+              key = event['key']
+              topic_arn = os.environ['SNS_TOPIC_ARN']
+              message = f"Human detected in image! Bucket: {bucket}, Key: {key}"
+              sns.publish(TopicArn=topic_arn, Message=message, Subject='Human Detected in Photo')
+              return {'statusCode': 200, 'body': json.dumps('Notification sent')}
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SNSTopic
+  StepFunctionsStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: PhotoAnalysisStateMachine
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "Photo Analysis State Machine",
+          "StartAt": "AnalyzeImage",
+          "States": {
+            "AnalyzeImage": {
+              "Type": "Task",
+              "Resource": "${RekognitionLambda.Arn}",
+              "Next": "CheckHuman"
+            },
+            "CheckHuman": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.hasHuman",
+                  "BooleanEquals": true,
+                  "Next": "SendNotification"
+                }
+              ],
+              "Default": "NoHumanDetected"
+            },
+            "SendNotification": {
+              "Type": "Task",
+              "Resource": "${NotifyLambda.Arn}",
+              "End": true
+            },
+            "NoHumanDetected": {
+              "Type": "Pass",
+              "End": true
+            }
+          }
+        }
+  S3Bucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "photo-analysis-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+  TriggerLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref TriggerLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt S3Bucket.Arn
+      SourceAccount: !Ref AWS::AccountId
+  CustomResourceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CustomResourcePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                Resource: !Sub "arn:aws:s3:::${S3Bucket}"
+  CustomResourceFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt CustomResourceRole.Arn
+      Runtime: python3.12
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+          s3 = boto3.client('s3')
+          def lambda_handler(event, context):
+              response_status = cfnresponse.SUCCESS
+              response_data = {}
+              try:
+                  if event['RequestType'] in ['Create', 'Update']:
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      lambda_arn = event['ResourceProperties']['LambdaArn']
+                      notification_configuration = {
+                          'LambdaFunctionConfigurations': [
+                              {
+                                  'LambdaFunctionArn': lambda_arn,
+                                  'Events': ['s3:ObjectCreated:*']
+                              }
+                          ]
+                      }
+                      s3.put_bucket_notification_configuration(Bucket=bucket_name, NotificationConfiguration=notification_configuration)
+                  elif event['RequestType'] == 'Delete':
+                      bucket_name = event['ResourceProperties']['BucketName']
+                      s3.put_bucket_notification_configuration(Bucket=bucket_name, NotificationConfiguration={})
+              except Exception as e:
+                  response_status = cfnresponse.FAILED
+                  response_data = {'Error': str(e)}
+              cfnresponse.send(event, context, response_status, response_data)
+  CustomResource:
+    Type: AWS::CloudFormation::CustomResource
+    Properties:
+      ServiceToken: !GetAtt CustomResourceFunction.Arn
+      BucketName: !Ref S3Bucket
+      LambdaArn: !GetAtt TriggerLambda.Arn
+Outputs:
+  BucketName:
+    Description: S3 bucket name for uploading images
+    Value: !Ref S3Bucket

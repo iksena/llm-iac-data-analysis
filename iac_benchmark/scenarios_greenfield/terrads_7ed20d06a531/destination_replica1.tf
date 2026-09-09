@@ -1,3 +1,7 @@
+data "aws_caller_identity" "replica1_bucket_owner" {
+    provider = aws.replica1
+}
+
 resource "aws_kms_key" "replicakey1" {
     provider                = aws.replica1
     description             = "This key is used to encrypt dest bucket objects"
@@ -14,7 +18,7 @@ resource "aws_s3_bucket" "replica1" {
     provider         = aws.replica1
     count            = sum([for _, names in var.s3_bucket_names : length(names)])
     acl              = "private"
-    bucket           = "${flatten([for _, names in var.s3_bucket_names : names ])[count.index]}-replica1"
+    bucket           = "${flatten([for _, names in var.s3_bucket_names : names ])[count.index]}-replica1-${data.aws_caller_identity.replica1_bucket_owner.account_id}"
 
     versioning {
         enabled = true

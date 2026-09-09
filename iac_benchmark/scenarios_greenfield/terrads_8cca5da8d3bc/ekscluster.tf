@@ -73,7 +73,7 @@ resource "aws_iam_role_policy_attachment" "daniela_eks_s3_policy" {
 #create the EKS Cluster
 resource "aws_eks_cluster" "k8s_cluster" {
   name     = "daniela-eks-cluster"
-  version  = "1.29"
+  version  = "1.31"
   role_arn = aws_iam_role.daniela_cluster_role.arn
 
   vpc_config {

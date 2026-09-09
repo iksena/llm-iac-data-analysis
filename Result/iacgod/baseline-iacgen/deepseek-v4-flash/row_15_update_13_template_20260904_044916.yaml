@@ -1,0 +1,333 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to create a scheduled workflow for closing AWS Organization accounts tagged with organizations:account-closure=REQUESTED'
+
+Resources:
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/stepfunctions/${AWS::StackName}-account-closure'
+      RetentionInDays: 365
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaTaggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - tag:GetResources
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: '*'
+
+  StepFunctionsExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsLoggingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogDelivery
+                  - logs:GetLogDelivery
+                  - logs:UpdateLogDelivery
+                  - logs:DeleteLogDelivery
+                  - logs:ListLogDeliveries
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                Resource: !GetAtt CloudWatchLogGroup.Arn
+        - PolicyName: OrganizationsAccountClosurePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                Resource: !GetAtt TaggedAccountFetcher.Arn
+              - Effect: Allow
+                Action:
+                  - organizations:DescribeAccount
+                  - organizations:CloseAccount
+                  - organizations:TagResource
+                Resource: '*'
+
+  EventBridgeInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeStepFunctionsPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref AccountClosureStateMachine
+
+  TaggedAccountFetcher:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-tagged-account-fetcher'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          
+          def lambda_handler(event, context):
+              client = boto3.client('resourcegroupstaggingapi')
+              tagged_accounts = []
+              pagination_token = None
+              
+              while True:
+                  params = {
+                      'TagFilters': [
+                          {
+                              'Key': 'organizations:account-closure',
+                              'Values': ['REQUESTED']
+                          }
+                      ],
+                      'ResourceTypeFilters': ['organizations:account']
+                  }
+                  if pagination_token:
+                      params['PaginationToken'] = pagination_token
+                  
+                  response = client.get_resources(**params)
+                  
+                  for resource in response.get('ResourceTagMappingList', []):
+                      arn = resource['ResourceARN']
+                      account_id = arn.split('/')[-1]
+                      tagged_accounts.append({'Id': account_id, 'ARN': arn})
+                  
+                  pagination_token = response.get('PaginationToken')
+                  if not pagination_token:
+                      break
+              
+              return {'Accounts': tagged_accounts}
+
+  AccountClosureStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub '${AWS::StackName}-account-closure'
+      StateMachineType: EXPRESS
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt CloudWatchLogGroup.Arn
+        IncludeExecutionData: true
+        Level: ALL
+      RoleArn: !GetAtt StepFunctionsExecutionRole.Arn
+      DefinitionString:
+        Fn::Sub:
+          - |-
+            {
+              "Comment": "State machine to close AWS Organization accounts tagged with organizations:account-closure=REQUESTED",
+              "StartAt": "FetchTaggedAccounts",
+              "States": {
+                "FetchTaggedAccounts": {
+                  "Type": "Task",
+                  "Resource": "arn:aws:states:::lambda:invoke",
+                  "Parameters": {
+                    "FunctionName": "${LambdaFunctionArn}",
+                    "Payload": {}
+                  },
+                  "ResultPath": "$.lambdaResult",
+                  "Next": "ProcessAccounts",
+                  "Retry": [
+                    {
+                      "ErrorEquals": ["Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException"],
+                      "IntervalSeconds": 5,
+                      "MaxAttempts": 3,
+                      "BackoffRate": 2
+                    }
+                  ],
+                  "Catch": [
+                    {
+                      "ErrorEquals": ["States.ALL"],
+                      "ResultPath": "$.error",
+                      "Next": "FailState"
+                    }
+                  ]
+                },
+                "ProcessAccounts": {
+                  "Type": "Map",
+                  "ItemsPath": "$.lambdaResult.Payload.Accounts",
+                  "MaxConcurrency": 10,
+                  "Iterator": {
+                    "StartAt": "DescribeAccount",
+                    "States": {
+                      "DescribeAccount": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:organizations:describeAccount",
+                        "Parameters": {
+                          "AccountId.$": "$.Id"
+                        },
+                        "Next": "CheckAccountStatus",
+                        "ResultPath": "$.accountDetails",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["Organizations.AccountNotFoundException", "Organizations.TooManyRequestsException"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2
+                          }
+                        ],
+                        "Catch": [
+                          {
+                            "ErrorEquals": ["States.ALL"],
+                            "ResultPath": "$.error",
+                            "Next": "LogError"
+                          }
+                        ]
+                      },
+                      "CheckAccountStatus": {
+                        "Type": "Choice",
+                        "Choices": [
+                          {
+                            "Variable": "$.accountDetails.Account.Status",
+                            "StringEquals": "ACTIVE",
+                            "Next": "CloseAccount"
+                          }
+                        ],
+                        "Default": "SkipAccount"
+                      },
+                      "CloseAccount": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:organizations:closeAccount",
+                        "Parameters": {
+                          "AccountId.$": "$.accountDetails.Account.Id"
+                        },
+                        "Next": "TagAccountAcknowledged",
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["Organizations.AccountNotFoundException", "Organizations.TooManyRequestsException", "Organizations.ConcurrentModificationException"],
+                            "IntervalSeconds": 10,
+                            "MaxAttempts": 5,
+                            "BackoffRate": 2
+                          }
+                        ],
+                        "Catch": [
+                          {
+                            "ErrorEquals": ["States.ALL"],
+                            "ResultPath": "$.error",
+                            "Next": "LogError"
+                          }
+                        ]
+                      },
+                      "TagAccountAcknowledged": {
+                        "Type": "Task",
+                        "Resource": "arn:aws:states:::aws-sdk:organizations:tagResource",
+                        "Parameters": {
+                          "ResourceId.$": "$.accountDetails.Account.Id",
+                          "Tags": [
+                            {
+                              "Key": "organizations:account-closure",
+                              "Value": "ACKNOWLEDGED"
+                            }
+                          ]
+                        },
+                        "End": true,
+                        "Retry": [
+                          {
+                            "ErrorEquals": ["Organizations.AccountNotFoundException", "Organizations.TooManyRequestsException"],
+                            "IntervalSeconds": 5,
+                            "MaxAttempts": 3,
+                            "BackoffRate": 2
+                          }
+                        ],
+                        "Catch": [
+                          {
+                            "ErrorEquals": ["States.ALL"],
+                            "ResultPath": "$.error",
+                            "Next": "LogError"
+                          }
+                        ]
+                      },
+                      "SkipAccount": {
+                        "Type": "Pass",
+                        "End": true
+                      },
+                      "LogError": {
+                        "Type": "Pass",
+                        "End": true
+                      }
+                    }
+                  },
+                  "Next": "SuccessState"
+                },
+                "SuccessState": {
+                  "Type": "Succeed"
+                },
+                "FailState": {
+                  "Type": "Fail",
+                  "Error": "FailedToFetchTaggedAccounts",
+                  "Cause": "The Lambda function to fetch tagged accounts failed."
+                }
+              }
+            }
+          - LambdaFunctionArn: !GetAtt TaggedAccountFetcher.Arn
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-account-closure-schedule'
+      ScheduleExpression: 'rate(1 hour)'
+      State: ENABLED
+      Targets:
+        - Arn: !Ref AccountClosureStateMachine
+          Id: AccountClosureTarget
+          RoleArn: !GetAtt EventBridgeInvokeRole.Arn
+
+Outputs:
+  StateMachineArn:
+    Description: ARN of the Step Functions state machine
+    Value: !Ref AccountClosureStateMachine
+  EventBridgeRuleArn:
+    Description: ARN of the EventBridge rule
+    Value: !GetAtt EventBridgeRule.Arn
+  LogGroupName:
+    Description: CloudWatch Log Group name
+    Value: !Ref CloudWatchLogGroup
+  LambdaFunctionArn:
+    Description: ARN of the Lambda function
+    Value: !GetAtt TaggedAccountFetcher.Arn
+  StepFunctionsRoleArn:
+    Description: IAM role ARN for Step Functions
+    Value: !GetAtt StepFunctionsExecutionRole.Arn

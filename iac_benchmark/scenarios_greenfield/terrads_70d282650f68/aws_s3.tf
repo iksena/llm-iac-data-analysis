@@ -1,5 +1,5 @@
 resource "aws_s3_bucket" "elb_log" {
-    bucket = "${var.app_name}-elb-log"
+    bucket = "${var.app_name}-elb-log-${data.aws_caller_identity.current.account_id}"
     acl = "private"
 
     # lifecycle_rule {

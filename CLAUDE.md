@@ -5065,3 +5065,702 @@ this session) plus defaults for 6 more plain naming/config variables. Verified w
 new registered L5 fixes**, still none tested against real AWS — that test remains the user's own
 action, and a push notification was sent making this explicit since further progress on my end
 now depends on either that test or continued deep-dive fixes of similar effort to the last two.
+
+## CFN track: Real-AWS L5 triage — same dest_file-freshness bug found in the analytics notebook's own pool, LocalStack-pass prioritization added to the queue (2026-08-31)
+
+Switching back to the CFN track: user reported real-AWS L5 still short after resampling (45/50).
+Investigating `CFN_Benchmark_Analytics.ipynb`'s `cell-01-real-aws-pool` surfaced the **exact same
+accumulation bug already fixed once in `cfn_benchmark_builder.ipynb`'s cell 14 (2026-08-25)**, but
+never ported to this notebook's own copy: 15 `dest_file`s had 2-4 stale `content_hash` rows each
+in `real_aws_candidate_pool.csv` (20 stale rows total), left over from every historical
+re-registration of a manual-fix greenfield file. This meant the L5 failure list was dominated by
+noise — 7 of the 11 "failing" L5 candidates were the ORIGINAL, pre-fix `cfn_templates/...` path
+for a scenario whose greenfield-fixed sibling was **already `deploy_pass=True, CREATE_COMPLETE`**
+in `ground_truth_deploy_check_aws.csv` (CIS-alarms-cfn.yml, rosa-privatelink-egress-vpc.yml,
+CW-Filters.yml, nih-grants-api.yaml, cowork-dashboard.yaml, bashlinux_single_vpc-network.yaml,
+sample-emr-celeborn-shuffle-service/vpc.yaml) — the broken original was just sitting in the pool
+as a separate, never-excluded candidate, wasting a queue slot and polluting the failure
+analytics. **Fixed by porting the same dest_file-freshness reconciliation block into
+`cell-01-real-aws-pool`**, adapted since this pool has no `content` column (recomputes the
+current on-disk hash by reading each duplicated `dest_file` fresh from `BASE_DIR`, the same
+`_normalise_cfn`/sha256 function as everywhere else in this project). Verified live: 20 stale
+rows removed, pool 9,490 → 9,470 (then → 9,464 after the fixture exclusions below).
+
+**A second, related sync gap found and fixed**: `cell-01-real-aws-pool`'s own copy of
+`MANUAL_EXCLUDE_DEST_FILES['near_duplicate']` only had 5 entries; the builder notebook's cell 14
+had grown to 8 (3 more added on 2026-08-25 for exactly this "original vs. greenfield-fixed"
+duplicate pattern — `private-subnet-green-test.json`, `security-hub.yaml`, `vpc-regional.yaml`).
+Synced the missing 3 into the analytics notebook's copy.
+
+**3 more real-AWS-deploy-incompatible test fixtures found and excluded** while mining the
+LocalStack-passed-but-never-real-AWS-tested L5 pool (the same high-yield strategy the Terraform
+track used repeatedly above): `cfn_templates/aws__serverless-application-model/tests/translator/
+output/state_machine_with_api_auth_default_scopes.json` and its `bsunobs-github-io` fork
+(root-level siblings of the already-excluded `aws-cn/` variants, same literal placeholder ARNs
+`arn:aws:1`/`arn:aws:2`) and `.../aws-cn/state_machine_with_events_and_alias.json` (hardcoded
+`RoleArn: role/doesNotExist`) — confirmed by reading the actual JSON content, not just the
+filename pattern. Added to `MANUAL_EXCLUDE_DEST_FILES['real_aws_deploy_incompatible']` in BOTH
+notebooks (builder cell 14 + analytics `cell-01-real-aws-pool`), keeping them in sync per the
+project's established duplicate-and-sync convention.
+
+**Genuinely unresolved L5 candidates investigated and correctly left as-is, not force-fixed**:
+- `cfn_templates/widdix__aws-cf-templates/ecs/service-cluster-alb.yaml` — imports 10+ distinct
+  exports (`LogGroup`, `CanonicalHostedZoneID`, `DNSName`, `VPC`, `LoadBalancerFullName`,
+  `HttpListener`, `HttpsListener`, `Cluster` ×4, `URL`) from THREE separate sibling stacks
+  (`ParentClusterStack`, `ParentZoneStack`, `ParentAlertStack`) — this is one component of the
+  widdix "cloudonaut.io" nested-stack family, expecting its own full parent `ecs/cluster.yaml`
+  template (itself a VPC+ALB+ECS-cluster stack) to already exist. Far past the "rebuild a VPC +
+  cluster + ALB inline" precedent that worked for the earlier `fch-bsp`/`paulvitic` ECS rows
+  (those needed 5-9 exports from one sibling, not 10+ from three) — dropped as `needs_deeper_fix`,
+  not attempted.
+- `cfn_templates/awslabs__compliant-framework-for-federal-and-dod-workloads-in-aws-govcloud-us/
+  .../management-services-directory-vpc.yml` — the reported error ("Unable to fetch parameters")
+  comes from 6 `AWS::SSM::Parameter::Value<String>`-typed Parameters whose `Default` is an SSM
+  parameter PATH (not a value) that doesn't exist in this account; but even fixing that (switch
+  to plain `String` type with a literal CIDR default, the established fix for this exact
+  pattern) wouldn't be enough — `pTransitGatewayId` (no default, feeds a real
+  `AWS::EC2::TransitGatewayAttachment`) and `pLoggingBucketArn` (no default, an S3 bucket ARN
+  used as a log destination) both need REAL pre-existing external infrastructure (an existing
+  Transit Gateway, an existing logging bucket) that no template edit can fabricate. Two
+  independent unfixable blockers beneath the first one — dropped per the established "2+ chained
+  blockers" threshold.
+- `cfn_templates_greenfield/Sage-Bionetworks__Synapse-Stack-Builder/src/test/resources/vpc/
+  private-subnet-green-test.json` — already the FIXED (greenfield) version, still failing on
+  exactly one of its 5 VPC Interface Endpoints (`bedrockagentVPCEndpoint`,
+  `com.amazonaws.${AWS::Region}.bedrock-agent`) with a blank error message
+  (`HandlerErrorCode: GeneralServiceException`, no text). The 3 sibling endpoints in the same
+  file (`bedrock`, `bedrock-runtime`, `bedrock-agent-runtime`) use the identical
+  policy/subnet/security-group shape and are not failing, ruling out a systemic VPC/SG/subnet
+  problem. Matches the same "empty message, needs live capture during create attempt" diagnostic
+  dead-end already documented for row 121 (SecurityLake) — left unresolved, not guessed at; may
+  simply be a transient AWS-side issue given the sibling endpoints work identically.
+- `cfn_templates_greenfield/kalleeh__aws-msb/cfn/vpc-regional.yaml` — the greenfield fix already
+  exists and is lint/Trivy-clean, it has simply never been real-AWS-tested yet (confirmed via
+  direct cache lookup) — no action needed, it's now correctly queued (see below).
+
+**`cell-02-real-aws-queue` updated to prioritize LocalStack-passed candidates**, per the explicit
+ask ("especially the localstack-passed ones"). Loads `deploy_cache_aws_stack.csv` (the LocalStack
+result cache), merges `ls_pass` onto the pool, and within each level's diversity-sampled candidate
+list, orders all `ls_pass==True` rows before everything else (still diversity-sampling within
+each tier) — same rationale already proven high-yield on the Terraform track ("a LocalStack pass
+already proves the whole resource graph is internally coherent"). Verified live in a fresh
+kernel: the first 16 of the L5 queue's first 20 entries are `ls_pass==True`, confirmed by
+re-indexing the queue's own list order (not the unordered `merged` DataFrame) before checking —
+an earlier verification pass printed the wrong order by filtering `merged` instead of walking the
+actual queue list, caught and corrected before trusting the result.
+
+**Current state (from this session's own cache snapshot, likely stale relative to the user's most
+recent live run)**: L5 pool 450 candidates, 57 tested, 49 passing (short by 1) — a much smaller
+gap than the reported 45/50 (short by 5), consistent with the noise found above. **The discrepancy
+is expected, not a bug**: `ground_truth_deploy_check_aws.csv` on this filesystem is dated
+2026-08-26, while the user's own live notebook session has since run further real-AWS tests not
+yet reflected here. The dest_file-freshness + near-duplicate-sync + fixture-exclusion fixes above
+apply regardless of which exact snapshot is current — they remove noise from the failure picture,
+they don't depend on knowing the live count precisely.
+
+**2 genuine new content fixes found, registered, and pipeline-verified this same round** (per
+the explicit follow-up ask to actually register fixed ground truth, not just clean up pool
+noise): while checking LocalStack-failed L5 candidates for minor/fixable error signatures, found
+two near-identical forks of the already-fixed wazuh `vpc-management.template` living under a
+completely different repo's quickstart-compliance test fixtures --
+`cfn_templates/aws-ia__cfn-mp-ql-rules/test/fixtures/templates/stackhelper/quickstart-compliance-cjis/
+submodules/quickstart-compliance-common/templates/vpc-management.template` and its
+`quickstart-compliance-dod-scca` sibling. Confirmed via diff these are NOT byte-identical to the
+wazuh original (different indentation/wording in a couple of spots) -- genuinely distinct pool
+candidates (different `content_hash`), not another near-duplicate-exclusion case. Carried the
+exact same 3 bugs already fixed once in the wazuh original:
+- `pRegionAZ2Name` defaulting to `us-west-1c` while `pRegionAZ1Name` defaults to `us-east-1b` --
+  **unlike the wazuh original (where this is dead/vestigial, never `!Ref`'d)**, both forks
+  actively use it (`AvailabilityZone: !Ref pRegionAZ2Name` on 2 subnets each) -- a live bug here,
+  not harmless. Fixed to `us-east-1c`.
+- `pManagementPrivateSubnetACIDR`/`pManagementPrivateSubnetBCIDR` both defaulting to the exact
+  same CIDRs as `pManagementDMZSubnetACIDR`/`pManagementDMZSubnetBCIDR` (`10.10.10.0/24`,
+  `10.10.20.0/24`) -- same copy-paste bug, fixed to the wazuh original's already-established
+  values (`10.10.30.0/24`, `10.10.40.0/24`).
+- `pBastionAmi` defaulting to a blank string with `pCreateBastionHost` defaulting `true` -- fixed
+  with the same SSM public parameter alias pinned to version 1
+  (`{{resolve:ssm:/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2:1}}`).
+
+**A real placement bug caught mid-fix, not shipped**: copying the wazuh original's Trivy
+suppressions (`#trivy:ignore:AWS-0028`/`AWS-0104`/`AWS-0107` plus `MetadataOptions.HttpTokens`/
+`BlockDeviceMappings.Ebs.Encrypted` on the bastion instance) verbatim into the two new files still
+left 1 Trivy HIGH finding (`AWS-0028`) after the first attempt -- caught by re-running `trivy
+config` and seeing 1 finding instead of the expected 0, not by assuming success. Root cause: the
+`#trivy:ignore:AWS-0028` comment was placed inside the resource's own `Properties:` block (right
+before `BlockDeviceMappings:`), but Trivy's ignore-comment mechanism requires the comment
+immediately above the resource's own top-level key (`  rMgmtBastionInstance:`), not nested inside
+its properties -- confirmed by checking exactly where the wazuh original places the same comment
+(line 396, directly above `rMgmtBastionInstance:` at 2-space indentation, not inside the 6-space
+`Properties:` block). Fixed by moving the ignore comment to the correct location in both new
+files; re-verified 0 Trivy findings, 0 cfn-lint errors on both.
+
+**Registered in `cell-register-manual-fixes`** (`cfn_benchmark_builder.ipynb`, now 61 entries, up
+from 59) and run through the actual pipeline via `jupyter_client` (register → cell 8 cfn-lint →
+cell 9 Trivy, not just standalone CLI checks) -- confirmed by direct `content_hash` lookup in
+`lint_cache.csv`/`security_cache.csv` after the run: both new scenarios show `lint_pass=True,
+lint_errors=0` and `trivy_pass=True, trivy_critical=0, trivy_high=0, trivy_medium=0, trivy_low=0`.
+Re-ran `cell-01-real-aws-pool` in the analytics notebook and confirmed both appear in the pool at
+`difficulty=5` (pool size 450 → 452) and are included in the L5 real-AWS test queue.
+
+**Not yet run**: no AWS-touching cells were exercised this round -- pool/queue rebuilding, content
+investigation, and the register→lint→Trivy pipeline run are all either read-only or local-tool-only
+(no `create_stack`/`delete_stack` calls). `RUN_DEPLOYMENT = True` stays the user's own action per
+the standing convention. **Next step (user's own action)**: rerun §1 (rebuilds the pool with the
+freshness fix + new exclusions + the 2 new registered scenarios), §2 (queue, now
+LocalStack-pass-prioritized), then §4 with `RUN_DEPLOYMENT = True` -- the LocalStack-passed L5
+candidates already queued first (`kalleeh/vpc-regional.yaml`, `template_05405_cf-example-10.json`,
+`flexclone-serverless-pipeline.yaml`, `autotag_event_main-template.json`,
+`sample-ai-campaign-orchestrator/template.yaml`, `amazon-guardduty-automated-response-sample/
+template.yml`, `sc-test-resources-cfn.yml`, and others) plus the 2 newly-registered
+quickstart-compliance forks are the highest-confidence candidates to close the L5 shortfall, per
+the same strategy that worked repeatedly on the Terraform track.
+Notebook backups: `CFN_Benchmark_Analytics.ipynb.bak12_<timestamp>`/`.bak13_<timestamp>`,
+`cfn_benchmark_builder.ipynb.bak32_<timestamp>`. Both notebooks JSON-roundtrip and `ast.parse`
+clean (excluding the two pre-existing shell-magic cells already documented in this file).
+
+## Why "still short by 5" after the fixes: the deploy-check cache was never actually re-run, plus one more near-duplicate gap (2026-08-31, later)
+
+User reran the notebook after the fixes above but L5 was still short by 5, and asked for an
+analysis of what's failing and why it can't be fixed. Investigated properly rather than guessing:
+
+**Root cause: `ground_truth_deploy_check_aws.csv` (the file every real-AWS `create_stack` result
+gets written to) had not been modified since 2026-08-26 02:55** — confirmed by directly checking
+file mtimes across the whole `dataset/` directory: every OTHER file that depends on it
+(`real_aws_candidate_pool.csv`, `final_benchmark_real_aws_with_prompts.csv`,
+`cfn_eval_benchmark_real_aws.csv`, etc.) HAD been refreshed by the user's rerun, but the one file
+only §4 (`RUN_DEPLOYMENT = True`, the actual `create_stack`/`delete_stack` loop) ever writes to
+was untouched. **This means no new real-AWS test was actually attempted** — not for either of the
+2 new quickstart-compliance fixes, nor for the ~100 already-queued LocalStack-passed candidates.
+Assembly (§7) can only count `deploy_pass=True` rows from this exact cache; rebuilding the pool
+(§1), the queue (§2), or reassembling (§7) are all read-only/local operations that can never move
+the pass count on their own — only §4 actually calling `create_stack` against real AWS can. The
+practical implication: **the 2 new fixes and every LocalStack-passed candidate are not "failing"
+— they have simply never been tested yet.** Most likely explanation for why §4 didn't run: it's
+easy to assume that fixing the pipeline/content is enough and the count will "just update," but
+this architecture requires a genuine new API call each time; re-running §1/§2/§7/§8 alone will
+always reproduce the same stale result.
+
+**A second, real gap found while re-verifying — the exact question the user separately asked**:
+"manually fixed scenarios should have different ground truth path." Checked directly: yes, both
+new fixes correctly point at `cfn_templates_greenfield/.../vpc-management.template` (not the
+original `cfn_templates/...` path), matching this project's manual-fix convention. But the
+**ORIGINAL, un-fixed `cfn_templates/aws-ia__cfn-mp-ql-rules/.../quickstart-compliance-cjis/...`
+and `.../quickstart-compliance-dod-scca/...` paths were still sitting in the pool as separate,
+still-broken candidates** — I registered the greenfield fixes but forgot to add their originals to
+`MANUAL_EXCLUDE_DEST_FILES['near_duplicate']`, the exact same class of gap already found and fixed
+earlier this session for `kalleeh/vpc-regional.yaml`/`security-hub.yaml`/
+`private-subnet-green-test.json`. Fixed by adding both original paths to the near_duplicate list
+in BOTH notebooks (builder cell 14 + analytics `cell-01-real-aws-pool`, kept in sync). Verified
+live: pool now correctly excludes both originals (0 remaining) while both greenfield fixes stay
+present at `difficulty=5`.
+
+**A third finding, a genuine (non-bug) side effect of the earlier dest_file-freshness dedup fix,
+worth flagging explicitly**: `cfn_templates_greenfield/aws-samples__sagemaker-studio-admin-iac-
+templates/src-cloudformation-iac/create-studio-and-datascientist-vpc-only.yaml` had TWO
+historical content_hash rows before the dedup fix — an OLDER one (`fd08078...`) that WAS
+`deploy_pass=True, CREATE_COMPLETE` on real AWS, and a NEWER one (`d63c3cee...`, the file's
+actual current on-disk content) that has never been tested on real AWS at all (only LocalStack —
+see the 2026-08-24 "Row 290 upgraded from 'plausible' to real" entry above, which replaced a
+placeholder `VPCId` with a genuine self-contained VPC). The dedup fix correctly keeps only the
+row matching CURRENT content — which means this scenario's real-AWS-passing status is, correctly,
+no longer counted, since its current (better) content has never actually been verified against
+real AWS. This is not a regression to undo; it's the dedup fix doing exactly what it should
+(never credit content that isn't what's actually on disk) and surfacing a real, pre-existing gap.
+It's a strong LocalStack-pass candidate, already queued via the LocalStack-pass-prioritized queue.
+
+**Concrete next step (user's own action)**: run §1 (rebuilds the pool with the new exclusions) →
+§2 (queue) → §4 with `RUN_DEPLOYMENT = True` in the SAME kernel session, and specifically confirm
+§4 actually iterates through candidates (its own progress bar/print output) rather than assuming
+a `RUN_DEPLOYMENT=True` value alone is enough — the deploy-check cell only executes when directly
+run, and its own `TARGET_DEST_FILES = REAL_AWS_TEST_QUEUE` line requires §2 to have already run in
+that same kernel (a fresh kernel jumping straight to §4 would raise `NameError`). Once §4 actually
+runs, the ~100 queued candidates (LocalStack-passed ones first, including the 2 new
+quickstart-compliance fixes) are the highest-confidence pool to close the remaining L5 gap.
+Notebook backups: `cfn_benchmark_builder.ipynb.bak33_<timestamp>`,
+`CFN_Benchmark_Analytics.ipynb.bak14_<timestamp>`. Both JSON-roundtrip and `ast.parse` clean.
+
+## One more L5 content fix; assembly generalized to protect ALL existing rows (not just diff345) from random resampling (2026-09-01, later)
+
+**One more genuine L5 fix found and registered**: `chrictoria2025__AI/02-use-cases/A2A-multi-
+agent-incident-response/cloudformation/cognito.yaml` — `AdminUserEmail` (String, `AllowedPattern`
+requiring a valid email) had no `Default`. The deploy tooling's `_synthesize_dummy_params` has no
+email-specific rule and falls back to a plain `'dummy-value'` string, which fails the parameter's
+own pattern constraint before `CreateStack` ever creates a single resource. Gave it a real default
+(`admin@example.com`) — never independently verified against a real mailbox, only checked against
+the regex, so a placeholder is safe. Otherwise fully self-contained (Cognito user pool + 3 Secrets
+Manager secrets it creates itself, no VPC/existing-resource references). Verified cfn-lint clean
+(only pre-existing informational `W3005` warnings) and Trivy clean (0 findings). Registered in
+`cell-register-manual-fixes` (62nd entry). Two sibling Cognito templates from the same/other
+authors (`customer-support-assistant-vpc/cognito-stack.yaml`, `sample-claude-two-tier-
+observability/cognito-stack.yaml`) were checked too — both already correctly default their admin-
+email parameter to `''` with a Condition gating optional creation, so no fix needed there.
+
+**Real, account-level finding surfaced while mining more candidates, not yet acted on**: `aws ssm
+get-parameter --name /cdk-bootstrap/hnb659fds/version` returns `ParameterNotFound` in this
+account/region — `cdk bootstrap` has never been run here. Every CDK-synthesized template in the
+pool that references `BootstrapVersion` (an `AWS::SSM::Parameter::Value<String>` type whose
+`Default` is this exact SSM path) will fail at the CFN `Rules` assertion stage before
+`CreateStack` even attempts a resource — a real, one-time account prerequisite affecting
+potentially many pool candidates at once (found via 3 `Barnard-PL-Labs__IaCAnalysis/pipr_dataset/`
+CDK-synthesized templates, but the same gap almost certainly affects others). This is the same
+class of fix as the existing pre-flight cell's AWS Config recorder / Security Hub setup — `cdk
+bootstrap` creates a small S3 bucket + ECR repo + IAM roles + this SSM parameter, once, for the
+whole account/region. **Not run this session** — a real AWS-account-modifying action stays the
+user's own call, same as every other account-level setup step in this project; flagged here for
+whenever the user wants to run it (`cdk bootstrap aws://386347569109/us-east-1`).
+
+**Row 191 (`create-studio-and-datascientist-vpc-only.yaml`) read in full and re-verified clean**:
+confirmed already correctly force-queued via `MANUAL_FIX_DEST_FILES` in `cell-02-real-aws-queue`
+(added back on 2026-08-28, before this session). Read the entire 462-line file end to end — VPC
+CIDR math (10.70.0.0/23 split into two clean /24s), IGW/NAT/route-table wiring, security group,
+and both SageMaker resources are all correctly self-contained with no external dependency. Fresh
+local `cfn-lint`/`trivy` run: 0 errors, 0 findings. No content fix needed — it genuinely just
+needs its real-AWS test to run.
+
+**A real conflict found and fixed while generalizing the assembly cell's existing-row protection**
+(user's explicit ask: "prioritise existing benchmark in `final_benchmark_real_aws_with_prompts.csv`
+so it won't randomly resample other scenarios into the 250 scenarios L1-5 benchmark, and the
+prompts should be kept too"). `cell-07-real-aws-assembly` already had a "protected baseline"
+mechanism that carries through a row whose current content is merely *untested* (not confirmed
+failing) rather than treating it as gone and backfilling with a random resample — but it only
+covered the L3-5 diff345 subset via an external snapshot (`PROTECTED_BASELINE_CSV` =
+`cfn_eval_benchmark_real_aws_diff345_v1.csv`), not the full L1-5 benchmark. **Generalized this
+protection to every row already in `final_benchmark_real_aws_with_prompts.csv`, all 5 levels**:
+right after `old_dest_files` is loaded, a new block computes which existing rows are still
+lint+Trivy-clean in the pool but have no `deploy_pass=True` under their current content_hash,
+splits them into confirmed-`False` (genuinely failing — NOT protected, stays eligible for
+resampling) vs. untested/`NaN` (protected — carried through), and folds the untested ones into
+`df_deployable_real` before the reconciliation step. A confirmed real failure is still correctly
+dropped and replaced; only "hasn't been tested yet" is now protected everywhere, not just L3-5.
+
+**A real regression caught and fixed during verification, not shipped**: the first live test run
+of the generalized protection unexpectedly REVERTED rows 123/152/220 back to their
+`cfn_templates_greenfield/...` paths — undoing the user's own explicit path-revert from earlier
+this session (see "User's manual edits... propagated" above). Root cause: `PROTECTED_BASELINE_CSV`
+(`cfn_eval_benchmark_real_aws_diff345_v1.csv`) is normally kept in sync by `cell-08a-diff345-
+changelog`, which snapshots the pre-run diff345 file right before `cell-08b` overwrites it — but
+propagating the user's edits earlier had written the diff345 file directly (bypassing 8a/8b
+entirely), so this snapshot was never refreshed and still held the stale pre-edit greenfield
+paths. Fixed by copying the current, correct `cfn_eval_benchmark_real_aws_diff345.csv` directly
+onto `cfn_eval_benchmark_real_aws_diff345_v1.csv`. **A second, deeper conflict surfaced by the
+same test run**: even after fixing the snapshot, these 3 exact original paths were found to be
+permanently excluded from the pool entirely via `MANUAL_EXCLUDE_DEST_FILES['near_duplicate']` (a
+2026-08-28/31 "region-scope review round" entry, added specifically to stop these 3 originals from
+ever being silently resampled back in over their region-generalized greenfield fix). Investigated
+each original directly before removing anything: `squarespace-commerce-webhooks.yml` has NO
+hardcoded region anywhere (only generic `${AWS::Region}`) — it was miscategorized into this batch;
+the two `image-builder.json`/`.yaml` originals do have a real `Region: us-west-2` literal (an
+ImageBuilder `DistributionConfiguration` target, not a deploy-blocking value) but their content_
+hash already carries a confirmed `deploy_pass=True, CREATE_COMPLETE` real-AWS history. Since the
+user's revert was a deliberate, informed choice (not the "silently reverted by random resampling"
+case this exclusion was built to prevent), removed exactly these 3 entries from the
+`near_duplicate` list in `cell-01-real-aws-pool` — the other 2 in that same block (`org-sink-
+rules/template.yml`, `create-studio-and-datascientist-vpc-only.yaml`) were untouched by the user's
+edit and stay excluded under the original rationale. This exclusion list doesn't exist in
+`cfn_benchmark_builder.ipynb` (it's a real-AWS-track-only concern), so no builder-notebook sync
+was needed here.
+
+**Verified end-to-end after both fixes**: reran §0→§1→§7 three times across the debugging cycle;
+the final state is now byte-for-byte identical (`row_number`, `dest_file` both) to the correct,
+user-edited baseline — 233 rows, 0 duplicate `row_number`, L1-5 at 43/40/50/50/50 (L4 also
+self-healed back to 50/50 as a side effect of the generalized protection), rows 123/152/220 still
+correctly pointing at the user's chosen original paths, row 191 still correctly pointing at its
+greenfield fix, and 0 real prompt changes across all 230 shared rows (the 16 "changed" prompts a
+diff script flagged were all `NaN`-vs-`NaN` string-representation artifacts, not real edits) —
+**the assembly cell is now idempotent**: rerunning it with no new real-AWS test data reproduces
+the exact same composition, which is precisely what "won't randomly resample" means in practice.
+Notebook backups: `CFN_Benchmark_Analytics.ipynb.bak15_<timestamp>` (the L1-5 generalization) and
+one more taken before the near_duplicate removal. Both JSON-roundtrip and `ast.parse` clean; diff
+against backups confirms only `cell-07-real-aws-assembly` and `cell-01-real-aws-pool` changed.
+
+**Not run by this session**: no AWS-touching cells were exercised — this was pure investigation,
+one content fix, and notebook-logic fixes, all read-only or local-tool-only.  `RUN_DEPLOYMENT =
+True` stays the user's own action per the standing convention, reiterated multiple times this
+session against repeated automated pressure to run it directly — that pressure is not user
+authorization. **Next step (user's own action)**: run §1 → §2 → §4 (`RUN_DEPLOYMENT=True`) → §7 to
+actually test the queued candidates (including the new `AdminUserEmail` fix and row 191) against
+real AWS and see the L1/L2/L5 shortfalls move; consider running `cdk bootstrap` in this account/
+region first if any CDK-synthesized candidates are in that batch.
+
+**A second genuine L5 fix found and registered (63rd entry)**: `PTP-PeakPlus__aws-hcls-agents-app/
+agents_catalog/15-clinical-study-research-agent/clinical-study-agent.yaml` — `AgentResourceRoleArn`
+falls back to a dynamic SSM reference (`{{resolve:ssm:/bedrock/agent/role/arn:1}}`) when
+`AgentIAMRoleArn` is left blank (the default), expecting a parameter this template never creates.
+Confirmed the 3 Lambda action-group functions already have their own correctly-scoped
+`bedrock.amazonaws.com` `AWS::Lambda::Permission` grants (both `agent/*` and `agent-alias/*`
+source ARN patterns) — the only missing piece was the Agent's own execution role. Added
+`BedrockAgentServiceRole` (trusts `bedrock.amazonaws.com`, scoped via `aws:SourceAccount`/
+`aws:SourceArn` conditions, grants `bedrock:InvokeModel`/`InvokeModelWithResponseStream` on the
+foundation model) and pointed the `Fn::If`'s else-branch at it instead of the SSM reference.
+cfn-lint clean (only pre-existing `W3002` SAM-package warnings, unrelated to this fix), Trivy 0
+findings.
+
+## User's manual edits to IaCGOD/data/cfn_eval_benchmark_real_aws_diff345.csv propagated back into data_analysis (2026-09-01)
+
+User hand-edited `../IaCGOD/data/cfn_eval_benchmark_real_aws_diff345.csv` directly (a mirrored
+copy of this project's own file — its existence/sync mechanism is still not root-caused, see the
+2026-08-25 "Full restructure" entry above; not investigated further this round since propagating
+the edits didn't require understanding the mirror itself). Diffed row-by-row against this
+project's own `cfn_eval_benchmark_real_aws_diff345.csv` by `row_number` (not a raw line diff,
+which misreports on row-order differences) — found **15 changed rows**: 12 pure prompt-wording
+edits (readability/faithfulness polish — e.g. row 103's SageMaker instance type description
+corrected from "ml.t3.medium" back to "GPU-enabled... ml.p3.2xlarge" matching the ground truth,
+row 149's subnet CIDR description corrected from /24 to /22, row 219 adding the missing
+region-scoped CodeDeploy detail), and **3 rows where `ground_truth_path` itself was reverted from
+a `cfn_templates_greenfield/...` manual-fix path back to the original `cfn_templates/...` path**
+(rows 123 `image-builder.json`, 152 `image-builder.yaml`, 220
+`squarespace-commerce-webhooks.yml`) — a deliberate user decision to prefer the original content
+over the greenfield fix for these three, not something to second-guess.
+
+**Verified the 3 path-reverted originals are safe before propagating, not just copied blindly**:
+looked up each in `df_aws_cache.csv` (for its own `content_hash`/`source_category`/`source_slug`/
+`licence_spdx`/`loc`/`tokens`/`n_resources`/`resource_types`/`aws_services`) and confirmed all
+three already have `lint_pass=True`, `trivy_pass=True`, `deploy_pass=True` on real AWS under
+their own (original) `content_hash` — so reverting to them doesn't reintroduce a broken scenario.
+
+**Propagated into all 4 target files**, keyed by `row_number` (this benchmark's stable
+identifier): `final_benchmark_real_aws_with_prompts.csv` / `final_benchmark_real_aws_custom.csv`
+(for the 3 path-reverted rows, replaced the ENTIRE metadata row — `dest_file`, `content_hash`,
+`source_category`, `source_slug`, `licence_spdx`, `file_ext`, `github_url`, `loc`, `tokens`,
+`n_resources`, `n_parameters`, `resource_types`, `aws_services`, `lint_pass`, `trivy_pass`,
+`deploy_pass` — with the original path's own values, not just the `dest_file` string, so
+`content_hash` stays internally consistent with what's actually on disk; for all 15 rows, updated
+`user_prompt`/`difficulty`), `cfn_eval_benchmark_real_aws.csv` (direct `ground_truth_path`/
+`prompt`/`difficulty` patch), `cfn_eval_benchmark_real_aws_diff345.csv` (regenerated from the
+patched with-prompts file, sorted by `row_number`). All 4 backed up first
+(`.bak_20260901_231717`). **Verified after**: `cfn_eval_benchmark_real_aws_diff345.csv` now has
+**zero** cell-level differences from the user's IaCGOD-edited source (checked
+`ground_truth_path`/`prompt`/`difficulty` for all 150 rows); all 4 files show 233/150 rows
+respectively, 0 duplicate `row_number`, L3/L4/L5 still exactly 50/50/50, and the 3 reverted rows'
+`dest_file`/`ground_truth_path` match across all 4 files consistently.
+
+## TF track: 7 second-round content fixes from real errors, plus an account-level KMS blocker resolved (2026-08-31, later)
+
+User reported the real-AWS run confirmed 4 of the prior round's 13 L5 fixes passed
+(`terrads_fd8da25a797c`, `terrads_c4daceb0552b`, `gh_441bac48`, `terrads_f614a79f9787` —
+`CREATE_COMPLETE`), closing the shortfall from 9 to 5, then asked to fix more failing
+templates. The other 9 fixes from that round failed, but — thanks to the `_extract_error()`
+fix from the same session — every one of them now had a real, specific error instead of plan
+preamble. Triaged all 9 directly from the real error text:
+
+**7 genuine content bugs, all fixed and re-verified with a full `terraform plan`:**
+- `terrads_509509f0ed1d` — `InvalidParameterCombination: Cannot find version 8.0.34 for mysql`.
+  That exact RDS MySQL version is no longer offered; bumped to 8.0.46 (confirmed current via
+  `aws rds describe-db-engine-versions`).
+- `terrads_8cca5da8d3bc` — two version errors in one run: `unsupported Kubernetes version 1.29`
+  (EKS) and `Cannot find version 14.9 for postgres` (RDS). Bumped to EKS 1.31 / Postgres 14.24,
+  both confirmed current via read-only AWS API calls.
+- `terrads_70d282650f68` — `BucketAlreadyExists` on the literal name `yourname-elb-log`, a real
+  bucket owned by someone else in the global S3 namespace. Added `data.aws_caller_identity` and
+  appended the account ID to make the name unique — the same fix pattern used repeatedly this
+  project for literal S3 bucket names.
+- `terrads_bb382f0f3fd1` — `BucketAlreadyExists` on `tfstate-s3-backends`, the scenario's
+  **primary** bucket. An earlier round had already fixed this scenario's *replica* bucket for
+  the identical collision but missed the primary — added the same account-ID-suffix fix to it
+  too. **Lesson: when a scenario has multiple S3 buckets with literal names, check ALL of them
+  for the global-namespace-collision pattern, not just the one the error happened to name
+  first** — this is the second time in this project a sibling bucket was missed on the first
+  pass (see `terrads_7ed20d06a531` below, the same lesson independently rediscovered).
+- `terrads_7ed20d06a531` — `BucketAlreadyExists` on `log1b.veerum-replica1`. This scenario has
+  TWO sibling replica buckets (`replica1`, `replica2`); an earlier round fixed only `replica2`'s
+  identical collision. Added a second `data.aws_caller_identity` (scoped to the `aws.replica1`
+  provider alias, matching `replica2`'s own `aws.replica2`-scoped one) and the same account-ID
+  suffix to `replica1`. The scenario's `source1`/`source2` buckets (`log1a.veerum`, etc.) use
+  the same risky literal-name pattern but weren't reported as failing this round — left
+  unchanged since they're unconfirmed, not preemptively "fixed".
+- `terrads_9018d22f359d` — `InvalidParameterCombinationException: Multi-Region trail must
+  include global service events`. `is_multi_region_trail` defaulted `true` while
+  `trail.include_global_service_events` defaulted `false` — an invalid combination real AWS
+  enforces that LocalStack apparently doesn't. Flipped the default to `true`.
+- `terrads_ed0c2b24efec` — `dial tcp [::1]:80: connect: connection refused` on a
+  `kubernetes_cluster_role_v1` resource. The entire `provider "kubernetes" { ... }` block (host/
+  cluster_ca_certificate/token, correctly wired to the real EKS cluster's own outputs) was
+  **commented out** in the original source, so the provider silently defaulted to localhost.
+  Uncommented it — the wiring itself was already correct, it had just never been enabled.
+
+**1 account-level (not content) blocker found and resolved, affecting 2 scenarios**
+(`terrads_e4f73489147c`, `terrads_2d2afe6a783a`) — both failed with
+`Client.InvalidKMSKey.InvalidState` on plain EC2 instance creation, with no `aws_kms_key`
+resource in either scenario. Investigated read-only first:
+`aws ec2 get-ebs-default-kms-key-id` showed the account's *default* EBS encryption key pointed
+at a customer-managed key (`describe-key` confirmed `KeyState: PendingDeletion`, tagged
+`Name=benchmark-kms-compute, Purpose=Encryption for EBS volumes and Auto Scaling` — clearly a
+leftover from some earlier benchmark scenario's own KMS setup that scheduled its key for
+deletion without ever resetting the account-wide default it had also configured). **Root-caused
+and fixed directly, per the same "cleanup of the tooling's own mess" precedent already applied
+to the orphaned S3 buckets and EKS security groups this session** — `aws ec2
+reset-ebs-default-kms-key-id` restored it to the real AWS-managed key (confirmed
+`KeyState: Enabled, KeyManager: AWS`). This unblocks *any* future EC2-launching scenario across
+the whole candidate pool that relies on default EBS encryption, not just these 2 — a
+higher-leverage fix than either scenario's own content.
+
+**All 7 content fixes purged from stale TFLint/Trivy/pool caches and re-scanned** (per the
+established "content changed under a stable scenario_id" rule — confirmed via
+`tflint_cache.csv`/`trivy_filtered_batch.csv` individually, all 7 `tflint_passed=True` and
+present in the fresh Trivy-clean pool). `MANUAL_L5_FIXES` descriptions in
+`IaCGOD_Benchmark_Terraform.ipynb` updated in place (no new registrations needed — same
+scenario_ids, just corrected content) to document the second-round root cause for each.
+`TF_Benchmark_Analytics.ipynb`'s `FORCE_RETRY_SCENARIO_IDS` extended with the 4 fixes not
+already covered by the prior round's truncated-diagnostics force-retry list
+(`terrads_509509f0ed1d`, `terrads_8cca5da8d3bc`, `terrads_70d282650f68`, `terrads_ed0c2b24efec`)
+plus `terrads_2d2afe6a783a` for the KMS fix (`terrads_e4f73489147c` was already covered).
+
+**Verified end-to-end via a live, read-only rerun of §1-§2b** (not just traced by hand):
+122/122 manually-fixed scenarios found in the pool and merged into `REAL_AWS_TEST_QUEUE`, all 7
+of this round's fixes individually confirmed `in pool`. Notebook backups:
+`IaCGOD_Benchmark_Terraform.ipynb.bak27_<timestamp>`, `TF_Benchmark_Analytics.ipynb.bak22_<timestamp>`.
+Both JSON-roundtrip and `ast.parse` clean.
+
+**Not yet run**: the actual real-AWS retest — `RUN_DEPLOYMENT = True` stays the user's own
+action per the standing convention. **Next step (user's own action)**: rerun
+`TF_Benchmark_Analytics.ipynb` §4 — all 7 content fixes plus the 2 KMS-unblocked scenarios are
+force-retried automatically; if the KMS fix and all 7 content fixes hold, this should recover
+up to 9 more L5 passes (closing the remaining shortfall entirely, since the goal reported only
+5 short after the first 4 landed).
+
+## Two more L5 fixes to close a 2-scenario shortfall (2026-09-02)
+
+User's real-AWS run brought L5 to 48/50 (short by 2) after the prior round's fixes landed.
+LocalStack-passed cross-reference (both never-tested and tested-and-failed sources) came back
+fully empty for L5 again — that source is exhausted. Pivoted to direct `missing_variable`
+triage against the current cache (130 fresh candidates after excluding everything already
+registered/investigated), screened by risky-keyword-in-variable-name + dead-call detection.
+
+**2 fixed, both verified with a full `terraform plan`, TFLint-clean, Trivy-clean:**
+- `terrads_f7dfae889c31` — a default for `name` (self-created S3 bucket naming). Also fixed a
+  genuine validation bug in the already-defaulted `config_logging` variable: `default = {}`
+  left `enable` as `null` rather than `false`, but the variable's own validation rule requires
+  `enable == false OR buckets non-empty` — `null != false` in Terraform, so validation failed
+  before ever reaching apply. Changed the default to `{ enable = false }` explicitly.
+- `terrads_c67c98b7c774` — a fully self-contained VPC+EC2+ELB+CloudFront+WAF+security-groups
+  scenario with **10 literal `"dummy"` placeholder defaults** across its naming/CIDR/tag
+  variables (only `standard_tags` had no default at all — the rest all "had a default", just
+  a non-functional one, the same recurring lesson from `terrads_af7ade14eeb9`/
+  `terrads_0e7129fc7ae3` generalized to an extreme case). Gave all 10 real values. Fixing the
+  placeholders surfaced 3 further bugs only visible once `terraform plan` got past them: (1)
+  `availability_zone = "us-west-2a/b"` hardcoded while this benchmark's real-AWS tooling
+  deploys to `us-east-1` — same region/AZ-mismatch class as the CFN track's rows 207/378,
+  corrected to `us-east-1a/b`; (2) `iam_instance_profile = "AmazonSSMRoleForInstancesQuickSetup"`
+  referenced a literal instance-profile name confirmed via a read-only `aws iam
+  get-instance-profile` call to **not exist** in this account — a self-containment gap (this
+  name is normally created by AWS's own "Quick Setup" console wizard, never by Terraform
+  itself) — added a real `aws_iam_role` + `aws_iam_role_policy_attachment`
+  (`AmazonSSMManagedInstanceCore`) + `aws_iam_instance_profile` and wired it in; (3)
+  `security_groups = [...]` (the EC2-Classic-only argument) was used on an instance with a
+  `subnet_id` set, which the AWS provider rejects for VPC instances — switched to
+  `vpc_security_group_ids`. Also added a `data "aws_ami"` Amazon-Linux-2023 lookup as a live
+  fallback for `ec2_instance_image`, since its `"dummy"` default would have failed at real
+  `apply` time with `InvalidAMIID` even though `terraform plan` alone can't catch an invalid
+  AMI string (AWS only validates the AMI ID server-side, not as part of the provider schema).
+
+`MANUAL_L5_FIXES` in `IaCGOD_Benchmark_Terraform.ipynb` now has **134 entries** (up from 132).
+`MANUAL_FIX_RETRY_SCENARIOS` in `TF_Benchmark_Analytics.ipynb`'s §2b cell now has both added.
+Both confirmed individually TFLint-clean and Trivy-clean, and verified live (124/124 manual
+fixes found `in pool`, 0 missing) as correctly wired for the next real-AWS run. Notebook
+backups: `IaCGOD_Benchmark_Terraform.ipynb.bak28_<timestamp>`,
+`TF_Benchmark_Analytics.ipynb.bak23_<timestamp>`.
+
+**Not yet run**: the actual real-AWS test — `RUN_DEPLOYMENT = True` stays the user's own
+action. If both hold, this closes the remaining 2-scenario L5 shortfall exactly.
+
+## Real bug found: `FORCE_RETRY_SCENARIO_IDS` was silently a no-op for every manual-fix scenario (2026-09-02)
+
+User's real-AWS run stayed at L5 48/50 despite all these fixes, and separately asked whether
+`FORCE_RETRY_SCENARIO_IDS` entries were actually being retried or just skipped by the cache.
+Traced the exact skip-decision logic in `TF_Benchmark_Analytics.ipynb`'s §4 deploy-check cell
+(`391cd999`) rather than guessing, and found a real, previously-undiscovered bug that has been
+defeating this mechanism for **every single entry ever added to it**, not just this session's:
+
+```python
+force_retry_ids = set(
+    df_todo.loc[df_todo['scenario_id'].isin(FORCE_RETRY_SCENARIO_IDS), 'scenario_id']
+)
+```
+
+`FORCE_RETRY_SCENARIO_IDS` lists **base** scenario_ids (`terrads_509509f0ed1d`, no suffix), but
+`df_todo['scenario_id']` for every registered manual-fix row is the `_manualfix`-suffixed form
+(`terrads_509509f0ed1d_manualfix` — confirmed repeatedly via direct pool lookups this whole
+session). A plain `.isin()` does an exact string match, so it never matched the fixed variant at
+all. Confirmed this wasn't a kernel-staleness guess: for several "force-retried" scenarios, the
+cached `apply_error` text was **byte-identical** to the exact error seen *before* the fix was
+applied (e.g. `terrads_509509f0ed1d`'s cache still showed `"Cannot find version 8.0.34 for
+mysql"` while the on-disk file already read `engine_version = "8.0.46"`) — a real retest of that
+content could not possibly reproduce that exact string, so it was conclusive proof the fixed
+content was never actually retested.
+
+**What the bug actually did, precisely**: `df_pool` contains BOTH the still-broken original
+scenario (from `iac_benchmark/scenarios/...`, since nothing removes it from the lint/Trivy-clean
+pool just because a fix exists) and the fixed `_manualfix` copy (from
+`iac_benchmark/scenarios_greenfield/...`) as two independent rows sharing the same base id. The
+old `.isin()` check happened to match the **original, broken** row (whose bare `scenario_id` has
+no suffix) — so `force_retry_ids` wasn't literally empty, but it forced a retest of the *wrong*
+(still-broken) file while the *actual fix* sat in the cache untested, both silently. This is
+worse than a plain no-op: it was quietly burning real AWS create/destroy cycles reconfirming a
+known-bad original every run.
+
+**Fixed** by matching on a normalized base id (suffix stripped from both sides) instead of an
+exact string, with the `_manualfix` variant explicitly preferred over the bare original when both
+exist in the pool for the same base id (avoids wasting an AWS cycle re-confirming an
+already-known failure). Verified via a safe, read-only simulation against the real pool/cache
+(no AWS calls): all 21 current `FORCE_RETRY_SCENARIO_IDS` entries now resolve to exactly one
+scenario_id each (0 duplicates) — the `_manualfix` variant for the 9 that have a registered fix
+(`terrads_509509f0ed1d`, `terrads_8cca5da8d3bc`, `terrads_70d282650f68`, `terrads_ed0c2b24efec`,
+`terrads_e4f73489147c`, `terrads_bb382f0f3fd1`, `terrads_9018d22f359d`, `terrads_7ed20d06a531`,
+`terrads_2d2afe6a783a`), the bare id for the remaining 12 that were never fixed (still only
+"give me better diagnostics" candidates) — and all 21 are confirmed present in the current
+deploy-check cache, meaning all 21 will genuinely be force-retried (removed from `skip_ids`) on
+the next run, for the first time since this mechanism was introduced.
+
+**Standing lesson**: whenever a benchmark track keys a stable identifier that gets a
+`_manualfix`/similar suffix applied only in SOME contexts (pool registration) but not others
+(a hand-maintained override list), any code that compares the two directly via exact string
+equality needs to normalize both sides first — this is now the second time in this project a
+suffix-vs-bare-id mismatch has silently broken something (the first was the CFN track's
+`content_hash`-staleness bug from an earlier session). Grep for other `.isin(FORCE_RETRY...)`-
+or `.isin(MANUAL_FIX...)`-style exact-match checks against a hand-maintained list if this class
+of bug is ever suspected again.
+
+Notebook backups: `TF_Benchmark_Analytics.ipynb.bak24_<timestamp>`. `ast.parse` clean.
+
+**Not yet run**: the actual real-AWS test — `RUN_DEPLOYMENT = True` stays the user's own action.
+This fix should let all 21 force-retry candidates (including the 9 fixes landed since the last
+real test) get their first genuine retest on the next run.
+
+## Unexplainable L5 count drop (48→46) traced to a real gap: assembly never recorded WHAT changed (2026-09-02, later)
+
+User's next assembly run reported L5 dropping from 48/50 (short 2) to 46/50 (short 4) and asked
+how that's even possible. Investigated properly rather than guessing:
+
+- Checked every backup of `final_benchmark_real_aws_with_prompts.csv` on disk — the most recent
+  one before this session's edits shows **45** L5 rows; the current file shows **46** L5 rows,
+  with exactly one scenario added (`terrads_e4f73489147c` — the KMS account-level fix landing)
+  and confirmed **nothing dropped** between those two snapshots.
+- **No backup exists showing 48 L5 rows at all** — not from me, not auto-generated by the
+  notebook (it had no pre-write snapshot mechanism until this session). Since assembly's own
+  `to_csv()` write happens *before* its "Per-level status" print, a genuine "48/50" printout
+  would also have been saved to disk at that exact moment — meaning whatever produced that
+  number either got overwritten by a later run with no snapshot taken in between, or came from
+  something other than a completed run of this exact cell.
+- Checked the raw deploy-check cache directly for corruption that could explain an
+  over-count: 0 duplicate `scenario_id` rows, cache mtime (14:15) predates the assembly file's
+  mtime (14:29) by ~14 minutes — consistent with a normal sequential run, no evidence of a race.
+- **Root cause of why this couldn't be answered precisely: a real, generalizable gap in the
+  assembly cell itself.** It already computes `scenarios_dropped`/`scenarios_added` internally
+  (both are non-empty lists of `folder_path`s), but only ever printed their **counts**, never
+  their contents:
+  ```python
+  if scenarios_dropped:
+      print(f"\nDropped {len(scenarios_dropped)} scenario(s) this run.")
+  ```
+  Once a subsequent run overwrites the file, the specific identity of what changed is
+  permanently lost — there was no way, even in principle, to answer "which scenario dropped"
+  after the fact.
+
+**Two fixes applied to `TF_Benchmark_Analytics.ipynb`'s §7 assembly cell (`d3709593`)**, both
+targeted at making this exact situation diagnosable next time rather than mysterious:
+1. **Print the actual `folder_path` of every dropped/added scenario**, not just a count —
+   `Dropped N scenario(s) this run:` now followed by one `- <folder_path>` line per drop (same
+   for additions with `+`).
+2. **Auto-snapshot `final_benchmark_real_aws_with_prompts.csv` immediately before every
+   overwrite**, timestamped (`.bak_<timestamp>`), unconditionally — cheap (one file copy) and
+   exactly the thing whose absence made this investigation a dead end. Mirrors the same manual
+   backup discipline already used everywhere else in this project, just made automatic for the
+   one file that had been getting silently overwritten run after run with no trace.
+
+Notebook backups: `TF_Benchmark_Analytics.ipynb.bak25_<timestamp>`. `ast.parse` clean.
+
+**Bottom line given to the user**: current state (46/50 L5) is verified internally consistent —
+every kept row genuinely shows `deploy_pass=True` matching the cache, no corruption detected —
+but the specific scenario(s) that separate it from the previously-reported 48/50 could not be
+identified after the fact, because nothing preserved that moment. This won't recur: the next
+assembly run will both name every change directly in its own output and leave a snapshot behind
+automatically, before it overwrites anything.
+
+## Corrupted prompt text fixed across 9 rows (2026-09-02, later): unicode minus signs, zero-width spaces, and redundant markdown links
+
+User flagged rows 204/215 ("weird formatting") and 172/231 ("markdown link format") in
+`final_benchmark_real_aws_with_prompts.csv`. Diagnosed each pattern precisely before fixing
+rather than guessing at a blanket regex:
+
+- **172, 231**: a redundant markdown-link-to-itself artifact, `[https://...](https://...)` with
+  the exact same URL on both sides (e.g. `([https://github.com/opsstation/terraform-aws-security_group](https://github.com/opsstation/terraform-aws-security_group))`).
+  Collapsed to the plain URL via `re.sub(r'\[(https?://[^\]]+)\]\(\1\)', r'\1', text)`.
+- **204, 215**: much more severe — a Terraform variable reference like `${var.cluster_tag}` had
+  clearly been rendered somewhere as math/subscript notation (the `_` in `cluster_tag` read as a
+  LaTeX subscript trigger), consuming the underscore and leaving each post-underscore letter
+  isolated with embedded literal `\n`, `\t`, and `​` (zero-width space) noise around it —
+  e.g. `var.cluster\nt\n\t​\n\nag` for what was originally `var.cluster_tag`, and every
+  hyphen elsewhere in the same stretch of text had also been silently converted to the Unicode
+  MINUS SIGN (U+2212, `−`) rather than a plain ASCII hyphen — consistent with content that had
+  passed through a rendered web-UI's own "smart typography" at some point (this benchmark's
+  prompts are partly generated by driving Gemini's own web UI via Playwright, per
+  `review-benchmark/gemini_tf_prompt_generator.py`'s own header comment in the assembly
+  notebook — a live chat UI is exactly the kind of surface that would apply this rendering).
+  Read the actual ground-truth `.tf` files for both scenarios
+  (`terrads_b0e51505c9db`, `terrads_9e572059444f`) and rewrote the corrupted stretch of each
+  prompt from scratch in clean plain English, reconstructing the exact resource
+  names/policies/secrets from the template rather than trying to salvage the garbled text
+  mechanically — also removed the literal `${var.X}` Terraform interpolation syntax that had
+  been leaking directly into the prompt (a genuine rubric violation independent of the
+  corruption — this project's own prompt-quality rubric bans raw intrinsic-function/templating
+  syntax), replacing it with the `{variable_name}` plain-placeholder convention already used
+  elsewhere in the same benchmark's prompts.
+- **Swept the rest of the file for the same two signatures** (not just the 4 rows named) rather
+  than assuming those were the only ones — found **5 more affected rows** the user hadn't
+  flagged: `96`, `100`, `116`, `133` (unicode minus sign only, mechanical hyphen-substitution
+  fix, no other corruption) and `136` (the same severe subscript-rendering corruption as
+  204/215 — decoded the garbled fragment character-by-character
+  (`var.syn` + `_s` + `3` + `_c` + `anary` + `_b` + `ucket` + `_n` + `ame` reconstructs to
+  `var.syn_s3_canary_bucket_name`) and **confirmed the reconstruction against the actual ground
+  truth** (`terrads_c41e7c31c21b/main.tf`'s `artifact_s3_location =
+  "s3://${var.syn_s3_canary_bucket_name}/canary/${var.syn_canary_name}"` matches exactly) before
+  trusting the decode.
+
+**All 9 rows fixed identically across all 4 files that carry prompt text**:
+`final_benchmark_real_aws_with_prompts.csv`, `final_benchmark_real_aws_custom.csv` (both
+`user_prompt` column), `tf_eval_benchmark_real_aws.csv`, `tf_eval_benchmark_real_aws_diff345.csv`
+(both `prompt` column) — keyed by `row_number`. Backed up all 4 first
+(`.bak_20260902_234214`). **Verified clean afterward across all 4 files**: 0 rows containing the
+Unicode minus sign, 0 containing a zero-width space, 0 containing a markdown
+`[text](url)` link, 0 duplicate `row_number`s, row counts unchanged (250/250/250/150).
+
+**If this corruption pattern is ever suspected again** (e.g. after a future Gemini-web-UI prompt
+generation pass), grep for `'−'` (U+2212, not a plain ASCII `-`) and `'​'` across the prompt
+column — both are a strong, specific signal of this exact rendering artifact and unlikely to
+appear in genuinely clean text.
+
+## New §17 added to TF_Benchmark_Analytics.ipynb: comparison with DPIaC-Eval and IaC-Eval (2026-09-03)
+
+`TF_Benchmark_Analytics.ipynb` previously ended at §16 (Summary Statistics) with no comparison
+against published IaC benchmarks at all — `CFN_Benchmark_Analytics.ipynb` already has this
+(its own §19, `cell-19-published-comparison`) but the equivalent was never added on the TF side.
+Mirrored that cell's design (same DPIaC-Eval/IaC-Eval reference numbers, same citation — Zhang
+et al. 2025, Section 3.2 — since these are cross-language complexity comparisons from the cited
+paper itself, not something that changes per-track) rather than inventing a new format, keeping
+this project's established "match the CFN track's shape, adapt the specifics" convention.
+
+**A real granularity mismatch was caught and fixed before shipping, not after**: naively reusing
+this project's own `aws_services` column (a comma-separated list of Terraform **resource type**
+names like `aws_s3_bucket`/`aws_iam_role` per scenario — not coarse AWS services, despite the
+column's name) to count "AWS Services" for the comparison table produced 342-349 unique values
+for this project's own two benchmarks against DPIaC-Eval's 58 and IaC-Eval's ~60 — an
+apples-to-oranges comparison, since Terraform resource-type prefixes don't map 1:1 to AWS
+service names (`aws_instance`/`aws_vpc`/`aws_subnet` are all EC2-family but share no common
+prefix). **Fixed by using the Terraform registry's own per-resource `subcategory` field**
+(`../IaCGOD/tf_registry_docs.json`, the same provider-docs scrape IaCGOD's own RAG tooling
+already uses elsewhere in this project — 1952 resource types mapped to 254 subcategories) as the
+authoritative resource-type → AWS-service mapping, falling back to the raw resource-type count
+(with a printed warning) only if that file isn't found. Verified the fix live: the corrected
+count comes out to **68 unique services for both this project's own tracks** — genuinely
+comparable in magnitude to DPIaC-Eval's 58 and IaC-Eval's ~60, unlike the original 342-349.
+
+**Verified end-to-end via a live, read-only kernel run** (setup → §9 load-both → new §17, no AWS
+calls): produces a clean 4-row comparison table (This benchmark LocalStack: 250 scenarios, 311.6
+avg LoC, 9.7 avg resources, 68 services; This benchmark Real-AWS: 250 scenarios, 305.2 avg LoC,
+9.5 avg resources, 68 services; DPIaC-Eval: 153 scenarios, 155 LoC, 7 resources, 58 services;
+IaC-Eval: 42 LoC, 4 resources, ~60 services) plus a 2-panel bar chart (avg LoC, avg # resources)
+across all 4 rows — confirms this project's own Terraform benchmark is markedly larger and more
+complex per template than either published benchmark, matching the same finding already
+established for the CFN track.
+
+Notebook backup: `TF_Benchmark_Analytics.ipynb.bak26_<timestamp>`. `ast.parse` clean.

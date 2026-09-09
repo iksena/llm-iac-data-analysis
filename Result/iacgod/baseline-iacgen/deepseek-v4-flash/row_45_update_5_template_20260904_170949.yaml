@@ -1,0 +1,358 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "Secure S3 backend for Terraform state with DynamoDB locking, KMS encryption, and optional CloudTrail logging."
+
+Parameters:
+  Name:
+    Type: String
+    Default: ""
+    Description: "Base name for resources. Defaults to AWS account ID if left empty."
+  AdminPrincipalArn:
+    Type: String
+    Default: ""
+    Description: "ARN of the admin IAM principal allowed to assume the state management role. Defaults to root of current account."
+  ExecutionPrincipalArn:
+    Type: String
+    Default: ""
+    Description: "ARN of the execution IAM principal allowed to assume the state management role. Defaults to root of current account."
+  RepositoryTagValue:
+    Type: String
+    Default: ""
+    Description: "Value for the 'Repository' tag condition on the role trust policy. Defaults to the Name parameter or account ID."
+  VpcId:
+    Type: String
+    Default: ""
+    Description: "Optional VPC ID to restrict S3 bucket access via bucket policy."
+  SsoPermissionSetArn:
+    Type: String
+    Default: ""
+    Description: "Optional SSO permission set ARN (for reference only)."
+  EnableCloudTrail:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: "Enable CloudTrail trail to log data events on the state bucket."
+  SendLogsToCloudWatch:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "false"
+    Description: "If CloudTrail is enabled, send logs to CloudWatch Logs."
+
+Conditions:
+  HasVpcId: !Not [!Equals [!Ref VpcId, ""]]
+  HasCloudTrail: !Equals [!Ref EnableCloudTrail, "true"]
+  HasCloudWatch: !And [!Condition HasCloudTrail, !Equals [!Ref SendLogsToCloudWatch, "true"]]
+  UseDefaultName: !Equals [!Ref Name, ""]
+  UseDefaultAdmin: !Equals [!Ref AdminPrincipalArn, ""]
+  UseDefaultExecution: !Equals [!Ref ExecutionPrincipalArn, ""]
+  UseDefaultRepositoryTag: !Equals [!Ref RepositoryTagValue, ""]
+
+Resources:
+  # KMS Key for encrypting all resources
+  TerraformStateKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "KMS key for Terraform state backend - ${AWS::AccountId}"
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "Enable IAM User Permissions"
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: "AllowAdminPrincipal"
+            Effect: Allow
+            Principal:
+              AWS: !If [UseDefaultAdmin, !Sub "arn:aws:iam::${AWS::AccountId}:root", !Ref AdminPrincipalArn]
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+          - Sid: "AllowExecutionPrincipal"
+            Effect: Allow
+            Principal:
+              AWS: !If [UseDefaultExecution, !Sub "arn:aws:iam::${AWS::AccountId}:root", !Ref ExecutionPrincipalArn]
+            Action:
+              - "kms:Encrypt"
+              - "kms:Decrypt"
+              - "kms:ReEncrypt*"
+              - "kms:GenerateDataKey*"
+              - "kms:DescribeKey"
+            Resource: "*"
+          - !If
+            - HasCloudTrail
+            - Sid: "AllowCloudTrail"
+              Effect: Allow
+              Principal:
+                Service: "cloudtrail.amazonaws.com"
+              Action:
+                - "kms:GenerateDataKey*"
+                - "kms:Decrypt"
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  "aws:SourceArn": !Sub "arn:aws:cloudtrail:${AWS::Region}:${AWS::AccountId}:trail/${AWS::AccountId}-cloudtrail"
+            - !Ref "AWS::NoValue"
+          - !If
+            - HasCloudWatch
+            - Sid: "AllowCloudWatchLogs"
+              Effect: Allow
+              Principal:
+                Service: !Sub "logs.${AWS::Region}.amazonaws.com"
+              Action:
+                - "kms:Encrypt"
+                - "kms:Decrypt"
+                - "kms:GenerateDataKey*"
+              Resource: "*"
+              Condition:
+                ArnLike:
+                  "aws:SourceArn": !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/cloudtrail/${AWS::AccountId}-cloudtrail-logs:*"
+            - !Ref "AWS::NoValue"
+
+  TerraformStateKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: "alias/terraform-state-key"
+      TargetKeyId: !Ref TerraformStateKmsKey
+
+  # S3 Bucket for Terraform state files
+  TerraformStateBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-terraform-state"
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !Ref TerraformStateKmsKey
+      LifecycleConfiguration:
+        Rules:
+          - Id: "NoncurrentVersionExpiration"
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 90
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !If [UseDefaultName, !Ref "AWS::AccountId", !Ref Name]
+
+  TerraformStateBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Condition: HasVpcId
+    Properties:
+      Bucket: !Ref TerraformStateBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "DenyAccessOutsideVpc"
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt TerraformStateBucket.Arn
+              - !Sub "${TerraformStateBucket.Arn}/*"
+            Condition:
+              StringNotEquals:
+                "aws:SourceVpc": !Ref VpcId
+
+  # DynamoDB Table for state locking
+  TerraformStateLockTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::AccountId}-terraform-lock"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: LockID
+          AttributeType: S
+      KeySchema:
+        - AttributeName: LockID
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref TerraformStateKmsKey
+      Tags:
+        - Key: Name
+          Value: !If [UseDefaultName, !Ref "AWS::AccountId", !Ref Name]
+
+  # IAM Role for managing Terraform state
+  TerraformStateRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::AccountId}-terraform-state-manager"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "AllowAdminPrincipal"
+            Effect: Allow
+            Principal:
+              AWS: !If [UseDefaultAdmin, !Sub "arn:aws:iam::${AWS::AccountId}:root", !Ref AdminPrincipalArn]
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "aws:RequestTag/Repository": !If [UseDefaultRepositoryTag, !If [UseDefaultName, !Ref "AWS::AccountId", !Ref Name], !Ref RepositoryTagValue]
+          - Sid: "AllowExecutionPrincipal"
+            Effect: Allow
+            Principal:
+              AWS: !If [UseDefaultExecution, !Sub "arn:aws:iam::${AWS::AccountId}:root", !Ref ExecutionPrincipalArn]
+            Action: "sts:AssumeRole"
+            Condition:
+              StringEquals:
+                "aws:RequestTag/Repository": !If [UseDefaultRepositoryTag, !If [UseDefaultName, !Ref "AWS::AccountId", !Ref Name], !Ref RepositoryTagValue]
+      Policies:
+        - PolicyName: "TerraformStateAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: "S3Access"
+                Effect: Allow
+                Action:
+                  - "s3:ListBucket"
+                  - "s3:GetObject"
+                  - "s3:PutObject"
+                  - "s3:DeleteObject"
+                  - "s3:GetObjectVersion"
+                  - "s3:PutObjectVersionTagging"
+                Resource:
+                  - !GetAtt TerraformStateBucket.Arn
+                  - !Sub "${TerraformStateBucket.Arn}/*"
+              - Sid: "DynamoDBAccess"
+                Effect: Allow
+                Action:
+                  - "dynamodb:GetItem"
+                  - "dynamodb:PutItem"
+                  - "dynamodb:DeleteItem"
+                  - "dynamodb:DescribeTable"
+                Resource: !GetAtt TerraformStateLockTable.Arn
+              - Sid: "KMSAccess"
+                Effect: Allow
+                Action:
+                  - "kms:Decrypt"
+                  - "kms:GenerateDataKey"
+                  - "kms:DescribeKey"
+                Resource: !GetAtt TerraformStateKmsKey.Arn
+      Tags:
+        - Key: Name
+          Value: !If [UseDefaultName, !Ref "AWS::AccountId", !Ref Name]
+
+  # Log Archive Bucket with lifecycle and object lock
+  LogArchiveBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::AccountId}-log-archive"
+      ObjectLockEnabled: true
+      ObjectLockConfiguration:
+        ObjectLockEnabled: Enabled
+        Rule:
+          DefaultRetention:
+            Mode: GOVERNANCE
+            Days: 30
+      LifecycleConfiguration:
+        Rules:
+          - Id: "TransitionToGlacier"
+            Status: Enabled
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 30
+          - Id: "Expiration"
+            Status: Enabled
+            ExpirationInDays: 365
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Name
+          Value: !If [UseDefaultName, !Ref "AWS::AccountId", !Ref Name]
+
+  # CloudTrail Trail (conditional)
+  TerraformStateCloudTrail:
+    Type: AWS::CloudTrail::Trail
+    Condition: HasCloudTrail
+    Properties:
+      TrailName: !Sub "${AWS::AccountId}-cloudtrail"
+      S3BucketName: !Ref LogArchiveBucket
+      S3KeyPrefix: "cloudtrail"
+      EnableLogFileValidation: true
+      IncludeGlobalServiceEvents: true
+      IsMultiRegionTrail: false
+      IsLogging: true
+      KMSKeyId: !Ref TerraformStateKmsKey
+      EventSelectors:
+        - ReadWriteType: All
+          IncludeManagementEvents: true
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub "${TerraformStateBucket.Arn}/"
+      CloudWatchLogsLogGroupArn: !If [HasCloudWatch, !GetAtt TerraformStateCloudWatchLogGroup.Arn, !Ref "AWS::NoValue"]
+      CloudWatchLogsRoleArn: !If [HasCloudWatch, !GetAtt CloudTrailCloudWatchRole.Arn, !Ref "AWS::NoValue"]
+
+  # CloudWatch Logs Group (conditional)
+  TerraformStateCloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Condition: HasCloudWatch
+    Properties:
+      LogGroupName: !Sub "/aws/cloudtrail/${AWS::AccountId}-cloudtrail-logs"
+      RetentionInDays: 365
+      KmsKeyId: !Ref TerraformStateKmsKey
+
+  # IAM Role for CloudTrail to write to CloudWatch Logs (conditional)
+  CloudTrailCloudWatchRole:
+    Type: AWS::IAM::Role
+    Condition: HasCloudWatch
+    Properties:
+      RoleName: !Sub "${AWS::AccountId}-cloudtrail-cloudwatch-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: "cloudtrail.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "CloudWatchLogsWrite"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: !GetAtt TerraformStateCloudWatchLogGroup.Arn
+
+Outputs:
+  TerraformStateBucketName:
+    Description: "Name of the S3 bucket for Terraform state files"
+    Value: !Ref TerraformStateBucket
+  TerraformStateLockTableName:
+    Description: "Name of the DynamoDB table for state locking"
+    Value: !Ref TerraformStateLockTable
+  TerraformStateRoleArn:
+    Description: "ARN of the IAM role for managing Terraform state"
+    Value: !GetAtt TerraformStateRole.Arn
+  TerraformStateKmsKeyArn:
+    Description: "ARN of the KMS key used for encryption"
+    Value: !GetAtt TerraformStateKmsKey.Arn
+  LogArchiveBucketName:
+    Description: "Name of the log archive bucket"
+    Value: !Ref LogArchiveBucket
+  CloudTrailTrailArn:
+    Description: "ARN of the CloudTrail trail (if enabled)"
+    Condition: HasCloudTrail
+    Value: !GetAtt TerraformStateCloudTrail.Arn
+  SsoPermissionSetArn:
+    Description: "Provided SSO permission set ARN (for reference)"
+    Value: !Ref SsoPermissionSetArn

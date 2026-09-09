@@ -1,0 +1,335 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFormation template for EC2 Image Builder pipeline with custom Chef recipe component, lifecycle policy, and daily scheduled builds"
+
+Parameters:
+  PipelineName:
+    Type: String
+    Default: "CustomAMIPipeline"
+    Description: "Name for the Image Builder pipeline"
+  ComponentName:
+    Type: String
+    Default: "ChefRecipeComponent"
+    Description: "Name for the custom build component"
+  ImageRecipeName:
+    Type: String
+    Default: "CustomAMIImageRecipe"
+    Description: "Name for the image recipe"
+  InfrastructureConfigName:
+    Type: String
+    Default: "CustomAMIInfrastructureConfig"
+    Description: "Name for the infrastructure configuration"
+  DistributionConfigName:
+    Type: String
+    Default: "CustomAMIDistributionConfig"
+    Description: "Name for the distribution configuration"
+  LifecyclePolicyName:
+    Type: String
+    Default: "CustomAMILifecyclePolicy"
+    Description: "Name for the lifecycle policy"
+  S3BucketName:
+    Type: String
+    Default: "my-image-builder-bucket"
+    Description: "S3 bucket containing the Chef recipe (must exist prior to deployment)"
+  S3Key:
+    Type: String
+    Default: "chef/recipes/default.rb"
+    Description: "S3 key for the Chef recipe file"
+  TargetRegion:
+    Type: String
+    Default: "us-east-1"
+    Description: "Target region for AMI distribution"
+  RetentionDays:
+    Type: Number
+    Default: 30
+    MinValue: 1
+    MaxValue: 365
+    Description: "Number of days to retain AMIs before deprecation"
+  InstanceType:
+    Type: String
+    Default: "t3.medium"
+    AllowedValues:
+      - t3.medium
+      - t3.large
+      - t3.xlarge
+      - m5.large
+      - m5.xlarge
+    Description: "Instance type for the build instance"
+  SubnetId:
+    Type: String
+    Default: ""
+    Description: "Optional subnet ID for the build instance. Leave empty to use default VPC."
+  ParentImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: "/aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id"
+    Description: "SSM parameter path to get the latest Amazon Linux 2 ECS optimized AMI ID"
+
+Conditions:
+  HasSubnetId: !Not [!Equals [!Ref SubnetId, ""]]
+
+Resources:
+  # IAM Roles and Policies
+  ImageBuilderServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${PipelineName}-ServiceRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: imagebuilder.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/EC2ImageBuilderServiceRolePolicy
+      Policies:
+        - PolicyName: ImageBuilderPassRolePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !GetAtt ImageBuilderInstanceProfile.Arn
+        - PolicyName: ImageBuilderLifecyclePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - imagebuilder:*
+                  - ec2:DescribeImages
+                  - ec2:ModifyImageAttribute
+                  - ec2:DescribeSnapshots
+                  - ec2:DeleteSnapshot
+                  - ec2:DeregisterImage
+                Resource: "*"
+
+  ImageBuilderInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${PipelineName}-InstanceRole"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/EC2InstanceConnect
+      Policies:
+        - PolicyName: S3AccessPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${S3BucketName}"
+                  - !Sub "arn:aws:s3:::${S3BucketName}/*"
+        - PolicyName: MetadataCollectionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeTags
+                  - ec2:DescribeInstances
+                Resource: "*"
+        - PolicyName: CloudWatchLogsPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: "*"
+
+  ImageBuilderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${PipelineName}-InstanceProfile"
+      Roles:
+        - !Ref ImageBuilderInstanceRole
+
+  # Custom Component
+  CustomBuildComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: !Ref ComponentName
+      Description: "Custom build component that updates SSM agent, downloads Chef recipe from S3, executes it, and collects metadata"
+      Platform: "Linux"
+      Version: "1.0.0"
+      Data: !Sub |
+        name: CustomBuildComponent
+        description: Updates SSM agent, downloads and executes Chef recipe, collects metadata
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: UpdateSSMAgent
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo yum update -y amazon-ssm-agent
+                    - sudo systemctl restart amazon-ssm-agent
+              - name: DownloadChefRecipe
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - aws s3 cp s3://${S3BucketName}/${S3Key} /tmp/chef-recipe.rb
+                    - echo "Chef recipe downloaded successfully"
+              - name: InstallChef
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - curl -L https://omnitruck.chef.io/install.sh | sudo bash
+                    - sudo /opt/chef/embedded/bin/gem install chef
+              - name: ExecuteChefRecipe
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo chef-client --local-mode /tmp/chef-recipe.rb
+                    - echo "Chef recipe executed successfully"
+              - name: CollectMetadata
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      cat <<EOF > /tmp/build-metada.json
+                      {
+                        "build_time": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
+                        "instance_id": "$(curl -s http://169.254.169.254/latest/meta-data/instance-id)",
+                        "instance_type": "$(curl -s http://169.254.169.254/latest/meta-data/instance-type)",
+                        "ami_id": "$(curl -s http://169.254.169.254/latest/meta-data/ami-id)",
+                        "region": "$(curl -s http://169.254.169.254/latest/meta-data/placement/region)"
+                      }
+                      EOF
+                    - aws s3 cp /tmp/build-metada.json s3://${S3BucketName}/metadata/build-$(date +%Y%m%d%H%M%S).json
+                    - echo "Metadata collected and uploaded"
+
+  # Image Recipe
+  ImageRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: !Ref ImageRecipeName
+      Description: "Image recipe using Amazon Linux 2 ECS optimized AMI with custom Chef component"
+      ParentImage: !Ref ParentImageId
+      Version: "1.0.0"
+      Components:
+        - ComponentArn: !Ref CustomBuildComponent
+      BlockDeviceMappings:
+        - DeviceName: "/dev/xvda"
+          Ebs:
+            VolumeSize: 30
+            VolumeType: gp3
+            Encrypted: false
+            DeleteOnTermination: true
+      WorkingDirectory: "/tmp"
+      AdditionalInstanceConfiguration:
+        SystemsManagerAgent:
+          UninstallAfterBuild: false
+
+  # Infrastructure Configuration
+  InfrastructureConfiguration:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: !Ref InfrastructureConfigName
+      Description: "Infrastructure configuration with terminate on failure enabled"
+      InstanceProfileName: !Ref ImageBuilderInstanceProfile
+      InstanceTypes:
+        - !Ref InstanceType
+      TerminateInstanceOnFailure: true
+      SubnetId: !If [HasSubnetId, !Ref SubnetId, !Ref "AWS::NoValue"]
+      Logging:
+        S3Logs:
+          S3BucketName: !Ref S3BucketName
+          S3KeyPrefix: "image-builder-logs/"
+
+  # Distribution Configuration
+  DistriutionConfiguration:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: !Ref DistributionConfigName
+      Description: "Distriution configuration sharing AMI with current account in target region"
+      Distributions:
+        - Region: !Ref TargetRegion
+          AmiDistributionConfiguration:
+            Name: "{{ imagebuilder:imageName }}-{{ imagebuilder:buildDate }}-{{ imagebuilder:buildVersion }}"
+            Description: "Custom AMI built with Chef recipe"
+            AmiTags:
+              Environment: "Production"
+              Pipeline: !Ref PipelineName
+            LaunchPermissionConfiguration:
+              UserIds:
+                - !Ref "AWS::AccountId"
+
+  # Lifecycle Policy
+  LifecyclePolicy:
+    Type: AWS::ImageBuilder::LifecyclePolicy
+    Properties:
+      Name: !Ref LifecyclePolicyName
+      Description: "Lifecycle policy that deprecates AMIs based on age and tag selection"
+      ExecutionRole: !GetAtt ImageBuilderServiceRole.Arn
+      ResourceType: "AMI_IMAGE"
+      ResourceSelection:
+        TagMap:
+          Environment: "Production"
+      PolicyDetails:
+        - Action:
+            Type: "DEPRECATE"
+          Filter:
+            Type: "AGE"
+            Value: !Ref RetentionDays
+            Unit: "DAYS"
+            RetainAtLeast: 1
+
+  # Image Pipeline
+  ImagePipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: !Ref PipelineName
+      Description: "Daily scheduled pipeline with image scanning and tests enabled"
+      ImageRecipeArn: !Ref ImageRecipe
+      InfrastructureConfigurationArn: !Ref InfrastructureConfiguration
+      DistributionConfigurationArn: !Ref DistributionConfiguration
+      ImageTestsConfiguration:
+        ImageTestsEnabled: true
+        TimeoutMinutes: 60
+      ImageScanningConfiguration:
+        ImageScanningEnabled: true
+      Schedule:
+        ScheduleExpression: "cron(0 0 * * ? *)"
+        PipelineExecutionStartCondition: "EXPRESSION_MATCH_AND_DEPENDENCY_UPDATES_AVAILABLE"
+      Status: "ENABLED"
+
+Outputs:
+  PipelineArn:
+    Description: "ARN of the Image Builder pipeline"
+    Value: !Ref ImagePipeline
+  ComponentArn:
+    Description: "ARN of the custom build component"
+    Value: !Ref CustomBuildComponent
+  ImageRecipeArn:
+    Description: "ARN of the image recipe"
+    Value: !Ref ImageRecipe
+  InfrastructureConfigurationArn:
+    Description: "ARN of the infrastructure configuration"
+    Value: !Ref InfrastructureConfiguration
+  DistributionConfigurationArn:
+    Description: "ARN of the distribution configuration"
+    Value: !Ref DistributionConfiguration
+  LifecyclePolicyArn:
+    Description: "ARN of the lifecycle policy"
+    Value: !Ref LifecyclePolicy
+  InstanceProfileArn:
+    Description: "ARN of the EC2 instance profile"
+    Value: !GetAtt ImageBuilderInstanceProfile.Arn
+  ServiceRoleArn:
+    Description: "ARN of the Image Builder service role"
+    Value: !GetAtt ImageBuilderServiceRole.Arn

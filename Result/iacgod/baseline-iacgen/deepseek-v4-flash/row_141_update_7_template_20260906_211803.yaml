@@ -1,0 +1,336 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: WebSocket API for grant-processing job status updates with encrypted Lambda environment variables and encrypted CloudWatch logs
+
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    Description: The name of the API Gateway stage
+  RelatedFunctionRoleArns:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: List of IAM role ARNs for related Lambda functions that can decrypt the KMS key used for Lambda environment variables
+
+Conditions:
+  HasRelatedRoles: !Not [!Equals [!Join ['', !Ref RelatedFunctionRoleArns], '']]
+
+Resources:
+  LambdaEnvKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for encrypting Lambda function environment variables
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - !If
+            - HasRelatedRoles
+            - Sid: AllowRelatedFunctionsToDecrypt
+              Effect: Allow
+              Principal:
+                AWS: !Ref RelatedFunctionRoleArns
+              Action:
+                - kms:Decrypt
+                - kms:GenerateDataKey
+              Resource: '*'
+            - !Ref AWS::NoValue
+
+  LambdaEnvKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/lambda-env-kms-key
+      TargetKeyId: !Ref LambdaEnvKmsKey
+
+  CloudWatchLogsKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for encrypting CloudWatch Logs log group used by API Gateway
+      Enabled: true
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowCloudWatchLogsToUseKey
+            Effect: Allow
+            Principal:
+              Service: logs.amazonaws.com
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:DescribeKey
+            Resource: '*'
+
+  CloudWatchLogsKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: alias/cloudwatch-logs-kms-key
+      TargetKeyId: !Ref CloudWatchLogsKmsKey
+
+  ConnectionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: WebSocketConnections
+      AttributeDefinitions:
+        - AttributeName: connectionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: connectionId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                  - dynamodb:UpdateItem
+                Resource: !GetAtt ConnectionsTable.Arn
+        - PolicyName: KMSDecrypt
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                  - kms:GenerateDataKey
+                Resource: !GetAtt LambdaEnvKmsKey.Arn
+        - PolicyName: ApiGatewayManageConnections
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - execute-api:ManageConnections
+                Resource: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*
+
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: WebSocketHandler
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      KmsKeyArn: !GetAtt LambdaEnvKmsKey.Arn
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ConnectionsTable
+          API_ENDPOINT: !Sub wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from botocore.exceptions import ClientError
+
+          dynamodb = boto3.resource('dynamodb')
+          table_name = os.environ['TABLE_NAME']
+          table = dynamodb.Table(table_name)
+
+          def lambda_handler(event, context):
+              route_key = event.get('requestContext', {}).get('routeKey')
+              connection_id = event.get('requestContext', {}).get('connectionId')
+              domain_name = event.get('requestContext', {}).get('domainName')
+              stage = event.get('requestContext', {}).get('stage')
+
+              if route_key == '$connect':
+                  try:
+                      table.put_item(Item={'connectionId': connection_id})
+                  except ClientError as e:
+                      print(f"Error storing connection {connection_id}: {e}")
+                      return {'statusCode': 500}
+                  return {'statusCode': 200}
+
+              elif route_key == '$disconnect':
+                  try:
+                      table.delete_item(Key={'connectionId': connection_id})
+                  except ClientError as e:
+                      print(f"Error removing connection {connection_id}: {e}")
+                  return {'statusCode': 200}
+
+              elif route_key == 'sendmessage':
+                  try:
+                      body = json.loads(event.get('body', '{}'))
+                      message = body.get('message', '')
+                      api_client = boto3.client('apigatewaymanagementapi', endpoint_url=f"https://{domain_name}/{stage}")
+                      response = table.scan(ProjectionExpression='connectionId')
+                      for item in response.get('Items', []):
+                          try:
+                              api_client.post_to_connection(
+                                  ConnectionId=item['connectionId'],
+                                  Data=json.dumps({'message': message}).encode('utf-8')
+                              )
+                          except ClientError as e:
+                              if e.response['Error']['Code'] == 'GoneException':
+                                  table.delete_item(Key={'connectionId': item['connectionId']})
+                  except Exception as e:
+                      print(f"Error in sendmessage: {e}")
+                  return {'statusCode': 200}
+
+              else:
+                  return {'statusCode': 200}
+
+  WebSocketApi:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: GrantStatusWebSocketApi
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: $request.body.action
+
+  WebSocketIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketApi
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt LambdaFunction.Arn
+      ConnectionType: INTERNET
+
+  ConnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $connect
+      Target: !Join ['/', ['integrations', !Ref WebSocketIntegration]]
+
+  DisconnectRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $disconnect
+      Target: !Join ['/', ['integrations', !Ref WebSocketIntegration]]
+
+  DefaultRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: $default
+      Target: !Join ['/', ['integrations', !Ref WebSocketIntegration]]
+
+  SendMessageRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketApi
+      RouteKey: sendmessage
+      Target: !Join ['/', ['integrations', !Ref WebSocketIntegration]]
+
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ConnectRoute
+      - DisconnectRoute
+      - DefaultRoute
+      - SendMessageRoute
+    Properties:
+      ApiId: !Ref WebSocketApi
+      Description: Initial deployment
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: !Ref StageName
+      ApiId: !Ref WebSocketApi
+      DeploymentId: !Ref WebSocketDeployment
+      DefaultRouteSettings:
+        LoggingLevel: INFO
+        DataTraceEnabled: true
+        ThrottlingBurstLimit: 5000
+        ThrottlingRateLimit: 10000
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiGatewayAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","ip":"$context.identity.sourceIp","caller":"$context.identity.caller","user":"$context.identity.user","requestTime":"$context.requestTime","httpMethod":"$context.httpMethod","resourcePath":"$context.resourcePath","status":"$context.status","protocol":"$context.protocol","responseLength":"$context.responseLength"}'
+      Tags:
+        Name: !Join ['', ['WebSocketStage-', !Ref StageName]]
+
+  ApiGatewayAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn:
+      - CloudWatchLogsKmsKey
+    Properties:
+      LogGroupName: !Sub /aws/apigateway/${WebSocketApi}
+      RetentionInDays: 14
+      KmsKeyId: !GetAtt CloudWatchLogsKmsKey.Arn
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref LambdaFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketApi}/*
+
+  ApiGatewayCloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ApiGatewayCloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:DescribeLogGroups
+                  - logs:DescribeLogStreams
+                  - logs:PutLogEvents
+                  - logs:GetLogEvents
+                  - logs:FilterLogEvents
+                Resource: '*'
+
+  ApiGatewayAccount:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt ApiGatewayCloudWatchRole.Arn
+
+Outputs:
+  WebSocketConnectionUrl:
+    Value: !Sub https://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+    Description: WebSocket connection URL (HTTP endpoint)
+  WssEndpoint:
+    Value: !Sub wss://${WebSocketApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}
+    Description: Secure WebSocket endpoint URL
+  ApiArn:
+    Value: !Sub arn:aws:apigateway:${AWS::Region}::/apis/${WebSocketApi}
+    Description: ARN of the WebSocket API

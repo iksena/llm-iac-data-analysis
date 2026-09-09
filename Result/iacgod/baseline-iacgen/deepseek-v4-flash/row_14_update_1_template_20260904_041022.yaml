@@ -1,0 +1,192 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "CloudFormation template for serverless content moderation API using Amazon Rekognition"
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    Description: Name of the API Gateway stage
+  ImageSizeLimitMB:
+    Type: Number
+    Default: 5
+    MinValue: 1
+    MaxValue: 10
+    Description: Maximum image file size in MB
+  ConfidenceThreshold:
+    Type: Number
+    Default: 60
+    MinValue: 0
+    MaxValue: 100
+    Description: Minimum confidence threshold for Rekognition moderation detection
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: RekognitionDetectModerationLabels
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rekognition:DetectModerationLabels
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+  InvokeContentModeration:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: invokeContentModeration
+      Runtime: python3.11
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          IMAGE_SIZE_LIMIT_MB: !Ref ImageSizeLimitMB
+          CONFIDENCE_THRESHOLD: !Ref ConfidenceThreshold
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import urllib.request
+          import urllib.error
+          import boto3
+          from botocore.exceptions import ClientError
+          
+          rekognition = boto3.client('rekognition')
+          
+          ALLOWED_EXTENSIONS = ['.jpg', '.jpeg', '.png']
+          IMAGE_SIZE_LIMIT = int(os.environ.get('IMAGE_SIZE_LIMIT_MB', 5)) * 1024 * 1024
+          CONFIDENCE_THRESHOLD = float(os.environ.get('CONFIDENCE_THRESHOLD', 60))
+          
+          def lambda_handler(event, context):
+              try:
+                  body = json.loads(event.get('body', '{}'))
+                  image_url = body.get('url', '')
+                  
+                  if not image_url:
+                      return response(400, {'error': 'Missing required field: url'})
+                  
+                  # Validate file extension
+                  valid_ext = False
+                  for ext in ALLOWED_EXTENSIONS:
+                      if image_url.lower().endswith(ext):
+                          valid_ext = True
+                          break
+                  
+                  if not valid_ext:
+                      return response(400, {'error': 'Unsupported image format. Allowed formats: jpg, jpeg, png'})
+                  
+                  # Fetch image from URL with size limit
+                  try:
+                      req = urllib.request.Request(image_url, headers={'User-Agent': 'Mozilla/5.0'})
+                      with urllib.request.urlopen(req) as conn:
+                          if conn.length and conn.length > IMAGE_SIZE_LIMIT:
+                              return response(413, {'error': f'Image exceeds maximum size of {IMAGE_SIZE_LIMIT/1024/1024} MB'})
+                          image_bytes = conn.read()
+                          if len(image_bytes) > IMAGE_SIZE_LIMIT:
+                              return response(413, {'error': f'Image exceeds maximum size of {IMAGE_SIZE_LIMIT/1024/1024} MB'})
+                  except urllib.error.HTTPError as e:
+                      return response(e.code, {'error': f'Failed to fetch image from URL: HTTP {e.code}'})
+                  except urllib.error.URLError as e:
+                      return response(400, {'error': f'Invalid URL or network error: {str(e.reason)}'})
+                  
+                  # Call Rekognition
+                  try:
+                      rekognition_response = rekognition.detect_moderation_labels(
+                          Image={
+                              'Bytes': image_bytes
+                          },
+                          MinConfidence=CONFIDENCE_THRESHOLD
+                      )
+                      
+                      moderation_labels = rekognition_response.get('ModerationLabels', [])
+                      return response(200, {
+                          'moderationLabels': [
+                              {
+                                  'name': label['Name'],
+                                  'confidence': label['Confidence'],
+                                  'parentName': label.get('ParentName', '')
+                              }
+                              for label in moderation_labels
+                          ]
+                      })
+                  except ClientError as e:
+                      return response(500, {'error': f'Rekognition error: {e.response["Error"]["Message"]}'})
+                  
+              except json.JSONDecodeError:
+                  return response(400, {'error': 'Invalid JSON in request body'})
+              except Exception as e:
+                  return response(500, {'error': f'Internal server error: {str(e)}'})
+          
+          def response(status_code, body):
+              return {
+                  'statusCode': status_code,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps(body)
+              }
+  ContentModerationApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: ContentModeration
+      Description: REST API for content moderation using Amazon Rekognition
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+  ApiGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref ContentModerationApi
+      ParentId: !GetAtt ContentModerationApi.RootResourceId
+      PathPart: "moderate"
+  ApiGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ContentModerationApi
+      ResourceId: !Ref ApiGatewayResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${InvokeContentModeration.Arn}/invocations
+        PassthroughBehavior: WHEN_NO_MATCH
+        TimeoutInMillis: 29000
+      MethodResponses:
+        - StatusCode: 200
+  ApiGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - ApiGatewayMethod
+    Properties:
+      RestApiId: !Ref ContentModerationApi
+      StageName: !Ref StageName
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt InvokeContentModeration.Arn
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ContentModerationApi}/*/POST/moderate
+Outputs:
+  ApiEndpoint:
+    Description: "API Gateway endpoint URL for content moderation"
+    Value: !Sub https://${ContentModerationApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}/moderate
+  LambdaFunctionArn:
+    Description: "ARN of the Lambda function"
+    Value: !GetAtt InvokeContentModeration.Arn
